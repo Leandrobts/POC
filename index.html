@@ -1,44 +1,41 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Hybrid Fuzzer (Stress + Cross-Doc)</title>
+    <title>PS4 Lite Fuzzer (Logic over RAM)</title>
     <style>
-        body { background: #000; color: #00ff00; font-family: monospace; overflow: hidden; }
-        .v-stress { 
-            position: absolute; 
-            transform: translate3d(0,0,0); /* Força GPU */
-            transition: all 0.1s;
-            display: flex;
-            border: 1px solid red;
+        body { background: #000; color: #00ffff; font-family: monospace; overflow: hidden; margin: 0; }
+        #hud { 
+            position: fixed; top: 0; left: 0; width: 100%; 
+            background: rgba(0, 0, 20, 0.95); 
+            border-bottom: 2px solid #0ff; 
+            padding: 15px; z-index: 9999;
+            font-size: 24px; font-weight: bold;
         }
-        #log { border-bottom: 1px solid #0f0; padding: 5px; font-size: 20px; }
+        .chaos { border: 1px solid #333; position: absolute; }
     </style>
 </head>
 <body>
-    <div id="log">Inicializando Hybrid Fuzzer...</div>
+    <div id="hud">
+        <div>LITE FUZZER: <span style="color:lime">ATIVO</span> <span id="beat">❤</span></div>
+        <div style="font-size: 18px; color: #aaa; margin-top: 5px;">
+            SEED ATUAL: <span id="seed-disp" style="color:#fff">...</span> | OBJETOS: <span id="nodes-count">0</span>
+        </div>
+    </div>
+
     <iframe id="victim-frame" style="width:1px; height:1px; opacity:0; position:absolute;"></iframe>
-    <div id="arena" style="width: 2000px; height: 2000px;"></div>
+    <div id="arena" style="margin-top: 100px;"></div>
 
     <script>
-        // ================= CONFIGURAÇÃO AJUSTADA =================
-        const REPLAY_MODE = false;
-        const REPLAY_SEED = 0; 
-        // REDUZIDO DE 60 PARA 30: Para evitar "Falta de Memória" e focar no Crash real
-        const ITERATIONS = 30; 
-        // =========================================================
+        // ================= CONFIGURAÇÃO LEVE =================
+        // Reduzido drasticamente para evitar OOM imediato
+        const MAX_NODES = 150; 
+        const ITERATIONS_PER_FRAME = 5; 
+        // =====================================================
 
-        const TAGS = [
-            'div', 'span', 'a', 'img', 'iframe', 'video', 'audio', 
-            'svg', 'path', 'circle', 'mask',
-            'math', 'row', 'frac', 'num',    
-            'table', 'form', 'fieldset', 'select', 'option',
-            'details', 'summary', 'marquee'  
-        ];
+        let currentSeed = parseInt(localStorage.getItem('lite_seed') || Math.floor(Math.random() * 100000));
+        localStorage.setItem('lite_last_start', currentSeed);
 
         // PRNG
-        let currentSeed = parseInt(localStorage.getItem('hyb_seed') || Math.floor(Math.random() * 100000));
-        localStorage.setItem('hyb_last_start', currentSeed);
-
         function seed(s) { currentSeed = s; }
         function rnd() {
             var t = currentSeed += 0x6D2B79F5;
@@ -46,127 +43,130 @@
             t ^= t + Math.imul(t ^ t >>> 7, t | 61);
             return ((t ^ t >>> 14) >>> 0) / 4294967296;
         }
-        function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
         function coinflip() { return rnd() > 0.5; }
 
-        // Estado
-        const logBox = document.getElementById('log');
-        const frame = document.getElementById('victim-frame'); // Referência ao iframe
-        
-        if (REPLAY_MODE) seed(REPLAY_SEED);
-        else seed(currentSeed);
+        // UI
+        const seedSpan = document.getElementById('seed-disp');
+        const nodesSpan = document.getElementById('nodes-count');
+        const beatSpan = document.getElementById('beat');
+        const arena = document.getElementById('arena');
+        const frame = document.getElementById('victim-frame');
 
-        if (!REPLAY_MODE) localStorage.setItem('hyb_seed', currentSeed + 1);
-        
-        logBox.innerHTML = `SEED: ${currentSeed} | <span style="color:red">❤</span>`;
+        let liveNodes = [];
+        let cycleCount = 0;
 
-        // --- FUNÇÕES DE ATAQUE ---
+        // --- VETORES DE ATAQUE (Lógica Pura) ---
 
-        function fuzzAttributes(el) {
-            try {
-                if (coinflip()) el.id = "id_" + Math.floor(rnd() * 1000);
-                if (coinflip()) el.className = "v-stress";
-                // Reduzi o tamanho do junk data para economizar RAM
-                if (rnd() > 0.9) el.setAttribute("data-junk", "X".repeat(500)); 
-                if (coinflip()) el.style.cssText = `float: ${coinflip()?'left':'right'}; width: ${rnd()*100}px;`;
-            } catch(e){}
+        function createToxicNode() {
+            // Mantemos o foreignObject pois é o vetor principal de vulnerabilidade
+            let svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            let foreign = document.createElementNS("http://www.w3.org/2000/svg", "foreignObject");
+            let div = document.createElement("div");
+            
+            // Atributos leves, sem junk data gigante
+            div.className = "chaos";
+            if (coinflip()) div.id = "id_" + Math.floor(rnd() * 500);
+
+            foreign.appendChild(div);
+            svg.appendChild(foreign);
+            return svg;
         }
 
-        function addEvilEvents(el) {
-            try {
-                el.addEventListener('DOMNodeRemoved', function(ev) {
-                    ev.target.innerHTML = "<b>DEAD</b>";
-                    // Tenta acessar estilo durante a morte do objeto (UAF Vector)
-                    let _ = ev.target.style.display; 
-                });
-            } catch(e){}
-        }
-
-        // [NOVO] O Ataque Nuclear: Mover entre documentos
         function triggerCrossDoc(el) {
             try {
                 if (!frame.contentDocument) return;
                 let otherDoc = frame.contentDocument;
+
+                // A mágica acontece aqui: mover o nó enquanto observamos
+                let obs = new MutationObserver((mutations) => {
+                    let t = mutations[0].target;
+                    // Tenta corromper o ponteiro
+                    t.textContent = "DEAD"; 
+                    if (t.parentNode) t.parentNode.removeChild(t);
+                });
                 
-                // Move para o iframe e volta
+                obs.observe(el, { attributes: true, childList: true, subtree: true });
+
+                // Move para o iframe
                 otherDoc.adoptNode(el);
                 otherDoc.body.appendChild(el);
-                document.adoptNode(el);
                 
-                // [NOVO] Corrupção de Protótipo pós-movimento
-                el.__proto__ = {};
+                // Traz de volta
+                document.adoptNode(el);
+                arena.appendChild(el);
+                
+                // Corrupção de estrutura (Prototype Confusion)
+                el.__proto__ = {}; 
+
+                obs.disconnect();
             } catch(e) {}
         }
 
-        function runFuzz() {
-            const arena = document.getElementById('arena');
-            let nodes = [];
+        // LOOP PRINCIPAL SEGURO
+        async function loop() {
+            while(true) {
+                cycleCount++;
+                seedSpan.innerText = currentSeed;
+                nodesSpan.innerText = liveNodes.length;
+                beatSpan.style.opacity = (beatSpan.style.opacity == "1") ? "0.2" : "1";
 
-            try {
-                // FASE 1: CRIAÇÃO
-                for (let i = 0; i < 40; i++) { // Leve redução na quantidade
-                    let tag = pick(TAGS);
-                    let el;
-                    if (['svg','path','circle'].includes(tag)) el = document.createElementNS("http://www.w3.org/2000/svg", tag);
-                    else if (['math','row'].includes(tag)) el = document.createElementNS("http://www.w3.org/1998/Math/MathML", tag);
-                    else el = document.createElement(tag);
+                // Salva seed com menos frequência para não travar I/O
+                if (cycleCount % 20 === 0) localStorage.setItem('lite_seed', currentSeed);
 
-                    fuzzAttributes(el);
-                    addEvilEvents(el);
+                // PAUSA IMPORTANTE: Deixa o navegador desenhar o HUD
+                await new Promise(r => setTimeout(r, 40));
 
-                    if (nodes.length > 0 && coinflip()) {
-                        let parent = pick(nodes);
-                        try { parent.appendChild(el); } catch(e){ arena.appendChild(el); }
-                    } else {
+                // Executa lote pequeno de testes
+                for(let k=0; k < ITERATIONS_PER_FRAME; k++) {
+                    seed(currentSeed);
+
+                    // 1. Criação Controlada
+                    if (liveNodes.length < MAX_NODES) {
+                        let el = createToxicNode();
                         arena.appendChild(el);
+                        liveNodes.push(el);
                     }
-                    nodes.push(el);
-                }
 
-                // FASE 2: CONFUSÃO (CROSS-DOC & TREEWALKER)
-                let walker = document.createTreeWalker(arena, NodeFilter.SHOW_ELEMENT, null, false);
-                let node = walker.nextNode();
-                while(node) {
-                    if (rnd() > 0.7) {
-                        // Aqui aplicamos o ataque nuclear nos nós existentes
-                        triggerCrossDoc(node);
+                    // 2. Ataque
+                    let victim = liveNodes[Math.floor(rnd() * liveNodes.length)];
+                    if (victim) {
+                        if (coinflip()) triggerCrossDoc(victim);
                         
-                        if (coinflip()) node.normalize();
+                        // Layout Thrashing leve
+                        try { let _ = victim.getBoundingClientRect().top; } catch(e){}
                     }
-                    node = walker.nextNode();
-                }
 
-                // FASE 3: DESTRUIÇÃO
-                for (let i = 0; i < 25; i++) {
-                    let victim = pick(nodes);
-                    try {
-                        // Remove com setTimeout 0 para causar Race Condition
+                    // 3. Limpeza (Garbage Collection Assistant)
+                    // Removemos nós mais agressivamente para manter RAM baixa
+                    if (liveNodes.length > MAX_NODES * 0.7) {
+                        let idx = Math.floor(rnd() * liveNodes.length);
+                        let dying = liveNodes[idx];
+                        liveNodes.splice(idx, 1);
+                        
+                        // Deleção imediata ou atrasada (Race Condition)
                         if (coinflip()) {
-                            setTimeout(() => victim.remove(), 0);
+                            setTimeout(() => { try{ dying.remove(); }catch(e){} }, 0);
                         } else {
-                            victim.remove();
+                            try{ dying.remove(); }catch(e){}
                         }
-                    } catch(e){}
+                    }
+                    rnd(); 
                 }
+                
+                currentSeed++;
 
-                // FASE 4: MEMÓRIA (Otimizada)
-                // Spray menor, mas mais frequente, evita OOM mas mantém pressão
-                let spray = [];
-                for(let k=0; k<50; k++) {
-                    spray.push(new Float64Array(100).fill(1.123456789e-100));
+                // Limpeza forçada do DOM para evitar vazamentos eternos
+                if (cycleCount % 100 === 0) {
+                    arena.innerHTML = ""; // Reseta visual
+                    liveNodes = []; // Reseta array JS
+                    // Pequeno spray para fragmentar o Heap após limpeza
+                    let spray = new Float64Array(100).fill(1.1);
                 }
-                spray = null;
-
-            } catch (e) {}
-
-            arena.textContent = "";
+            }
         }
 
-        // Loop
-        setTimeout(() => {
-            for (let j=0; j < ITERATIONS; j++) runFuzz();
-            if (!REPLAY_MODE) window.location.reload();
-        }, 200);
+        // Iniciar
+        setTimeout(loop, 500);
 
     </script>
 </body>
