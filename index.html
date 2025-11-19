@@ -1,104 +1,140 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 12.00 DOM Crusher (No-JIT)</title>
-    <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        .log { border: 1px solid #333; height: 300px; overflow-y: scroll; padding: 5px; margin-top: 10px; }
-        /* CSS Complexo para forçar recálculo pesado */
-        .complex-style { 
-            transform: rotate(1deg); 
-            opacity: 0.9; 
-            transition: all 0.1s;
-            display: flex;
-        }
-    </style>
+<meta charset="UTF-8">
+<title>PS4 12.xx Modern Fuzzer 2025 - WASM + SAB + GC Race</title>
+<style>
+  body { background:#000; color:#0f0; font-family:monospace; padding:20px; }
+  .log { background:#111; border:1px solid #0f0; height:500px; overflow-y:scroll; padding:10px; margin-top:20px; }
+  button { background:#000; color:#0f0; border:2px solid #0f0; padding:10px 20px; margin:5px; font-size:18px; }
+</style>
 </head>
 <body>
-    <h1>PS4 DOM Crusher (Focus: WebCore Lifecycle)</h1>
-    <p>Status: WebKit < Mar 2024 Confirmado via Object.groupBy</p>
+<h1>PS4 12.xx Modern Fuzzer (2025)</h1>
+<p>Alvo: WebKit ≥ 618.1 (março 2024+) + patches Sony</p>
+<button onclick="startFuzzer()">INICIAR FUZZER (CUIDADO)</button>
+<button onclick="console.clear(); log('Log limpo')">LIMPAR LOG</button>
+
+<div id="log" class="log">Pronto...</div>
+
+<script>
+const logElement = document.getElementById('log');
+function log(msg) {
+  const div = document.createElement('div');
+  div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  logElement.appendChild(div);
+  logElement.scrollTop = logElement.scrollHeight;
+}
+
+// === CONFIGURAÇÃO ===
+const ITERATIONS = 800;          // Ajuste conforme coragem
+const WASM_CORRUPT = true;       // true = tenta corromper validation
+const SAB_RACE = true;           // SharedArrayBuffer race
+
+let sab, atomic;
+
+// === 1. Habilita SharedArrayBuffer (funciona no PS4 oficial) ===
+if (crossOriginIsolated) {
+  log("crossOriginIsolated = true → SharedArrayBuffer habilitado!");
+  sab = new SharedArrayBuffer(1024 * 64);
+  atomic = new Int32Array(sab);
+} else {
+  log("Sem SharedArrayBuffer (normal em algumas abas). Continuando sem race...");
+}
+
+// === 2. WASM maliciosos (validation bugs) ===
+const wasmBytes = [
+  // Módulo válido base (vazio)
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  // Vamos corromper várias partes aleatoriamente
+];
+
+function generateEvilWasm() {
+  let bytes = new Uint8Array(2048 + Math.floor(Math.random() * 1024));
+  // Cabeçalho válido
+  bytes.set([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00], 0);
+  
+  // Injeta lixo controlado em seções críticas
+  const corruptOffset = 8 + Math.floor(Math.random() * 300);
+  for (let i = corruptOffset; i < corruptOffset + 200; i++) {
+    if (Math.random() > 0.3)
+      bytes[i] = Math.floor(Math.random() * 256);
+  }
+  
+  // Força br_table gigante ou loop infinito de validação
+  if (WASM_CORRUPT && Math.random() > 0.6) {
+    const brTableSize = 0xFFFF + Math.floor(Math.random() * 0x10000);
+    const pos = 500 + Math.floor(Math.random() * 200);
+    bytes[pos] = 0x0E; // br_table opcode
+    bytes[pos+1] = brTableSize & 0xFF;
+    bytes[pos+2] = (brTableSize >> 8) & 0xFF;
+  }
+  
+  return bytes;
+}
+
+// === 3. Worker para race (se SAB disponível) ===
+let worker = null;
+if (sab && SAB_RACE) {
+  const workerCode = `
+    onmessage = () => {
+      const atomic = new Int32Array(${sab});
+      while(true) {
+        Atomics.store(atomic, 0, 0xDEADBEEF);
+        Atomics.load(atomic, 0);
+        Atomics.wait(atomic, 0, 10);
+      }
+    };
+  `;
+  const blob = new Blob([workerCode], {type: 'application/javascript'});
+  worker = new Worker(URL.createObjectURL(blob));
+}
+
+// === 4. FUZZER PRINCIPAL ===
+async function startFuzzer() {
+  log("Iniciando fuzzer moderno - 800 iterações");
+  if (worker) worker.postMessage('go');
+  
+  for (let i = 0; i < ITERATIONS; i++) {
+    try {
+      // 4.1 Cria WASM malicioso
+      const evil = generateEvilWasm();
+      const module = new WebAssembly.Module(evil);
+      
+      // 4.2 Instancia rápido (muitas vezes falha na validação → crash no validador)
+      const instance = new WebAssembly.Instance(module, {});
+      
+      // 4.3 GC forçado + DOM thrashing enquanto valida
+      document.body.offsetHeight; // reflow
+      const div = document.createElement('div');
+      div.innerHTML = '<span>'.repeat(10000);
+      document.body.appendChild(div);
+      div.remove();
+      
+      // 4.4 Trigger potencial type confusion
+      if (instance.exports && Math.random() > 0.7) {
+        try { instance.exports.main?.(); } catch(e) {}
+      }
+      
+      // 4.5 Pressão no GC
+      if (i % 20 === 0) {
+        log(`Iteração ${i} - ainda vivo (RAM: ${performance.memory?.usedJSHeapSize || 'N/A'})`);
+        gc?.(); // forçado se disponível
+      }
+      
+    } catch (e) {
+      // Muitos erros são esperados (validação falhou)
+      if (e.message.includes('validation') || e.message.includes('compile')) {
+        // Isso é bom! Significa que chegamos no validador
+      }
+    }
     
-    <button onclick="startDOMStorm()">INICIAR DOM STORM</button>
-    <button onclick="testLargeAllocation()">TESTE DE MEMÓRIA (OOM)</button>
-    
-    <div id="console" class="log">Log de execução...</div>
-
-    <script>
-        const logDiv = document.getElementById('console');
-        function log(msg) {
-            logDiv.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            logDiv.scrollTop = logDiv.scrollHeight;
-        }
-
-        // --- TESTE 1: DOM STORM (Tentativa de UAF em Renderização) ---
-        // Cria estruturas HTML profundas e as destroi enquanto força recálculo de estilo
-        function startDOMStorm() {
-            log("Iniciando DOM Storm (500 ciclos)...");
-            let container = document.createElement('div');
-            document.body.appendChild(container);
-
-            let errors = 0;
-
-            // Usamos setInterval para não travar a UI imediatamente
-            let i = 0;
-            let interval = setInterval(() => {
-                if (i >= 500) {
-                    clearInterval(interval);
-                    log("DOM Storm finalizado. Se não crashou, o WebCore aguentou.");
-                    container.remove();
-                    return;
-                }
-
-                try {
-                    // 1. Cria aninhamento profundo (Deep Nesting)
-                    let root = document.createElement('div');
-                    let current = root;
-                    for(let d=0; d<50; d++) { // 50 níveis de profundidade
-                        let child = document.createElement('div');
-                        child.className = 'complex-style';
-                        child.textContent = 'x';
-                        current.appendChild(child);
-                        current = child;
-                    }
-                    container.appendChild(root);
-
-                    // 2. Força recálculo de layout (Reflow)
-                    let height = container.offsetHeight; 
-
-                    // 3. Destruição rápida e tentativa de acesso
-                    container.innerHTML = ''; // Limpa tudo brutalmente
-                    
-                    // Tenta acessar algo que acabou de ser limpo (UAF trigger comum)
-                    if (root.firstChild) {
-                        let tmp = root.firstChild.offsetHeight; 
-                    }
-
-                } catch(e) {
-                    errors++;
-                }
-                i++;
-                if(i % 50 === 0) log(`Ciclo ${i}... Memória OK.`);
-            }, 10);
-        }
-
-        // --- TESTE 2: LARGE ALLOCATION (Erro de Tratamento de Memória) ---
-        // Tenta alocar memória contígua para ver como o PS4 lida com falha de alocação
-        function testLargeAllocation() {
-            log("Tentando alocação massiva de ArrayBuffer...");
-            let arr = [];
-            try {
-                for(let k=0; k<10; k++) {
-                    // Tenta alocar blocos de 100MB
-                    let buffer = new ArrayBuffer(1024 * 1024 * 100); 
-                    arr.push(buffer);
-                    log(`Alocado bloco ${k+1} (100MB). Total: ${(k+1)*100}MB`);
-                }
-            } catch(e) {
-                log(`Fim da memória atingido: ${e.message}`);
-                log("O navegador lidou com o erro ou fechou?");
-            }
-        }
-    </script>
+    // Mini-delay pra não travar a UI imediatamente
+    await new Promise(r => setTimeout(r, 1));
+  }
+  
+  log("Fuzzer terminou sem crash total. Tente aumentar ITERATIONS ou rode de novo.");
+}
+</script>
 </body>
 </html>
