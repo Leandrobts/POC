@@ -1,44 +1,44 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 WebKit Fuzzer: Advanced Vector</title>
+    <title>PS4 Hybrid Fuzzer (Stress + Cross-Doc)</title>
     <style>
-        body { background: #000; color: lime; font-family: monospace; overflow: hidden; }
-        /* CSS Fuzzer: Força recálculos complexos */
+        body { background: #000; color: #00ff00; font-family: monospace; overflow: hidden; }
         .v-stress { 
             position: absolute; 
             transform: translate3d(0,0,0); /* Força GPU */
             transition: all 0.1s;
             display: flex;
+            border: 1px solid red;
         }
-        #log { border-bottom: 1px solid #444; padding: 5px; }
+        #log { border-bottom: 1px solid #0f0; padding: 5px; font-size: 20px; }
     </style>
 </head>
 <body>
-    <div id="log">Inicializando Advanced Fuzzer...</div>
+    <div id="log">Inicializando Hybrid Fuzzer...</div>
+    <iframe id="victim-frame" style="width:1px; height:1px; opacity:0; position:absolute;"></iframe>
     <div id="arena" style="width: 2000px; height: 2000px;"></div>
 
     <script>
-        // ================= CONFIGURAÇÃO =================
+        // ================= CONFIGURAÇÃO AJUSTADA =================
         const REPLAY_MODE = false;
-        const REPLAY_SEED = 0; // Coloque a seed assassina aqui
-        const ITERATIONS = 60; // Mais operações por ciclo
-        // =================================================
+        const REPLAY_SEED = 0; 
+        // REDUZIDO DE 60 PARA 30: Para evitar "Falta de Memória" e focar no Crash real
+        const ITERATIONS = 30; 
+        // =========================================================
 
-        // 1. DICIONÁRIO EXPANDIDO (Ovos de Ouro do WebKit)
-        // Inclui SVG, MathML e tags de mídia que têm parsers complexos
         const TAGS = [
             'div', 'span', 'a', 'img', 'iframe', 'video', 'audio', 
-            'svg', 'path', 'circle', 'mask', // SVG Vector
-            'math', 'row', 'frac', 'num',    // MathML Vector
+            'svg', 'path', 'circle', 'mask',
+            'math', 'row', 'frac', 'num',    
             'table', 'form', 'fieldset', 'select', 'option',
-            'details', 'summary', 'marquee'  // Tags Legacy problemáticas
+            'details', 'summary', 'marquee'  
         ];
 
-        const EVENTS = ['click', 'focus', 'blur', 'scroll', 'DOMNodeRemoved', 'DOMSubtreeModified'];
+        // PRNG
+        let currentSeed = parseInt(localStorage.getItem('hyb_seed') || Math.floor(Math.random() * 100000));
+        localStorage.setItem('hyb_last_start', currentSeed);
 
-        // 2. SEEDED PRNG (Copiado do anterior para manter reprodutibilidade)
-        let currentSeed = 1;
         function seed(s) { currentSeed = s; }
         function rnd() {
             var t = currentSeed += 0x6D2B79F5;
@@ -49,50 +49,53 @@
         function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
         function coinflip() { return rnd() > 0.5; }
 
-        // Gerenciamento de Estado
+        // Estado
         const logBox = document.getElementById('log');
-        let savedCycle = parseInt(localStorage.getItem('adv_cycle') || 1);
-        let savedSeed  = parseInt(localStorage.getItem('adv_seed') || 12345);
-
-        if (REPLAY_MODE) savedSeed = REPLAY_SEED;
-        else savedSeed++;
-
-        if (!REPLAY_MODE) {
-            localStorage.setItem('adv_cycle', savedCycle + 1);
-            localStorage.setItem('adv_seed', savedSeed);
-        }
+        const frame = document.getElementById('victim-frame'); // Referência ao iframe
         
-        logBox.innerHTML = `Ciclo: ${savedCycle} | <b>SEED: ${savedSeed}</b>`;
-        seed(savedSeed);
+        if (REPLAY_MODE) seed(REPLAY_SEED);
+        else seed(currentSeed);
 
-        // 3. ARSENAL AVANÇADO
+        if (!REPLAY_MODE) localStorage.setItem('hyb_seed', currentSeed + 1);
         
-        // Função que cria atributos problemáticos
+        logBox.innerHTML = `SEED: ${currentSeed} | <span style="color:red">❤</span>`;
+
+        // --- FUNÇÕES DE ATAQUE ---
+
         function fuzzAttributes(el) {
             try {
                 if (coinflip()) el.id = "id_" + Math.floor(rnd() * 1000);
-                if (coinflip()) el.setAttribute("class", "v-stress");
-                // Atributos gigantes podem causar buffer overflow no parser
-                if (rnd() > 0.9) el.setAttribute("data-junk", "X".repeat(2000)); 
-                // Estilos que quebram layout
+                if (coinflip()) el.className = "v-stress";
+                // Reduzi o tamanho do junk data para economizar RAM
+                if (rnd() > 0.9) el.setAttribute("data-junk", "X".repeat(500)); 
                 if (coinflip()) el.style.cssText = `float: ${coinflip()?'left':'right'}; width: ${rnd()*100}px;`;
             } catch(e){}
         }
 
-        // O "Interrompedor": Adiciona eventos que rodam DURANTE a destruição
         function addEvilEvents(el) {
             try {
-                // DOMNodeRemoved é síncrono. Se o PS4 tentar remover este elemento,
-                // esta função roda ANTES dele sumir. Se mudarmos o elemento aqui, 
-                // o WebKit pode se perder e causar UAF.
                 el.addEventListener('DOMNodeRemoved', function(ev) {
-                    // Tenta modificar o elemento enquanto ele morre
-                    ev.target.innerHTML = "<b>ZOMBIE</b>";
-                    ev.target.setAttribute("id", "dead");
-                    // Tenta acessar o pai que talvez já esteja instável
-                    if (ev.target.parentNode) ev.target.parentNode.style.display = 'none';
+                    ev.target.innerHTML = "<b>DEAD</b>";
+                    // Tenta acessar estilo durante a morte do objeto (UAF Vector)
+                    let _ = ev.target.style.display; 
                 });
             } catch(e){}
+        }
+
+        // [NOVO] O Ataque Nuclear: Mover entre documentos
+        function triggerCrossDoc(el) {
+            try {
+                if (!frame.contentDocument) return;
+                let otherDoc = frame.contentDocument;
+                
+                // Move para o iframe e volta
+                otherDoc.adoptNode(el);
+                otherDoc.body.appendChild(el);
+                document.adoptNode(el);
+                
+                // [NOVO] Corrupção de Protótipo pós-movimento
+                el.__proto__ = {};
+            } catch(e) {}
         }
 
         function runFuzz() {
@@ -100,23 +103,17 @@
             let nodes = [];
 
             try {
-                // FASE 1: CRIAÇÃO (Build)
-                for (let i = 0; i < 50; i++) {
+                // FASE 1: CRIAÇÃO
+                for (let i = 0; i < 40; i++) { // Leve redução na quantidade
                     let tag = pick(TAGS);
-                    // SVG e MathML precisam de namespace correto ou são tratados como span
                     let el;
-                    if (['svg','path','circle'].includes(tag)) {
-                        el = document.createElementNS("http://www.w3.org/2000/svg", tag);
-                    } else if (['math','row'].includes(tag)) {
-                        el = document.createElementNS("http://www.w3.org/1998/Math/MathML", tag);
-                    } else {
-                        el = document.createElement(tag);
-                    }
+                    if (['svg','path','circle'].includes(tag)) el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+                    else if (['math','row'].includes(tag)) el = document.createElementNS("http://www.w3.org/1998/Math/MathML", tag);
+                    else el = document.createElement(tag);
 
                     fuzzAttributes(el);
                     addEvilEvents(el);
 
-                    // Aninhamento complexo
                     if (nodes.length > 0 && coinflip()) {
                         let parent = pick(nodes);
                         try { parent.appendChild(el); } catch(e){ arena.appendChild(el); }
@@ -126,51 +123,49 @@
                     nodes.push(el);
                 }
 
-                // FASE 2: MUTAÇÃO (Modify) - TreeWalker
-                // O TreeWalker é uma forma nativa de andar pelo DOM.
-                // Se modificarmos o DOM enquanto andamos, o TreeWalker pode crashar.
+                // FASE 2: CONFUSÃO (CROSS-DOC & TREEWALKER)
                 let walker = document.createTreeWalker(arena, NodeFilter.SHOW_ELEMENT, null, false);
                 let node = walker.nextNode();
                 while(node) {
                     if (rnd() > 0.7) {
-                        // Mutações agressivas
-                        if (coinflip()) node.textContent = "A".repeat(100);
-                        if (coinflip()) node.normalize(); // Junta text nodes (historicamente bugado)
+                        // Aqui aplicamos o ataque nuclear nos nós existentes
+                        triggerCrossDoc(node);
+                        
+                        if (coinflip()) node.normalize();
                     }
                     node = walker.nextNode();
                 }
 
-                // FASE 3: DESTRUIÇÃO (Destroy) com GC
-                for (let i = 0; i < 30; i++) {
+                // FASE 3: DESTRUIÇÃO
+                for (let i = 0; i < 25; i++) {
                     let victim = pick(nodes);
                     try {
-                        victim.remove(); 
-                        // Acesso imediato pós-remoção para checar UAF
-                        let ghost = victim.getAttribute("id");
+                        // Remove com setTimeout 0 para causar Race Condition
+                        if (coinflip()) {
+                            setTimeout(() => victim.remove(), 0);
+                        } else {
+                            victim.remove();
+                        }
                     } catch(e){}
                 }
 
-                // FASE 4: HEAP SPRAY (Pressão de Memória)
-                // Cria arrays tipados para preencher buracos na memória
+                // FASE 4: MEMÓRIA (Otimizada)
+                // Spray menor, mas mais frequente, evita OOM mas mantém pressão
                 let spray = [];
-                for(let k=0; k<200; k++) {
-                    spray.push(new Float64Array(1000).fill(1.123456789e-100)); // Padrão float específico
+                for(let k=0; k<50; k++) {
+                    spray.push(new Float64Array(100).fill(1.123456789e-100));
                 }
-                spray = null; // Solta para o GC limpar tudo de uma vez
+                spray = null;
 
-            } catch (e) {
-                // Ignora erros de JS, queremos segfaults
-            }
+            } catch (e) {}
 
-            // Limpa visualmente (mas a memória pode estar suja)
             arena.textContent = "";
         }
 
-        // Loop de Execução
+        // Loop
         setTimeout(() => {
             for (let j=0; j < ITERATIONS; j++) runFuzz();
             if (!REPLAY_MODE) window.location.reload();
-            else logBox.innerHTML += "<br>Replay finalizado.";
         }, 200);
 
     </script>
