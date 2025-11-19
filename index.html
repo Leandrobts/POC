@@ -2,23 +2,31 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.xx Modern Fuzzer 2025 - WASM + SAB + GC Race</title>
+<title>PS4 12.xx Hybrid Fuzzer (WASM + CSS Storm)</title>
+<script src="coi-serviceworker.js"></script>
 <style>
   body { background:#000; color:#0f0; font-family:monospace; padding:20px; }
-  .log { background:#111; border:1px solid #0f0; height:500px; overflow-y:scroll; padding:10px; margin-top:20px; }
-  button { background:#000; color:#0f0; border:2px solid #0f0; padding:10px 20px; margin:5px; font-size:18px; }
+  .log { background:#111; border:1px solid #0f0; height:400px; overflow-y:scroll; padding:10px; margin-top:20px; font-size: 14px; }
+  button { background:#000; color:#0f0; border:2px solid #0f0; padding:10px 20px; margin:5px; font-size:18px; cursor: pointer; }
+  button:hover { background: #003300; }
+  .status-ok { color: #00ff00; font-weight: bold; }
+  .status-fail { color: #ff0000; font-weight: bold; }
 </style>
 </head>
 <body>
-<h1>PS4 12.xx Modern Fuzzer (2025)</h1>
-<p>Alvo: WebKit ≥ 618.1 (março 2024+) + patches Sony</p>
-<button onclick="startFuzzer()">INICIAR FUZZER (CUIDADO)</button>
-<button onclick="console.clear(); log('Log limpo')">LIMPAR LOG</button>
+<h1>PS4 12.xx Hybrid Fuzzer</h1>
+<p>Status SAB: <span id="sab-status">Verificando...</span></p>
+<p>Este teste combina WASM Validation + CSS Layout Thrashing + Race Condition.</p>
 
-<div id="log" class="log">Pronto...</div>
+<button onclick="startFuzzer()">INICIAR FUZZER (MODO HARDCORE)</button>
+<button onclick="location.reload()">RECARREGAR PÁGINA</button>
+
+<div id="log" class="log">Aguardando início...</div>
 
 <script>
 const logElement = document.getElementById('log');
+const statusElement = document.getElementById('sab-status');
+
 function log(msg) {
   const div = document.createElement('div');
   div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -26,63 +34,47 @@ function log(msg) {
   logElement.scrollTop = logElement.scrollHeight;
 }
 
-// === CONFIGURAÇÃO ===
-const ITERATIONS = 800;          // Ajuste conforme coragem
-const WASM_CORRUPT = true;       // true = tenta corromper validation
-const SAB_RACE = true;           // SharedArrayBuffer race
-
+// === 1. CONFIGURAÇÃO DO AMBIENTE ===
 let sab, atomic;
+const ITERATIONS = 1500; // Aumentado para stressar mais
 
-// === 1. Habilita SharedArrayBuffer (funciona no PS4 oficial) ===
+// Verifica se o coi-serviceworker funcionou
 if (crossOriginIsolated) {
-  log("crossOriginIsolated = true → SharedArrayBuffer habilitado!");
+  statusElement.innerHTML = "ATIVO (SharedArrayBuffer Disponível)";
+  statusElement.className = "status-ok";
+  log("SUCESSO: crossOriginIsolated está ativo via Service Worker!");
   sab = new SharedArrayBuffer(1024 * 64);
   atomic = new Int32Array(sab);
 } else {
-  log("Sem SharedArrayBuffer (normal em algumas abas). Continuando sem race...");
+  statusElement.innerHTML = "INATIVO (Sem Race Condition)";
+  statusElement.className = "status-fail";
+  log("AVISO: SharedArrayBuffer desativado. O arquivo 'coi-serviceworker.js' está na mesma pasta?");
 }
 
-// === 2. WASM maliciosos (validation bugs) ===
-const wasmBytes = [
-  // Módulo válido base (vazio)
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-  // Vamos corromper várias partes aleatoriamente
-];
-
+// === 2. GERADOR DE WASM CORROMPIDO ===
 function generateEvilWasm() {
-  let bytes = new Uint8Array(2048 + Math.floor(Math.random() * 1024));
-  // Cabeçalho válido
-  bytes.set([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00], 0);
+  // Tamanho variável para fragmentar a heap
+  let bytes = new Uint8Array(1024 + Math.floor(Math.random() * 2048));
+  bytes.set([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00], 0); // Header Mágico
   
-  // Injeta lixo controlado em seções críticas
-  const corruptOffset = 8 + Math.floor(Math.random() * 300);
-  for (let i = corruptOffset; i < corruptOffset + 200; i++) {
-    if (Math.random() > 0.3)
-      bytes[i] = Math.floor(Math.random() * 256);
+  // Injeta lixo em offsets aleatórios
+  const corruptOffset = 8 + Math.floor(Math.random() * 500);
+  for (let i = corruptOffset; i < corruptOffset + 100; i++) {
+    bytes[i] = Math.floor(Math.random() * 256);
   }
-  
-  // Força br_table gigante ou loop infinito de validação
-  if (WASM_CORRUPT && Math.random() > 0.6) {
-    const brTableSize = 0xFFFF + Math.floor(Math.random() * 0x10000);
-    const pos = 500 + Math.floor(Math.random() * 200);
-    bytes[pos] = 0x0E; // br_table opcode
-    bytes[pos+1] = brTableSize & 0xFF;
-    bytes[pos+2] = (brTableSize >> 8) & 0xFF;
-  }
-  
   return bytes;
 }
 
-// === 3. Worker para race (se SAB disponível) ===
+// === 3. WORKER DE RACE CONDITION ===
 let worker = null;
-if (sab && SAB_RACE) {
+if (sab) {
   const workerCode = `
     onmessage = () => {
       const atomic = new Int32Array(${sab});
+      // Loop infinito tentando causar condição de corrida na memória
       while(true) {
         Atomics.store(atomic, 0, 0xDEADBEEF);
-        Atomics.load(atomic, 0);
-        Atomics.wait(atomic, 0, 10);
+        let x = Atomics.load(atomic, 0);
       }
     };
   `;
@@ -90,50 +82,65 @@ if (sab && SAB_RACE) {
   worker = new Worker(URL.createObjectURL(blob));
 }
 
-// === 4. FUZZER PRINCIPAL ===
+// === 4. CSS / DOM STORM (O "CRUSHER") ===
+function triggerCSSStress() {
+    // Cria uma tabela complexa que força o PS4 a recalcular layout violentamente
+    let table = document.createElement('table');
+    table.style.display = 'none'; // Prepara fora da tela
+    
+    for(let k=0; k<50; k++) {
+        let row = table.insertRow();
+        // Transformações 3D e Opacidade são pesadas para o WebKit antigo
+        row.style.transform = "rotate(" + (Math.random() * 360) + "deg) translateZ(0)";
+        row.style.opacity = Math.random();
+        row.style.filter = "blur(" + Math.random() + "px)"; // Filtros são ótimos para crashes
+        
+        for(let j=0; j<10; j++) {
+            let cell = row.insertCell();
+            cell.textContent = 'A'.repeat(100); // Texto longo
+        }
+    }
+    
+    document.body.appendChild(table);
+    table.style.display = 'block';
+    
+    // FORÇA O REFLOW (O momento crítico)
+    let reflow = table.offsetHeight; 
+    
+    // Destroi imediatamente (UAF Potential)
+    table.remove();
+    table = null;
+}
+
+// === 5. LOOP PRINCIPAL ===
 async function startFuzzer() {
-  log("Iniciando fuzzer moderno - 800 iterações");
+  log("=== INICIANDO HYBRID FUZZER (WASM + DOM + RACE) ===");
   if (worker) worker.postMessage('go');
   
   for (let i = 0; i < ITERATIONS; i++) {
     try {
-      // 4.1 Cria WASM malicioso
+      // A. Ataque WebAssembly
       const evil = generateEvilWasm();
-      const module = new WebAssembly.Module(evil);
-      
-      // 4.2 Instancia rápido (muitas vezes falha na validação → crash no validador)
-      const instance = new WebAssembly.Instance(module, {});
-      
-      // 4.3 GC forçado + DOM thrashing enquanto valida
-      document.body.offsetHeight; // reflow
-      const div = document.createElement('div');
-      div.innerHTML = '<span>'.repeat(10000);
-      document.body.appendChild(div);
-      div.remove();
-      
-      // 4.4 Trigger potencial type confusion
-      if (instance.exports && Math.random() > 0.7) {
-        try { instance.exports.main?.(); } catch(e) {}
+      // Tenta compilar o lixo (estressa o parser do WebKit)
+      try { await WebAssembly.compile(evil); } catch(e) {}
+      try { new WebAssembly.Instance(new WebAssembly.Module(evil), {}); } catch(e) {}
+
+      // B. Ataque CSS/DOM (Misturado com o processamento do WASM)
+      triggerCSSStress();
+
+      // C. Relatório de Progresso
+      if (i % 50 === 0) {
+        log(`Iteração ${i}/${ITERATIONS} - Memória JS: ${performance.memory?.usedJSHeapSize || '?'} bytes`);
+        // Pequena pausa para não congelar a UI totalmente (queremos crash, não freeze)
+        await new Promise(r => setTimeout(r, 10));
       }
-      
-      // 4.5 Pressão no GC
-      if (i % 20 === 0) {
-        log(`Iteração ${i} - ainda vivo (RAM: ${performance.memory?.usedJSHeapSize || 'N/A'})`);
-        gc?.(); // forçado se disponível
-      }
-      
+
     } catch (e) {
-      // Muitos erros são esperados (validação falhou)
-      if (e.message.includes('validation') || e.message.includes('compile')) {
-        // Isso é bom! Significa que chegamos no validador
-      }
+      // Erros são esperados, o que buscamos é o fechamento do navegador
     }
-    
-    // Mini-delay pra não travar a UI imediatamente
-    await new Promise(r => setTimeout(r, 1));
   }
   
-  log("Fuzzer terminou sem crash total. Tente aumentar ITERATIONS ou rode de novo.");
+  log("Fuzzer finalizado sem crash. O navegador resistiu.");
 }
 </script>
 </body>
