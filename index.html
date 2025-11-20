@@ -1,100 +1,175 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Interpreter Breaker (No-JIT)</title>
+    <title>PS4 WebKit Diagnostic (Safe Mode)</title>
     <style>
-        body { background: #200; color: #ffaaaa; font-family: monospace; overflow: hidden; }
-        #hud { position: fixed; top:0; left:0; padding:10px; background:rgba(0,0,0,0.8); width:100%; border-bottom: 2px solid red; }
-        .success { background-color: #0f0 !important; color: #000 !important; }
+        body { background: #111; color: #fff; font-family: 'Courier New', monospace; padding: 20px; font-size: 18px; }
+        #console { 
+            background: #000; border: 1px solid #444; 
+            height: 80vh; overflow-y: auto; padding: 10px; 
+            white-space: pre-wrap;
+        }
+        .log { color: #aaa; margin-bottom: 4px; }
+        .info { color: #0ff; font-weight: bold; }
+        .warn { color: #ff0; font-weight: bold; }
+        .vuln { color: #f00; font-weight: bold; background: #220000; padding: 2px; }
+        .safe { color: #0f0; font-weight: bold; }
+        .title { border-bottom: 1px solid #666; margin-bottom: 10px; padding-bottom: 5px; }
     </style>
 </head>
 <body>
-    <div id="hud">
-        NO-JIT MODE: <span id="status" style="color:yellow">RUNNING...</span> | 
-        MEM: <span id="mem-status">OK</span>
-    </div>
-    
+    <h2 class="title">DIAGNÓSTICO DE WEBKIT (FW 12.00+)</h2>
+    <div id="console">Inicializando testes...<br></div>
+
     <script>
-        // CONFIGURAÇÃO "INTERPRETER-ONLY"
-        // Sem loops gigantes, apenas lógica C++ quebrada
-        const ARRAY_SIZE = 100; 
-        
-        const status = document.getElementById('status');
-        let holes = [];
+        const consoleDiv = document.getElementById('console');
 
-        // 1. O GATILHO: Array.prototype.sort
-        // O 'sort' usa código C++ nativo. Se mudarmos o array durante a ordenação,
-        // o C++ pode se perder nos ponteiros.
-        function triggerInterpreterBug() {
-            let arr = [];
-            for(let i=0; i<ARRAY_SIZE; i++) arr[i] = i;
+        // Função de Log Visual (Simula o DevTools)
+        function log(msg, type = 'log') {
+            const el = document.createElement('div');
+            el.className = type;
+            el.innerText = `[${type.toUpperCase()}] ${msg}`;
+            consoleDiv.appendChild(el);
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
 
-            // Criamos um "buraco" na memória
-            arr[0] = {}; 
+        const wait = ms => new Promise(r => setTimeout(r, ms));
+
+        async function runSuite() {
+            await test1_PrototypePollution();
+            await wait(500);
+            await test2_JSONTrap();
+            await wait(500);
+            await test3_ArrayHoles();
+            await wait(500);
+            await test4_AdoptNodeUAF();
             
-            // Define um getter malicioso que roda QUANDO o C++ tenta ler o valor
-            Object.defineProperty(arr, '1', {
-                get: function() {
-                    // AQUI ESTÁ O TRUQUE:
-                    // O Interpretador C++ está no meio do 'sort'.
-                    // Nós limpamos o array debaixo dos pés dele.
-                    arr.length = 0; 
-                    
-                    // Enchemos a memória com lixo para ocupar o lugar
-                    holes.push(new ArrayBuffer(1024 * 10)); 
-                    
-                    return 0;
-                }
-            });
+            log("--- DIAGNÓSTICO CONCLUÍDO ---", "info");
+        }
 
-            // Dispara a função nativa
+        // ================= TESTE 1: Prototype Pollution =================
+        async function test1_PrototypePollution() {
+            log("TESTE 1: Verificando Prototype Pollution...", "info");
             try {
-                arr.sort(function(a, b) {
-                    return a - b; 
-                });
-            } catch(e) {}
-        }
-
-        // 2. O ATAQUE DE CLASSE (Class Factory)
-        // Cria construtores dinâmicos para confundir o cache de tipos do interpretador
-        function triggerFactory() {
-            class Base {}
-            let p = Base;
-            for(let i=0; i<50; i++) {
-                class Derived extends p {
-                    constructor() {
-                        super();
-                        this["prop"+i] = 1; // Poluição de forma
-                    }
-                }
-                p = Derived;
-            }
-            new p();
-        }
-
-        async function loop() {
-            let count = 0;
-            while(true) {
-                count++;
-                status.innerText = `CYCLES: ${count}`;
+                let obj = {};
+                // Tenta poluir o protótipo base
+                Object.prototype.__ps4_test__ = "HACKED";
                 
-                // Pausa visual
-                await new Promise(r => setTimeout(r, 50));
-
-                // Tenta quebrar a lógica do interpretador
-                triggerInterpreterBug();
-                triggerFactory();
-
-                // Limpeza para não dar OOM (Out of Memory)
-                if(count % 20 === 0) {
-                    holes = [];
-                    // Força GC (Garbage Collection) criando allocs temporários
-                    let junk = new Uint8Array(1024*1024);
+                if (obj.__ps4_test__ === "HACKED") {
+                    log("ALERTA: Prototype Pollution possível! (Gadgets podem ser explorados)", "vuln");
+                } else {
+                    log("Seguro: Prototype Pollution bloqueado ou mitigado.", "safe");
                 }
+                
+                // Limpeza
+                delete Object.prototype.__ps4_test__;
+            } catch(e) {
+                log("Erro no Teste 1: " + e.message, "warn");
             }
         }
 
-        setTimeout(loop, 1000);
+        // ================= TESTE 2: JSON Confusion (Sem Crash) =================
+        async function test2_JSONTrap() {
+            log("TESTE 2: Verificando JSON Type Confusion...", "info");
+            let trapTriggered = false;
+            let strangeBehavior = false;
+
+            try {
+                let victim = { a: 1 };
+                
+                // Define a armadilha, mas NÃO escreve na memória (apenas loga)
+                Object.defineProperty(Object.prototype, 'toJSON', {
+                    value: function() {
+                        trapTriggered = true;
+                        // Verifica se o 'this' se comporta de maneira estranha
+                        if (this === window || this === undefined) strangeBehavior = true;
+                        return "TRAPPED";
+                    },
+                    configurable: true
+                });
+
+                JSON.stringify(victim);
+
+                if (trapTriggered) {
+                    log("ALERTA: JSON.stringify acionou o getter poluído!", "vuln");
+                    if (strangeBehavior) {
+                        log("CRÍTICO: O contexto 'this' foi corrompido dentro do toJSON.", "vuln");
+                    }
+                } else {
+                    log("Seguro: JSON.stringify ignorou a poluição.", "safe");
+                }
+
+                delete Object.prototype.toJSON;
+            } catch(e) {
+                log("Erro no Teste 2: " + e.message, "warn");
+            }
+        }
+
+        // ================= TESTE 3: Array Holes (Interpretador) =================
+        async function test3_ArrayHoles() {
+            log("TESTE 3: Verificando Lógica de Arrays (Interpretador)...", "info");
+            try {
+                let arr = [1, 2, 3];
+                let confused = false;
+
+                // Tenta confundir o tamanho do array durante acesso
+                Object.defineProperty(arr, '1', {
+                    get: function() {
+                        arr.length = 0; // Esvazia o array no meio da leitura
+                        return 99;
+                    }
+                });
+
+                // Se o interpretador for seguro, isso deve dar undefined ou erro controlado
+                let val = arr[2]; 
+                
+                // Se o array foi esvaziado mas conseguimos ler algo depois...
+                if (val !== undefined && arr.length === 0) {
+                     log("ALERTA: Lógica de Array quebrada! Leitura após esvaziamento.", "vuln");
+                } else {
+                    log("Seguro: Array Holes tratados corretamente.", "safe");
+                }
+            } catch(e) {
+                log("Seguro: O motor lançou erro corretamente (" + e.message + ")", "safe");
+            }
+        }
+
+        // ================= TESTE 4: AdoptNode UAF (Lógico) =================
+        async function test4_AdoptNodeUAF() {
+            log("TESTE 4: Verificando AdoptNode (UAF Lógico)...", "info");
+            try {
+                let el = document.createElement('div');
+                let frame = document.createElement('iframe');
+                document.body.appendChild(frame);
+                
+                let otherDoc = frame.contentDocument;
+                let uafPotential = false;
+
+                // Observador para detectar comportamento estranho
+                let obs = new MutationObserver(() => {
+                    // Tenta acessar propriedades durante a mudança
+                    try {
+                        let _ = el.parentNode;
+                    } catch(e) { uafPotential = true; }
+                });
+                obs.observe(el, { attributes: true });
+
+                otherDoc.adoptNode(el);
+                
+                // Se conseguirmos acessar o elemento antigo sem erro
+                el.setAttribute('id', 'test');
+                
+                log("Teste concluído sem crash. Comportamento estável.", "safe");
+                
+                frame.remove();
+            } catch(e) {
+                log("Erro no Teste 4: " + e.message, "warn");
+            }
+        }
+
+        // Iniciar
+        setTimeout(runSuite, 1000);
+
     </script>
 </body>
 </html>
