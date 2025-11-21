@@ -1,178 +1,203 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 JSON Logic Probe (Advanced)</title>
+    <title>PS4 WebKit CVE Test Suite (No-JIT)</title>
     <style>
-        body { background: #050505; color: #0f0; font-family: monospace; padding: 20px; font-size: 20px; }
-        #console { border: 1px solid #333; padding: 10px; height: 85vh; overflow-y: auto; }
-        .log { margin-bottom: 5px; color: #aaa; }
-        .vuln { color: #f00; font-weight: bold; background: #200; border-left: 4px solid red; padding-left: 5px; }
-        .safe { color: #0f0; font-weight: bold; }
-        .info { color: #0ff; font-weight: bold; margin-top: 10px; }
+        body { background: #1a1a1a; color: #e0e0e0; font-family: monospace; padding: 20px; }
+        h2 { border-bottom: 1px solid #555; padding-bottom: 10px; }
+        .btn-group { margin-bottom: 20px; }
+        button { 
+            background: #333; color: #fff; border: 1px solid #666; 
+            padding: 10px 15px; font-size: 16px; cursor: pointer; 
+            margin-right: 10px; margin-bottom: 10px;
+        }
+        button:hover { background: #555; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #log { 
+            background: #000; border: 1px solid #444; 
+            padding: 10px; height: 400px; overflow-y: auto; 
+            white-space: pre-wrap; font-size: 14px;
+        }
+        .vuln { color: #ff4444; font-weight: bold; }
+        .safe { color: #4caf50; font-weight: bold; }
+        .info { color: #2196f3; }
+        .warn { color: #ffeb3b; }
+        /* Para testes de RenderLayer */
+        #render-container { position: absolute; top: -9999px; }
     </style>
 </head>
 <body>
-    <h3>JSON LOGIC PROBE (FW 12.00)</h3>
-    <div id="console">Iniciando sondas lógicas...<br></div>
+
+    <h2>PS4 WebKit CVE Triggers (FW 12.00+)</h2>
+    <p>Testes lógicos focados em bugs de DOM, Bindings e Lifecycle (sem JIT).</p>
+
+    <div class="btn-group">
+        <button onclick="test_CVE_2023_41993()">CVE-2023-41993 (IndexedDB)</button>
+        <button onclick="test_CVE_2024_23222()">CVE-2024-23222 (Type Conf.)</button>
+        <button onclick="test_RenderLayer_Group()">CVE-2023-2536x (RenderLayer)</button>
+        <button onclick="test_CVE_2024_27834()">CVE-2024-27834 (Pointer Auth)</button>
+    </div>
+
+    <div id="log">Aguardando inicio...</div>
+    <div id="render-container"></div>
 
     <script>
-        const con = document.getElementById('console');
-        function log(msg, type='log') {
-            con.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            con.scrollTop = con.scrollHeight;
+        const logDiv = document.getElementById('log');
+        
+        function log(msg, type = 'info') {
+            const el = document.createElement('div');
+            el.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            el.className = type;
+            logDiv.appendChild(el);
+            logDiv.scrollTop = logDiv.scrollHeight;
         }
 
-        // ================= SONDA 1: Transição de Memória (Map Transition) =================
-        async function probe1_MapTransition() {
-            log("SONDA 1: Testando Transição de Estrutura (Fast->Slow)...", "info");
-            
-            let victim = { a: 1, b: 2 };
-            let hijacked = false;
-            
-            // O gatilho
-            Object.defineProperty(Object.prototype, 'toJSON', {
-                value: function() {
-                    if(this === victim) {
-                        hijacked = true;
-                        // Expandimos o objeto massivamente para forçar o motor a mover ele na memória
-                        // De "Fast Properties" (no objeto) para "Dictionary Mode" (hash map externo)
-                        for(let i=0; i<2000; i++) {
-                            this['prop' + i] = i; 
-                        }
-                        return "trap";
-                    }
-                },
-                configurable: true
-            });
-
+        // --- CVE-2023-41993: IndexedDB Bindings Issue ---
+        // Tenta confundir o gerenciamento de memória ao usar chaves complexas no IndexedDB
+        async function test_CVE_2023_41993() {
+            log("INICIANDO: CVE-2023-41993 (IndexedDB Bindings)...", "info");
             try {
-                JSON.stringify(victim);
-            } catch(e) {}
+                const dbName = "CVE_2023_41993_Test";
+                const request = indexedDB.open(dbName, 1);
+                
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    if (!db.objectStoreNames.contains("store")) {
+                        db.createObjectStore("store");
+                    }
+                };
 
-            // Verificação: O objeto sobreviveu à cirurgia?
-            if (victim.a === 1 && victim.prop1999 === 1999) {
-                log("Seguro: O motor lidou bem com a transição de memória.", "safe");
-            } else {
-                log("ALERTA: Objeto corrompido após transição!", "vuln");
+                request.onsuccess = (event) => {
+                    const db = event.target.result;
+                    const tx = db.transaction("store", "readwrite");
+                    const store = tx.objectStore("store");
+
+                    // O Bug: Usar um array com getters maliciosos como CHAVE
+                    let maliciousKey = [];
+                    Object.defineProperty(maliciousKey, "0", {
+                        get: () => {
+                            // Tenta causar efeitos colaterais durante a conversão da chave
+                            // Ex: Fechar o banco de dados ou limpar o array
+                            try { db.close(); } catch(e){}
+                            return "key";
+                        }
+                    });
+
+                    try {
+                        store.put("value", maliciousKey);
+                        log("Comando 'put' executado. Se o browser não travar, pode estar mitigado.", "warn");
+                    } catch(e) {
+                        log(`Erro capturado (Seguro): ${e.message}`, "safe");
+                    }
+                };
+            } catch(e) {
+                log(`Erro geral: ${e.message}`, "safe");
             }
-            delete Object.prototype.toJSON;
         }
 
-        // ================= SONDA 2: Conversão de Array (Int -> Double) =================
-        // ESTE É O MAIS CRÍTICO. Se der VULN, temos leitura de memória.
-        async function probe2_ArrayConversion() {
-            log("SONDA 2: Testando Conversão de Array (Int->Double)...", "info");
+        // --- CVE-2024-23222: Type Confusion (Object Lifecycle) ---
+        // Tenta mudar o tipo de um objeto (Array -> Dicionário) durante acesso otimizado
+        async function test_CVE_2024_23222() {
+            log("INICIANDO: CVE-2024-23222 (Type Confusion)...", "info");
+            let arr = [1.1, 2.2, 3.3]; // Array de Doubles
             
-            // Array de inteiros (SMI - Small Integers)
-            let arr = [1, 2, 3, 4]; 
-            let val = 0;
-
-            // Armadilha no índice 1
-            Object.defineProperty(arr, '1', {
-                get: function() {
-                    // Convertemos o array inteiro para Doubles (Floats)
-                    // Isso muda o armazenamento interno de 4 bytes para 8 bytes
-                    arr[0] = 1.5; 
-                    arr[2] = 2.5;
-                    return 99;
+            // Tenta confundir o tipo via Proxy
+            let p = new Proxy(arr, {
+                get: (target, prop) => {
+                    if (prop === "length") {
+                        // Transição destrutiva: Adiciona propriedade string para mudar a estrutura interna
+                        target[0] = {}; 
+                        target.newProp = "slow";
+                        return 0; // Retorna length falso
+                    }
+                    return target[prop];
                 }
             });
 
-            // O motor lê o índice 0 (Int), entra no índice 1 (Armadilha),
-            // converte o array, e depois volta para ler o índice 2.
-            // Se o motor ainda acha que é um array de Ints, ele vai ler metade do Float 2.5
-            // resultando em um número lixo enorme.
-            
-            // Simula a leitura sequencial que o JSON faria
-            // Usamos um loop forçado para emular o acesso C++
-            let res = [];
             try {
-                res = arr.map(x => x); // .map é nativo e rápido, vulnerável a isso
-            } catch(e) {}
-
-            log(`Resultado da leitura: [${res.join(', ')}]`);
-
-            // Se lermos um número estranho (não 1.5, 99, 2.5), o motor leu lixo
-            if (res.some(x => x > 1000 || x < 0)) {
-                log("CRÍTICO: Leitura de memória inválida detectada (Confusão Int/Double)!", "vuln");
-                log("Este é um vetor de Exploit válido (Addrof/Fakeobj).", "vuln");
-            } else {
-                log("Seguro: O motor percebeu a mudança de tipo do array.", "safe");
-            }
-        }
-
-        // ================= SONDA 3: Reentrância Recursiva =================
-        async function probe3_Recursion() {
-            log("SONDA 3: Testando Recursão de Stack...", "info");
-            
-            let depth = 0;
-            let victim = { a: 1 };
-
-            Object.defineProperty(Object.prototype, 'toJSON', {
-                value: function() {
-                    depth++;
-                    if(depth < 5) {
-                        // Chama stringify de novo no mesmo objeto
-                        // Isso pode confundir o estado interno de "visitado"
-                        return JSON.stringify(this); 
-                    }
-                    return "deep";
-                },
-                configurable: true
-            });
-
-            try {
-                let res = JSON.stringify(victim);
-                log(`Retorno: ${res.substring(0, 20)}...`);
-                log("Seguro: Recursão tratada sem travar.", "safe");
+                // Acesso que pode disparar o bug se o motor não checar o tipo novamente
+                let val = Array.prototype.slice.call(p);
+                log(`Resultado Slice: ${val}`, "info");
+                
+                if (val.length === 0 && arr[0].toString() === "[object Object]") {
+                    log("Comportamento confuso detectado (Transição ocorreu durante operação).", "warn");
+                } else {
+                    log("Seguro: O motor lidou bem com o Proxy.", "safe");
+                }
             } catch(e) {
-                log(`Erro (Esperado): ${e.message}`, "safe");
+                log(`Erro capturado: ${e.message}`, "safe");
             }
-            delete Object.prototype.toJSON;
         }
 
-        // ================= SONDA 4: Prototype Swapping =================
-        async function probe4_ProtoSwap() {
-            log("SONDA 4: Testando Troca de Protótipo em Voo...", "info");
+        // --- CVE-2023-25360/61/62: RenderLayer Use-After-Free ---
+        // Cria estruturas CSS complexas e remove elementos para tentar UAF no Layout
+        async function test_RenderLayer_Group() {
+            log("INICIANDO: RenderLayer Group (CVE-2023-25360/1/2)...", "info");
+            const container = document.getElementById('render-container');
             
-            let protoA = { id: "A", val: 1 };
-            let protoB = { id: "B", val: 2, extra: 999 }; // Tamanhos diferentes
-            let victim = Object.create(protoA);
+            try {
+                // Setup: Elemento com propriedades de layout complexas
+                let el = document.createElement('div');
+                el.style.position = 'absolute';
+                el.style.zIndex = '1'; // Cria RenderLayer
+                el.style.overflow = 'scroll';
+                el.innerHTML = '<div style="height:200px; width:200px;">CONTENT</div>';
+                container.appendChild(el);
 
-            Object.defineProperty(Object.prototype, 'toJSON', {
-                value: function() {
-                    // Troca o pai do objeto enquanto o filho está sendo lido
-                    Object.setPrototypeOf(victim, protoB);
-                    return "swapped";
-                },
-                configurable: true
+                // Trigger: Manipulação de DOM + Forçar Layout + Remoção
+                // Tenta confundir o contador de referências do RenderLayer
+                document.body.offsetLeft; // Força layout
+                
+                let child = el.firstElementChild;
+                child.style.position = 'relative'; // Muda tipo de layer
+                
+                // Remove o pai enquanto acessa propriedades de layout
+                el.remove();
+                
+                // Tenta acessar geometria do filho órfão (UAF potencial)
+                let h = child.offsetHeight;
+                
+                log(`Operação de Layout concluída (Height: ${h}). Se não travou, provável safe.`, "safe");
+            } catch(e) {
+                log(`Erro RenderLayer: ${e.message}`, "warn");
+            } finally {
+                container.innerHTML = ""; // Limpeza
+            }
+        }
+
+        // --- CVE-2024-27834: Pointer Authentication / Logic Bypass ---
+        // Teste lógico para verificar integridade de ponteiros em objetos complexos
+        async function test_CVE_2024_27834() {
+            log("INICIANDO: CVE-2024-27834 (Logic Bypass)...", "info");
+            
+            // Criação de objeto com setters profundos
+            let obj = { a: 1 };
+            let val = 0;
+            
+            Object.defineProperty(obj, "b", {
+                set: (v) => {
+                    val = v;
+                    // Tenta invalidar o objeto 'this' durante o set
+                    obj = null; 
+                    // Força GC
+                    try { new ArrayBuffer(1024*1024); } catch(e){}
+                }
             });
 
-            JSON.stringify(victim);
-            
-            // Verifica se a propriedade herdada está correta
-            if(victim.extra === 999) {
-                log("Seguro: Protótipo atualizado corretamente.", "safe");
-            } else {
-                log("ALERTA: Cache de protótipo desatualizado!", "vuln");
+            try {
+                // Atribuição que pode falhar se a referência 'obj' for perdida incorretamente
+                obj.b = 10; 
+                
+                if (val === 10) {
+                    log("Seguro: Atribuição funcionou, referência mantida.", "safe");
+                } else {
+                    log("ALERTA: Falha na lógica de atribuição.", "vuln");
+                }
+            } catch(e) {
+                log(`Erro capturado: ${e.message}`, "safe");
             }
-            delete Object.prototype.toJSON;
         }
 
-        async function run() {
-            await new Promise(r=>setTimeout(r, 500));
-            await probe1_MapTransition();
-            await new Promise(r=>setTimeout(r, 500));
-            await probe2_ArrayConversion();
-            await new Promise(r=>setTimeout(r, 500));
-            await probe3_Recursion();
-            await new Promise(r=>setTimeout(r, 500));
-            await probe4_ProtoSwap();
-            
-            log("--- SONDAGEM FINALIZADA ---", "info");
-        }
-
-        setTimeout(run, 1000);
     </script>
 </body>
 </html>
