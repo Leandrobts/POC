@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Logic Validation Fuzzer</title>
+    <title>PS4 Logic Fuzzer v2</title>
     <style>
         body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
         button { 
@@ -11,120 +11,138 @@
             font-size: 16px; font-weight: bold; cursor: pointer; text-align: left;
         }
         button:hover { background: #ccc; }
-        #log { border-top: 1px solid #fff; padding-top: 10px; margin-top: 20px; }
+        #log { border-top: 1px solid #fff; padding-top: 10px; margin-top: 20px; white-space: pre-wrap; }
     </style>
 </head>
 <body>
 
-    <h1>INPUT VALIDATION ATTACKS</h1>
-    <p>Target: C++ Parser Logic (Null Bytes, State Machine, URL Norm)</p>
+    <h1>LOGIC & SERIALIZATION ATTACKS</h1>
+    <p>Target: IPC (Inter-Process Communication) & Structured Clone</p>
 
-    <button onclick="runNullByteXHR()">TEST 1: XHR Null Byte Injection (Method/URL)</button>
-    <button onclick="runTypeConfusion()">TEST 2: XHR ResponseType Switching (Race)</button>
-    <button onclick="runURLNormalization()">TEST 3: URL Path Normalization Overflow</button>
-    <button onclick="runDoubleFree()">TEST 4: Event Listener Double Detach</button>
+    <button onclick="runHeaderOverflow()">TEST 1: HTTP Header Integer Overflow</button>
+    <button onclick="runSerializerBomb()">TEST 2: History API Serializer Crash</button>
+    <button onclick="runEventRecursion()">TEST 3: Sync Event Dispatch Loop</button>
+    <button onclick="runURIConfusion()">TEST 4: URI Scheme Confusion</button>
 
-    <div id="log">Status: Aguardando...</div>
+    <div id="log">Status: Pronto.</div>
 
     <script>
         function log(msg) { 
             document.getElementById('log').innerText = `> ${msg}\n` + document.getElementById('log').innerText;
         }
 
-        // TESTE 1: Injeção de Null Byte (\u0000)
-        // O JS suporta \0, mas o C++ acha que é o fim da string.
-        // Se o WebKit não validar isso na ponte JS->C++, pode haver leitura inválida.
-        function runNullByteXHR() {
-            log("Enviando Null Bytes para o NetworkProcess...");
+        // TESTE 1: Header Integer Overflow
+        // Tenta enviar cabeçalhos HTTP com valores negativos ou absurdos.
+        // Se o parser C++ usar 'unsigned int', -1 vira um número gigante e pode causar Buffer Overflow.
+        function runHeaderOverflow() {
+            log("Enviando cabeçalhos HTTP tóxicos...");
             try {
                 const xhr = new XMLHttpRequest();
-                // Tenta injetar null byte no método HTTP
-                // Esperado: Erro de sintaxe. Crash se a validação falhar.
-                const methods = ["GET\u0000", "POST\u0000", "GET\u0000POST"];
+                xhr.open("POST", "/");
                 
-                methods.forEach(m => {
-                    try {
-                        xhr.open(m, "/");
-                        xhr.send();
-                    } catch(e) { /* Ignora erros tratados */ }
-                });
+                // Vetor de Ataque: Confundir o tamanho do corpo da requisição
+                // Tenta valores limite de 32 e 64 bits
+                xhr.setRequestHeader("Content-Length", "-1"); 
+                xhr.setRequestHeader("Content-Length", "4294967296"); // 2^32
+                xhr.setRequestHeader("X-Custom-Overflow", "A".repeat(1000)); 
+                
+                // Tenta Range Request inválido (comum causar crash em downloaders)
+                xhr.setRequestHeader("Range", "bytes=0--1");
 
-                // Tenta injetar no cabeçalho
-                xhr.open("GET", "/");
-                xhr.setRequestHeader("X-Test", "A".repeat(100) + "\u0000" + "B".repeat(100));
-                xhr.send();
+                xhr.send("DATA");
+                log("Requisição enviada. Se não crashou, o NetworkProcess validou.");
+            } catch(e) { log("Erro JS (Validado): " + e.message); }
+        }
+
+        // TESTE 2: History API Serializer Crash
+        // O history.pushState usa um algoritmo C++ para "clonar" o objeto JS.
+        // Vamos usar um 'Proxy' que se comporta mal durante a leitura.
+        function runSerializerBomb() {
+            log("Iniciando ataque ao Serializador (Structured Clone)...");
+            
+            try {
+                // Cria um objeto que mente sobre suas propriedades
+                const target = { foo: "bar" };
+                const handler = {
+                    get: function(obj, prop) {
+                        if (prop === "foo") {
+                            // Quando o C++ tentar ler 'foo', nós mudamos o objeto original
+                            // Isso pode causar Memory Corruption no clonador
+                            log("C++ acessou a propriedade. Tentando corromper...");
+                            delete obj.foo; 
+                            obj.boom = new Array(1000).fill("A");
+                            return "crash";
+                        }
+                        return Reflect.get(obj, prop);
+                    }
+                };
                 
-                log("Sobreviveu ao Null Byte.");
+                const proxy = new Proxy(target, handler);
+                
+                // Gatilho: Tenta salvar esse objeto no histórico do navegador
+                history.pushState(proxy, "Title", "?crash");
+                
+                log("Sobreviveu ao pushState.");
             } catch(e) { log("Erro JS: " + e.message); }
         }
 
-        // TESTE 2: XHR Type Confusion
-        // Tenta mudar o formato de armazenamento dos dados (JSON -> Blob -> ArrayBuffer)
-        // ENQUANTO os dados estão chegando. Confunde o ponteiro de memória.
-        function runTypeConfusion() {
-            log("Iniciando XHR Type Switching...");
-            const xhr = new XMLHttpRequest();
-            xhr.open("GET", document.location.href + "?" + Math.random()); // Baixa a própria página
+        // TESTE 3: Sync Event Dispatch Loop
+        // Dispara eventos dentro do próprio manipulador de forma síncrona.
+        // Diferente da recursão DOM, isso ataca a fila de eventos do navegador.
+        function runEventRecursion() {
+            log("Disparando Loop de Eventos Síncronos...");
+            const btn = document.createElement('button');
+            let count = 0;
             
-            xhr.onreadystatechange = function() {
-                try {
-                    // Estado 3 = LOADING (Recebendo dados)
-                    if (xhr.readyState === 3) {
-                        // O C++ está escrevendo na memória. Vamos mudar o tipo do buffer.
-                        xhr.responseType = "arraybuffer";
-                        xhr.responseType = "text";
-                        xhr.responseType = "blob";
-                    }
-                } catch(e) {}
-            };
-            
-            xhr.send();
-            log("Requisição enviada. Monitorando...");
-        }
-
-        // TESTE 3: URL Path Normalization
-        // Caminhos com muitos pontos (..) forçam o parser a calcular o diretório pai.
-        // Um buffer overflow pode ocorrer se o caminho resultante for negativo ou gigante.
-        function runURLNormalization() {
-            log("Gerando URL Malformada...");
-            setTimeout(() => {
-                try {
-                    // Cria: /a/../a/../a/../ repetido 50.000 vezes
-                    const part = "/a/..";
-                    const evilPath = part.repeat(50000);
-                    
-                    // Tenta forçar o navegador a resolver esse caminho na barra de endereço
-                    history.pushState({}, "", evilPath);
-                    
-                    log("URL inserida no History (Sem Crash).");
-                } catch(e) { log("Erro: " + e.message); }
-            }, 100);
-        }
-
-        // TESTE 4: Event Listener Double Detach (DOM Logic)
-        // Tenta remover um nó DOM dentro do evento que ele mesmo disparou.
-        // Clássico Use-After-Free lógico.
-        function runDoubleFree() {
-            log("Executando DOM Detach...");
-            const div = document.createElement('div');
-            const child = document.createElement('span');
-            div.appendChild(child);
-            document.body.appendChild(div);
-
-            child.addEventListener('DOMNodeRemoved', function() {
-                // O nó está sendo removido. Vamos tentar acessar o pai
-                // e forçar uma operação de layout nele.
-                try {
-                    div.innerHTML = ""; // Destrói o pai enquanto o filho morre
-                    const crash = child.offsetWidth; // Acessa propriedade do filho morto
-                } catch(e) {}
+            btn.addEventListener('click', function() {
+                count++;
+                if(count % 1000 === 0) log("Eventos: " + count);
+                
+                // Dispara o evento de novo DENTRO do evento atual
+                // O WebKit tem que empilhar contextos de execução
+                if (count < 20000) {
+                    btn.dispatchEvent(new Event('click'));
+                }
             });
+            
+            try {
+                btn.dispatchEvent(new Event('click'));
+                log("Loop finalizado com segurança.");
+            } catch(e) { log("Stack Overflow detectado (JS Safe): " + e.message); }
+        }
 
-            // Dispara o evento
-            div.removeChild(child);
-            log("DOM Detach finalizado.");
+        // TESTE 4: URI Scheme Confusion
+        // Tenta navegar para protocolos internos ou malformados
+        function runURIConfusion() {
+            log("Testando Protocolos Internos...");
+            const schemes = [
+                "view-source:view-source:http://google.com", // Recursão de parser
+                "blob:null/123", // Blob inválido
+                "about:crash", // Clássico de debug (provavelmente removido)
+                "tel:1234567890" + "A".repeat(5000), // Buffer overflow em handlers externos
+                "ps4-app:?" + "A".repeat(1000) // Tenta atingir o launcher do PS4
+            ];
+            
+            let i = 0;
+            const ifr = document.createElement('iframe');
+            document.body.appendChild(ifr);
+            
+            const interval = setInterval(() => {
+                if(i >= schemes.length) {
+                    clearInterval(interval);
+                    log("Testes de URI finalizados.");
+                    return;
+                }
+                
+                log("Navegando: " + schemes[i].substring(0, 30) + "...");
+                try {
+                    ifr.src = schemes[i];
+                } catch(e) {}
+                i++;
+            }, 1000);
         }
 
     </script>
 </body>
 </html>
+
