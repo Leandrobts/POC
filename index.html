@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Logic Fuzzer v2</title>
+    <title>PS4 Storage & State Fuzzer</title>
     <style>
         body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
         button { 
@@ -12,18 +12,19 @@
         }
         button:hover { background: #ccc; }
         #log { border-top: 1px solid #fff; padding-top: 10px; margin-top: 20px; white-space: pre-wrap; }
+        #editor { background: #222; padding: 10px; min-height: 50px; }
     </style>
 </head>
 <body>
 
-    <h1>LOGIC & SERIALIZATION ATTACKS</h1>
-    <p>Target: IPC (Inter-Process Communication) & Structured Clone</p>
+    <h1>STORAGE & STATE ATTACKS</h1>
+    <p>Target: IndexedDB Transactions & DOM Selection Range</p>
 
-    <button onclick="runHeaderOverflow()">TEST 1: HTTP Header Integer Overflow</button>
-    <button onclick="runSerializerBomb()">TEST 2: History API Serializer Crash</button>
-    <button onclick="runEventRecursion()">TEST 3: Sync Event Dispatch Loop</button>
-    <button onclick="runURIConfusion()">TEST 4: URI Scheme Confusion</button>
+    <button onclick="runIDBRace()">TEST 1: IndexedDB Transaction Abort Race</button>
+    <button onclick="runSelectionChaos()">TEST 2: Selection API Range Chaos</button>
+    <button onclick="runFontFaceCrash()">TEST 3: FontFace Lifecycle UAF</button>
 
+    <div id="editor" contenteditable="true">Texto editável para teste de seleção...</div>
     <div id="log">Status: Pronto.</div>
 
     <script>
@@ -31,118 +32,136 @@
             document.getElementById('log').innerText = `> ${msg}\n` + document.getElementById('log').innerText;
         }
 
-        // TESTE 1: Header Integer Overflow
-        // Tenta enviar cabeçalhos HTTP com valores negativos ou absurdos.
-        // Se o parser C++ usar 'unsigned int', -1 vira um número gigante e pode causar Buffer Overflow.
-        function runHeaderOverflow() {
-            log("Enviando cabeçalhos HTTP tóxicos...");
-            try {
-                const xhr = new XMLHttpRequest();
-                xhr.open("POST", "/");
-                
-                // Vetor de Ataque: Confundir o tamanho do corpo da requisição
-                // Tenta valores limite de 32 e 64 bits
-                xhr.setRequestHeader("Content-Length", "-1"); 
-                xhr.setRequestHeader("Content-Length", "4294967296"); // 2^32
-                xhr.setRequestHeader("X-Custom-Overflow", "A".repeat(1000)); 
-                
-                // Tenta Range Request inválido (comum causar crash em downloaders)
-                xhr.setRequestHeader("Range", "bytes=0--1");
-
-                xhr.send("DATA");
-                log("Requisição enviada. Se não crashou, o NetworkProcess validou.");
-            } catch(e) { log("Erro JS (Validado): " + e.message); }
-        }
-
-        // TESTE 2: History API Serializer Crash
-        // O history.pushState usa um algoritmo C++ para "clonar" o objeto JS.
-        // Vamos usar um 'Proxy' que se comporta mal durante a leitura.
-        function runSerializerBomb() {
-            log("Iniciando ataque ao Serializador (Structured Clone)...");
+        // TESTE 1: IndexedDB Race
+        // Tenta criar e abortar transações rapidamente.
+        // O objetivo é confundir o gerenciador de estado do banco de dados.
+        function runIDBRace() {
+            log("Iniciando IndexedDB Transaction Race...");
+            const request = indexedDB.open("CrashDB", 1);
             
-            try {
-                // Cria um objeto que mente sobre suas propriedades
-                const target = { foo: "bar" };
-                const handler = {
-                    get: function(obj, prop) {
-                        if (prop === "foo") {
-                            // Quando o C++ tentar ler 'foo', nós mudamos o objeto original
-                            // Isso pode causar Memory Corruption no clonador
-                            log("C++ acessou a propriedade. Tentando corromper...");
-                            delete obj.foo; 
-                            obj.boom = new Array(1000).fill("A");
-                            return "crash";
-                        }
-                        return Reflect.get(obj, prop);
-                    }
-                };
-                
-                const proxy = new Proxy(target, handler);
-                
-                // Gatilho: Tenta salvar esse objeto no histórico do navegador
-                history.pushState(proxy, "Title", "?crash");
-                
-                log("Sobreviveu ao pushState.");
-            } catch(e) { log("Erro JS: " + e.message); }
-        }
-
-        // TESTE 3: Sync Event Dispatch Loop
-        // Dispara eventos dentro do próprio manipulador de forma síncrona.
-        // Diferente da recursão DOM, isso ataca a fila de eventos do navegador.
-        function runEventRecursion() {
-            log("Disparando Loop de Eventos Síncronos...");
-            const btn = document.createElement('button');
-            let count = 0;
-            
-            btn.addEventListener('click', function() {
-                count++;
-                if(count % 1000 === 0) log("Eventos: " + count);
-                
-                // Dispara o evento de novo DENTRO do evento atual
-                // O WebKit tem que empilhar contextos de execução
-                if (count < 20000) {
-                    btn.dispatchEvent(new Event('click'));
+            request.onupgradeneeded = function(e) {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains("store")) {
+                    db.createObjectStore("store");
                 }
-            });
-            
-            try {
-                btn.dispatchEvent(new Event('click'));
-                log("Loop finalizado com segurança.");
-            } catch(e) { log("Stack Overflow detectado (JS Safe): " + e.message); }
+            };
+
+            request.onsuccess = function(e) {
+                const db = e.target.result;
+                let count = 0;
+                
+                const interval = setInterval(() => {
+                    count++;
+                    if(count > 1000) {
+                        clearInterval(interval);
+                        log("IDB Teste Finalizado.");
+                        return;
+                    }
+
+                    try {
+                        // Cria transação de escrita
+                        const tx = db.transaction("store", "readwrite");
+                        const store = tx.objectStore("store");
+                        
+                        // Adiciona dados
+                        store.put("Dados de Teste " + Math.random(), "key");
+                        
+                        // O GOLPE: Aborta imediatamente (50% de chance)
+                        // Isso força o rollback no meio da operação de I/O
+                        if (Math.random() > 0.5) {
+                            tx.abort();
+                        }
+                    } catch(err) { /* Ignora erros de lógica */ }
+                }, 5); // Muito rápido
+            };
         }
 
-        // TESTE 4: URI Scheme Confusion
-        // Tenta navegar para protocolos internos ou malformados
-        function runURIConfusion() {
-            log("Testando Protocolos Internos...");
-            const schemes = [
-                "view-source:view-source:http://google.com", // Recursão de parser
-                "blob:null/123", // Blob inválido
-                "about:crash", // Clássico de debug (provavelmente removido)
-                "tel:1234567890" + "A".repeat(5000), // Buffer overflow em handlers externos
-                "ps4-app:?" + "A".repeat(1000) // Tenta atingir o launcher do PS4
-            ];
+        // TESTE 2: Selection Chaos
+        // Manipula faixas de seleção de texto (Ranges) de forma inválida.
+        // O WebKit odeia quando o "foco" da seleção desaparece.
+        function runSelectionChaos() {
+            log("Executando Selection API Fuzzer...");
+            const editor = document.getElementById('editor');
+            const sel = window.getSelection();
             
+            // Popula o editor com nós complexos
+            editor.innerHTML = "<b>Negrito</b><i>Itálico</i><span>Normal</span>".repeat(50);
+
             let i = 0;
-            const ifr = document.createElement('iframe');
-            document.body.appendChild(ifr);
-            
             const interval = setInterval(() => {
-                if(i >= schemes.length) {
+                i++;
+                if(i > 500) {
                     clearInterval(interval);
-                    log("Testes de URI finalizados.");
+                    log("Selection Test Finalizado.");
                     return;
                 }
-                
-                log("Navegando: " + schemes[i].substring(0, 30) + "...");
+
                 try {
-                    ifr.src = schemes[i];
+                    // Cria um Range aleatório
+                    const range = document.createRange();
+                    
+                    // Seleciona nós aleatórios dentro do editor
+                    const nodes = editor.childNodes;
+                    const startNode = nodes[Math.floor(Math.random() * nodes.length)];
+                    const endNode = nodes[Math.floor(Math.random() * nodes.length)];
+                    
+                    range.setStart(startNode, 0);
+                    range.setEnd(endNode, 0);
+                    
+                    // Aplica a seleção
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    
+                    // O GOLPE: Modifica o DOM selecionado imediatamente
+                    // Tenta causar desincronia entre o Range visual e a memória
+                    startNode.textContent = "MODIFICADO";
+                    if (Math.random() > 0.8) {
+                        editor.removeChild(endNode); // Remove o nó onde a seleção termina
+                    }
+                    
+                } catch(e) {} // Ignora erros de índice inválido
+            }, 10);
+        }
+
+        // TESTE 3: FontFace Lifecycle
+        // Carrega e deleta fontes personalizadas durante a renderização.
+        function runFontFaceCrash() {
+            log("Testando ciclo de vida de Fontes...");
+            
+            const interval = setInterval(() => {
+                try {
+                    // 1. Cria uma fonte (pode ser válida ou url lixo)
+                    const fontName = "Font" + Math.random();
+                    const f = new FontFace(fontName, 'url(data:font/woff;base64,d09GRgABAAAA...)');
+                    
+                    // 2. Adiciona ao documento
+                    document.fonts.add(f);
+                    
+                    // 3. Usa a fonte num elemento
+                    const el = document.createElement('div');
+                    el.style.fontFamily = fontName;
+                    el.innerText = "TESTE DE FONTE";
+                    document.body.appendChild(el);
+                    
+                    // 4. Força renderização (Layout)
+                    const width = el.offsetWidth;
+                    
+                    // 5. O GOLPE: Remove a fonte e o elemento simultaneamente
+                    document.fonts.delete(f);
+                    document.body.removeChild(el);
+                    
+                    // Tenta acessar propriedade após delete (Race?)
+                    const check = f.status; 
+                    
                 } catch(e) {}
-                i++;
-            }, 1000);
+            }, 20);
+
+            setTimeout(() => {
+                clearInterval(interval);
+                log("FontFace Test Finalizado.");
+            }, 5000);
         }
 
     </script>
 </body>
 </html>
-
