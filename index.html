@@ -2,129 +2,121 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Libc String Fuzzer</title>
+    <title>PS4 Math & Recursion Fuzzer</title>
     <style>
-        body { background-color: #100000; color: #ff4444; font-family: monospace; padding: 20px; }
+        body { background-color: #000; color: #ffff00; font-family: monospace; padding: 20px; }
         button { 
-            background: #330000; color: #ff4444; border: 2px solid #ff4444; 
+            background: #222200; color: #ffff00; border: 2px solid #ffff00; 
             padding: 15px; width: 100%; margin-bottom: 10px; 
             font-size: 18px; font-weight: bold; cursor: pointer;
         }
-        button:hover { background: #550000; }
-        #log { border: 1px solid #ff4444; padding: 10px; height: 250px; overflow-y: scroll; white-space: pre-wrap; }
+        button:hover { background: #444400; }
+        #log { border: 1px solid #ffff00; padding: 10px; height: 250px; overflow-y: scroll; white-space: pre-wrap; }
+        canvas { display: none; }
     </style>
 </head>
 <body>
 
-    <h1>LIBC STRING & BUFFER ATTACKS</h1>
-    <p>Target: mbstowcs_s (Unicode Conv), decodeURI, Intl Segmenter</p>
+    <h1>MATH & RECURSION ATTACKS</h1>
+    <p>Target: Integer Overflow (Canvas), Stack Exhaustion (JSON/Bind)</p>
 
-    <button onclick="runURIBomb()">TEST 1: decodeURIComponent Buffer Overflow</button>
-    <button onclick="runSegmenterOOM()">TEST 2: Intl.Segmenter Allocator Panic</button>
-    <button onclick="runTypedArrayWrap()">TEST 3: TypedArray Offset Wraparound</button>
+    <button onclick="runCanvasOverflow()">TEST 1: Canvas GetImageData Integer Overflow</button>
+    <button onclick="runJSONBomb()">TEST 2: JSON.parse Depth Bomb</button>
+    <button onclick="runBindChain()">TEST 3: Function.bind() Chain Reaction</button>
 
     <div id="log">Status: Aguardando testes...</div>
+    <canvas id="c" width="100" height="100"></canvas>
 
     <script>
         function log(msg) { 
             document.getElementById('log').innerText = `> ${msg}\n` + document.getElementById('log').innerText;
         }
 
-        // --- TESTE 1: decodeURIComponent Buffer Overflow ---
-        // Ataca a função 'mbstowcs_s' (Multibyte to Wide Char) encontrada no libc.
-        // Tenta decodificar uma string que expande violentamente na memória.
-        function runURIBomb() {
-            log("Iniciando URI Decode Attack...");
+        // --- TESTE 1: Canvas GetImageData Integer Overflow ---
+        // Tenta enganar o cálculo de tamanho do buffer de pixels.
+        // Alvo: (w * h * 4) causando overflow em 32-bit.
+        function runCanvasOverflow() {
+            log("Iniciando Canvas Integer Overflow Check...");
+            const c = document.getElementById('c');
+            const ctx = c.getContext('2d');
+            
+            // Dimensões que, multiplicadas por 4, excedem 2^32 (4GB)
+            // 32768 * 32768 * 4 = 4,294,967,296 (0 em 32-bit)
+            // Tentamos um valor "seguro" para alocação 2D, mas fatal para o buffer linear
+            const hugeSide = 65536; 
             
             try {
-                // Cria uma string gigante de caracteres codificados
-                // O navegador precisa alocar um buffer temporário para converter isso.
-                // Sequências % repetidas podem confundir o cálculo de tamanho do buffer de destino.
-                const part = "%C0%AF".repeat(50000); // Caracteres 'overlong' inválidos
-                const hugeURI = part + part + part;
+                log(`Solicitando buffer de imagem: ${hugeSide}x10...`);
+                // Isso deveria falhar com "Out of Memory" ou "InvalidStateError"
+                // Se crashar, o cálculo de tamanho "deu a volta" e tentou ler memória inválida.
+                const data = ctx.getImageData(0, 0, hugeSide, 10);
+                log("Buffer alocado (Inesperado, tamanho: " + data.data.length + ")");
                 
-                log("Decodificando URI de " + hugeURI.length + " bytes...");
+                log("Tentando overflow massivo (Pode travar)...");
+                // Tenta provocar o overflow aritmético exato
+                const overflowData = ctx.getImageData(0, 0, 32768, 32768); 
+                log("Sobreviveu ao Overflow.");
                 
-                // Se o cálculo de tamanho falhar (Integer Overflow), ele aloca pouco e escreve muito.
-                const result = decodeURIComponent(hugeURI);
-                
-                log("Decode sobreviveu (Length: " + result.length + ")");
             } catch(e) {
-                log("Erro URI: " + e.message);
-                if (e.message.includes("URI")) {
-                    log("Nota: Erro de URI padrão. Procuramos Crash.");
-                }
+                log("Erro Canvas (Protegido): " + e.message);
             }
         }
 
-        // --- TESTE 2: Intl.Segmenter Allocator Panic ---
-        // A API Intl.Segmenter (nova no Safari 17 base) é complexa.
-        // Ela precisa criar um iterador sobre o texto. Vamos tentar forçar o erro "Bad Array New Length".
-        function runSegmenterOOM() {
-            log("Atacando Intl.Segmenter (Heap Allocation)...");
+        // --- TESTE 2: JSON.parse Depth Bomb ---
+        // O parser JSON usa recursão C++. O limite de pilha do PS4 é baixo.
+        // Criamos uma string JSON válida, mas absurdamente profunda.
+        function runJSONBomb() {
+            log("Gerando JSON Depth Bomb...");
             
-            if (!window.Intl || !Intl.Segmenter) {
-                log("Intl.Segmenter não suportado.");
-                return;
-            }
-
-            try {
-                // Cria uma string maciça
-                const blob = new Array(1024 * 1024 * 10).join("A "); // 20MB
-                
-                const segmenter = new Intl.Segmenter("en", {granularity: "word"});
-                log("Segmentando string gigante...");
-                
-                // O iterador pode tentar alocar um array de índices internamente.
-                // Se a string for grande demais, o tamanho do array de índices pode estourar 32-bit.
-                const segments = segmenter.segment(blob);
-                
-                // Força a leitura para efetivar a alocação
-                let count = 0;
-                for (const seg of segments) {
-                    count++;
-                    if (count > 1000) break; // Só para testar o início
-                }
-                
-                log("Segmentação iniciada sem crash.");
-                
-            } catch(e) {
-                log("Erro Segmenter: " + e.message);
-            }
-        }
-
-        // --- TESTE 3: TypedArray Offset Wraparound ---
-        // Explora o cálculo de ponteiros: (Base + Offset).
-        // Se passarmos um offset negativo (que em 32-bit é um número gigante),
-        // o cálculo pode "dar a volta" (Wrap Around) e apontar para memória antes do buffer.
-        function runTypedArrayWrap() {
-            log("Testando TypedArray Offset Wraparound...");
-            
-            try {
-                const buffer = new ArrayBuffer(1024);
-                
-                // Vetores de ataque para Offset:
-                // -1  (0xFFFFFFFF em 32-bit)
-                // -4  (Para alinhamento de Int32)
-                // MaxSafeInteger
-                const offsets = [-1, -4, 4294967292, 2147483644];
-                
-                offsets.forEach(off => {
-                    try {
-                        // Tenta criar uma view que aponta para (Buffer + Offset Gigante)
-                        // Se o sistema somar sem checar, pode acessar memória proibida.
-                        const view = new Uint32Array(buffer, off, 1);
-                        log(`ALERTA: View criada com offset ${off}! Leitura OOB possível.`);
-                        log("Valor lido: " + view[0]);
-                    } catch(e) {
-                        // Erro esperado se a proteção funcionar
+            setTimeout(() => {
+                try {
+                    const depth = 5000; // Profundidade alta
+                    log(`Construindo JSON com profundidade ${depth}...`);
+                    
+                    // Cria '[[[[...]]]]'
+                    const jsonString = "[".repeat(depth) + "1" + "]".repeat(depth);
+                    
+                    log("Parseando (Isso deve estourar a Stack C++)...");
+                    const obj = JSON.parse(jsonString);
+                    
+                    log("JSON parseado com sucesso (Stack robusta).");
+                } catch(e) {
+                    log("Erro JSON: " + e.message);
+                    if (e.message.toLowerCase().includes("stack")) {
+                        log("SUCESSO: Stack Overflow detectado no JSON Parser!");
                     }
-                });
+                }
+            }, 100);
+        }
+
+        // --- TESTE 3: Function.bind() Chain Reaction ---
+        // Cria uma cadeia de funções ligadas (bound functions).
+        // A execução força o motor a desempilhar contextos infinitamente.
+        function runBindChain() {
+            log("Criando cadeia Function.bind()...");
+            
+            try {
+                let func = function() { return "pow"; };
                 
-                log("Teste de Offset finalizado.");
+                // Encadeia .bind() 50.000 vezes
+                // Isso cria 50.000 objetos na memória ligados entre si
+                for (let i = 0; i < 50000; i++) {
+                    func = func.bind(null);
+                }
+                
+                log("Cadeia criada. Executando (Trigger)...");
+                
+                // O gatilho: Chamar a função final
+                // O WebKit tem que resolver a cadeia inteira de uma vez
+                func();
+                
+                log("Bind Chain executada (Sem crash).");
                 
             } catch(e) {
-                log("Erro Fatal: " + e.message);
+                log("Erro Bind: " + e.message);
+                if (e.message.includes("stack")) {
+                    log("SUCESSO: Stack Overflow via Bind Chain!");
+                }
             }
         }
 
