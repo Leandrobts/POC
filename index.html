@@ -1,95 +1,323 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Detecção Cross-buffer Leak (PS4)</title>
-  <style>#log{white-space:pre-wrap;font-family:monospace;padding:10px;background:#111;color:#efe;height:60vh;overflow:auto}</style>
+<meta charset="utf-8"/>
+<title>PS4 Safe FuzzPack v1.0 — DataView OOB & Cross-buffer Detectors</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b1020;color:#e6eef8;padding:14px}
+  h1{margin:6px 0 12px;font-size:20px}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+  button{background:#154; color:#fff;border:none;padding:8px 12px;border-radius:6px;cursor:pointer}
+  button.warn{background:#a33}
+  #log{white-space:pre-wrap;font-family:monospace;background:#071020;color:#bfe8ff;padding:12px;height:52vh;overflow:auto;border-radius:6px;border:1px solid rgba(255,255,255,0.03)}
+  .small{font-size:13px;color:#a7c0d6}
+  label{display:inline-flex;gap:6px;align-items:center}
+  input[type=number]{width:80px;padding:4px;border-radius:4px;border:1px solid rgba(255,255,255,0.06);background:#071a2a;color:#e6eef8}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  footer{margin-top:10px;font-size:12px;color:#8fb5d0}
+</style>
 </head>
 <body>
-  <h2>Detecção Cross-buffer Leak — execute no navegador do PS4</h2>
-  <button id="run">Rodar Teste de Contaminação</button>
-  <div id="log">Aguardando...</div>
+  <h1>PS4 Safe FuzzPack v1.0</h1>
+  <div class="small">Testes seguros para detectar comportamento inválido (OOB, contaminação de buffers, inconsistências). <strong>Não contém técnicas de exploit.</strong></div>
 
-  <script>
-  const L = document.getElementById('log');
-  function log(...a){ L.textContent = new Date().toISOString() + '  ' + a.join(' ') + '\n' + L.textContent; }
-  function hex4(n){ return '0x' + (n>>>0).toString(16).padStart(8,'0'); }
+  <div class="controls" role="toolbar" aria-label="controls">
+    <button id="btn-dv">Run DataView OOB Detector</button>
+    <button id="btn-xbuf">Run Cross-Buffer Contamination</button>
+    <button id="btn-typed">Run TypedArray Boundary Tests</button>
+    <button id="btn-iter">Run Iterator/Proxy Checks</button>
+    <button id="btn-gc">Run GC Pressure (safe)</button>
+    <button id="btn-all" style="background:#1a5">Run ALL (seq)</button>
+    <button id="btn-clear" class="warn">Clear Log</button>
+    <button id="btn-report">Compile Report (copy)</button>
+  </div>
 
-  async function detectCrossBufferLeak(buffersCount = 256, bufSize = 4096, rounds = 5) {
-    log('=== Iniciando cross-buffer contamination detector ===');
-    log('Buffers:', buffersCount, 'size:', bufSize, 'rounds:', rounds);
+  <div class="row">
+    <label>DataView iterations <input id="dv-iter" type="number" value="800" min="10"/></label>
+    <label>DV probe max offset <input id="dv-probe" type="number" value="80" min="16"/></label>
+    <label>Cross-buffer count <input id="xb-count" type="number" value="192" min="8"/></label>
+    <label>Cross-buffer size <input id="xb-size" type="number" value="4096" min="256"/></label>
+  </div>
 
-    // allocate array of buffers and fill with unique pattern per index
-    const bufs = [];
-    for (let i = 0; i < buffersCount; i++) {
-      const ab = new ArrayBuffer(bufSize);
-      const dv = new DataView(ab);
-      const pattern = (0x11111111 + i) >>> 0;
-      for (let off = 0; off < Math.min(64, bufSize); off += 4) dv.setUint32(off, pattern, true);
-      bufs.push({ab, pattern});
-    }
-    log('All buffers allocated and seeded with patterns.');
+  <div id="log">[INFO] Ready. Click a test button to run. Keep this page open when anomalies occur.</div>
 
-    // Repeat stress rounds: perform pressure allocations + verify
-    let anomalies = [];
-    for (let r = 0; r < rounds; r++) {
-      log('Round', r+1, ' — stress allocations and GC (if available).');
-      // stress: allocate many large buffers to force heap churn
-      const tmp = [];
+<script>
+/* PS4 Safe FuzzPack v1.0
+   - Safe instrumentation for detection only.
+   - If you see anomalies, copy the log and include timestamps + userAgent when reporting.
+   - Author: Leandro + ChatGPT (instrumentation only)
+*/
+
+const L = document.getElementById('log');
+function ts(){ return new Date().toISOString(); }
+function log(...args){
+  L.textContent = '[' + ts() + '] ' + args.join(' ') + '\n' + L.textContent;
+}
+
+/* Utility hexdump */
+function hex32(v){ return '0x' + (v>>>0).toString(16).padStart(8,'0'); }
+
+/* ===============================
+   Test A: DataView OOB Detector
+   =============================== */
+async function detectDataViewOOB(iterations=800, maxOffsetProbe=80) {
+  log('=== START DataView OOB Detector === iterations=' + iterations + ' probeMax=' + maxOffsetProbe);
+  const anomalies = [];
+  for (let it = 0; it < iterations; it++) {
+    // small buffer that must throw for offsets >= length
+    const ab = new ArrayBuffer(16);
+    const dv = new DataView(ab);
+    // seed known sentinels
+    dv.setUint32(0, 0x11111111, true);
+    dv.setUint32(4, 0x22222222, true);
+    dv.setUint32(8, 0x33333333, true);
+    dv.setUint32(12, 0x44444444, true);
+
+    for (let off = 0; off <= maxOffsetProbe; off += 4) {
       try {
-        for (let i = 0; i < 40; i++) {
-          tmp.push(new ArrayBuffer(1024 * 1024)); // 1MB blocks
+        const val = dv.getUint32(off, true);
+        // allowed for offsets 0..12; >=16 must throw RangeError
+        if (off >= 16) {
+          anomalies.push({iteration: it, offset: off, value: val});
+          log('[ANOMALIA] getUint32 retornou sem RangeError at offset', off, '=>', hex32(val));
+          if (anomalies.length >= 25) break;
         }
       } catch (e) {
-        log('Stress allocation failed (expected sometimes):', e.message);
+        // expected for off >=16; if thrown for valid off -> note
+        if (off < 16) log('[ERRO INESPERADO] leitura em offset válido lançou:', off, e.message);
       }
-
-      // small pause (yield)
-      await new Promise(res => setTimeout(res, 50));
-
-      // verify
-      for (let idx = 0; idx < bufs.length; idx++) {
-        const {ab, pattern} = bufs[idx];
-        const dv = new DataView(ab);
-        try {
-          for (let off = 0; off < Math.min(64, ab.byteLength); off += 4) {
-            const v = dv.getUint32(off, true);
-            if (v !== pattern) {
-              anomalies.push({index: idx, offset: off, expected: hex4(pattern), found: hex4(v)});
-              log('[ANOMALIA] Buffer', idx, 'offset', off, 'expected', hex4(pattern), 'found', hex4(v));
-              if (anomalies.length >= 30) break;
-            }
-          }
-          if (anomalies.length >= 30) break;
-        } catch (e) {
-          log('Erro leitura buffer', idx, e.message);
-        }
-      }
-
-      // encourage GC
-      if (typeof gc !== 'undefined') { try { gc(); log('Forced gc()'); } catch(e){} }
-
-      // cleanup temporary allocations to relieve memory
-      tmp.length = 0;
-      await new Promise(res => setTimeout(res, 30));
-      if (anomalies.length >= 30) break;
     }
 
-    if (anomalies.length === 0) {
-      log('Resultado: Nenhuma contaminação detectada nas regiões verificadas (esperado).');
-    } else {
-      log('>>> POSSÍVEL VAZAMENTO/CONTAMINAÇÃO detectado! total anomalies:', anomalies.length);
-      anomalies.slice(0,20).forEach(a => log(JSON.stringify(a)));
+    // small allocation pressure to mix heaps
+    if (it % 50 === 0) {
+      try { new ArrayBuffer(0x7FFFF0); } catch(e){ /* ignore */ }
+      await new Promise(r => setTimeout(r, 1));
     }
 
-    return { anomaliesCount: anomalies.length, sample: anomalies.slice(0,10) };
+    if (anomalies.length >= 25) break;
   }
 
-  document.getElementById('run').onclick = async () => {
-    L.textContent = '';
-    const res = await detectCrossBufferLeak(192, 4096, 6);
-    log('Teste finalizado. anomaliesCount=', res.anomaliesCount);
-  };
-  </script>
+  if (anomalies.length === 0) {
+    log('RESULT: nenhum OOB detectado (comportamento esperado).');
+  } else {
+    log('RESULT: POSSIVEL OOB detectado! total anomalies=', anomalies.length);
+    // keep page open for copying logs
+  }
+  log('=== END DataView OOB Detector ===');
+  return anomalies;
+}
+
+/* ===============================
+   Test B: Cross-buffer contamination detector
+   =============================== */
+async function detectCrossBufferLeak(buffersCount=192, bufSize=4096, rounds=6) {
+  log('=== START Cross-buffer contamination detector === count=' + buffersCount + ' size=' + bufSize);
+  const bufs = [];
+  const anomalies = [];
+
+  // allocate and seed patterns
+  for (let i = 0; i < buffersCount; i++) {
+    const ab = new ArrayBuffer(bufSize);
+    const dv = new DataView(ab);
+    const pattern = (0x11111111 + i) >>> 0;
+    for (let off = 0; off < Math.min(64, bufSize); off += 4) dv.setUint32(off, pattern, true);
+    bufs.push({ab, pattern});
+  }
+  log('All buffers allocated and seeded with unique patterns.');
+
+  for (let r = 0; r < rounds; r++) {
+    log('Round', r+1, '— stress allocations and verify.');
+    const tmp = [];
+    try {
+      for (let i = 0; i < 40; i++) tmp.push(new ArrayBuffer(1024*1024)); // 1MB blocks
+    } catch(e) {
+      log('[INFO] stress allocation failed/limited:', e.message);
+    }
+    await new Promise(res => setTimeout(res, 40));
+
+    // verify
+    for (let idx = 0; idx < bufs.length; idx++) {
+      const {ab, pattern} = bufs[idx];
+      const dv = new DataView(ab);
+      for (let off = 0; off < Math.min(64, ab.byteLength); off += 4) {
+        try {
+          const v = dv.getUint32(off, true);
+          if (v !== pattern) {
+            anomalies.push({index: idx, offset: off, expected: hex32(pattern), found: hex32(v)});
+            log('[ANOMALIA] Buffer', idx, 'offset', off, 'expected', hex32(pattern), 'found', hex32(v));
+            if (anomalies.length >= 40) break;
+          }
+        } catch(e) {
+          log('[ERROR] reading buffer', idx, e.message);
+        }
+      }
+      if (anomalies.length >= 40) break;
+    }
+
+    // force GC if available and cleanup
+    if (typeof gc !== 'undefined') { try { gc(); log('[INFO] forced gc()'); } catch(e){} }
+    tmp.length = 0;
+    await new Promise(res => setTimeout(res, 30));
+    if (anomalies.length >= 40) break;
+  }
+
+  if (anomalies.length === 0) log('RESULT: Nenhuma contaminação detectada (esperado).');
+  else log('RESULT: POSSIVEL CONTAMINACAO detectada! total anomalies=', anomalies.length);
+
+  log('=== END Cross-buffer contamination detector ===');
+  return anomalies;
+}
+
+/* ===============================
+   TypedArray boundary tests (safe)
+   =============================== */
+function typedArrayBoundaryTests() {
+  log('=== START TypedArray Boundary Tests ===');
+  const trials = [
+    {fn: () => { try { new Uint8Array(-1); log('[INFO] new Uint8Array(-1) threw as expected'); } catch(e){ log('[INFO] new Uint8Array(-1) ->', e.message); } }},
+    {fn: () => { try { new Uint8Array(0xFFFFFFFF); log('[INFO] new Uint8Array(0xFFFFFFFF) allocated (unexpected)'); } catch(e){ log('[INFO] new Uint8Array(0xFFFFFFFF) ->', e.message); } }},
+    {fn: () => { try { const a = new Uint8Array(16); a[100] = 1; log('[INFO] write out-of-range produced no exception (JS ignores OOB writes)'); } catch(e){ log('[ERROR] write OOB threw', e.message); } }},
+    {fn: () => { try { 'x'.repeat(0x20000000); log('[INFO] huge string created (unexpected)'); } catch(e){ log('[INFO] huge string failed ->', e.message); } }}
+  ];
+  for (const t of trials) {
+    try { t.fn(); } catch(e) { log('[ERROR test] ', e.message); }
+  }
+  log('=== END TypedArray Boundary Tests ===');
+}
+
+/* ===============================
+   Iterator/Proxy checks (safe)
+   =============================== */
+function iteratorProxyChecks() {
+  log('=== START Iterator/Proxy Checks ===');
+  try {
+    const buf = new ArrayBuffer(8);
+    const view = new Uint8Array(buf);
+    const proxy = new Proxy(view, {
+      get(t, p) {
+        if (p === Symbol.iterator) return function*(){ yield 0xDE; yield 0xAD; };
+        return Reflect.get(t,p);
+      }
+    });
+    let sum = 0;
+    for (const v of proxy) { sum += v; log('[INFO] proxy iter val', v); }
+    log('[INFO] proxy iter sum', sum);
+  } catch(e) {
+    log('[ERROR] iteratorProxyChecks caught', e.message);
+  }
+  log('=== END Iterator/Proxy Checks ===');
+}
+
+/* ===============================
+   GC Pressure (safe, short)
+   =============================== */
+async function gcPressure(durationMs = 2000) {
+  log('=== START GC Pressure (duration ' + durationMs + 'ms) ===');
+  const end = Date.now() + durationMs;
+  const cl = [];
+  while (Date.now() < end) {
+    try {
+      for (let i = 0; i < 20; i++) cl.push(new ArrayBuffer(256*1024));
+    } catch(e) { log('[INFO] allocation limit', e.message); }
+    cl.length = 0;
+    await new Promise(r => setTimeout(r, 10));
+  }
+  log('=== END GC Pressure ===');
+}
+
+/* ===============================
+   Run-all orchestration
+   =============================== */
+async function runAll() {
+  log('=== RUN ALL START ===');
+  const dvIter = Number(document.getElementById('dv-iter').value) || 400;
+  const dvProbe = Number(document.getElementById('dv-probe').value) || 80;
+  const xbCount = Number(document.getElementById('xb-count').value) || 160;
+  const xbSize = Number(document.getElementById('xb-size').value) || 4096;
+
+  await detectDataViewOOB(dvIter, dvProbe);
+  await detectCrossBufferLeak(xbCount, xbSize, 4);
+  typedArrayBoundaryTests();
+  iteratorProxyChecks();
+  await gcPressure(1200);
+  log('=== RUN ALL END ===');
+}
+
+/* ===============================
+   Report compiler — collects header + log snippet
+   =============================== */
+function compileReport() {
+  const ua = navigator.userAgent || '(unknown)';
+  const title = 'Potential WebKit memory inconsistency detected on PS4';
+  const now = new Date().toISOString();
+  const logText = document.getElementById('log').textContent;
+  const snippet = logText.split('\n').slice(0,80).join('\n'); // first 80 lines
+  const report = [
+    'Title: ' + title,
+    'Date: ' + now,
+    'User Agent: ' + ua,
+    '',
+    'Summary: (paste short one-line summary here)',
+    '',
+    'Steps to reproduce (minimal):',
+    '1) Open ps4-safe-fuzzpack.html on PS4 web browser',
+    '2) Click the named test that produced anomalies (see logs)',
+    '3) Collect logs and any PS4 crash code (CE-xxxx) if present',
+    '',
+    'Observed behavior (copy/paste from logs):',
+    snippet,
+    '',
+    'Full log (attach as text):',
+    logText,
+    '',
+    'Notes: I confirm this is a detection run only — no exploit code was executed. Contact for replay steps.'
+  ].join('\n');
+
+  // copy to clipboard
+  try {
+    navigator.clipboard.writeText(report).then(() => {
+      log('[REPORT] Compiled and copied to clipboard. Paste into HackerOne report form.');
+    }, () => {
+      log('[REPORT] Clipboard write failed — show below for manual copy.');
+      alert(report.slice(0, 4000));
+    });
+  } catch(e) {
+    log('[REPORT] Clipboard unavailable: ' + e.message);
+    // fallback: open new window with report content
+    const w = window.open('', '_blank');
+    w.document.write('<pre>' + escapeHtml(report) + '</pre>');
+  }
+}
+
+/* small helper */
+function escapeHtml(s) { return s.replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+/* UI wiring */
+document.getElementById('btn-dv').onclick = async () => {
+  const iter = Number(document.getElementById('dv-iter').value) || 800;
+  const probe = Number(document.getElementById('dv-probe').value) || 80;
+  await detectDataViewOOB(iter, probe);
+};
+document.getElementById('btn-xbuf').onclick = async () => {
+  const c = Number(document.getElementById('xb-count').value) || 192;
+  const s = Number(document.getElementById('xb-size').value) || 4096;
+  await detectCrossBufferLeak(c, s, 6);
+};
+document.getElementById('btn-typed').onclick = () => typedArrayBoundaryTests();
+document.getElementById('btn-iter').onclick = () => iteratorProxyChecks();
+document.getElementById('btn-gc').onclick = () => gcPressure(2000);
+document.getElementById('btn-all').onclick = () => runAll();
+document.getElementById('btn-clear').onclick = () => { L.textContent = '['+ts()+'] Log cleared.\n'; };
+document.getElementById('btn-report').onclick = () => compileReport();
+
+/* initial info */
+log('[INFO] PS4 Safe FuzzPack v1.0 loaded. userAgent: ' + (navigator.userAgent || '(unknown)'));
+log('[INFO] Recommended: run a single test at a time and keep this page open if anomalies appear.');
+</script>
+
+<footer>
+  <div class="small">Use strictly for responsible disclosure testing. Do not attempt to bypass sandbox or escalate privileges. Collect logs, timestamps and PS4 crash codes (CE-xxxx) if present, and submit minimal repro + logs to HackerOne.</div>
+</footer>
 </body>
 </html>
