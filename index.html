@@ -2,82 +2,93 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Detecção DataView OOB (PS4)</title>
+  <title>Detecção Cross-buffer Leak (PS4)</title>
   <style>#log{white-space:pre-wrap;font-family:monospace;padding:10px;background:#111;color:#efe;height:60vh;overflow:auto}</style>
 </head>
 <body>
-  <h2>Detecção DataView OOB — execute no navegador do PS4</h2>
-  <button id="run">Rodar Teste DataView OOB (seguro)</button>
+  <h2>Detecção Cross-buffer Leak — execute no navegador do PS4</h2>
+  <button id="run">Rodar Teste de Contaminação</button>
   <div id="log">Aguardando...</div>
 
   <script>
   const L = document.getElementById('log');
   function log(...a){ L.textContent = new Date().toISOString() + '  ' + a.join(' ') + '\n' + L.textContent; }
+  function hex4(n){ return '0x' + (n>>>0).toString(16).padStart(8,'0'); }
 
-  function hexdump32(v){ return '0x' + v.toString(16); }
+  async function detectCrossBufferLeak(buffersCount = 256, bufSize = 4096, rounds = 5) {
+    log('=== Iniciando cross-buffer contamination detector ===');
+    log('Buffers:', buffersCount, 'size:', bufSize, 'rounds:', rounds);
 
-  function detectDataViewOOB(iterations = 2000, maxOffsetProbe = 80) {
-    log('=== Iniciando DataView OOB detector ===');
-    log('Iterations:', iterations, 'probe max offset:', maxOffsetProbe);
-
-    let anomalies = [];
-    for (let it = 0; it < iterations; it++) {
-      // small buffer that must throw for offsets >= length
-      const ab = new ArrayBuffer(16);
+    // allocate array of buffers and fill with unique pattern per index
+    const bufs = [];
+    for (let i = 0; i < buffersCount; i++) {
+      const ab = new ArrayBuffer(bufSize);
       const dv = new DataView(ab);
+      const pattern = (0x11111111 + i) >>> 0;
+      for (let off = 0; off < Math.min(64, bufSize); off += 4) dv.setUint32(off, pattern, true);
+      bufs.push({ab, pattern});
+    }
+    log('All buffers allocated and seeded with patterns.');
 
-      // put a known sentinel on valid positions
-      dv.setUint32(0, 0x11111111, true);
-      dv.setUint32(4, 0x22222222, true);
-      dv.setUint32(8, 0x33333333, true);
-      dv.setUint32(12, 0x44444444, true);
+    // Repeat stress rounds: perform pressure allocations + verify
+    let anomalies = [];
+    for (let r = 0; r < rounds; r++) {
+      log('Round', r+1, ' — stress allocations and GC (if available).');
+      // stress: allocate many large buffers to force heap churn
+      const tmp = [];
+      try {
+        for (let i = 0; i < 40; i++) {
+          tmp.push(new ArrayBuffer(1024 * 1024)); // 1MB blocks
+        }
+      } catch (e) {
+        log('Stress allocation failed (expected sometimes):', e.message);
+      }
 
-      // probe offsets (including offsets beyond buffer)
-      for (let off = 0; off <= maxOffsetProbe; off += 4) {
+      // small pause (yield)
+      await new Promise(res => setTimeout(res, 50));
+
+      // verify
+      for (let idx = 0; idx < bufs.length; idx++) {
+        const {ab, pattern} = bufs[idx];
+        const dv = new DataView(ab);
         try {
-          const val = dv.getUint32(off, true); // expected: works for 0..12, RangeError for >=16
-          // If no exception and offset >= 16 -> ANOMALIA
-          if (off >= 16) {
-            anomalies.push({iteration: it, offset: off, value: val});
-            log('[ANOMALIA] getUint32 retornou sem RangeError at offset', off, '=>', hexdump32(val));
-            // break early if many anomalies
-            if (anomalies.length >= 20) break;
+          for (let off = 0; off < Math.min(64, ab.byteLength); off += 4) {
+            const v = dv.getUint32(off, true);
+            if (v !== pattern) {
+              anomalies.push({index: idx, offset: off, expected: hex4(pattern), found: hex4(v)});
+              log('[ANOMALIA] Buffer', idx, 'offset', off, 'expected', hex4(pattern), 'found', hex4(v));
+              if (anomalies.length >= 30) break;
+            }
           }
+          if (anomalies.length >= 30) break;
         } catch (e) {
-          // RangeError or other is expected for out-of-range offsets
-          if (off < 16) {
-            log('[ERRO INESPERADO] leitura em offset válido lançou:', off, e.message);
-          }
+          log('Erro leitura buffer', idx, e.message);
         }
       }
 
-      // small pressure to encourage GC / mixing
-      if ((it % 50) === 0) {
-        try {
-          new ArrayBuffer(0x7FFFFF0); // stress allocation
-        } catch (e) { /* ignore */ }
-      }
+      // encourage GC
+      if (typeof gc !== 'undefined') { try { gc(); log('Forced gc()'); } catch(e){} }
 
-      if (anomalies.length >= 20) break;
+      // cleanup temporary allocations to relieve memory
+      tmp.length = 0;
+      await new Promise(res => setTimeout(res, 30));
+      if (anomalies.length >= 30) break;
     }
 
     if (anomalies.length === 0) {
-      log('Resultado: nenhum OOB detectado neste ciclo. (Comportamento esperado)');
+      log('Resultado: Nenhuma contaminação detectada nas regiões verificadas (esperado).');
     } else {
-      log('>>> POSSÍVEL OOB detectado! total anomalies:', anomalies.length);
-      // print short report
+      log('>>> POSSÍVEL VAZAMENTO/CONTAMINAÇÃO detectado! total anomalies:', anomalies.length);
       anomalies.slice(0,20).forEach(a => log(JSON.stringify(a)));
     }
 
-    // return summary for automated capture
-    return { anomaliesCount: anomalies.length, anomaliesSample: anomalies.slice(0,10) };
+    return { anomaliesCount: anomalies.length, sample: anomalies.slice(0,10) };
   }
 
-  document.getElementById('run').onclick = () => {
+  document.getElementById('run').onclick = async () => {
     L.textContent = '';
-    const res = detectDataViewOOB(800, 80);
+    const res = await detectCrossBufferLeak(192, 4096, 6);
     log('Teste finalizado. anomaliesCount=', res.anomaliesCount);
-    // if anomaly -> keep page open for you to copy logs
   };
   </script>
 </body>
