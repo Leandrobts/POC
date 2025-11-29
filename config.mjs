@@ -1,6 +1,6 @@
 export const CONFIG = {
     // Limite de segurança (Mantido)
-    WORKER_LIMIT: 403,
+    WORKER_LIMIT: 402,
     
     // Quantidade de sprays (Aumentamos para garantir cobertura no Butterfly Heap)
     SPRAY_QUANTITY: 15000,
