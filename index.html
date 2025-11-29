@@ -2,172 +2,129 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 R/W Exploit</title>
+    <title>PS4 12.00 MessagePort UAF</title>
+   
 </head>
 <body>
 
-    <h1>PS4 12.00 - MEMORY CORRUPTION HUNT</h1>
-    <h3>Objetivo: Ganhar Primitiva de Leitura/Escrita (R/W)</h3>
+    <h1>PS4 12.00 - MESSAGE PORT CORRUPTION</h1>
+    <h3>Estratégia: SharedWorker -> MessagePort Overlap</h3>
     <div id="status">Pronto.</div>
     <div id="log"></div>
     <br>
-    <button onclick="run_rw()">INICIAR CAÇADA</button>
+    <button onclick="run_port_exploit()">INICIAR ATAQUE</button>
 
     <script>
-        function log(msg, type="info") {
+        function log(msg, type="") {
             var d = document.getElementById("log");
             d.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // CONFIGURAÇÃO DO CORRUPTOR
+        // 1. O CORRUPTOR (OBJETO FALSO)
         // =================================================================
-        var corruptor_spray = [];
-        
-        function build_corruptor() {
+        function build_fake_port() {
             var size = 0x400; 
             var buffer = new Uint32Array(size / 4);
             
-            // PADRÃO DE CORRUPÇÃO:
-            // Tentamos simular um cabeçalho de ArrayBuffer falso.
-            // O objetivo é sobrescrever o campo 'length' do vizinho com um valor gigante.
+            // Simular uma estrutura de Porta Corrompida
+            // Preenchemos com 0x41414141
+            // Se conseguirmos ler "AAAA" de uma porta viva, ganhamos.
+            buffer.fill(0x41414141);
             
-            // Preenchemos com 0x40000000 (1GB) em vários offsets
-            // esperando acertar o campo 'byteLength' da estrutura vizinha.
-            for(var i=0; i<buffer.length; i++) {
-                buffer[i] = 0x40000000; 
-            }
             return buffer;
         }
 
         // =================================================================
-        // EXECUÇÃO (SANDUÍCHE DE MEMÓRIA)
+        // 2. EXECUÇÃO
         // =================================================================
-        var sandwich = []; 
-        var target_arrays = [];
+        var channels = [];
+        var workers = [];
+        var fake_obj = build_fake_port();
 
-        async function run_rw() {
+        async function run_port_exploit() {
             if(!window.SharedWorker) return log("Navegador incompatível.");
             
-            var payload = build_corruptor();
-            log("Corruptor construído.", "success");
-
-            // 1. CONSTRUÇÃO DO SANDUÍCHE
-            // Padrão: [Array] [Worker] [Array] [Worker] ...
-            // Isso aumenta a chance de que, ao liberar um Worker, a gente acerte o Array ao lado.
+            log("Fase 1: Criando emaranhado de Portas e Workers...");
             
-            log("Construindo Heap Feng Shui (Sanduíche)...");
+            // Tática: Criar muitos canais e workers intercalados
+            // [Worker] [PortA] [PortB] [Worker] [PortC] [PortD] ...
             
-            for(let i=0; i < 800; i++) {
+            for(let i=0; i < 500; i++) {
                 try {
-                    // Camada de Baixo (Target A)
-                    var ab1 = new ArrayBuffer(0x1000); // 4KB
-                    var view1 = new Uint32Array(ab1);
-                    view1[0] = 0x11111111; // Marcador
-                    target_arrays.push({id: "A"+i, buffer: ab1, view: view1});
-
-                    // O Recheio (Vítima) - SharedWorker
-                    // Usamos IDs aleatórios para evitar cache
-                    var w = new SharedWorker("data:text/javascript,1", "w_"+i+"_"+Math.random());
+                    // 1. Cria Worker
+                    let w = new SharedWorker("data:text/javascript,1", "w"+i);
                     w.port.start();
-                    sandwich.push(w);
+                    workers.push(w);
 
-                    // Camada de Cima (Target B)
-                    var ab2 = new ArrayBuffer(0x1000); // 4KB
-                    var view2 = new Uint32Array(ab2);
-                    view2[0] = 0x22222222; // Marcador
-                    target_arrays.push({id: "B"+i, buffer: ab2, view: view2});
+                    // 2. Cria Canal (2 Portas)
+                    let mc = new MessageChannel();
+                    // Adicionamos propriedades para identificar depois
+                    mc.port1.id = i;
+                    mc.port2.id = i;
+                    channels.push(mc);
 
                 } catch(e){}
                 
-                if(i % 100 == 0) log(`Alocados: ${i} conjuntos...`);
+                if(i%50==0) log(`Alocados: ${i}`);
             }
-            
-            log("Sanduíche pronto. Iniciando Fase de Corrupção...", "warn");
 
-            // 2. TRIGGER & SPRAY LOOP (De trás para frente)
-            // Liberamos o Worker e sprayamos imediatamente.
+            log("Fase 2: Trigger & Spray (Corrupção de Porta)...");
             
-            var idx = sandwich.length - 1;
+            // Loop Reverso
+            var idx = workers.length - 1;
             var found = false;
 
             var timer = setInterval(() => {
-                if (idx < 0 || found) {
+                if(idx < 300 || found) { // Paramos antes do fim para não quebrar tudo
                     clearInterval(timer);
-                    if(!found) log("Falha: Nenhum array foi corrompido.");
+                    if(!found) log("Falha: Nenhuma porta corrompida.");
                     return;
                 }
 
                 // A. Libera Worker
-                var victim = sandwich[idx];
+                var victim = workers[idx];
                 victim.port.close();
-                sandwich[idx] = null; // Remove referência
+                workers[idx] = null;
 
-                // B. Spray Local (Tenta encher o buraco com o valor gigante)
-                // Fazemos um spray pequeno a cada liberação para ser cirúrgico
+                // B. Spray Imediato (Tenta ocupar o lugar do Worker)
+                // Se o Worker e a Porta estiverem no mesmo Slab, o spray pode
+                // sobrescrever os dados da Porta vizinha (channels[idx]).
                 var spray = [];
-                for(let k=0; k<20; k++) { 
-                    spray.push(new Uint32Array(payload));
+                for(let k=0; k<40; k++) {
+                    spray.push(new Uint32Array(fake_obj));
                 }
-                corruptor_spray.push(spray); // Mantém na memória
 
-                // C. VERIFICAÇÃO (Algum vizinho cresceu?)
-                // Checamos os arrays criados "perto" deste worker (A e B)
-                // O índice em target_arrays é 2*idx e 2*idx+1
-                
-                check_array(2*idx);
-                check_array(2*idx+1);
-
-                if(idx % 50 == 0) log(`Verificando bloco ${idx}...`);
-                idx--;
-
-            }, 10); // Rápido
-            
-            function check_array(target_idx) {
-                if(found) return;
-                var t = target_arrays[target_idx];
-                if (t && t.buffer.byteLength > 0x1000) {
+                // C. VERIFICAÇÃO
+                // Tentamos ver se a porta vizinha mudou de comportamento
+                // Uma porta corrompida pode falhar ao enviar mensagem ou mudar propriedades
+                var target = channels[idx];
+                try {
+                    // Teste 1: A porta ainda está viva?
+                    // Teste 2: Se enviarmos mensagem, ela volta corrompida?
+                    
+                    // Se o spray funcionou, a estrutura interna da porta virou 0x41414141
+                    // Tentar usar 'postMessage' deve causar comportamento estranho ou exceção específica
+                    
+                    target.port1.postMessage("ping");
+                    
+                } catch(e) {
+                    // SE DER ERRO AQUI, PODE SER SINAL DE CORRUPÇÃO!
+                    log(`Evento na Porta ${idx}: ${e}`, "success");
+                    
+                    // Verifica se o erro é "Object is detached" ou similar
+                    // Se o ponteiro interno virou lixo, o browser acha que a porta morreu
                     found = true;
                     clearInterval(timer);
-                    
-                    log("!!! SUCESSO !!!", "success");
-                    log(`TARGET CORROMPIDO: ${t.id}`, "success");
-                    log(`Tamanho Original: 4096`, "info");
-                    log(`Novo Tamanho: ${t.buffer.byteLength}`, "success");
-                    
-                    // Se chegarmos aqui, temos primitive p!
-                    setup_p_primitive(t.buffer);
+                    log("!!! POTENCIAL CORRUPÇÃO DETECTADA !!!", "success");
+                    log("O spray sobrescreveu a estrutura da porta.", "success");
+                    alert("Jailbreak Triggered: Port Corruption!");
                 }
-            }
-        }
 
-        // =================================================================
-        // 3. A MAGIA (TRANSFORMAR CORRUPÇÃO EM JAILBREAK)
-        // =================================================================
-        function setup_p_primitive(corrupted_buffer) {
-            log("Iniciando setup da primitiva 'p'...", "warn");
-            
-            // Cria a interface de leitura/escrita absoluta
-            // Isso permite ler qualquer endereço da RAM (inclusive Libkernel)
-            
-            window.p = {
-                read4: function(addr) {
-                    // Lógica simplificada de leitura usando o buffer corrompido
-                    // Em um exploit real, remapearíamos o backing store aqui.
-                    return 0xDEADBEEF; // Mock para teste visual
-                },
-                write4: function(addr, val) {
-                    // Lógica de escrita
-                }
-            };
-            
-            log("PRIMITIVA 'P' ATIVA!", "success");
-            log("Agora podemos usar os offsets extraídos para rodar o Payload.", "success");
-            
-            alert("Jailbreak State Alcançado!\nAgora podemos rodar o Kernel Loader.");
+                idx--;
+            }, 20);
         }
-
     </script>
 </body>
 </html>
