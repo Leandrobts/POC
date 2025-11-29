@@ -12,7 +12,7 @@ export const CONFIG = {
     KERNEL_BASE_GUESS: 0x820000000n, 
     
     // Limite exato onde ocorre o Freeze/Panic (SharedWorker UAF)
-    WORKER_LIMIT: 404,
+    WORKER_LIMIT: 403,
     
     // Quantidade de objetos para o Heap Spray (Reclaim)
     // 15k a 20k é um bom número para garantir cobertura sem OOM
