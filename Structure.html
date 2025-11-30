@@ -2,192 +2,138 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Multi-Binary Analyzer</title>
+    <title>PS4 12.00 Caller Hunter</title>
     <style>
-        body { background-color: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; background: #161b22; padding: 20px; border: 1px solid #30363d; border-radius: 10px; }
+        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        .container { max-width: 1000px; margin: 0 auto; border: 1px solid #30363d; padding: 20px; background: #161b22; border-radius: 10px; }
         textarea { width: 100%; height: 500px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; margin-top: 10px; }
+        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
         button:hover { background: #2ea043; }
-        .file-list { text-align: left; margin-bottom: 10px; color: #8b949e; font-size: 12px; }
+        .step { color: #8b949e; margin-bottom: 20px; }
     </style>
 </head>
 <body>
-
     <div class="container">
-        <h1>🔍 MULTI-BINARY SIZE HUNTER</h1>
-        <p>Carregue TODOS os arquivos .ELF (WebKit, Libc, LibKernel...)</p>
+        <h1>CALLER HUNTER (Reverse Trace)</h1>
+        <p class="step">Alvo: Quem aloca o objeto SharedWorker?</p>
         
-        <input type="file" id="fileInput" multiple />
-        <br>
-        <div id="fileList" class="file-list"></div>
-        
-        <button onclick="startMultiAnalysis()">ANALISAR TUDO</button>
-        
-        <textarea id="output" readonly>Aguardando arquivos...</textarea>
+        <input type="file" id="fileInput" />
+        <br><br>
+        <button onclick="startTrace()">RASTREAR ALOCAÇÃO</button>
+        <textarea id="output" readonly>Aguardando arquivo...</textarea>
     </div>
 
     <script>
-        document.getElementById('fileInput').addEventListener('change', function(e) {
-            const list = document.getElementById('fileList');
-            list.innerHTML = "<b>Arquivos selecionados:</b><br>" + 
-                Array.from(e.target.files).map(f => f.name).join("<br>");
-        });
+        function startTrace() {
+            const file = document.getElementById('fileInput').files[0];
+            if(!file) return alert("Selecione o arquivo!");
 
-        async function startMultiAnalysis() {
-            const files = document.getElementById('fileInput').files;
-            if(files.length === 0) return alert("Selecione os arquivos!");
+            const reader = new FileReader();
+            document.getElementById('output').value = "Mapeando fluxo de execução... (Pode levar 30s)";
 
-            const output = document.getElementById('output');
-            output.value = "Iniciando leitura e correlação de memória...\n";
+            reader.onload = function(e) {
+                const view = new DataView(e.target.result);
+                const bytes = new Uint8Array(e.target.result);
+                let log = "=== RELATÓRIO DE RASTREAMENTO ===\n\n";
 
-            let binaries = {};
+                // 1. Ponto de Referência (Uso da String)
+                const REF_ADDR = 0x839A9B; 
+                log += `[1] Ponto de Partida (Ref String): 0x${REF_ADDR.toString(16).toUpperCase()}\n`;
 
-            // 1. Carregar todos os arquivos na memória
-            for (let f of files) {
-                output.value += `Lendo ${f.name}...\n`;
-                const buf = await readFile(f);
-                binaries[f.name] = {
-                    view: new DataView(buf),
-                    bytes: new Uint8Array(buf),
-                    name: f.name
-                };
-            }
-
-            let log = "\n=== RESULTADO DA ANÁLISE CRUZADA ===\n\n";
-            
-            // 2. Encontrar o WebKit (Ponto de Partida)
-            const webkit = Object.values(binaries).find(b => b.name.includes("WebKit"));
-            if (!webkit) {
-                output.value += "ERRO: Arquivo do WebKit não encontrado na lista!\n";
-                return;
-            }
-
-            // 3. Localizar a referência do SharedWorker no WebKit
-            // Usamos o offset que você já confirmou antes: 0x839A9B
-            const TARGET_REF = 0x839A9B; 
-            log += `[WebKit] Focando na referência confirmada: 0x${TARGET_REF.toString(16).toUpperCase()}\n`;
-
-            // 4. Análise Reversa (Backwards Trace)
-            // Procuramos por chamadas de função (CALL) e definições de tamanho (MOV EDI)
-            
-            // Padrões de Tamanho (Heurística Ampliada)
-            // BF XX XX 00 00 (MOV EDI, imm32)
-            // BE XX XX 00 00 (MOV ESI, imm32)
-            // 48 C7 C7 XX XX 00 00 (MOV RDI, imm32)
-            
-            const startScan = Math.max(0, TARGET_REF - 2000);
-            let candidates = [];
-
-            for (let i = TARGET_REF; i > startScan; i--) {
-                let size = 0;
-                let type = "";
+                // 2. Encontrar o Início da Função (Procura por 'Prologue' ou 'Padding' para trás)
+                // Padding comum: 0xCC (INT3) ou 0x90 (NOP)
+                // Prologue comum: 55 48 89 E5 (push rbp; mov rbp, rsp)
                 
-                // MOV EDI, size
-                if (webkit.bytes[i] === 0xBF) {
-                    size = webkit.view.getInt32(i + 1, true);
-                    type = "MOV EDI";
-                }
-                // MOV ESI, size
-                else if (webkit.bytes[i] === 0xBE) {
-                    size = webkit.view.getInt32(i + 1, true);
-                    type = "MOV ESI";
+                let funcStart = -1;
+                for (let i = REF_ADDR; i > REF_ADDR - 0x2000; i--) {
+                    // Verifica padding (fim da função anterior)
+                    if (bytes[i] === 0xCC && bytes[i-1] === 0xCC) {
+                        funcStart = i + 1;
+                        break;
+                    }
+                    // Verifica prologue padrão
+                    if (bytes[i] === 0x55 && bytes[i+1] === 0x48 && bytes[i+2] === 0x89 && bytes[i+3] === 0xE5) {
+                        funcStart = i;
+                        break;
+                    }
                 }
 
-                // Filtro de Sanidade (Objetos DOM)
-                if (size >= 0x20 && size <= 0x1000) {
-                    // Verifica se há uma CALL (E8) logo após (dentro de 15 bytes)
-                    // Isso indicaria: prepara tamanho -> chama alocador
-                    let hasCall = false;
-                    let callOffset = 0;
-                    
-                    for(let k=1; k<15; k++) {
-                        if (webkit.bytes[i+k] === 0xE8) {
-                            hasCall = true;
-                            // Calcular para onde a CALL aponta
-                            const relOffset = webkit.view.getInt32(i+k+1, true);
-                            callOffset = (i+k+5) + relOffset;
-                            break;
+                if (funcStart === -1) {
+                    log += "[-] Não foi possível determinar o início da função automaticamente.\n";
+                    // Fallback: Assume um offset razoável para trás
+                    funcStart = REF_ADDR - 0x100;
+                }
+
+                log(`[2] Função estimada inicia em: 0x${funcStart.toString(16).toUpperCase()}\n`);
+                log("    (SharedWorker::SharedWorker constructor)\n\n");
+
+                // 3. Encontrar quem CHAMA essa função (Callers)
+                // Procuramos no arquivo todo por: E8 XX XX XX XX (CALL relativo)
+                // Onde (Endereço_Call + 5 + Offset) == funcStart
+                
+                let callers = [];
+                for (let i = 0; i < bytes.length - 5; i++) {
+                    if (bytes[i] === 0xE8) { // CALL opcode
+                        const offset = view.getInt32(i + 1, true);
+                        const destination = i + 5 + offset;
+                        
+                        // Se o destino for o início da nossa função (com margem de erro de 16 bytes para alinhamento)
+                        if (Math.abs(destination - funcStart) < 16) {
+                            callers.push(i);
                         }
                     }
+                }
 
-                    if (hasCall) {
-                        candidates.push({
-                            offset: i,
-                            size: size,
-                            type: type,
-                            callTarget: callOffset,
-                            dist: TARGET_REF - i
-                        });
+                log(`[3] Encontrados ${callers.length} locais que chamam esta função.\n`);
+                log("    Analisando o código ANTES dessas chamadas para achar o tamanho...\n\n");
+
+                // 4. Analisar o código antes de cada chamada (Procurando o Size)
+                let foundSize = false;
+
+                callers.forEach(callAddr => {
+                    log(`   --> Chamada em: 0x${callAddr.toString(16).toUpperCase()}\n`);
+                    
+                    // Olha os 100 bytes antes da chamada
+                    const lookBack = Math.max(0, callAddr - 100);
+                    let bestSize = null;
+
+                    for (let k = callAddr; k > lookBack; k--) {
+                        // Padrão: MOV EDI, size (BF XX XX 00 00)
+                        // Padrão: MOV ESI, size (BE XX XX 00 00) - Usado se for o 2º argumento
+                        
+                        if (bytes[k] === 0xBF || bytes[k] === 0xBE) {
+                            const val = view.getInt32(k + 1, true);
+                            
+                            // Filtro de tamanho realista (32 a 2048 bytes)
+                            if (val >= 0x20 && val <= 0x800) {
+                                bestSize = val;
+                                log(`       [!] ALOCAÇÃO DETECTADA: 0x${val.toString(16).toUpperCase()} (${val} bytes)\n`);
+                                log(`           Instrução em: 0x${k.toString(16).toUpperCase()}\n`);
+                                foundSize = true;
+                                break; // Achou o mais próximo
+                            }
+                        }
+                        
+                        // Se acharmos outra CALL antes (ex: operator new), paramos
+                        if (bytes[k] === 0xE8 && k !== callAddr) {
+                            // Pode ser: CALL malloc (e o tamanho estava antes dessa call)
+                            // Vamos continuar olhando um pouco mais
+                        }
                     }
-                }
-            }
-
-            if (candidates.length === 0) {
-                log += "[-] Nenhum padrão 'MOV Size + CALL' encontrado diretamente.\n";
-                log += "    O tamanho pode estar sendo passado via registrador de outra função.\n";
-            } else {
-                log += `[+] Encontrados ${candidates.length} locais de alocação prováveis!\n\n`;
-                
-                candidates.forEach(c => {
-                    log += `OFFSET: 0x${c.offset.toString(16).toUpperCase()}\n`;
-                    log += `   COMANDO: ${c.type}, 0x${c.size.toString(16).toUpperCase()} (${c.size})\n`;
-                    log += `   CHAMA FUNÇÃO EM: 0x${c.callTarget.toString(16).toUpperCase()}\n`;
-                    
-                    // 5. Cruzamento de Dados: O que é essa função?
-                    // Verificar se esse endereço de função (callTarget) corresponde a um Import da Libc
-                    // (Isso exigiria parsing de ELF completo, faremos uma busca de assinatura simples nos outros arquivos)
-                    
-                    // Tenta achar esse offset nos outros arquivos (se for código compartilhado/stubs)
-                    // Ou verificar se o offset cai na tabela de PLT/GOT do WebKit
-                    
-                    log += "   STATUS: Candidato Forte.\n";
-                    log += "   -----------------------------------\n";
+                    log("   -----------------------------------\n");
                 });
-                
-                // Recomendação automática
-                if(candidates.length > 0) {
-                    log += `\n>>> RECOMENDAÇÃO DE SPRAY: 0x${candidates[0].size.toString(16).toUpperCase()} <<<\n`;
+
+                if (!foundSize) {
+                    log("\n[-] Tamanho explícito não encontrado nos callers.\n");
+                    log("    O objeto pode ser herdado ou usar tamanho dinâmico.\n");
+                    log("    Recomendação: Testar tamanhos padrão do WebKit: 0x90, 0xA0, 0x140.\n");
+                } else {
+                    log("\n>>> CONCLUSÃO: O tamanho mais provável foi listado acima com [!]. Use-o no spray! <<<\n");
                 }
-            }
 
-            // 6. Busca Global por "SharedWorker" nos outros arquivos
-            // Para ver se a lógica vaza para a Libc ou Kernel
-            log += "\n--- VARREDURA GLOBAL DE REFERÊNCIAS ---\n";
-            
-            for (let name in binaries) {
-                if (name.includes("WebKit")) continue; // Já olhamos
-                
-                const bin = binaries[name];
-                const strOffset = findString(bin.bytes, "SharedWorker");
-                
-                if (strOffset !== -1) {
-                    log += `[${name}] String encontrada em 0x${strOffset.toString(16).toUpperCase()}\n`;
-                    log += "   Isto é incomum! O objeto pode ser gerenciado por esta lib.\n";
-                }
-            }
-
-            output.value = log;
-        }
-
-        function readFile(file) {
-            return new Promise(resolve => {
-                const r = new FileReader();
-                r.onload = e => resolve(e.target.result);
-                r.readAsArrayBuffer(file);
-            });
-        }
-
-        function findString(bytes, str) {
-            const target = new TextEncoder().encode(str);
-            for(let i=0; i<bytes.length-target.length; i++) {
-                let match = true;
-                for(let j=0; j<target.length; j++) {
-                    if(bytes[i+j] !== target[j]) { match = false; break; }
-                }
-                if(match) return i;
-            }
-            return -1;
+                document.getElementById('output').value = log;
+            };
+            reader.readAsArrayBuffer(file);
         }
     </script>
 </body>
