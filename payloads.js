@@ -1,5 +1,5 @@
 import { CONFIG, GADGETS, SHELLCODE_HEX } from './config.mjs';
-import { hexToBytes } from './utils.mjs';
+import { hexToBytes } from './utils.js';
 
 // Constrói um objeto de estado para o History API
 export function build_history_payload(size) {
