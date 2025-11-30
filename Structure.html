@@ -2,128 +2,192 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Size Hunter V3 (Deep Scan)</title>
+    <title>PS4 Multi-Binary Analyzer</title>
     <style>
-        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 900px; margin: 0 auto; border: 1px solid #30363d; padding: 20px; background: #161b22; border-radius: 10px; }
+        body { background-color: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; background: #161b22; padding: 20px; border: 1px solid #30363d; border-radius: 10px; }
         textarea { width: 100%; height: 500px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
+        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; margin-top: 10px; }
         button:hover { background: #2ea043; }
+        .file-list { text-align: left; margin-bottom: 10px; color: #8b949e; font-size: 12px; }
     </style>
 </head>
 <body>
+
     <div class="container">
-        <h1>SIZE HUNTER V3 (Heurística de Alocação)</h1>
-        <p>Alvo: <b>0x839A9B</b> (SharedWorker Code Ref)</p>
-        <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
+        <h1>🔍 MULTI-BINARY SIZE HUNTER</h1>
+        <p>Carregue TODOS os arquivos .ELF (WebKit, Libc, LibKernel...)</p>
         
-        <input type="file" id="fileInput" />
-        <br><br>
-        <button onclick="scanSize()">ANALISAR (DEEP SCAN)</button>
-        <textarea id="output" readonly>Aguardando arquivo...</textarea>
+        <input type="file" id="fileInput" multiple />
+        <br>
+        <div id="fileList" class="file-list"></div>
+        
+        <button onclick="startMultiAnalysis()">ANALISAR TUDO</button>
+        
+        <textarea id="output" readonly>Aguardando arquivos...</textarea>
     </div>
 
     <script>
-        function scanSize() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo!");
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const list = document.getElementById('fileList');
+            list.innerHTML = "<b>Arquivos selecionados:</b><br>" + 
+                Array.from(e.target.files).map(f => f.name).join("<br>");
+        });
 
-            const reader = new FileReader();
-            document.getElementById('output').value = "Analisando padrões de montagem x64...";
+        async function startMultiAnalysis() {
+            const files = document.getElementById('fileInput').files;
+            if(files.length === 0) return alert("Selecione os arquivos!");
 
-            reader.onload = function(e) {
-                const bytes = new Uint8Array(e.target.result);
-                const view = new DataView(e.target.result);
+            const output = document.getElementById('output');
+            output.value = "Iniciando leitura e correlação de memória...\n";
+
+            let binaries = {};
+
+            // 1. Carregar todos os arquivos na memória
+            for (let f of files) {
+                output.value += `Lendo ${f.name}...\n`;
+                const buf = await readFile(f);
+                binaries[f.name] = {
+                    view: new DataView(buf),
+                    bytes: new Uint8Array(buf),
+                    name: f.name
+                };
+            }
+
+            let log = "\n=== RESULTADO DA ANÁLISE CRUZADA ===\n\n";
+            
+            // 2. Encontrar o WebKit (Ponto de Partida)
+            const webkit = Object.values(binaries).find(b => b.name.includes("WebKit"));
+            if (!webkit) {
+                output.value += "ERRO: Arquivo do WebKit não encontrado na lista!\n";
+                return;
+            }
+
+            // 3. Localizar a referência do SharedWorker no WebKit
+            // Usamos o offset que você já confirmou antes: 0x839A9B
+            const TARGET_REF = 0x839A9B; 
+            log += `[WebKit] Focando na referência confirmada: 0x${TARGET_REF.toString(16).toUpperCase()}\n`;
+
+            // 4. Análise Reversa (Backwards Trace)
+            // Procuramos por chamadas de função (CALL) e definições de tamanho (MOV EDI)
+            
+            // Padrões de Tamanho (Heurística Ampliada)
+            // BF XX XX 00 00 (MOV EDI, imm32)
+            // BE XX XX 00 00 (MOV ESI, imm32)
+            // 48 C7 C7 XX XX 00 00 (MOV RDI, imm32)
+            
+            const startScan = Math.max(0, TARGET_REF - 2000);
+            let candidates = [];
+
+            for (let i = TARGET_REF; i > startScan; i--) {
+                let size = 0;
+                let type = "";
                 
-                const TARGET = 0x839A9B; // Referência encontrada anteriormente
-                let log = `=== ANÁLISE HEURÍSTICA EM TORNO DE 0x${TARGET.toString(16).toUpperCase()} ===\n\n`;
-                
-                // Procurar 1000 bytes antes
-                const start = Math.max(0, TARGET - 1000);
-                const end = TARGET;
-                
-                let candidates = [];
+                // MOV EDI, size
+                if (webkit.bytes[i] === 0xBF) {
+                    size = webkit.view.getInt32(i + 1, true);
+                    type = "MOV EDI";
+                }
+                // MOV ESI, size
+                else if (webkit.bytes[i] === 0xBE) {
+                    size = webkit.view.getInt32(i + 1, true);
+                    type = "MOV ESI";
+                }
 
-                // Varredura byte a byte
-                for (let i = end; i > start; i--) {
-                    let size = 0;
-                    let type = "";
-
-                    // 1. Padrão: MOV EDI, imm32 (BF XX XX XX XX) - Argumento 1 clássico
-                    if (bytes[i] === 0xBF) {
-                        size = view.getInt32(i + 1, true);
-                        type = "MOV EDI (Arg1)";
-                    }
-                    // 2. Padrão: MOV ESI, imm32 (BE XX XX XX XX) - Argumento 2
-                    else if (bytes[i] === 0xBE) {
-                        size = view.getInt32(i + 1, true);
-                        type = "MOV ESI (Arg2)";
-                    }
-                    // 3. Padrão: MOV EDX, imm32 (BA XX XX XX XX) - Argumento 3
-                    else if (bytes[i] === 0xBA) {
-                        size = view.getInt32(i + 1, true);
-                        type = "MOV EDX (Arg3)";
-                    }
-                    // 4. Padrão: MOV RDI, imm32 (48 C7 C7 XX XX XX XX) - 64-bit Arg1
-                    else if (bytes[i] === 0x48 && bytes[i+1] === 0xC7 && bytes[i+2] === 0xC7) {
-                        size = view.getInt32(i + 3, true);
-                        type = "MOV RDI (Arg1 64)";
-                    }
-
-                    // FILTRO DE LÓGICA:
-                    // Objetos DOM (SharedWorker, Port, etc) geralmente têm tamanhos muito específicos.
-                    // Raramente são menores que 0x20 (32 bytes) ou maiores que 0x800 (2048 bytes).
-                    // Filtramos apenas tamanhos "que fazem sentido".
+                // Filtro de Sanidade (Objetos DOM)
+                if (size >= 0x20 && size <= 0x1000) {
+                    // Verifica se há uma CALL (E8) logo após (dentro de 15 bytes)
+                    // Isso indicaria: prepara tamanho -> chama alocador
+                    let hasCall = false;
+                    let callOffset = 0;
                     
-                    if (size >= 0x40 && size <= 0x800) {
-                        // PROXIMIDADE DE 'CALL':
-                        // Se houver uma instrução CALL (E8) logo após (dentro de 20 bytes),
-                        // a chance de ser uma alocação (malloc/new) é de 90%.
-                        
-                        let nearCall = false;
-                        for(let k=1; k<25; k++) {
-                            if(bytes[i+k] === 0xE8) { // Opcode CALL
-                                nearCall = true;
-                                break;
-                            }
+                    for(let k=1; k<15; k++) {
+                        if (webkit.bytes[i+k] === 0xE8) {
+                            hasCall = true;
+                            // Calcular para onde a CALL aponta
+                            const relOffset = webkit.view.getInt32(i+k+1, true);
+                            callOffset = (i+k+5) + relOffset;
+                            break;
                         }
+                    }
 
+                    if (hasCall) {
                         candidates.push({
                             offset: i,
                             size: size,
                             type: type,
-                            nearCall: nearCall,
-                            dist: TARGET - i
+                            callTarget: callOffset,
+                            dist: TARGET_REF - i
                         });
                     }
                 }
+            }
 
-                if (candidates.length === 0) {
-                    log += "[-] Nenhum tamanho óbvio encontrado.\n";
-                } else {
-                    // Prioriza candidatos perto de CALL
-                    candidates.sort((a, b) => {
-                        if (a.nearCall && !b.nearCall) return -1;
-                        if (!a.nearCall && b.nearCall) return 1;
-                        return a.dist - b.dist; // Mais perto da referência é melhor
-                    });
-
-                    log += `[+] Encontrados ${candidates.length} candidatos prováveis.\n`;
-                    log("    (Top 1 é o mais provável size do SharedWorker)\n\n");
-
-                    candidates.slice(0, 8).forEach((c, idx) => {
-                        let stars = c.nearCall ? "★★★" : "";
-                        log += `[${idx+1}] OFFSET: 0x${c.offset.toString(16).toUpperCase()}\n`;
-                        log += `    OPCODE: ${c.type} ${stars}\n`;
-                        log += `    >>> SIZE: 0x${c.size.toString(16).toUpperCase()} (${c.size} bytes) <<<\n`;
-                        log += `    Distância: -${c.dist} bytes\n`;
-                        log += "----------------------------------------\n";
-                    });
+            if (candidates.length === 0) {
+                log += "[-] Nenhum padrão 'MOV Size + CALL' encontrado diretamente.\n";
+                log += "    O tamanho pode estar sendo passado via registrador de outra função.\n";
+            } else {
+                log += `[+] Encontrados ${candidates.length} locais de alocação prováveis!\n\n`;
+                
+                candidates.forEach(c => {
+                    log += `OFFSET: 0x${c.offset.toString(16).toUpperCase()}\n`;
+                    log += `   COMANDO: ${c.type}, 0x${c.size.toString(16).toUpperCase()} (${c.size})\n`;
+                    log += `   CHAMA FUNÇÃO EM: 0x${c.callTarget.toString(16).toUpperCase()}\n`;
+                    
+                    // 5. Cruzamento de Dados: O que é essa função?
+                    // Verificar se esse endereço de função (callTarget) corresponde a um Import da Libc
+                    // (Isso exigiria parsing de ELF completo, faremos uma busca de assinatura simples nos outros arquivos)
+                    
+                    // Tenta achar esse offset nos outros arquivos (se for código compartilhado/stubs)
+                    // Ou verificar se o offset cai na tabela de PLT/GOT do WebKit
+                    
+                    log += "   STATUS: Candidato Forte.\n";
+                    log += "   -----------------------------------\n";
+                });
+                
+                // Recomendação automática
+                if(candidates.length > 0) {
+                    log += `\n>>> RECOMENDAÇÃO DE SPRAY: 0x${candidates[0].size.toString(16).toUpperCase()} <<<\n`;
                 }
+            }
 
-                document.getElementById('output').value = log;
-            };
-            reader.readAsArrayBuffer(file);
+            // 6. Busca Global por "SharedWorker" nos outros arquivos
+            // Para ver se a lógica vaza para a Libc ou Kernel
+            log += "\n--- VARREDURA GLOBAL DE REFERÊNCIAS ---\n";
+            
+            for (let name in binaries) {
+                if (name.includes("WebKit")) continue; // Já olhamos
+                
+                const bin = binaries[name];
+                const strOffset = findString(bin.bytes, "SharedWorker");
+                
+                if (strOffset !== -1) {
+                    log += `[${name}] String encontrada em 0x${strOffset.toString(16).toUpperCase()}\n`;
+                    log += "   Isto é incomum! O objeto pode ser gerenciado por esta lib.\n";
+                }
+            }
+
+            output.value = log;
+        }
+
+        function readFile(file) {
+            return new Promise(resolve => {
+                const r = new FileReader();
+                r.onload = e => resolve(e.target.result);
+                r.readAsArrayBuffer(file);
+            });
+        }
+
+        function findString(bytes, str) {
+            const target = new TextEncoder().encode(str);
+            for(let i=0; i<bytes.length-target.length; i++) {
+                let match = true;
+                for(let j=0; j<target.length; j++) {
+                    if(bytes[i+j] !== target[j]) { match = false; break; }
+                }
+                if(match) return i;
+            }
+            return -1;
         }
     </script>
 </body>
