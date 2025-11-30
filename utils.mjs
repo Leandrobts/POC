@@ -1,18 +1,22 @@
-export function log(msg, type = "info") {
-    const d = document.getElementById("log");
-    if (!d) return; // Proteção caso o DOM não esteja pronto
+import { log } from './utils.mjs';
 
-    let color = "#7d8590"; // Cinza padrão
-    if (type === "success") color = "#2ea043"; // Verde
-    if (type === "fail") color = "#f85149";    // Vermelho
-    if (type === "warn") color = "#d29922";    // Amarelo
-    if (type === "leak") color = "#a371f7";    // Roxo (Leak)
+var grooming_stash = [];
 
-    const entry = document.createElement("div");
-    entry.style.color = color;
-    if (type === "leak" || type === "success") entry.style.fontWeight = "bold";
+export function prepare_checkerboard_heap(size) {
+    log(`HEAP: Preparando 0x${size.toString(16)}...`);
+    grooming_stash = [];
     
-    entry.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    d.appendChild(entry);
-    d.scrollTop = d.scrollHeight;
+    let temp = [];
+    // Aloca 2000 buffers
+    for(let i=0; i<2000; i++) {
+        temp.push(new ArrayBuffer(size));
+    }
+    
+    // Libera alternado para criar buracos
+    for(let i=0; i<temp.length; i+=2) {
+        temp[i] = null;
+    }
+    
+    grooming_stash = temp.filter(x => x !== null);
+    log("HEAP: Pronto.", "success");
 }
