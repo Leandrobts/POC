@@ -2,102 +2,124 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 HEX DUMPER V2</title>
+    <title>PS4 12.00 BINARY DISSECTOR</title>
     <style>
-        body { background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #555; margin-top: 15px; font-size: 13px; line-height: 1.4; }
-        button { padding: 15px 30px; background: #006600; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; font-size: 16px; }
-        .highlight { color: #ff00ff; }
+        body { background-color: #0d0d0d; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        textarea { width: 95%; height: 600px; background: #000; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 13px; white-space: pre; }
+        button { padding: 15px 40px; background: #b30000; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 18px; border-radius: 5px; }
+        button:hover { background: #ff0000; }
+        .info { color: #aaa; margin-bottom: 20px; }
     </style>
 </head>
 <body>
-    <h1>HEX DUMPER V2 (Sliced Read)</h1>
-    <p>Alvo: <b>0x839A98</b> (SharedWorker Reference)</p>
+
+    <h1>BINARY DISSECTOR (Opcode Analyzer)</h1>
+    <p class="info">Alvo: Encontrar a instrução 'MOV EDI, SIZE' antes do construtor.</p>
+    
+    <p>Selecione: <b>1200_libSceNKWebKit.sprx.elf</b></p>
     <input type="file" id="fileInput" />
     <br><br>
-    <button onclick="readSlice()">LER REGIÃO (INSTANTÂNEO)</button>
+    <button onclick="dissect()">DISSECAR CÓDIGO</button>
+    
     <textarea id="output" readonly>Aguardando arquivo...</textarea>
 
     <script>
-        function readSlice() {
-            const fileInput = document.getElementById('fileInput');
-            if (fileInput.files.length === 0) return alert("Selecione o arquivo ELF!");
+        function dissect() {
+            const file = document.getElementById('fileInput').files[0];
+            if(!file) return alert("Selecione o arquivo ELF!");
 
-            const file = fileInput.files[0];
-            const TARGET = 0x839A98;
-            
-            // Lê apenas 512 bytes antes e 64 depois (foco na alocação)
-            const start = Math.max(0, TARGET - 512);
-            const end = Math.min(file.size, TARGET + 64);
-            
-            const blob = file.slice(start, end);
             const reader = new FileReader();
+            document.getElementById('output').value = "Lendo e desmontando... (Aguarde)";
 
             reader.onload = function(e) {
-                const bytes = new Uint8Array(e.target.result);
                 const view = new DataView(e.target.result);
-                let log = `=== DUMP HEXADECIMAL (${start.toString(16).toUpperCase()} - ${end.toString(16).toUpperCase()}) ===\n`;
-                log += `Alvo (String Ref): 0x${TARGET.toString(16).toUpperCase()}\n\n`;
+                const bytes = new Uint8Array(e.target.result);
+                let log = "=== RELATÓRIO DE ALOCAÇÃO (SharedWorker) ===\n\n";
+
+                // Ponto de referência conhecido (Uso da String SharedWorker)
+                // Do seu relatório anterior: 0x839A9B (aproximado)
+                // Vamos olhar para trás, onde a alocação acontece.
+                const REF_POINT = 0x839A98;
                 
-                log += "OFFSET     | BYTES (Instruções)              | ASCII / ANÁLISE\n";
-                log += "-----------|---------------------------------|----------------\n";
+                log += `Ponto de Referência: 0x${REF_POINT.toString(16).toUpperCase()}\n`;
+                log += "Procurando instruções de alocação (MOV EDI/ESI, SIZE) nos 500 bytes anteriores...\n\n";
+                log("OFFSET     | HEXBYTES          | INSTRUÇÃO (Estimada)\n");
+                log("-----------|-------------------|---------------------\n");
 
-                for (let i = 0; i < bytes.length; i++) {
-                    const globalOffset = start + i;
+                // Varre 500 bytes para trás
+                const start = Math.max(0, REF_POINT - 500);
+                const end = REF_POINT;
+
+                for (let i = start; i < end; i++) {
                     const b = bytes[i];
+                    let line = "";
+                    let hex = b.toString(16).toUpperCase().padStart(2,'0');
+                    let isInteresting = false;
 
-                    // Detectar Instruções de Tamanho (Heurística)
-                    // BF = MOV EDI (Arg 1)
-                    // BE = MOV ESI (Arg 2)
-                    let comment = "";
-                    
+                    // 1. Padrão: MOV EDI, imm32 (BF XX XX XX XX)
+                    // Usado para passar o 1º argumento (Tamanho) para funções C
                     if (b === 0xBF) {
-                        // Verifica se há espaço para ler int32
-                        if (i + 4 < bytes.length) {
+                        if (i + 4 < end) {
                             const val = view.getInt32(i + 1, true);
-                            if (val > 0x20 && val <= 0x1000) {
-                                comment = `<<< MOV EDI, 0x${val.toString(16).toUpperCase()} (${val}) [POSSÍVEL TAMANHO]`;
+                            // Filtra tamanhos plausíveis (entre 32 e 4096)
+                            if (val >= 0x20 && val <= 0x1000) {
+                                line = `MOV EDI, 0x${val.toString(16).toUpperCase()} (${val})`;
+                                isInteresting = true;
                             }
                         }
                     }
                     
-                    if (b === 0xBE) {
-                         if (i + 4 < bytes.length) {
+                    // 2. Padrão: MOV ESI, imm32 (BE XX XX XX XX)
+                    // Usado para passar o 2º argumento
+                    else if (b === 0xBE) {
+                        if (i + 4 < end) {
                             const val = view.getInt32(i + 1, true);
-                            if (val > 0x20 && val <= 0x1000) {
-                                comment = `<<< MOV ESI, 0x${val.toString(16).toUpperCase()} (${val}) [ALTERNATIVA]`;
+                            if (val >= 0x20 && val <= 0x1000) {
+                                line = `MOV ESI, 0x${val.toString(16).toUpperCase()} (${val})`;
+                                isInteresting = true;
                             }
                         }
-                    }
-                    
-                    if (globalOffset === TARGET) {
-                        comment = "<<< REFERÊNCIA DO ALVO (SharedWorker)";
                     }
 
-                    // Formatação de linha (16 bytes por linha)
-                    if (globalOffset % 16 === 0) {
-                        if (i > 0) log += "\n";
-                        log += `0x${globalOffset.toString(16).toUpperCase().padStart(8, '0')} | `;
+                    // 3. Padrão: MOV EDX, imm32 (BA XX XX XX XX)
+                    // 3º Argumento
+                    else if (b === 0xBA) {
+                        if (i + 4 < end) {
+                            const val = view.getInt32(i + 1, true);
+                            if (val >= 0x20 && val <= 0x1000) {
+                                line = `MOV EDX, 0x${val.toString(16).toUpperCase()} (${val})`;
+                                isInteresting = true;
+                            }
+                        }
                     }
                     
-                    log += b.toString(16).toUpperCase().padStart(2, '0') + " ";
-                    
-                    if ((globalOffset + 1) % 16 === 0 || i === bytes.length - 1 || comment !== "") {
-                        // Preenchimento se a linha quebrar no meio por causa de um comentário
-                        if (comment !== "") {
-                             log += " " + comment + "\n";
-                             // Ajusta alinhamento da próxima linha se não terminou os 16 bytes
-                             if ((globalOffset + 1) % 16 !== 0) {
-                                 log += `0x${(globalOffset+1).toString(16).toUpperCase().padStart(8, '0')} | `.padStart(13 + ((globalOffset % 16) * 3)); 
-                             }
+                    // 4. CALL (E8)
+                    // Indica chamada de função (possivelmente o alocador)
+                    else if (b === 0xE8) {
+                         line = "CALL (Função)";
+                         isInteresting = true;
+                    }
+
+                    if (isInteresting) {
+                        // Mostra o offset e os bytes seguintes
+                        let fullHex = "";
+                        for(let k=0; k<5; k++) {
+                            if(i+k < bytes.length) fullHex += bytes[i+k].toString(16).toUpperCase().padStart(2,'0') + " ";
+                        }
+                        
+                        log += `0x${i.toString(16).toUpperCase()} | ${fullHex} | ${line}\n`;
+                        
+                        // Adiciona marcador visual se for um tamanho muito suspeito
+                        // Tamanhos comuns de WebKit: 0x90, 0xA0, 0xC0, 0x140
+                        if (line.includes("0x90") || line.includes("0xA0") || line.includes("0xC0") || line.includes("0x140")) {
+                            log += "           ^^^^^ CANDIDATO FORTE ^^^^^\n";
                         }
                     }
                 }
 
                 document.getElementById('output').value = log;
             };
-
-            reader.readAsArrayBuffer(blob);
+            reader.readAsArrayBuffer(file);
         }
     </script>
 </body>
