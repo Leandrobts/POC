@@ -2,23 +2,24 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Size Hunter V2</title>
+    <title>PS4 12.00 Size Hunter V3 (Deep Scan)</title>
     <style>
-        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
-        .container { max-width: 800px; margin: 0 auto; border: 1px solid #333; padding: 20px; }
-        textarea { width: 100%; height: 300px; background: #000; color: #fff; border: 1px solid #555; margin-top: 10px; }
-        button { padding: 15px 30px; background: #005500; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; font-size: 16px; }
+        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        .container { max-width: 900px; margin: 0 auto; border: 1px solid #30363d; padding: 20px; background: #161b22; border-radius: 10px; }
+        textarea { width: 100%; height: 500px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
+        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
+        button:hover { background: #2ea043; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎯 SIZE HUNTER V2 (Precision Mode)</h1>
-        <p>Alvo Confirmado: <b>0x839A9B</b> (SharedWorker Code)</p>
+        <h1>SIZE HUNTER V3 (Heurística de Alocação)</h1>
+        <p>Alvo: <b>0x839A9B</b> (SharedWorker Code Ref)</p>
         <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
         
         <input type="file" id="fileInput" />
         <br><br>
-        <button onclick="scanSize()">ANALISAR OFFSET 0x839A9B</button>
+        <button onclick="scanSize()">ANALISAR (DEEP SCAN)</button>
         <textarea id="output" readonly>Aguardando arquivo...</textarea>
     </div>
 
@@ -28,55 +29,96 @@
             if(!file) return alert("Selecione o arquivo!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Lendo e analisando...";
+            document.getElementById('output').value = "Analisando padrões de montagem x64...";
 
             reader.onload = function(e) {
-                const view = new DataView(e.target.result);
                 const bytes = new Uint8Array(e.target.result);
+                const view = new DataView(e.target.result);
                 
-                // O endereço que você encontrou
-                const TARGET = 0x839A9B; 
+                const TARGET = 0x839A9B; // Referência encontrada anteriormente
+                let log = `=== ANÁLISE HEURÍSTICA EM TORNO DE 0x${TARGET.toString(16).toUpperCase()} ===\n\n`;
                 
-                // Vamos olhar os 500 bytes ANTES desse endereço
-                // Procurando por: BF XX XX 00 00 (MOV EDI, TAMANHO)
-                // EDI é o registrador usado para passar o tamanho para o 'operator new' no PS4 (ABI System V)
+                // Procurar 1000 bytes antes
+                const start = Math.max(0, TARGET - 1000);
+                const end = TARGET;
                 
-                let log = `=== VARREDURA EM TORNO DE 0x${TARGET.toString(16).toUpperCase()} ===\n\n`;
-                let found = false;
-                
-                // Varre de trás para frente (do código para o malloc)
-                for (let i = TARGET; i > TARGET - 1000; i--) {
-                    // Opcode BF = MOV EDI, imm32
+                let candidates = [];
+
+                // Varredura byte a byte
+                for (let i = end; i > start; i--) {
+                    let size = 0;
+                    let type = "";
+
+                    // 1. Padrão: MOV EDI, imm32 (BF XX XX XX XX) - Argumento 1 clássico
                     if (bytes[i] === 0xBF) {
-                        const size = view.getInt32(i + 1, true); // Little Endian
+                        size = view.getInt32(i + 1, true);
+                        type = "MOV EDI (Arg1)";
+                    }
+                    // 2. Padrão: MOV ESI, imm32 (BE XX XX XX XX) - Argumento 2
+                    else if (bytes[i] === 0xBE) {
+                        size = view.getInt32(i + 1, true);
+                        type = "MOV ESI (Arg2)";
+                    }
+                    // 3. Padrão: MOV EDX, imm32 (BA XX XX XX XX) - Argumento 3
+                    else if (bytes[i] === 0xBA) {
+                        size = view.getInt32(i + 1, true);
+                        type = "MOV EDX (Arg3)";
+                    }
+                    // 4. Padrão: MOV RDI, imm32 (48 C7 C7 XX XX XX XX) - 64-bit Arg1
+                    else if (bytes[i] === 0x48 && bytes[i+1] === 0xC7 && bytes[i+2] === 0xC7) {
+                        size = view.getInt32(i + 3, true);
+                        type = "MOV RDI (Arg1 64)";
+                    }
+
+                    // FILTRO DE LÓGICA:
+                    // Objetos DOM (SharedWorker, Port, etc) geralmente têm tamanhos muito específicos.
+                    // Raramente são menores que 0x20 (32 bytes) ou maiores que 0x800 (2048 bytes).
+                    // Filtramos apenas tamanhos "que fazem sentido".
+                    
+                    if (size >= 0x40 && size <= 0x800) {
+                        // PROXIMIDADE DE 'CALL':
+                        // Se houver uma instrução CALL (E8) logo após (dentro de 20 bytes),
+                        // a chance de ser uma alocação (malloc/new) é de 90%.
                         
-                        // Filtro: Objetos DOM raramente são maiores que 2048 bytes (0x800)
-                        // e raramente menores que 32 bytes (0x20)
-                        if (size > 0x20 && size <= 0x800) {
-                            found = true;
-                            log += `[POTENCIAL TAMANHO ENCONTRADO]\n`;
-                            log += `   Endereço da Instrução: 0x${i.toString(16).toUpperCase()}\n`;
-                            log += `   Distância do Alvo: -${TARGET - i} bytes\n`;
-                            log += `   >>> SIZE: 0x${size.toString(16).toUpperCase()} (${size} bytes) <<<\n`;
-                            log += `   ----------------------------------------\n`;
+                        let nearCall = false;
+                        for(let k=1; k<25; k++) {
+                            if(bytes[i+k] === 0xE8) { // Opcode CALL
+                                nearCall = true;
+                                break;
+                            }
                         }
+
+                        candidates.push({
+                            offset: i,
+                            size: size,
+                            type: type,
+                            nearCall: nearCall,
+                            dist: TARGET - i
+                        });
                     }
                 }
 
-                if (!found) {
-                    log += "Nenhum padrão 'MOV EDI' óbvio encontrado.\n";
-                    log += "O código pode estar usando 'MOV ESI' (BE XX...) ou registrador diferente.\n";
-                    log += "Tentando padrão alternativo (BE = MOV ESI)...\n";
-                    
-                    for (let i = TARGET; i > TARGET - 1000; i--) {
-                        if (bytes[i] === 0xBE) {
-                             const size = view.getInt32(i + 1, true);
-                             if (size > 0x20 && size <= 0x800) {
-                                log += `[ALTERNATIVA MOV ESI]\n`;
-                                log += `   >>> SIZE: 0x${size.toString(16).toUpperCase()} <<<\n`;
-                             }
-                        }
-                    }
+                if (candidates.length === 0) {
+                    log += "[-] Nenhum tamanho óbvio encontrado.\n";
+                } else {
+                    // Prioriza candidatos perto de CALL
+                    candidates.sort((a, b) => {
+                        if (a.nearCall && !b.nearCall) return -1;
+                        if (!a.nearCall && b.nearCall) return 1;
+                        return a.dist - b.dist; // Mais perto da referência é melhor
+                    });
+
+                    log += `[+] Encontrados ${candidates.length} candidatos prováveis.\n`;
+                    log("    (Top 1 é o mais provável size do SharedWorker)\n\n");
+
+                    candidates.slice(0, 8).forEach((c, idx) => {
+                        let stars = c.nearCall ? "★★★" : "";
+                        log += `[${idx+1}] OFFSET: 0x${c.offset.toString(16).toUpperCase()}\n`;
+                        log += `    OPCODE: ${c.type} ${stars}\n`;
+                        log += `    >>> SIZE: 0x${c.size.toString(16).toUpperCase()} (${c.size} bytes) <<<\n`;
+                        log += `    Distância: -${c.dist} bytes\n`;
+                        log += "----------------------------------------\n";
+                    });
                 }
 
                 document.getElementById('output').value = log;
