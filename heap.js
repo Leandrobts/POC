@@ -1,4 +1,4 @@
-import { log } from './utils.mjs';
+import { log } from './utils.js';
 
 var grooming_stash = [];
 
