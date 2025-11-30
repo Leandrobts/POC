@@ -2,103 +2,102 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 HEX DUMPER</title>
+    <title>PS4 12.00 HEX DUMPER V2</title>
     <style>
         body { background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        textarea { width: 90%; height: 400px; background: #111; color: #fff; border: 1px solid #555; margin-top: 15px; font-size: 12px; }
-        button { padding: 15px 30px; background: #0055aa; color: #fff; border: none; cursor: pointer; font-weight: bold; }
+        textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #555; margin-top: 15px; font-size: 13px; line-height: 1.4; }
+        button { padding: 15px 30px; background: #006600; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; font-size: 16px; }
+        .highlight { color: #ff00ff; }
     </style>
 </head>
 <body>
-    <h1>HEX DUMPER (Deep Analysis)</h1>
+    <h1>HEX DUMPER V2 (Sliced Read)</h1>
     <p>Alvo: <b>0x839A98</b> (SharedWorker Reference)</p>
     <input type="file" id="fileInput" />
     <br><br>
-    <button onclick="dumpHex()">EXTRAIR CÓDIGO (DUMP)</button>
+    <button onclick="readSlice()">LER REGIÃO (INSTANTÂNEO)</button>
     <textarea id="output" readonly>Aguardando arquivo...</textarea>
 
     <script>
-        function dumpHex() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo!");
+        function readSlice() {
+            const fileInput = document.getElementById('fileInput');
+            if (fileInput.files.length === 0) return alert("Selecione o arquivo ELF!");
 
+            const file = fileInput.files[0];
+            const TARGET = 0x839A98;
+            
+            // Lê apenas 512 bytes antes e 64 depois (foco na alocação)
+            const start = Math.max(0, TARGET - 512);
+            const end = Math.min(file.size, TARGET + 64);
+            
+            const blob = file.slice(start, end);
             const reader = new FileReader();
-            document.getElementById('output').value = "Lendo...";
 
             reader.onload = function(e) {
-                const view = new DataView(e.target.result);
                 const bytes = new Uint8Array(e.target.result);
+                const view = new DataView(e.target.result);
+                let log = `=== DUMP HEXADECIMAL (${start.toString(16).toUpperCase()} - ${end.toString(16).toUpperCase()}) ===\n`;
+                log += `Alvo (String Ref): 0x${TARGET.toString(16).toUpperCase()}\n\n`;
                 
-                // O Ponto de Referência que encontramos
-                const TARGET = 0x839A98;
-                
-                // Vamos pegar 200 bytes ANTES e 100 bytes DEPOIS
-                // Isso cobre a criação do objeto (new/malloc) e o uso da string.
-                const start = Math.max(0, TARGET - 200);
-                const end = Math.min(bytes.length, TARGET + 100);
-                
-                let log = `=== DUMP DA REGIÃO 0x${start.toString(16).toUpperCase()} - 0x${end.toString(16).toUpperCase()} ===\n`;
-                log += `Referência Central: 0x${TARGET.toString(16).toUpperCase()}\n\n`;
+                log += "OFFSET     | BYTES (Instruções)              | ASCII / ANÁLISE\n";
+                log += "-----------|---------------------------------|----------------\n";
 
-                for (let i = start; i < end; i += 16) {
-                    // Endereço
-                    log += `0x${i.toString(16).toUpperCase().padStart(8, '0')}: `;
+                for (let i = 0; i < bytes.length; i++) {
+                    const globalOffset = start + i;
+                    const b = bytes[i];
+
+                    // Detectar Instruções de Tamanho (Heurística)
+                    // BF = MOV EDI (Arg 1)
+                    // BE = MOV ESI (Arg 2)
+                    let comment = "";
                     
-                    // Bytes Hex
-                    let hex = "";
-                    let ascii = "";
-                    for (let j = 0; j < 16; j++) {
-                        if (i + j < end) {
-                            const b = bytes[i + j];
-                            hex += b.toString(16).toUpperCase().padStart(2, '0') + " ";
-                            ascii += (b >= 32 && b <= 126) ? String.fromCharCode(b) : ".";
-                        } else {
-                            hex += "   ";
+                    if (b === 0xBF) {
+                        // Verifica se há espaço para ler int32
+                        if (i + 4 < bytes.length) {
+                            const val = view.getInt32(i + 1, true);
+                            if (val > 0x20 && val <= 0x1000) {
+                                comment = `<<< MOV EDI, 0x${val.toString(16).toUpperCase()} (${val}) [POSSÍVEL TAMANHO]`;
+                            }
                         }
                     }
-                    log += hex + " | " + ascii + "\n";
-                }
-
-                log += "\n=== BUSCA POR VTABLE (VARREDURA RELATIVA) ===\n";
-                
-                // Tentar achar ponteiros relativos que apontem para TARGET (ou perto)
-                // Fórmula: Posição + 4 + S32 = TARGET
-                // Varre o arquivo inteiro
-                let vtFound = false;
-                // Otimização: VTables costumam estar na seção .data (geralmente após o código)
-                // Vamos varrer a partir de 0x1000000 para frente (chute seguro para .data)
-                const scanStart = 0; 
-                
-                for(let i = scanStart; i < view.byteLength - 8; i+=4) {
-                    // Teste 1: Ponteiro Absoluto
-                    try {
-                        const ptr = Number(view.getBigUint64(i, true));
-                        // Verifica se aponta para a região do código (TARGET +/- 0x20)
-                        if (ptr >= TARGET - 0x20 && ptr <= TARGET + 0x20) {
-                             log += `[ABSOLUTE] Em 0x${i.toString(16).toUpperCase()} -> Aponta para 0x${ptr.toString(16).toUpperCase()}\n`;
-                             vtFound = true;
-                        }
-                    } catch(e){}
-
-                    // Teste 2: Ponteiro Relativo (Offset 32-bit)
-                    // VTableAddr + Offset = CodeAddr
-                    try {
-                        const rel = view.getInt32(i, true);
-                        const dest = i + rel; // Simplificado (algumas implementações usam base)
-                        if (dest >= TARGET - 0x20 && dest <= TARGET + 0x20) {
-                             // Filtro de ruído: offsets relativos geralmente são usados em tabelas densas
-                             // log += `[RELATIVE] Em 0x${i.toString(16).toUpperCase()} -> Aponta para 0x${dest.toString(16).toUpperCase()}\n`;
-                        }
-                    } catch(e){}
                     
-                    if (vtFound && i > scanStart + 0x10000000) break; // Limite
+                    if (b === 0xBE) {
+                         if (i + 4 < bytes.length) {
+                            const val = view.getInt32(i + 1, true);
+                            if (val > 0x20 && val <= 0x1000) {
+                                comment = `<<< MOV ESI, 0x${val.toString(16).toUpperCase()} (${val}) [ALTERNATIVA]`;
+                            }
+                        }
+                    }
+                    
+                    if (globalOffset === TARGET) {
+                        comment = "<<< REFERÊNCIA DO ALVO (SharedWorker)";
+                    }
+
+                    // Formatação de linha (16 bytes por linha)
+                    if (globalOffset % 16 === 0) {
+                        if (i > 0) log += "\n";
+                        log += `0x${globalOffset.toString(16).toUpperCase().padStart(8, '0')} | `;
+                    }
+                    
+                    log += b.toString(16).toUpperCase().padStart(2, '0') + " ";
+                    
+                    if ((globalOffset + 1) % 16 === 0 || i === bytes.length - 1 || comment !== "") {
+                        // Preenchimento se a linha quebrar no meio por causa de um comentário
+                        if (comment !== "") {
+                             log += " " + comment + "\n";
+                             // Ajusta alinhamento da próxima linha se não terminou os 16 bytes
+                             if ((globalOffset + 1) % 16 !== 0) {
+                                 log += `0x${(globalOffset+1).toString(16).toUpperCase().padStart(8, '0')} | `.padStart(13 + ((globalOffset % 16) * 3)); 
+                             }
+                        }
+                    }
                 }
-                
-                if(!vtFound) log("Nenhum ponteiro direto encontrado (VTable pode estar ofuscada).");
 
                 document.getElementById('output').value = log;
             };
-            reader.readAsArrayBuffer(file);
+
+            reader.readAsArrayBuffer(blob);
         }
     </script>
 </body>
