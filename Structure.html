@@ -2,72 +2,83 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTABLE RANGE SCANNER</title>
+    <title>PS4 12.00 RELATIVE VTABLE SCANNER</title>
     <style>
-        body { background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        body { background: #050505; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
         textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 30px; background: #550055; color: #fff; border: 1px solid #f0f; cursor: pointer; font-weight: bold; font-size: 16px; }
-        .highlight { color: #ff00ff; }
+        button { padding: 15px 30px; background: #440044; color: #fff; border: 1px solid #f0f; cursor: pointer; font-weight: bold; font-size: 16px; }
+        .highlight { color: #ff00ff; font-weight: bold; }
     </style>
 </head>
 <body>
-    <h1>VTABLE RANGE SCANNER</h1>
-    <p>Alvo: Vizinhança de <b>0x839A98</b> (SharedWorker)</p>
+    <h1>RELATIVE VTABLE SCANNER</h1>
+    <p>Alvo: Função SharedWorker (Zona <b>0x839A00</b>)</p>
     <input type="file" id="fileInput" />
     <br><br>
-    <button onclick="scanRange()">INICIAR SCAN DE ALCANCE</button>
+    <button onclick="scanRelative()">INICIAR MATEMÁTICA REVERSA</button>
     <textarea id="output" readonly>Aguardando...</textarea>
 
     <script>
-        function scanRange() {
+        function scanRelative() {
             const file = document.getElementById('fileInput').files[0];
             if(!file) return alert("Selecione o arquivo ELF!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Varrendo o arquivo inteiro em busca de ponteiros para a zona do SharedWorker...";
+            document.getElementById('output').value = "Calculando offsets relativos em 70MB... Aguarde...";
 
             reader.onload = function(e) {
                 const view = new DataView(e.target.result);
                 const len = view.byteLength;
                 
-                // A referência de código que temos
-                const CODE_REF = 0x839A98;
+                // A zona onde sabemos que o código do SharedWorker está (baseado no seu Hex Dump anterior)
+                // O código começa por volta de 0x8398A0 e vai até 0x839AD0
+                const FUNC_START = 0x839800;
+                const FUNC_END   = 0x839B00;
                 
-                // Vamos procurar ponteiros que apontem para [CODE_REF - 500] até [CODE_REF]
-                // Isso cobre o início da função, não importa quão grande ela seja.
-                const RANGE_START = CODE_REF - 500;
-                const RANGE_END = CODE_REF;
-                
-                let log = `=== VARREDURA DE PONTEIROS (Range: 0x${RANGE_START.toString(16)} - 0x${RANGE_END.toString(16)}) ===\n\n`;
+                let log = `=== SCANNER RELATIVO (Alvo: 0x${FUNC_START.toString(16)} - 0x${FUNC_END.toString(16)}) ===\n\n`;
                 let foundCount = 0;
 
-                // Varre o arquivo inteiro procurando valores de 64 bits (Ponteiros)
-                // Passo de 4 bytes para pegar desalinhados, mas VTables geralmente são alinhadas a 8.
-                for (let i = 0; i < len - 8; i += 8) {
+                // Varre o arquivo inteiro procurando inteiros de 32 bits (alinhados a 4 bytes)
+                // A maioria das VTables relativas são arrays de int32.
+                
+                // Otimização: Começamos a busca na seção .data (geralmente após o código)
+                // Mas vamos varrer tudo para garantir.
+                
+                for (let i = 0; i < len - 4; i += 4) {
                     try {
-                        // Lê 64 bits Little Endian
-                        const ptrVal = Number(view.getBigUint64(i, true));
+                        // Lê valor de 32 bits com sinal (pode ser negativo se a vtable estiver depois do código)
+                        const offset = view.getInt32(i, true); // Little Endian
                         
-                        // Se o valor aponta para a nossa zona de interesse
-                        if (ptrVal >= RANGE_START && ptrVal <= RANGE_END) {
+                        // A Lógica Relativa: Destino = Posição Atual (i) + Offset
+                        const dest = i + offset;
+                        
+                        // Verifica se o destino cai dentro da função do SharedWorker
+                        if (dest >= FUNC_START && dest <= FUNC_END) {
                             foundCount++;
-                            log += `[CANDIDATO A VTABLE ENCONTRADO]\n`;
-                            log += `   OFFSET NO ARQUIVO (Endereço da VTable): 0x${i.toString(16).toUpperCase()}\n`;
-                            log += `   APONTA PARA (Início da Função):         0x${ptrVal.toString(16).toUpperCase()}\n`;
-                            log += `   Distância da Ref (0x${CODE_REF.toString(16)}):  ${CODE_REF - ptrVal} bytes\n`;
+                            log += `[CANDIDATO ENCONTRADO]\n`;
+                            log += `   OFFSET NO ARQUIVO (Endereço VTable): 0x${i.toString(16).toUpperCase()}\n`;
+                            log += `   VALOR (Offset Relativo):             0x${offset.toString(16).toUpperCase()}\n`;
+                            log += `   APONTA PARA (Código):                0x${dest.toString(16).toUpperCase()}\n`;
+                            
+                            // Verifica se é uma sequência (VTable real tem vários ponteiros seguidos)
+                            // Vamos olhar o próximo valor (+4)
+                            if (i + 8 < len) {
+                                const nextOff = view.getInt32(i+4, true);
+                                const nextDest = (i+4) + nextOff;
+                                log += `   [Vizinho +4] Aponta para: 0x${nextDest.toString(16).toUpperCase()}\n`;
+                            }
+                            
                             log += `   -----------------------------------------------------\n`;
                         }
                     } catch(e){}
                 }
 
                 if (foundCount === 0) {
-                    log += "[-] Nenhum ponteiro absoluto encontrado para esta região.\n";
-                    log += "    Isso sugere que o binário usa 'Relative VTables' (Offsets de 32 bits a partir da própria VTable).\n";
-                    log += "    Tente rodar o 'Relative Scanner' se este falhar.\n";
+                    log += "[-] Nenhum ponteiro relativo encontrado.\n";
+                    log += "    Possibilidade: A VTable usa um 'Base Address' diferente da sua própria posição.\n";
                 } else {
-                    log(`\n[SUCCESS] Encontrados ${foundCount} candidatos.\n`);
-                    log("O candidato mais provável é aquele que está dentro de uma sequência de outros ponteiros (Cluster).\n");
-                    log("Use o 'OFFSET NO ARQUIVO' como o endereço da VTable no seu exploit.");
+                    log(`\n[SUCESSO] Encontrados ${foundCount} candidatos.\n`);
+                    log("O Offset da VTable é o número 'OFFSET NO ARQUIVO'.");
                 }
 
                 document.getElementById('output').value = log;
