@@ -2,193 +2,103 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 GOD MODE ANALYZER</title>
+    <title>PS4 12.00 HEX DUMPER</title>
     <style>
-        body { background-color: #111; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 1200px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #000; }
-        textarea { width: 100%; height: 600px; background: #0a0a0a; color: #ddd; border: 1px solid #444; font-size: 12px; margin-top: 15px; white-space: pre; }
-        button { padding: 15px 30px; background: #0055aa; color: #fff; font-weight: bold; border: none; cursor: pointer; border-radius: 5px; margin: 5px; }
-        button:hover { background: #0077cc; }
-        .highlight { color: #ff00ff; font-weight: bold; }
-        .header { color: #ffff00; border-bottom: 1px solid #333; padding-bottom: 5px; margin-bottom: 10px; }
+        body { background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        textarea { width: 90%; height: 400px; background: #111; color: #fff; border: 1px solid #555; margin-top: 15px; font-size: 12px; }
+        button { padding: 15px 30px; background: #0055aa; color: #fff; border: none; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🔬 GOD MODE BINARY ANALYZER</h1>
-        <h3>Alvo: SharedWorker & MessagePort (Size & VTable)</h3>
-        
-        <input type="file" id="fileInput" />
-        <br><br>
-        <button onclick="startAnalysis()">INICIAR VARREDURA PROFUNDA</button>
-        <textarea id="output" readonly>Carregue o arquivo .ELF do WebKit...</textarea>
-    </div>
+    <h1>HEX DUMPER (Deep Analysis)</h1>
+    <p>Alvo: <b>0x839A98</b> (SharedWorker Reference)</p>
+    <input type="file" id="fileInput" />
+    <br><br>
+    <button onclick="dumpHex()">EXTRAIR CÓDIGO (DUMP)</button>
+    <textarea id="output" readonly>Aguardando arquivo...</textarea>
 
     <script>
-        function log(msg) {
-            document.getElementById('output').value += msg + "\n";
-        }
-
-        function startAnalysis() {
+        function dumpHex() {
             const file = document.getElementById('fileInput').files[0];
             if(!file) return alert("Selecione o arquivo!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Lendo binário (Isso pode levar um minuto)...\n";
+            document.getElementById('output').value = "Lendo...";
 
             reader.onload = function(e) {
-                const buffer = e.target.result;
-                const view = new DataView(buffer);
-                const bytes = new Uint8Array(buffer);
+                const view = new DataView(e.target.result);
+                const bytes = new Uint8Array(e.target.result);
                 
-                analyze(view, bytes);
+                // O Ponto de Referência que encontramos
+                const TARGET = 0x839A98;
+                
+                // Vamos pegar 200 bytes ANTES e 100 bytes DEPOIS
+                // Isso cobre a criação do objeto (new/malloc) e o uso da string.
+                const start = Math.max(0, TARGET - 200);
+                const end = Math.min(bytes.length, TARGET + 100);
+                
+                let log = `=== DUMP DA REGIÃO 0x${start.toString(16).toUpperCase()} - 0x${end.toString(16).toUpperCase()} ===\n`;
+                log += `Referência Central: 0x${TARGET.toString(16).toUpperCase()}\n\n`;
+
+                for (let i = start; i < end; i += 16) {
+                    // Endereço
+                    log += `0x${i.toString(16).toUpperCase().padStart(8, '0')}: `;
+                    
+                    // Bytes Hex
+                    let hex = "";
+                    let ascii = "";
+                    for (let j = 0; j < 16; j++) {
+                        if (i + j < end) {
+                            const b = bytes[i + j];
+                            hex += b.toString(16).toUpperCase().padStart(2, '0') + " ";
+                            ascii += (b >= 32 && b <= 126) ? String.fromCharCode(b) : ".";
+                        } else {
+                            hex += "   ";
+                        }
+                    }
+                    log += hex + " | " + ascii + "\n";
+                }
+
+                log += "\n=== BUSCA POR VTABLE (VARREDURA RELATIVA) ===\n";
+                
+                // Tentar achar ponteiros relativos que apontem para TARGET (ou perto)
+                // Fórmula: Posição + 4 + S32 = TARGET
+                // Varre o arquivo inteiro
+                let vtFound = false;
+                // Otimização: VTables costumam estar na seção .data (geralmente após o código)
+                // Vamos varrer a partir de 0x1000000 para frente (chute seguro para .data)
+                const scanStart = 0; 
+                
+                for(let i = scanStart; i < view.byteLength - 8; i+=4) {
+                    // Teste 1: Ponteiro Absoluto
+                    try {
+                        const ptr = Number(view.getBigUint64(i, true));
+                        // Verifica se aponta para a região do código (TARGET +/- 0x20)
+                        if (ptr >= TARGET - 0x20 && ptr <= TARGET + 0x20) {
+                             log += `[ABSOLUTE] Em 0x${i.toString(16).toUpperCase()} -> Aponta para 0x${ptr.toString(16).toUpperCase()}\n`;
+                             vtFound = true;
+                        }
+                    } catch(e){}
+
+                    // Teste 2: Ponteiro Relativo (Offset 32-bit)
+                    // VTableAddr + Offset = CodeAddr
+                    try {
+                        const rel = view.getInt32(i, true);
+                        const dest = i + rel; // Simplificado (algumas implementações usam base)
+                        if (dest >= TARGET - 0x20 && dest <= TARGET + 0x20) {
+                             // Filtro de ruído: offsets relativos geralmente são usados em tabelas densas
+                             // log += `[RELATIVE] Em 0x${i.toString(16).toUpperCase()} -> Aponta para 0x${dest.toString(16).toUpperCase()}\n`;
+                        }
+                    } catch(e){}
+                    
+                    if (vtFound && i > scanStart + 0x10000000) break; // Limite
+                }
+                
+                if(!vtFound) log("Nenhum ponteiro direto encontrado (VTable pode estar ofuscada).");
+
+                document.getElementById('output').value = log;
             };
             reader.readAsArrayBuffer(file);
-        }
-
-        function analyze(view, bytes) {
-            log("=== RELATÓRIO DE ENGENHARIA REVERSA (PS4 12.00) ===\n");
-
-            // Lista de alvos para comparar
-            const TARGETS = ["SharedWorker", "MessagePort", "Worker"];
-
-            TARGETS.forEach(name => {
-                log(`\n========================================`);
-                log(`   ANALISANDO OBJETO: ${name}`);
-                log(`========================================`);
-
-                // 1. Localizar a String (Nome da Classe)
-                const strOffset = findString(bytes, name);
-                if (strOffset === -1) {
-                    log(`[-] String '${name}' não encontrada.`);
-                    return;
-                }
-                log(`[+] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
-
-                // 2. Localizar XREFs (Código que usa a string)
-                // Isso geralmente é o construtor ou RTTI
-                const codeRefs = findRipRelativeRefs(view, strOffset);
-                if (codeRefs.length === 0) {
-                    log(`[-] Nenhuma referência de código direta encontrada.`);
-                    return;
-                }
-
-                codeRefs.forEach(ref => {
-                    log(`\n   -> Referência de Código em: 0x${ref.toString(16).toUpperCase()}`);
-                    
-                    // 3. SIZE HUNTER (Rastreamento Reverso de Alocação)
-                    // Olhamos 1000 bytes para trás procurando 'MOV EDI, size' ou 'MOV ESI, size'
-                    // Filtramos apenas tamanhos que fazem sentido para WebKit (32 a 2048 bytes)
-                    
-                    let sizes = [];
-                    const lookback = 1000;
-                    const startScan = Math.max(0, ref - lookback);
-
-                    for (let i = ref; i > startScan; i--) {
-                        let size = 0;
-                        let reg = "";
-                        
-                        // MOV EDI, imm32 (Argumento 1 - Malloc)
-                        if (bytes[i] === 0xBF) {
-                            size = view.getInt32(i+1, true);
-                            reg = "EDI";
-                        }
-                        // MOV ESI, imm32 (Argumento 2 - Operator New)
-                        else if (bytes[i] === 0xBE) {
-                            size = view.getInt32(i+1, true);
-                            reg = "ESI";
-                        }
-                        // MOV RDI, imm32 (64-bit)
-                        else if (bytes[i] === 0x48 && bytes[i+1] === 0xC7 && bytes[i+2] === 0xC7) {
-                            size = view.getInt32(i+3, true);
-                            reg = "RDI";
-                        }
-
-                        if (size >= 0x20 && size <= 0x800) {
-                            // Verifica se é alinhado (frequentemente é)
-                            let confidence = "Baixa";
-                            if (size % 16 === 0) confidence = "Alta";
-                            else if (size % 8 === 0) confidence = "Média";
-
-                            // Verifica se tem CALL perto
-                            let hasCall = false;
-                            for(let k=0; k<15; k++) { if(bytes[i+5+k] === 0xE8) hasCall = true; }
-                            if(hasCall) confidence = "MUITO ALTA (Perto de Call)";
-
-                            sizes.push({ offset: i, size: size, reg: reg, conf: confidence, dist: ref - i });
-                        }
-                    }
-
-                    if (sizes.length > 0) {
-                        log(`      [CANDIDATOS A TAMANHO]`);
-                        // Mostra apenas os top 5 mais próximos ou confiáveis
-                        sizes.sort((a, b) => a.dist - b.dist);
-                        sizes.slice(0, 5).forEach(s => {
-                            log(`      * 0x${s.size.toString(16).toUpperCase()} (${s.size} bytes) | Confiança: ${s.conf} | Dist: -${s.dist}`);
-                        });
-                    } else {
-                        log(`      [-] Nenhum tamanho óbvio encontrado.`);
-                    }
-
-                    // 4. VTABLE HUNTER (Rastreamento de Ponteiros)
-                    // Procura quem aponta para este código (ref)
-                    // VTables são arrays de ponteiros absolutos na seção .data
-                    
-                    // Procuramos ponteiros para 'ref' ou 'ref - offset' (início da função)
-                    // Varredura heurística: Assume que 'ref' está dentro da função
-                    const vtables = findAbsoluteRefsToRange(view, ref - 200, ref + 20);
-                    
-                    if (vtables.length > 0) {
-                        log(`      [CANDIDATOS A VTABLE (Para Leak)]`);
-                        vtables.forEach(vt => {
-                            // O ponteiro da VTable geralmente aponta para o início da função.
-                            // O local ONDE achamos o ponteiro (vt.loc) é o endereço da VTable.
-                            log(`      * Offset no Arquivo: 0x${vt.loc.toString(16).toUpperCase()} (Aponta para 0x${vt.target.toString(16).toUpperCase()})`);
-                        });
-                    }
-                });
-            });
-        }
-
-        // --- UTILITÁRIOS ---
-        function findString(bytes, str) {
-            const target = new TextEncoder().encode(str);
-            for(let i=0; i<bytes.length - target.length; i++) {
-                let match = true;
-                for(let j=0; j<target.length; j++) {
-                    if(bytes[i+j] !== target[j]) { match = false; break; }
-                }
-                if(match && bytes[i+target.length] === 0) return i;
-            }
-            return -1;
-        }
-
-        function findRipRelativeRefs(view, target) {
-            const refs = [];
-            const len = view.byteLength - 7;
-            for (let i = 0; i < len; i++) {
-                // Opcode LEA/MOV (48 8D / 48 8B)
-                if (view.getUint8(i) === 0x48 && (view.getUint8(i+1) === 0x8D || view.getUint8(i+1) === 0x8B)) {
-                    const offset = view.getInt32(i + 3, true);
-                    const dest = i + 7 + offset;
-                    if (dest === target) refs.push(i);
-                }
-            }
-            return refs;
-        }
-
-        function findAbsoluteRefsToRange(view, start, end) {
-            const refs = [];
-            const len = view.byteLength - 8;
-            for (let i = 0; i < len; i+=8) {
-                try {
-                    const val = Number(view.getBigUint64(i, true)); // Safe for file offsets
-                    if (val >= start && val <= end) {
-                        refs.push({ loc: i, target: val });
-                    }
-                } catch(e){}
-            }
-            return refs;
         }
     </script>
 </body>
