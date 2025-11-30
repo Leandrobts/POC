@@ -3,9 +3,9 @@ export const CONFIG = {
     WORKER_LIMIT: 405, 
     
     // Tamanhos alvo (Focando no que deu sinal de vida)
-    // 0xC0 = 192 bytes (Deu Panic antes)
+    
     // 0xA0 = 160 bytes (Análise binária)
-    SIZES_TO_TEST: [0xA0, 0xC0],
+    SIZES_TO_TEST: [0xA0],
 
     // Quantidade massiva para vencer a fragmentação
     SPRAY_QUANTITY: 30000,
