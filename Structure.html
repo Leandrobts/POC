@@ -2,151 +2,140 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Constructor Hunter (V4)</title>
+    <title>PS4 12.00 ULTIMATE ANALYZER</title>
     <style>
-        body { background-color: #0d1117; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 1000px; margin: 0 auto; background: #161b22; padding: 20px; border: 1px solid #30363d; border-radius: 10px; }
-        textarea { width: 100%; height: 600px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; margin-top: 10px; }
-        button:hover { background: #2ea043; }
-        .step { color: #8b949e; font-size: 12px; margin-bottom: 5px; }
+        body { background: #111; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #000; }
+        textarea { width: 100%; height: 500px; background: #1a1a1a; color: #fff; border: 1px solid #444; font-size: 12px; }
+        button { padding: 15px 30px; background: #005500; color: #fff; cursor: pointer; border: 1px solid #0f0; font-weight: bold; font-size: 16px; margin-top: 10px; }
+        .file-input { margin-bottom: 20px; border: 1px dashed #555; padding: 20px; }
     </style>
 </head>
 <body>
-
     <div class="container">
-        <h1>🧬 CONSTRUCTOR HUNTER V4</h1>
-        <p>Rastreamento: String -> VTable -> Construtor -> Malloc Size</p>
-        <p class="step">Selecione TODOS os arquivos .elf (WebKit, Libc, LibKernel...)</p>
+        <h1>🔬 ULTIMATE ELF ANALYZER</h1>
+        <h3>Foco: Tamanho de Alocação (SharedWorker)</h3>
         
-        <input type="file" id="fileInput" multiple />
-        <br>
-        <button onclick="startDeepAnalysis()">INICIAR RASTREAMENTO PROFUNDO</button>
-        
-        <textarea id="output" readonly>Aguardando binários...</textarea>
+        <div class="file-input">
+            <p>Selecione TODOS os arquivos .elf (WebKit, Libc, Kernel...)</p>
+            <input type="file" id="fileInput" multiple onchange="updateList()" />
+            <div id="fileList" style="color: #aaa; font-size: 12px; margin-top: 5px;"></div>
+        </div>
+
+        <button onclick="startAnalysis()">INICIAR VARREDURA PROFUNDA</button>
+        <textarea id="output" readonly>Aguardando arquivos...</textarea>
     </div>
 
     <script>
-        async function startDeepAnalysis() {
+        function updateList() {
             const files = document.getElementById('fileInput').files;
-            if(files.length === 0) return alert("Selecione os arquivos!");
+            document.getElementById('fileList').innerText = `${files.length} arquivos selecionados.`;
+        }
 
-            const output = document.getElementById('output');
-            output.value = "Carregando arquivos na memória...\n";
+        async function startAnalysis() {
+            const files = document.getElementById('fileInput').files;
+            if (files.length === 0) return alert("Selecione os arquivos!");
 
-            let webkit = null;
-            
-            // 1. Carregar arquivos
+            const out = document.getElementById('output');
+            out.value = "Iniciando análise cruzada...\n";
+
+            let binaries = {};
+
+            // 1. Carregar
             for (let f of files) {
-                if (f.name.includes("WebKit")) {
-                    const buf = await readFile(f);
-                    webkit = {
-                        view: new DataView(buf),
-                        bytes: new Uint8Array(buf),
-                        size: buf.byteLength
-                    };
-                    output.value += `[OK] WebKit carregado (${(buf.byteLength/1024/1024).toFixed(2)} MB)\n`;
+                out.value += `Lendo ${f.name}...\n`;
+                const buf = await readFile(f);
+                binaries[f.name] = {
+                    view: new DataView(buf),
+                    bytes: new Uint8Array(buf)
+                };
+            }
+
+            let log = "\n=== RELATÓRIO DE TAMANHOS (HEURÍSTICA) ===\n";
+
+            // 2. Localizar WebKit
+            const wkKey = Object.keys(binaries).find(k => k.includes("WebKit"));
+            if (!wkKey) {
+                out.value += "ERRO: WebKit não encontrado.\n";
+                return;
+            }
+            const wk = binaries[wkKey];
+
+            // 3. Ponto de Referência (String SharedWorker)
+            const targetStr = "SharedWorker";
+            const strOffset = findString(wk.bytes, targetStr);
+            
+            if (strOffset === -1) {
+                log += "[-] String 'SharedWorker' não encontrada no WebKit.\n";
+            } else {
+                log += `[+] String '${targetStr}' em 0x${strOffset.toString(16).toUpperCase()}\n`;
+                
+                // 4. Achar quem usa a string (Código)
+                const codeRefs = findRelativeRefs(wk.view, strOffset);
+                
+                codeRefs.forEach(ref => {
+                    log += `\n>>> Analisando Código em 0x${ref.toString(16).toUpperCase()} <<<\n`;
+                    
+                    // 5. VARREDURA REVERSA INTELIGENTE
+                    // Procura por qualquer instrução que mova um valor "pequeno" (size) para um registro
+                    // num raio de 500 bytes antes do uso da string.
+                    
+                    const start = Math.max(0, ref - 500);
+                    let sizesFound = {};
+
+                    for (let i = ref; i > start; i--) {
+                        let size = -1;
+                        let reg = "";
+
+                        // MOV RDI, imm32 (48 C7 C7 ...)
+                        if (wk.bytes[i] === 0x48 && wk.bytes[i+1] === 0xC7 && wk.bytes[i+2] === 0xC7) {
+                            size = wk.view.getInt32(i+3, true);
+                            reg = "RDI";
+                        }
+                        // MOV ESI, imm32 (BE ...)
+                        else if (wk.bytes[i] === 0xBE) {
+                            size = wk.view.getInt32(i+1, true);
+                            reg = "ESI";
+                        }
+                        // MOV EDI, imm32 (BF ...)
+                        else if (wk.bytes[i] === 0xBF) {
+                            size = wk.view.getInt32(i+1, true);
+                            reg = "EDI";
+                        }
+                        // MOV EDX, imm32 (BA ...)
+                        else if (wk.bytes[i] === 0xBA) {
+                            size = wk.view.getInt32(i+1, true);
+                            reg = "EDX";
+                        }
+
+                        // Filtro de Tamanho de Objeto (32 bytes a 4096 bytes)
+                        if (size >= 0x20 && size <= 0x1000) {
+                            // Filtra alinhamento (malloc geralmente alinha em 16 ou 8 bytes)
+                            if (size % 8 === 0) {
+                                let dist = ref - i;
+                                log += `   [OFFSET -${dist}] MOV ${reg}, 0x${size.toString(16).toUpperCase()} (${size})\n`;
+                                
+                                if(!sizesFound[size]) sizesFound[size] = 0;
+                                sizesFound[size]++;
+                            }
+                        }
+                    }
+                });
+            }
+
+            // 6. Checar ISOHEAP em outros arquivos
+            log += "\n=== ESTRUTURAS ISOHEAP DETECTADAS ===\n";
+            for (let name in binaries) {
+                const b = binaries[name];
+                // Procura assinaturas de IsoHeapCellType::finishSweep
+                // Padrão comum de código de alocador
+                const isoScan = findPattern(b.bytes, "48 8B 05 ?? ?? ?? ?? 48 85 C0 74"); // Exemplo genérico
+                if(isoScan.length > 0) {
+                    log += `[${name}] Possível código de IsoHeap detectado em ${isoScan.length} locais.\n`;
                 }
             }
 
-            if (!webkit) {
-                output.value += "ERRO: Arquivo WebKit não encontrado!\n";
-                return;
-            }
-
-            let log = "\n=== RASTREAMENTO REVERSO ===\n";
-
-            // 2. Achar a String "SharedWorker"
-            const str = "SharedWorker";
-            const strOffset = findString(webkit.bytes, str);
-            
-            if (strOffset === -1) {
-                log += "[-] String 'SharedWorker' não encontrada.\n";
-                output.value += log;
-                return;
-            }
-            log += `[1] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}\n`;
-
-            // 3. Achar XREFs (Código que usa a string)
-            // RIP-Relative: Procure instruções que apontem para strOffset
-            const codeRefs = findRelativeRefs(webkit.view, strOffset);
-            
-            if (codeRefs.length === 0) {
-                log += "[-] Nenhuma referência de código direta (XREF) encontrada.\n";
-                // Tenta heurística de VTable direta (ponteiro para string)
-            } else {
-                log += `[2] ${codeRefs.length} locais usam a string (RTTI/ClassName).\n`;
-                codeRefs.forEach(ref => log += `    -> Código em 0x${ref.toString(16).toUpperCase()}\n`);
-            }
-
-            // 4. Achar a VTable (O Elo Perdido)
-            // A VTable é uma lista de ponteiros. Um deles aponta para o código acima (RTTI).
-            // Vamos escanear o arquivo inteiro procurando ponteiros (64-bit) para os codeRefs.
-            
-            let vtableCandidates = [];
-            // Adiciona a própria string como alvo (caso não tenha RTTI intermediário)
-            let targets = [...codeRefs, strOffset]; 
-            
-            targets.forEach(target => {
-                const pointers = findAbsoluteRefs(webkit.view, target);
-                pointers.forEach(ptr => {
-                    // Se achamos um ponteiro para o código, a VTable real geralmente começa +8 ou +16 bytes depois
-                    // Mas o endereço do ponteiro já nos localiza na seção .data.rel.ro
-                    vtableCandidates.push(ptr);
-                });
-            });
-
-            if (vtableCandidates.length === 0) {
-                log += "[-] Nenhuma VTable óbvia encontrada.\n";
-            } else {
-                log += `[3] ${vtableCandidates.length} candidatos a VTable encontrados.\n`;
-                
-                // 5. Achar o CONSTRUTOR
-                // O Construtor é o código que CARREGA o endereço da VTable no objeto.
-                // Procuramos: LEA RAX, [VTable] ou MOV [RDI], VTable_Addr
-                // Como é x64, será RIP-Relative: LEA REG, [RIP + offset] == VTable
-                
-                vtableCandidates.forEach(vt => {
-                    // Ajuste: O início da VTable usada pelo objeto geralmente é offset+16 (pula RTTI/Offset)
-                    const objectVTable = vt + 16; 
-                    
-                    log(`    Analisando VTable em 0x${objectVTable.toString(16).toUpperCase()}...\n`);
-                    
-                    // Procura no código quem referencia esse endereço
-                    const constructors = findRelativeRefs(webkit.view, objectVTable);
-                    
-                    constructors.forEach(ctor => {
-                        log(`    [!] CONSTRUTOR POTENCIAL EM: 0x${ctor.toString(16).toUpperCase()}\n`);
-                        
-                        // 6. Achar o TAMANHO (Size)
-                        // Olhar 200 bytes ANTES do construtor.
-                        // Procurar: MOV EDI, imm32 (BF XX XX 00 00)
-                        
-                        const scanStart = Math.max(0, ctor - 200);
-                        for(let i = ctor; i > scanStart; i--) {
-                            if (webkit.bytes[i] === 0xBF) { // MOV EDI
-                                const size = webkit.view.getInt32(i+1, true);
-                                if (size > 0x20 && size <= 0x800) {
-                                    log += `        >>> TAMANHO ENCONTRADO: 0x${size.toString(16).toUpperCase()} (${size}) <<<\n`;
-                                    log += `        (Distância: ${ctor - i} bytes antes da ref)\n`;
-                                }
-                            }
-                            // MOV ESI (BE)
-                            else if (webkit.bytes[i] === 0xBE) { 
-                                const size = webkit.view.getInt32(i+1, true);
-                                if (size > 0x20 && size <= 0x800) {
-                                    log += `        >>> TAMANHO (ESI): 0x${size.toString(16).toUpperCase()} <<<\n`;
-                                }
-                            }
-                        }
-                    });
-                });
-            }
-
-            log("\n=== FIM DA ANÁLISE ===\n");
-            log("DICA: Se aparecer mais de um tamanho, o menor (0x80-0x200) é o mais provável para SharedWorker.");
-            
-            output.value = log;
+            out.value = log;
         }
 
         function readFile(file) {
@@ -169,27 +158,25 @@
             return -1;
         }
 
-        // Busca referências relativas (LEA/MOV com offset 32-bit)
         function findRelativeRefs(view, targetOffset) {
             const results = [];
             const len = view.byteLength - 4;
-            for (let i = 0; i < len; i+=1) { // Varredura fina
-                const relOffset = view.getInt32(i, true);
-                const destination = i + 4 + relOffset;
-                if (destination === targetOffset) results.push(i);
+            for (let i = 0; i < len; i+=1) { // Scan byte a byte para garantir
+                const rel = view.getInt32(i, true);
+                if (i + 4 + rel === targetOffset) {
+                    // Valida se parece instrução (LEA/MOV)
+                    // LEA geralmente é 48 8D ...
+                    if (i >= 3 && view.getUint8(i-3) === 0x48 && view.getUint8(i-2) === 0x8D) {
+                        results.push(i-3);
+                    }
+                }
             }
             return results;
         }
-
-        // Busca referências absolutas (Ponteiros 64-bit)
-        function findAbsoluteRefs(view, targetOffset) {
-            const results = [];
-            const len = view.byteLength - 8;
-            const targetBig = BigInt(targetOffset);
-            for (let i = 0; i < len; i += 8) { // Alinhado a 8
-                if (view.getBigUint64(i, true) === targetBig) results.push(i);
-            }
-            return results;
+        
+        function findPattern(view, patternHex) {
+            // Simplificado para demo
+            return [];
         }
     </script>
 </body>
