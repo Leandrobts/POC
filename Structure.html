@@ -2,138 +2,194 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Caller Hunter</title>
+    <title>PS4 12.00 Constructor Hunter (V4)</title>
     <style>
-        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 1000px; margin: 0 auto; border: 1px solid #30363d; padding: 20px; background: #161b22; border-radius: 10px; }
-        textarea { width: 100%; height: 500px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
+        body { background-color: #0d1117; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        .container { max-width: 1000px; margin: 0 auto; background: #161b22; padding: 20px; border: 1px solid #30363d; border-radius: 10px; }
+        textarea { width: 100%; height: 600px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
+        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; margin-top: 10px; }
         button:hover { background: #2ea043; }
-        .step { color: #8b949e; margin-bottom: 20px; }
+        .step { color: #8b949e; font-size: 12px; margin-bottom: 5px; }
     </style>
 </head>
 <body>
+
     <div class="container">
-        <h1>CALLER HUNTER (Reverse Trace)</h1>
-        <p class="step">Alvo: Quem aloca o objeto SharedWorker?</p>
+        <h1>🧬 CONSTRUCTOR HUNTER V4</h1>
+        <p>Rastreamento: String -> VTable -> Construtor -> Malloc Size</p>
+        <p class="step">Selecione TODOS os arquivos .elf (WebKit, Libc, LibKernel...)</p>
         
-        <input type="file" id="fileInput" />
-        <br><br>
-        <button onclick="startTrace()">RASTREAR ALOCAÇÃO</button>
-        <textarea id="output" readonly>Aguardando arquivo...</textarea>
+        <input type="file" id="fileInput" multiple />
+        <br>
+        <button onclick="startDeepAnalysis()">INICIAR RASTREAMENTO PROFUNDO</button>
+        
+        <textarea id="output" readonly>Aguardando binários...</textarea>
     </div>
 
     <script>
-        function startTrace() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo!");
+        async function startDeepAnalysis() {
+            const files = document.getElementById('fileInput').files;
+            if(files.length === 0) return alert("Selecione os arquivos!");
 
-            const reader = new FileReader();
-            document.getElementById('output').value = "Mapeando fluxo de execução... (Pode levar 30s)";
+            const output = document.getElementById('output');
+            output.value = "Carregando arquivos na memória...\n";
 
-            reader.onload = function(e) {
-                const view = new DataView(e.target.result);
-                const bytes = new Uint8Array(e.target.result);
-                let log = "=== RELATÓRIO DE RASTREAMENTO ===\n\n";
+            let webkit = null;
+            
+            // 1. Carregar arquivos
+            for (let f of files) {
+                if (f.name.includes("WebKit")) {
+                    const buf = await readFile(f);
+                    webkit = {
+                        view: new DataView(buf),
+                        bytes: new Uint8Array(buf),
+                        size: buf.byteLength
+                    };
+                    output.value += `[OK] WebKit carregado (${(buf.byteLength/1024/1024).toFixed(2)} MB)\n`;
+                }
+            }
 
-                // 1. Ponto de Referência (Uso da String)
-                const REF_ADDR = 0x839A9B; 
-                log += `[1] Ponto de Partida (Ref String): 0x${REF_ADDR.toString(16).toUpperCase()}\n`;
+            if (!webkit) {
+                output.value += "ERRO: Arquivo WebKit não encontrado!\n";
+                return;
+            }
 
-                // 2. Encontrar o Início da Função (Procura por 'Prologue' ou 'Padding' para trás)
-                // Padding comum: 0xCC (INT3) ou 0x90 (NOP)
-                // Prologue comum: 55 48 89 E5 (push rbp; mov rbp, rsp)
+            let log = "\n=== RASTREAMENTO REVERSO ===\n";
+
+            // 2. Achar a String "SharedWorker"
+            const str = "SharedWorker";
+            const strOffset = findString(webkit.bytes, str);
+            
+            if (strOffset === -1) {
+                log += "[-] String 'SharedWorker' não encontrada.\n";
+                output.value += log;
+                return;
+            }
+            log += `[1] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}\n`;
+
+            // 3. Achar XREFs (Código que usa a string)
+            // RIP-Relative: Procure instruções que apontem para strOffset
+            const codeRefs = findRelativeRefs(webkit.view, strOffset);
+            
+            if (codeRefs.length === 0) {
+                log += "[-] Nenhuma referência de código direta (XREF) encontrada.\n";
+                // Tenta heurística de VTable direta (ponteiro para string)
+            } else {
+                log += `[2] ${codeRefs.length} locais usam a string (RTTI/ClassName).\n`;
+                codeRefs.forEach(ref => log += `    -> Código em 0x${ref.toString(16).toUpperCase()}\n`);
+            }
+
+            // 4. Achar a VTable (O Elo Perdido)
+            // A VTable é uma lista de ponteiros. Um deles aponta para o código acima (RTTI).
+            // Vamos escanear o arquivo inteiro procurando ponteiros (64-bit) para os codeRefs.
+            
+            let vtableCandidates = [];
+            // Adiciona a própria string como alvo (caso não tenha RTTI intermediário)
+            let targets = [...codeRefs, strOffset]; 
+            
+            targets.forEach(target => {
+                const pointers = findAbsoluteRefs(webkit.view, target);
+                pointers.forEach(ptr => {
+                    // Se achamos um ponteiro para o código, a VTable real geralmente começa +8 ou +16 bytes depois
+                    // Mas o endereço do ponteiro já nos localiza na seção .data.rel.ro
+                    vtableCandidates.push(ptr);
+                });
+            });
+
+            if (vtableCandidates.length === 0) {
+                log += "[-] Nenhuma VTable óbvia encontrada.\n";
+            } else {
+                log += `[3] ${vtableCandidates.length} candidatos a VTable encontrados.\n`;
                 
-                let funcStart = -1;
-                for (let i = REF_ADDR; i > REF_ADDR - 0x2000; i--) {
-                    // Verifica padding (fim da função anterior)
-                    if (bytes[i] === 0xCC && bytes[i-1] === 0xCC) {
-                        funcStart = i + 1;
-                        break;
-                    }
-                    // Verifica prologue padrão
-                    if (bytes[i] === 0x55 && bytes[i+1] === 0x48 && bytes[i+2] === 0x89 && bytes[i+3] === 0xE5) {
-                        funcStart = i;
-                        break;
-                    }
-                }
-
-                if (funcStart === -1) {
-                    log += "[-] Não foi possível determinar o início da função automaticamente.\n";
-                    // Fallback: Assume um offset razoável para trás
-                    funcStart = REF_ADDR - 0x100;
-                }
-
-                log(`[2] Função estimada inicia em: 0x${funcStart.toString(16).toUpperCase()}\n`);
-                log("    (SharedWorker::SharedWorker constructor)\n\n");
-
-                // 3. Encontrar quem CHAMA essa função (Callers)
-                // Procuramos no arquivo todo por: E8 XX XX XX XX (CALL relativo)
-                // Onde (Endereço_Call + 5 + Offset) == funcStart
+                // 5. Achar o CONSTRUTOR
+                // O Construtor é o código que CARREGA o endereço da VTable no objeto.
+                // Procuramos: LEA RAX, [VTable] ou MOV [RDI], VTable_Addr
+                // Como é x64, será RIP-Relative: LEA REG, [RIP + offset] == VTable
                 
-                let callers = [];
-                for (let i = 0; i < bytes.length - 5; i++) {
-                    if (bytes[i] === 0xE8) { // CALL opcode
-                        const offset = view.getInt32(i + 1, true);
-                        const destination = i + 5 + offset;
-                        
-                        // Se o destino for o início da nossa função (com margem de erro de 16 bytes para alinhamento)
-                        if (Math.abs(destination - funcStart) < 16) {
-                            callers.push(i);
-                        }
-                    }
-                }
-
-                log(`[3] Encontrados ${callers.length} locais que chamam esta função.\n`);
-                log("    Analisando o código ANTES dessas chamadas para achar o tamanho...\n\n");
-
-                // 4. Analisar o código antes de cada chamada (Procurando o Size)
-                let foundSize = false;
-
-                callers.forEach(callAddr => {
-                    log(`   --> Chamada em: 0x${callAddr.toString(16).toUpperCase()}\n`);
+                vtableCandidates.forEach(vt => {
+                    // Ajuste: O início da VTable usada pelo objeto geralmente é offset+16 (pula RTTI/Offset)
+                    const objectVTable = vt + 16; 
                     
-                    // Olha os 100 bytes antes da chamada
-                    const lookBack = Math.max(0, callAddr - 100);
-                    let bestSize = null;
-
-                    for (let k = callAddr; k > lookBack; k--) {
-                        // Padrão: MOV EDI, size (BF XX XX 00 00)
-                        // Padrão: MOV ESI, size (BE XX XX 00 00) - Usado se for o 2º argumento
+                    log(`    Analisando VTable em 0x${objectVTable.toString(16).toUpperCase()}...\n`);
+                    
+                    // Procura no código quem referencia esse endereço
+                    const constructors = findRelativeRefs(webkit.view, objectVTable);
+                    
+                    constructors.forEach(ctor => {
+                        log(`    [!] CONSTRUTOR POTENCIAL EM: 0x${ctor.toString(16).toUpperCase()}\n`);
                         
-                        if (bytes[k] === 0xBF || bytes[k] === 0xBE) {
-                            const val = view.getInt32(k + 1, true);
-                            
-                            // Filtro de tamanho realista (32 a 2048 bytes)
-                            if (val >= 0x20 && val <= 0x800) {
-                                bestSize = val;
-                                log(`       [!] ALOCAÇÃO DETECTADA: 0x${val.toString(16).toUpperCase()} (${val} bytes)\n`);
-                                log(`           Instrução em: 0x${k.toString(16).toUpperCase()}\n`);
-                                foundSize = true;
-                                break; // Achou o mais próximo
+                        // 6. Achar o TAMANHO (Size)
+                        // Olhar 200 bytes ANTES do construtor.
+                        // Procurar: MOV EDI, imm32 (BF XX XX 00 00)
+                        
+                        const scanStart = Math.max(0, ctor - 200);
+                        for(let i = ctor; i > scanStart; i--) {
+                            if (webkit.bytes[i] === 0xBF) { // MOV EDI
+                                const size = webkit.view.getInt32(i+1, true);
+                                if (size > 0x20 && size <= 0x800) {
+                                    log += `        >>> TAMANHO ENCONTRADO: 0x${size.toString(16).toUpperCase()} (${size}) <<<\n`;
+                                    log += `        (Distância: ${ctor - i} bytes antes da ref)\n`;
+                                }
+                            }
+                            // MOV ESI (BE)
+                            else if (webkit.bytes[i] === 0xBE) { 
+                                const size = webkit.view.getInt32(i+1, true);
+                                if (size > 0x20 && size <= 0x800) {
+                                    log += `        >>> TAMANHO (ESI): 0x${size.toString(16).toUpperCase()} <<<\n`;
+                                }
                             }
                         }
-                        
-                        // Se acharmos outra CALL antes (ex: operator new), paramos
-                        if (bytes[k] === 0xE8 && k !== callAddr) {
-                            // Pode ser: CALL malloc (e o tamanho estava antes dessa call)
-                            // Vamos continuar olhando um pouco mais
-                        }
-                    }
-                    log("   -----------------------------------\n");
+                    });
                 });
+            }
 
-                if (!foundSize) {
-                    log("\n[-] Tamanho explícito não encontrado nos callers.\n");
-                    log("    O objeto pode ser herdado ou usar tamanho dinâmico.\n");
-                    log("    Recomendação: Testar tamanhos padrão do WebKit: 0x90, 0xA0, 0x140.\n");
-                } else {
-                    log("\n>>> CONCLUSÃO: O tamanho mais provável foi listado acima com [!]. Use-o no spray! <<<\n");
+            log("\n=== FIM DA ANÁLISE ===\n");
+            log("DICA: Se aparecer mais de um tamanho, o menor (0x80-0x200) é o mais provável para SharedWorker.");
+            
+            output.value = log;
+        }
+
+        function readFile(file) {
+            return new Promise(resolve => {
+                const r = new FileReader();
+                r.onload = e => resolve(e.target.result);
+                r.readAsArrayBuffer(file);
+            });
+        }
+
+        function findString(bytes, str) {
+            const target = new TextEncoder().encode(str);
+            for(let i=0; i<bytes.length-target.length; i++) {
+                let match = true;
+                for(let j=0; j<target.length; j++) {
+                    if(bytes[i+j] !== target[j]) { match = false; break; }
                 }
+                if(match && bytes[i+target.length] === 0) return i;
+            }
+            return -1;
+        }
 
-                document.getElementById('output').value = log;
-            };
-            reader.readAsArrayBuffer(file);
+        // Busca referências relativas (LEA/MOV com offset 32-bit)
+        function findRelativeRefs(view, targetOffset) {
+            const results = [];
+            const len = view.byteLength - 4;
+            for (let i = 0; i < len; i+=1) { // Varredura fina
+                const relOffset = view.getInt32(i, true);
+                const destination = i + 4 + relOffset;
+                if (destination === targetOffset) results.push(i);
+            }
+            return results;
+        }
+
+        // Busca referências absolutas (Ponteiros 64-bit)
+        function findAbsoluteRefs(view, targetOffset) {
+            const results = [];
+            const len = view.byteLength - 8;
+            const targetBig = BigInt(targetOffset);
+            for (let i = 0; i < len; i += 8) { // Alinhado a 8
+                if (view.getBigUint64(i, true) === targetBig) results.push(i);
+            }
+            return results;
         }
     </script>
 </body>
