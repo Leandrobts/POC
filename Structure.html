@@ -2,86 +2,81 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 Object Size Hunter</title>
+    <title>PS4 12.00 Size Hunter V2</title>
     <style>
-        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
-        textarea { width: 90%; height: 400px; background: #111; color: #fff; border: 1px solid #555; margin-top: 15px; }
-        button { padding: 15px 30px; background: #004400; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; }
-        .highlight { color: #ff00ff; }
+        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
+        .container { max-width: 800px; margin: 0 auto; border: 1px solid #333; padding: 20px; }
+        textarea { width: 100%; height: 300px; background: #000; color: #fff; border: 1px solid #555; margin-top: 10px; }
+        button { padding: 15px 30px; background: #005500; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; font-size: 16px; }
     </style>
 </head>
 <body>
-
-    <h1>SIZE HUNTER (WebKit)</h1>
-    <h3>Alvo: Descobrir sizeof(SharedWorker)</h3>
-    <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
-    
-    <input type="file" id="fileInput" />
-    <br><br>
-    <button onclick="analyzeSize()">ENCONTRAR TAMANHO</button>
-    <textarea id="output" readonly>Aguardando...</textarea>
+    <div class="container">
+        <h1>🎯 SIZE HUNTER V2 (Precision Mode)</h1>
+        <p>Alvo Confirmado: <b>0x839A9B</b> (SharedWorker Code)</p>
+        <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
+        
+        <input type="file" id="fileInput" />
+        <br><br>
+        <button onclick="scanSize()">ANALISAR OFFSET 0x839A9B</button>
+        <textarea id="output" readonly>Aguardando arquivo...</textarea>
+    </div>
 
     <script>
-        function analyzeSize() {
+        function scanSize() {
             const file = document.getElementById('fileInput').files[0];
             if(!file) return alert("Selecione o arquivo!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Analisando binário...";
+            document.getElementById('output').value = "Lendo e analisando...";
 
             reader.onload = function(e) {
                 const view = new DataView(e.target.result);
                 const bytes = new Uint8Array(e.target.result);
-                let log = "=== RELATÓRIO DE TAMANHO (SharedWorker) ===\n\n";
-
-                // O offset de código que você encontrou anteriormente
-                const TARGET_CODE_REF = 0x839A9B;
                 
-                // Vamos olhar para trás (Backwards Scan) a partir da referência da string.
-                // Geralmente: Aloca Memória (Size) -> Chama Construtor -> Usa String (Nome)
-                // Procuramos padrão: BF XX 00 00 00 (MOV EDI, XX)
+                // O endereço que você encontrou
+                const TARGET = 0x839A9B; 
                 
-                log(`Analisando arredores de 0x${TARGET_CODE_REF.toString(16).toUpperCase()}...\n`);
+                // Vamos olhar os 500 bytes ANTES desse endereço
+                // Procurando por: BF XX XX 00 00 (MOV EDI, TAMANHO)
+                // EDI é o registrador usado para passar o tamanho para o 'operator new' no PS4 (ABI System V)
                 
-                // Varre 2000 bytes antes da referência
-                const startSearch = Math.max(0, TARGET_CODE_REF - 2000);
-                const endSearch = TARGET_CODE_REF;
+                let log = `=== VARREDURA EM TORNO DE 0x${TARGET.toString(16).toUpperCase()} ===\n\n`;
+                let found = false;
                 
-                let candidates = [];
-
-                for(let i = endSearch; i > startSearch; i--) {
-                    // Padrão x64 para 'MOV EDI, IMM32' (usado para passar tamanho para malloc/fastMalloc)
-                    // Opcode: BF
+                // Varre de trás para frente (do código para o malloc)
+                for (let i = TARGET; i > TARGET - 1000; i--) {
+                    // Opcode BF = MOV EDI, imm32
                     if (bytes[i] === 0xBF) {
                         const size = view.getInt32(i + 1, true); // Little Endian
                         
-                        // Filtro de Sanidade: Objetos SharedWorker costumam ter entre 64 (0x40) e 512 (0x200) bytes
-                        if (size > 0x20 && size <= 0x400) {
-                            // Verifica se é seguido ou precedido por uma CALL (E8)
-                            // (Heurística simples)
-                            let dist = TARGET_CODE_REF - i;
-                            candidates.push({ offset: i, size: size, dist: dist });
+                        // Filtro: Objetos DOM raramente são maiores que 2048 bytes (0x800)
+                        // e raramente menores que 32 bytes (0x20)
+                        if (size > 0x20 && size <= 0x800) {
+                            found = true;
+                            log += `[POTENCIAL TAMANHO ENCONTRADO]\n`;
+                            log += `   Endereço da Instrução: 0x${i.toString(16).toUpperCase()}\n`;
+                            log += `   Distância do Alvo: -${TARGET - i} bytes\n`;
+                            log += `   >>> SIZE: 0x${size.toString(16).toUpperCase()} (${size} bytes) <<<\n`;
+                            log += `   ----------------------------------------\n`;
                         }
                     }
                 }
 
-                if (candidates.length === 0) {
-                    log("[-] Nenhum padrão de alocação óbvio encontrado perto da referência.\n");
-                } else {
-                    log(`[+] Encontrados ${candidates.length} candidatos a tamanho!\n`);
-                    log("Os mais prováveis (mais próximos da referência):\n");
+                if (!found) {
+                    log += "Nenhum padrão 'MOV EDI' óbvio encontrado.\n";
+                    log += "O código pode estar usando 'MOV ESI' (BE XX...) ou registrador diferente.\n";
+                    log += "Tentando padrão alternativo (BE = MOV ESI)...\n";
                     
-                    // Ordena por proximidade
-                    candidates.sort((a, b) => a.dist - b.dist);
-
-                    candidates.slice(0, 5).forEach(c => {
-                        log(`   OFFSET: 0x${c.offset.toString(16).toUpperCase()}`);
-                        log(`   SIZE:   0x${c.size.toString(16).toUpperCase()} (${c.size} bytes)`);
-                        log(`   DIST:   ${c.dist} bytes antes da string\n`);
-                        log("   -------------------------------------\n");
-                    });
-
-                    log("\nRECOMENDAÇÃO: Use o tamanho do primeiro candidato no seu exploit (Spray).");
+                    for (let i = TARGET; i > TARGET - 1000; i--) {
+                        if (bytes[i] === 0xBE) {
+                             const size = view.getInt32(i + 1, true);
+                             if (size > 0x20 && size <= 0x800) {
+                                log += `[ALTERNATIVA MOV ESI]\n`;
+                                log += `   >>> SIZE: 0x${size.toString(16).toUpperCase()} <<<\n`;
+                             }
+                        }
+                    }
                 }
 
                 document.getElementById('output').value = log;
