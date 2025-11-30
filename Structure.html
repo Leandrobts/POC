@@ -2,181 +2,77 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTable Structure Analyzer</title>
+    <title>PS4 12.00 VTABLE RANGE SCANNER</title>
     <style>
-        body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 900px; margin: 0 auto; background: #252526; padding: 20px; border: 1px solid #3e3e42; border-radius: 8px; }
-        textarea { width: 100%; height: 450px; background: #1e1e1e; color: #9cdcfe; border: 1px solid #3e3e42; margin-top: 15px; font-size: 13px; white-space: pre; }
-        button { padding: 12px 24px; font-size: 16px; cursor: pointer; background: #0e639c; color: white; border: none; border-radius: 4px; margin: 10px; font-weight: bold; }
-        button:hover { background: #1177bb; }
-        .highlight { color: #ce9178; font-weight: bold; }
-        .found { color: #b5cea8; }
+        body { background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 13px; }
+        button { padding: 15px 30px; background: #550055; color: #fff; border: 1px solid #f0f; cursor: pointer; font-weight: bold; font-size: 16px; }
+        .highlight { color: #ff00ff; }
     </style>
 </head>
 <body>
-
-    <div class="container">
-        <h1>🧬 VTABLE & STRUCTURE ANALYZER</h1>
-        <p>Foco: Encontrar o Offset da VTable do SharedWorker</p>
-        
-        <input type="file" id="fileInput" />
-        <br>
-        <button onclick="startAnalysis()">RASTREAR ESTRUTURA</button>
-        
-        <textarea id="output" readonly>Aguardando arquivo ELF...</textarea>
-    </div>
+    <h1>VTABLE RANGE SCANNER</h1>
+    <p>Alvo: Vizinhança de <b>0x839A98</b> (SharedWorker)</p>
+    <input type="file" id="fileInput" />
+    <br><br>
+    <button onclick="scanRange()">INICIAR SCAN DE ALCANCE</button>
+    <textarea id="output" readonly>Aguardando...</textarea>
 
     <script>
-        function log(msg) {
-            document.getElementById('output').value += msg + "\n";
-        }
-
-        function startAnalysis() {
-            const fileInput = document.getElementById('fileInput');
-            if (fileInput.files.length === 0) return alert("Selecione o arquivo ELF!");
+        function scanRange() {
+            const file = document.getElementById('fileInput').files[0];
+            if(!file) return alert("Selecione o arquivo ELF!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Iniciando leitura binária...\n";
+            document.getElementById('output').value = "Varrendo o arquivo inteiro em busca de ponteiros para a zona do SharedWorker...";
 
             reader.onload = function(e) {
-                const buffer = e.target.result;
-                const view = new DataView(buffer);
-                const bytes = new Uint8Array(buffer);
+                const view = new DataView(e.target.result);
+                const len = view.byteLength;
                 
-                analyze(view, bytes);
-            };
-            reader.readAsArrayBuffer(fileInput.files[0]);
-        }
-
-        function analyze(view, bytes) {
-            log("=== ANÁLISE ESTRUTURAL (SharedWorker) ===\n");
-
-            // 1. Localizar String "SharedWorker"
-            // Esta string é usada pelo método class_name() ou type_info
-            const targetStr = "SharedWorker";
-            const strOffset = findString(bytes, targetStr);
-            
-            if (strOffset === -1) {
-                log("[-] String não encontrada.");
-                return;
-            }
-            log(`[1] String '${targetStr}' encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
-
-            // 2. Encontrar XREFs (Códigos que usam a string)
-            // No x64 (PS4), usa-se RIP-Relative Addressing (LEA ou MOV)
-            // Instrução: [Opcode] [Offset 32-bit]
-            // Destino = EndereçoInstrucao + TamanhoInstrucao + Offset
-            
-            const codeRefs = findRipRelativeRefs(view, strOffset);
-            if (codeRefs.length === 0) {
-                log("[-] Nenhuma referência de código encontrada para a string.");
-                return;
-            }
-
-            log(`[2] Encontradas ${codeRefs.length} referências de código (XREFs).`);
-
-            codeRefs.forEach(codeOffset => {
-                log(`\n   >>> Analisando Código em: 0x${codeOffset.toString(16).toUpperCase()} <<<`);
+                // A referência de código que temos
+                const CODE_REF = 0x839A98;
                 
-                // A. Validar Tamanho 0xA0 perto daqui
-                // Procura por MOV EDI, 0xA0 (BF A0 00 00 00) num raio de 500 bytes para trás
-                let sizeFound = false;
-                for(let i = codeOffset; i > Math.max(0, codeOffset - 500); i--) {
-                    // BF = MOV EDI (Arg 1)
-                    if (bytes[i] === 0xBF && bytes[i+1] === 0xA0 && bytes[i+2] === 0x00) {
-                         log(`       [CONFIRMAÇÃO] Alocação de 0xA0 (160 bytes) encontrada em 0x${i.toString(16).toUpperCase()}`);
-                         sizeFound = true;
-                    }
+                // Vamos procurar ponteiros que apontem para [CODE_REF - 500] até [CODE_REF]
+                // Isso cobre o início da função, não importa quão grande ela seja.
+                const RANGE_START = CODE_REF - 500;
+                const RANGE_END = CODE_REF;
+                
+                let log = `=== VARREDURA DE PONTEIROS (Range: 0x${RANGE_START.toString(16)} - 0x${RANGE_END.toString(16)}) ===\n\n`;
+                let foundCount = 0;
+
+                // Varre o arquivo inteiro procurando valores de 64 bits (Ponteiros)
+                // Passo de 4 bytes para pegar desalinhados, mas VTables geralmente são alinhadas a 8.
+                for (let i = 0; i < len - 8; i += 8) {
+                    try {
+                        // Lê 64 bits Little Endian
+                        const ptrVal = Number(view.getBigUint64(i, true));
+                        
+                        // Se o valor aponta para a nossa zona de interesse
+                        if (ptrVal >= RANGE_START && ptrVal <= RANGE_END) {
+                            foundCount++;
+                            log += `[CANDIDATO A VTABLE ENCONTRADO]\n`;
+                            log += `   OFFSET NO ARQUIVO (Endereço da VTable): 0x${i.toString(16).toUpperCase()}\n`;
+                            log += `   APONTA PARA (Início da Função):         0x${ptrVal.toString(16).toUpperCase()}\n`;
+                            log += `   Distância da Ref (0x${CODE_REF.toString(16)}):  ${CODE_REF - ptrVal} bytes\n`;
+                            log += `   -----------------------------------------------------\n`;
+                        }
+                    } catch(e){}
                 }
-                if (!sizeFound) log("       [-] Alocação explícita 0xA0 não vista (pode ser implícita/herdada).");
 
-                // B. Encontrar a VTable (O Pulo do Gato)
-                // A VTable é uma lista de ponteiros na seção .data.
-                // Um dos ponteiros da VTable aponta para ESTE código (ou o início da função dele).
-                
-                // Vamos procurar ponteiros de 64-bits que apontem para a região [codeOffset-100 até codeOffset]
-                // Assumindo que o ponteiro aponta para o início da função.
-                
-                const startSearchFn = codeOffset - 200;
-                const endSearchFn = codeOffset + 4; // Um pouco depois por segurança
-                
-                const vtables = findPointersToRange(view, startSearchFn, endSearchFn);
-                
-                if (vtables.length > 0) {
-                    vtables.forEach(vt => {
-                        log(`       [!!!] CANDIDATO A VTABLE ENCONTRADO [!!!]`);
-                        log(`       Endereço do Ponteiro (No Arquivo): 0x${vt.loc.toString(16).toUpperCase()}`);
-                        log(`       Aponta para a função em: 0x${vt.target.toString(16).toUpperCase()}`);
-                        
-                        // A VTable real começa geralmente 16 bytes antes do primeiro método (offset do RTTI)
-                        // Mas para fins de exploit, o endereço onde achamos o ponteiro é o 'AddressOfVtable + Offset'
-                        
-                        log(`       ---> OFFSET MÁGICO PARA O EXPLOIT: 0x${vt.loc.toString(16).toUpperCase()}`);
-                    });
+                if (foundCount === 0) {
+                    log += "[-] Nenhum ponteiro absoluto encontrado para esta região.\n";
+                    log += "    Isso sugere que o binário usa 'Relative VTables' (Offsets de 32 bits a partir da própria VTable).\n";
+                    log += "    Tente rodar o 'Relative Scanner' se este falhar.\n";
                 } else {
-                    log("       [-] Nenhum ponteiro direto encontrado para este código na seção de dados.");
+                    log(`\n[SUCCESS] Encontrados ${foundCount} candidatos.\n`);
+                    log("O candidato mais provável é aquele que está dentro de uma sequência de outros ponteiros (Cluster).\n");
+                    log("Use o 'OFFSET NO ARQUIVO' como o endereço da VTable no seu exploit.");
                 }
-            });
-            
-            log("\n=== FIM DA ANÁLISE ===");
-        }
 
-        // Utilitários de Busca
-        function findString(bytes, str) {
-            const target = new TextEncoder().encode(str);
-            for(let i=0; i<bytes.length - target.length; i++) {
-                let match = true;
-                for(let j=0; j<target.length; j++) {
-                    if(bytes[i+j] !== target[j]) { match = false; break; }
-                }
-                // Verifica null terminator para garantir string exata
-                if(match && bytes[i+target.length] === 0) return i;
-            }
-            return -1;
-        }
-
-        function findRipRelativeRefs(view, target) {
-            const refs = [];
-            // Varre o arquivo procurando instruções LEA/MOV com offset relativo
-            // Otimização: pular de 1 em 1 é lento, mas seguro.
-            const len = view.byteLength - 7;
-            
-            for (let i = 0; i < len; i++) {
-                // 48 8D ?? ?? ?? ?? ?? (LEA R64, [RIP+disp])
-                const b1 = view.getUint8(i);
-                const b2 = view.getUint8(i+1);
-                
-                if (b1 === 0x48 && (b2 === 0x8D || b2 === 0x8B)) { // LEA ou MOV
-                    const offset = view.getInt32(i+3, true);
-                    const nextInstr = i + 7;
-                    const dest = nextInstr + offset;
-                    
-                    if (dest === target) {
-                        refs.push(i);
-                    }
-                }
-            }
-            return refs;
-        }
-
-        function findPointersToRange(view, startRange, endRange) {
-            const refs = [];
-            // VTables estão alinhadas a 8 bytes. Varre de 8 em 8.
-            // Começa depois do código (heurística), mas varrer tudo é mais seguro.
-            const len = view.byteLength - 8;
-            
-            for (let i = 0; i < len; i+=8) {
-                try {
-                    // Pega valor de 64 bits
-                    const val = Number(view.getBigUint64(i, true));
-                    
-                    // Verifica se aponta para dentro da função
-                    if (val >= startRange && val <= endRange) {
-                        refs.push({ loc: i, target: val });
-                    }
-                } catch(e){}
-            }
-            return refs;
+                document.getElementById('output').value = log;
+            };
+            reader.readAsArrayBuffer(file);
         }
     </script>
 </body>
