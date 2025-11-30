@@ -2,184 +2,91 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTable Hunter (JS Edition)</title>
+    <title>PS4 12.00 Object Size Hunter</title>
     <style>
-        body { background-color: #1e1e1e; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #252526; border-radius: 8px; }
-        textarea { width: 100%; height: 500px; background: #000; color: #0f0; border: 1px solid #555; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 40px; font-size: 18px; background: #007acc; color: white; border: none; cursor: pointer; font-weight: bold; border-radius: 5px; margin-top: 10px; }
-        button:hover { background: #005c99; }
-        .highlight { color: #ff00ff; font-weight: bold; }
-        input { margin: 15px; color: #fff; }
+        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
+        textarea { width: 90%; height: 400px; background: #111; color: #fff; border: 1px solid #555; margin-top: 15px; }
+        button { padding: 15px 30px; background: #004400; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; }
+        .highlight { color: #ff00ff; }
     </style>
 </head>
 <body>
 
-    <div class="container">
-        <h1>🛠️ VTable Hunter (Web Edition)</h1>
-        <h3>Alvo: Encontrar Offset da VTable do SharedWorker</h3>
-        <p>Selecione o arquivo: <b>1200_libSceNKWebKit.sprx.elf</b></p>
-        
-        <input type="file" id="fileInput" />
-        <br>
-        <button onclick="startAnalysis()">RASTREAR (START)</button>
-        
-        <div id="status" style="margin-top:10px; color: #aaa;">Aguardando...</div>
-        <textarea id="output" readonly></textarea>
-    </div>
+    <h1>SIZE HUNTER (WebKit)</h1>
+    <h3>Alvo: Descobrir sizeof(SharedWorker)</h3>
+    <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
+    
+    <input type="file" id="fileInput" />
+    <br><br>
+    <button onclick="analyzeSize()">ENCONTRAR TAMANHO</button>
+    <textarea id="output" readonly>Aguardando...</textarea>
 
     <script>
-        function log(msg) {
-            document.getElementById('output').value += msg + "\n";
-        }
+        function analyzeSize() {
+            const file = document.getElementById('fileInput').files[0];
+            if(!file) return alert("Selecione o arquivo!");
 
-        function startAnalysis() {
-            const fileInput = document.getElementById('fileInput');
-            if (fileInput.files.length === 0) {
-                alert("Selecione o arquivo ELF primeiro!");
-                return;
-            }
-
-            const file = fileInput.files[0];
             const reader = new FileReader();
-
-            document.getElementById('output').value = "";
-            document.getElementById('status').innerText = "Lendo arquivo (30MB+)... aguarde...";
+            document.getElementById('output').value = "Analisando binário...";
 
             reader.onload = function(e) {
-                document.getElementById('status').innerText = "Processando Binário...";
+                const view = new DataView(e.target.result);
+                const bytes = new Uint8Array(e.target.result);
+                let log = "=== RELATÓRIO DE TAMANHO (SharedWorker) ===\n\n";
+
+                // O offset de código que você encontrou anteriormente
+                const TARGET_CODE_REF = 0x839A9B;
                 
-                // Pequeno delay para a UI não travar
-                setTimeout(() => {
-                    try {
-                        const buffer = e.target.result;
-                        analyzeBinary(buffer);
-                        document.getElementById('status').innerText = "Análise Concluída!";
-                    } catch (err) {
-                        log("ERRO FATAL: " + err);
+                // Vamos olhar para trás (Backwards Scan) a partir da referência da string.
+                // Geralmente: Aloca Memória (Size) -> Chama Construtor -> Usa String (Nome)
+                // Procuramos padrão: BF XX 00 00 00 (MOV EDI, XX)
+                
+                log(`Analisando arredores de 0x${TARGET_CODE_REF.toString(16).toUpperCase()}...\n`);
+                
+                // Varre 2000 bytes antes da referência
+                const startSearch = Math.max(0, TARGET_CODE_REF - 2000);
+                const endSearch = TARGET_CODE_REF;
+                
+                let candidates = [];
+
+                for(let i = endSearch; i > startSearch; i--) {
+                    // Padrão x64 para 'MOV EDI, IMM32' (usado para passar tamanho para malloc/fastMalloc)
+                    // Opcode: BF
+                    if (bytes[i] === 0xBF) {
+                        const size = view.getInt32(i + 1, true); // Little Endian
+                        
+                        // Filtro de Sanidade: Objetos SharedWorker costumam ter entre 64 (0x40) e 512 (0x200) bytes
+                        if (size > 0x20 && size <= 0x400) {
+                            // Verifica se é seguido ou precedido por uma CALL (E8)
+                            // (Heurística simples)
+                            let dist = TARGET_CODE_REF - i;
+                            candidates.push({ offset: i, size: size, dist: dist });
+                        }
                     }
-                }, 100);
+                }
+
+                if (candidates.length === 0) {
+                    log("[-] Nenhum padrão de alocação óbvio encontrado perto da referência.\n");
+                } else {
+                    log(`[+] Encontrados ${candidates.length} candidatos a tamanho!\n`);
+                    log("Os mais prováveis (mais próximos da referência):\n");
+                    
+                    // Ordena por proximidade
+                    candidates.sort((a, b) => a.dist - b.dist);
+
+                    candidates.slice(0, 5).forEach(c => {
+                        log(`   OFFSET: 0x${c.offset.toString(16).toUpperCase()}`);
+                        log(`   SIZE:   0x${c.size.toString(16).toUpperCase()} (${c.size} bytes)`);
+                        log(`   DIST:   ${c.dist} bytes antes da string\n`);
+                        log("   -------------------------------------\n");
+                    });
+
+                    log("\nRECOMENDAÇÃO: Use o tamanho do primeiro candidato no seu exploit (Spray).");
+                }
+
+                document.getElementById('output').value = log;
             };
-
             reader.readAsArrayBuffer(file);
-        }
-
-        function analyzeBinary(buffer) {
-            const view = new DataView(buffer);
-            const bytes = new Uint8Array(buffer);
-            const targets = ["SharedWorker", "MessagePort"];
-
-            log("=== RELATÓRIO DE VTABLES (12.00) ===");
-            log("Arquivo carregado. Tamanho: " + buffer.byteLength + " bytes.\n");
-
-            targets.forEach(targetName => {
-                log(`\n>>> RASTREANDO: ${targetName} <<<`);
-                
-                // 1. ACHAR A STRING
-                const strOffset = findString(bytes, targetName);
-                if (strOffset === -1) {
-                    log("   [X] String não encontrada.");
-                    return;
-                }
-                log(`   1. String encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
-
-                // 2. ACHAR QUEM USA A STRING (Referência Cruzada - XREF)
-                // Procura por instruções que apontam para essa string.
-                // Em x64 (PS4), o código usa endereçamento relativo (RIP-Relative).
-                // Fórmula: Destino = Offset_Instrucao + 4 + Valor_Int32
-                
-                const xrefs = findRelativeRefs(view, strOffset);
-                
-                if (xrefs.length === 0) {
-                    log("   [X] Nenhuma referência de código encontrada (estranho).");
-                    return;
-                }
-
-                log(`   2. Encontradas ${xrefs.length} referências de código (XREFs).`);
-
-                xrefs.forEach(codeOffset => {
-                    log(`      -> Código em 0x${codeOffset.toString(16).toUpperCase()} aponta para a string.`);
-                    
-                    // 3. ACHAR A VTABLE
-                    // A VTable é uma lista de ponteiros. O segundo ou terceiro ponteiro costuma
-                    // ser a função 'type_info::name' ou o destrutor, que usa o código acima.
-                    // Vamos procurar ponteiros absolutos (64-bit) que apontem para 'codeOffset'.
-                    // NOTA: Procuramos ponteiros para o INÍCIO da função (heurística: codeOffset - alguns bytes)
-                    // Mas para ser exato, procuramos ponteiros diretos para onde achamos a referência.
-                    
-                    const vtables = findAbsoluteRefs(view, codeOffset);
-                    
-                    if (vtables.length > 0) {
-                        vtables.forEach(vt => {
-                            // Ajuste de Heurística C++:
-                            // Se encontramos um ponteiro para o código RTTI, a VTable real começa geralmente +8 ou +16 bytes depois.
-                            // Mas o número cru já serve para calcularmos a base.
-                            log(`      [!!!] PONTEIRO ENCONTRADO EM: 0x${vt.toString(16).toUpperCase()}`);
-                            log(`            Este endereço contém um ponteiro para o código acima.`);
-                            log(`            >>> OFFSET POTENCIAL DA VTABLE: 0x${vt.toString(16).toUpperCase()} <<<`);
-                        });
-                    }
-                });
-            });
-        }
-
-        // Busca string exata terminada em null
-        function findString(bytes, str) {
-            const encoder = new TextEncoder();
-            const target = encoder.encode(str);
-            
-            for (let i = 0; i < bytes.length - target.length; i++) {
-                let match = true;
-                for (let j = 0; j < target.length; j++) {
-                    if (bytes[i + j] !== target[j]) {
-                        match = false;
-                        break;
-                    }
-                }
-                // Verifica null terminator
-                if (match && bytes[i + target.length] === 0) {
-                    return i;
-                }
-            }
-            return -1;
-        }
-
-        // Busca referências relativas (LEA/MOV com offset 32-bit)
-        function findRelativeRefs(view, targetOffset) {
-            const results = [];
-            const len = view.byteLength - 4;
-            
-            // Varre o arquivo procurando inteiros de 32 bits
-            for (let i = 0; i < len; i++) {
-                // Pega o valor de 32 bits na posição i
-                const relOffset = view.getInt32(i, true); // Little Endian
-                
-                // Calcula onde isso apontaria: Posição Atual + 4 bytes da instrução + Offset
-                const destination = i + 4 + relOffset;
-                
-                if (destination === targetOffset) {
-                    // Filtro simples: Instruções x64 LEA geralmente começam com 0x48 0x8D
-                    // Vamos aceitar por enquanto e o humano filtra
-                    results.push(i); 
-                }
-            }
-            return results;
-        }
-
-        // Busca referências absolutas (Ponteiros de 64 bits)
-        function findAbsoluteRefs(view, targetOffset) {
-            const results = [];
-            const len = view.byteLength - 8;
-            const targetBig = BigInt(targetOffset);
-            
-            // Varre alinhado a 4 ou 8 bytes
-            for (let i = 0; i < len; i += 4) {
-                const val = view.getBigUint64(i, true);
-                if (val === targetBig) {
-                    results.push(i);
-                }
-            }
-            return results;
         }
     </script>
 </body>
