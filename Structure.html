@@ -2,88 +2,118 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 RELATIVE VTABLE SCANNER</title>
+    <title>PS4 12.00 VTABLE SCANNER (ASYNC)</title>
     <style>
         body { background: #050505; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
         textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 13px; }
         button { padding: 15px 30px; background: #440044; color: #fff; border: 1px solid #f0f; cursor: pointer; font-weight: bold; font-size: 16px; }
+        #progress-container { width: 100%; background-color: #333; height: 20px; margin-top: 10px; display: none; }
+        #progress-bar { width: 0%; height: 100%; background-color: #00ff00; }
         .highlight { color: #ff00ff; font-weight: bold; }
     </style>
 </head>
 <body>
-    <h1>RELATIVE VTABLE SCANNER</h1>
+    <h1>RELATIVE VTABLE SCANNER V2 (NO-FREEZE)</h1>
     <p>Alvo: Função SharedWorker (Zona <b>0x839A00</b>)</p>
     <input type="file" id="fileInput" />
-    <br><br>
-    <button onclick="scanRelative()">INICIAR MATEMÁTICA REVERSA</button>
-    <textarea id="output" readonly>Aguardando...</textarea>
+    <br>
+    <div id="progress-container"><div id="progress-bar"></div></div>
+    <div id="status" style="margin:10px; color: yellow;">Aguardando...</div>
+    
+    <button onclick="initScan()">INICIAR MATEMÁTICA REVERSA</button>
+    <textarea id="output" readonly></textarea>
 
     <script>
-        function scanRelative() {
+        let isRunning = false;
+
+        function log(msg) {
+            document.getElementById('output').value += msg + "\n";
+        }
+
+        function initScan() {
             const file = document.getElementById('fileInput').files[0];
             if(!file) return alert("Selecione o arquivo ELF!");
 
-            const reader = new FileReader();
-            document.getElementById('output').value = "Calculando offsets relativos em 70MB... Aguarde...";
+            document.getElementById('output').value = "";
+            document.getElementById('progress-container').style.display = "block";
+            isRunning = true;
 
+            const reader = new FileReader();
             reader.onload = function(e) {
                 const view = new DataView(e.target.result);
-                const len = view.byteLength;
-                
-                // A zona onde sabemos que o código do SharedWorker está (baseado no seu Hex Dump anterior)
-                // O código começa por volta de 0x8398A0 e vai até 0x839AD0
-                const FUNC_START = 0x839800;
-                const FUNC_END   = 0x839B00;
-                
-                let log = `=== SCANNER RELATIVO (Alvo: 0x${FUNC_START.toString(16)} - 0x${FUNC_END.toString(16)}) ===\n\n`;
-                let foundCount = 0;
-
-                // Varre o arquivo inteiro procurando inteiros de 32 bits (alinhados a 4 bytes)
-                // A maioria das VTables relativas são arrays de int32.
-                
-                // Otimização: Começamos a busca na seção .data (geralmente após o código)
-                // Mas vamos varrer tudo para garantir.
-                
-                for (let i = 0; i < len - 4; i += 4) {
-                    try {
-                        // Lê valor de 32 bits com sinal (pode ser negativo se a vtable estiver depois do código)
-                        const offset = view.getInt32(i, true); // Little Endian
-                        
-                        // A Lógica Relativa: Destino = Posição Atual (i) + Offset
-                        const dest = i + offset;
-                        
-                        // Verifica se o destino cai dentro da função do SharedWorker
-                        if (dest >= FUNC_START && dest <= FUNC_END) {
-                            foundCount++;
-                            log += `[CANDIDATO ENCONTRADO]\n`;
-                            log += `   OFFSET NO ARQUIVO (Endereço VTable): 0x${i.toString(16).toUpperCase()}\n`;
-                            log += `   VALOR (Offset Relativo):             0x${offset.toString(16).toUpperCase()}\n`;
-                            log += `   APONTA PARA (Código):                0x${dest.toString(16).toUpperCase()}\n`;
-                            
-                            // Verifica se é uma sequência (VTable real tem vários ponteiros seguidos)
-                            // Vamos olhar o próximo valor (+4)
-                            if (i + 8 < len) {
-                                const nextOff = view.getInt32(i+4, true);
-                                const nextDest = (i+4) + nextOff;
-                                log += `   [Vizinho +4] Aponta para: 0x${nextDest.toString(16).toUpperCase()}\n`;
-                            }
-                            
-                            log += `   -----------------------------------------------------\n`;
-                        }
-                    } catch(e){}
-                }
-
-                if (foundCount === 0) {
-                    log += "[-] Nenhum ponteiro relativo encontrado.\n";
-                    log += "    Possibilidade: A VTable usa um 'Base Address' diferente da sua própria posição.\n";
-                } else {
-                    log(`\n[SUCESSO] Encontrados ${foundCount} candidatos.\n`);
-                    log("O Offset da VTable é o número 'OFFSET NO ARQUIVO'.");
-                }
-
-                document.getElementById('output').value = log;
+                scanAsync(view);
             };
             reader.readAsArrayBuffer(file);
+        }
+
+        async function scanAsync(view) {
+            const len = view.byteLength;
+            const status = document.getElementById('status');
+            const pBar = document.getElementById('progress-bar');
+            
+            // ZONA ALVO (Código do SharedWorker)
+            // Ajustado para cobrir o prólogo da função
+            const FUNC_START = 0x839800;
+            const FUNC_END   = 0x839B00;
+            
+            log(`=== SCANNER RELATIVO INICIADO ===`);
+            log(`Alvo: Ponteiros que matematicamente resultem em [0x${FUNC_START.toString(16)} - 0x${FUNC_END.toString(16)}]`);
+            log(`Tamanho do arquivo: ${(len/1024/1024).toFixed(2)} MB\n`);
+
+            let foundCount = 0;
+            const CHUNK_SIZE = 200000; // Processa 200k bytes por vez
+
+            // Loop Assíncrono
+            for (let i = 0; i < len - 4; i += 4) {
+                
+                // Pausa para a UI respirar a cada Chunk
+                if (i % CHUNK_SIZE === 0) {
+                    const pct = (i / len) * 100;
+                    pBar.style.width = pct + "%";
+                    status.innerText = `Varrendo: ${(pct).toFixed(1)}% (Offset 0x${i.toString(16)})`;
+                    await new Promise(r => setTimeout(r, 0)); // Yield
+                }
+
+                try {
+                    // Lê valor de 32 bits com sinal (Little Endian)
+                    const offset = view.getInt32(i, true);
+                    
+                    // Lógica Relativa: Destino = Endereço_VTable + Offset
+                    const dest = i + offset;
+                    
+                    // Verifica se o destino cai na função alvo
+                    if (dest >= FUNC_START && dest <= FUNC_END) {
+                        foundCount++;
+                        let msg = `[CANDIDATO] VTable em 0x${i.toString(16).toUpperCase()} -> Aponta para 0x${dest.toString(16).toUpperCase()}`;
+                        
+                        // Verifica se tem "amigos" (outros ponteiros válidos logo depois)
+                        // VTables reais são arrays. Se o próximo int32 também apontar para perto, é BINGO.
+                        if (i + 8 < len) {
+                            const nextOff = view.getInt32(i+4, true);
+                            const nextDest = (i+4) + nextOff;
+                            // Se o próximo ponteiro também aponta para a mesma região de código (Text Segment)
+                            // O Text Segment do WebKit é gigante, mas vamos ver se está "perto".
+                            if (Math.abs(nextDest - dest) < 0x10000) { // Funções vizinhas
+                                msg += ` [VALIDADO: Sequência detectada]`;
+                            }
+                        }
+                        
+                        log(msg);
+                    }
+                } catch(e){}
+            }
+
+            status.innerText = "Concluído.";
+            pBar.style.width = "100%";
+            
+            if (foundCount === 0) {
+                log("\n[-] Nenhum ponteiro relativo encontrado.");
+                log("    Conclusão: O binário usa ponteiros absolutos (mas não achamos antes) ou a VTable está comprimida.");
+                log("    Recomendação: Tente procurar a string 'MessagePort' e repetir o processo.");
+            } else {
+                log(`\n[SUCESSO] Encontrados ${foundCount} candidatos.`);
+                log("Use o endereço 'VTable em 0x...' como offset estático.");
+            }
         }
     </script>
 </body>
