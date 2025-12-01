@@ -2,118 +2,204 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTABLE SCANNER (ASYNC)</title>
+    <title>PS4 12.00 CHUNKED SIZE SCANNER</title>
     <style>
-        body { background: #050505; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 30px; background: #440044; color: #fff; border: 1px solid #f0f; cursor: pointer; font-weight: bold; font-size: 16px; }
-        #progress-container { width: 100%; background-color: #333; height: 20px; margin-top: 10px; display: none; }
-        #progress-bar { width: 0%; height: 100%; background-color: #00ff00; }
+        body { background-color: #050505; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #111; border-radius: 8px; }
+        textarea { width: 100%; height: 400px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 12px; }
+        button { padding: 15px 40px; background: #006600; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        #progress-container { width: 100%; background: #333; height: 20px; margin-top: 10px; display: none; }
+        #progress-bar { width: 0%; height: 100%; background: #00ff00; transition: width 0.1s; }
         .highlight { color: #ff00ff; font-weight: bold; }
     </style>
 </head>
 <body>
-    <h1>RELATIVE VTABLE SCANNER V2 (NO-FREEZE)</h1>
-    <p>Alvo: Função SharedWorker (Zona <b>0x839A00</b>)</p>
-    <input type="file" id="fileInput" />
-    <br>
-    <div id="progress-container"><div id="progress-bar"></div></div>
-    <div id="status" style="margin:10px; color: yellow;">Aguardando...</div>
-    
-    <button onclick="initScan()">INICIAR MATEMÁTICA REVERSA</button>
-    <textarea id="output" readonly></textarea>
+
+    <div class="container">
+        <h1>CHUNKED SIZE SCANNER</h1>
+        <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
+        
+        <input type="file" id="fileInput" />
+        <br>
+        <div id="progress-container"><div id="progress-bar"></div></div>
+        <div id="status" style="margin:10px; color: yellow;">Pronto.</div>
+        
+        <button onclick="initScan()">INICIAR VARREDURA (SEM TRAVAR)</button>
+        <textarea id="output" readonly>Os resultados aparecerão aqui...</textarea>
+    </div>
 
     <script>
-        let isRunning = false;
-
+        let fileBytes = null;
+        
         function log(msg) {
             document.getElementById('output').value += msg + "\n";
         }
 
         function initScan() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo ELF!");
+            const input = document.getElementById('fileInput');
+            if (input.files.length === 0) return alert("Selecione o arquivo ELF!");
 
-            document.getElementById('output').value = "";
+            const file = input.files[0];
+            document.getElementById('output').value = "=== INICIANDO ANÁLISE ESTATÍSTICA DE ALOCAÇÃO ===\n";
             document.getElementById('progress-container').style.display = "block";
-            isRunning = true;
-
+            
+            // 1. Primeiro passo: Ler o arquivo inteiro (Blob)
+            // Para arquivos de 70MB, ler como ArrayBuffer direto é seguro em navegadores modernos.
+            // O travamento ocorre no processamento (loop), não na leitura.
+            
             const reader = new FileReader();
+            document.getElementById('status').innerText = "Carregando arquivo na memória...";
+            
             reader.onload = function(e) {
-                const view = new DataView(e.target.result);
-                scanAsync(view);
+                fileBytes = new Uint8Array(e.target.result);
+                findSharedWorkerRef();
             };
             reader.readAsArrayBuffer(file);
         }
 
-        async function scanAsync(view) {
-            const len = view.byteLength;
+        function findSharedWorkerRef() {
+            const status = document.getElementById('status');
+            status.innerText = "Localizando 'SharedWorker'...";
+            
+            const targetStr = "SharedWorker";
+            const targetBytes = new TextEncoder().encode(targetStr);
+            
+            let strOffset = -1;
+            
+            // Busca Rápida
+            for(let i=0; i < fileBytes.length - targetBytes.length; i++) {
+                let match = true;
+                for(let j=0; j < targetBytes.length; j++) {
+                    if(fileBytes[i+j] !== targetBytes[j]) { match = false; break; }
+                }
+                if(match && fileBytes[i+targetBytes.length] === 0) {
+                    strOffset = i;
+                    break;
+                }
+            }
+
+            if (strOffset === -1) {
+                log("[-] String 'SharedWorker' não encontrada.");
+                return;
+            }
+            
+            log(`[+] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
+            
+            // Inicia o processamento pesado em chunks
+            findCodeReferences(strOffset);
+        }
+
+        async function findCodeReferences(strOffset) {
             const status = document.getElementById('status');
             const pBar = document.getElementById('progress-bar');
+            const len = fileBytes.length;
+            const view = new DataView(fileBytes.buffer);
             
-            // ZONA ALVO (Código do SharedWorker)
-            // Ajustado para cobrir o prólogo da função
-            const FUNC_START = 0x839800;
-            const FUNC_END   = 0x839B00;
+            let codeRefs = [];
             
-            log(`=== SCANNER RELATIVO INICIADO ===`);
-            log(`Alvo: Ponteiros que matematicamente resultem em [0x${FUNC_START.toString(16)} - 0x${FUNC_END.toString(16)}]`);
-            log(`Tamanho do arquivo: ${(len/1024/1024).toFixed(2)} MB\n`);
-
-            let foundCount = 0;
-            const CHUNK_SIZE = 200000; // Processa 200k bytes por vez
-
-            // Loop Assíncrono
-            for (let i = 0; i < len - 4; i += 4) {
-                
-                // Pausa para a UI respirar a cada Chunk
+            log("[*] Rastreando referências cruzadas (RIP-Relative)...");
+            
+            // Processamento em Chunks para não travar
+            const CHUNK_SIZE = 500000; // 500KB por frame
+            
+            for (let i = 0; i < len - 7; i += 1) {
+                // Pausa a cada chunk para atualizar UI
                 if (i % CHUNK_SIZE === 0) {
                     const pct = (i / len) * 100;
                     pBar.style.width = pct + "%";
-                    status.innerText = `Varrendo: ${(pct).toFixed(1)}% (Offset 0x${i.toString(16)})`;
-                    await new Promise(r => setTimeout(r, 0)); // Yield
+                    status.innerText = `Varrendo: ${pct.toFixed(1)}%`;
+                    await new Promise(r => setTimeout(r, 0));
                 }
 
-                try {
-                    // Lê valor de 32 bits com sinal (Little Endian)
-                    const offset = view.getInt32(i, true);
+                // Verifica LEA/MOV (48 8D / 48 8B)
+                const b1 = fileBytes[i];
+                const b2 = fileBytes[i+1];
+                
+                if (b1 === 0x48 && (b2 === 0x8D || b2 === 0x8B)) {
+                    const offset = view.getInt32(i + 3, true);
+                    const dest = i + 7 + offset;
                     
-                    // Lógica Relativa: Destino = Endereço_VTable + Offset
-                    const dest = i + offset;
-                    
-                    // Verifica se o destino cai na função alvo
-                    if (dest >= FUNC_START && dest <= FUNC_END) {
-                        foundCount++;
-                        let msg = `[CANDIDATO] VTable em 0x${i.toString(16).toUpperCase()} -> Aponta para 0x${dest.toString(16).toUpperCase()}`;
-                        
-                        // Verifica se tem "amigos" (outros ponteiros válidos logo depois)
-                        // VTables reais são arrays. Se o próximo int32 também apontar para perto, é BINGO.
-                        if (i + 8 < len) {
-                            const nextOff = view.getInt32(i+4, true);
-                            const nextDest = (i+4) + nextOff;
-                            // Se o próximo ponteiro também aponta para a mesma região de código (Text Segment)
-                            // O Text Segment do WebKit é gigante, mas vamos ver se está "perto".
-                            if (Math.abs(nextDest - dest) < 0x10000) { // Funções vizinhas
-                                msg += ` [VALIDADO: Sequência detectada]`;
-                            }
-                        }
-                        
-                        log(msg);
+                    if (dest === strOffset) {
+                        codeRefs.push(i);
+                        log(`   -> Referência encontrada em: 0x${i.toString(16).toUpperCase()}`);
                     }
-                } catch(e){}
+                }
+            }
+            
+            pBar.style.width = "100%";
+            status.innerText = "Analisando Tamanhos...";
+            analyzeSizes(codeRefs);
+        }
+
+        function analyzeSizes(refs) {
+            if (refs.length === 0) {
+                log("[-] Nenhuma referência de código encontrada.");
+                return;
             }
 
-            status.innerText = "Concluído.";
-            pBar.style.width = "100%";
+            const view = new DataView(fileBytes.buffer);
+            let sizeHistogram = {};
+
+            log("\n=== ANÁLISE DE ALOCAÇÃO (BACK-TRACING) ===");
+            log("Procurando instruções 'MOV EDI/ESI, SIZE' antes das referências...\n");
+
+            refs.forEach(ref => {
+                // Olha 1000 bytes para trás de cada referência
+                const start = Math.max(0, ref - 1000);
+                
+                for (let i = ref; i > start; i--) {
+                    let size = 0;
+                    let type = "";
+
+                    // MOV EDI, imm32 (BF ...)
+                    if (fileBytes[i] === 0xBF) {
+                        size = view.getInt32(i + 1, true);
+                        type = "EDI (Arg1)";
+                    }
+                    // MOV ESI, imm32 (BE ...)
+                    else if (fileBytes[i] === 0xBE) {
+                        size = view.getInt32(i + 1, true);
+                        type = "ESI (Arg2)";
+                    }
+                    // MOV RDI, imm32 (48 C7 C7 ...)
+                    else if (fileBytes[i] === 0x48 && fileBytes[i+1] === 0xC7 && fileBytes[i+2] === 0xC7) {
+                        size = view.getInt32(i + 3, true);
+                        type = "RDI (Arg1)";
+                    }
+
+                    // Filtra tamanhos válidos para objetos DOM
+                    if (size >= 0x20 && size <= 0x800) {
+                        // Verifica alinhamento
+                        if (size % 8 === 0) {
+                            // Conta frequência
+                            if (!sizeHistogram[size]) sizeHistogram[size] = 0;
+                            sizeHistogram[size]++;
+                            
+                            // Loga se estiver muito perto (< 200 bytes)
+                            if (ref - i < 200) {
+                                log(`[PERTO] Em 0x${i.toString(16).toUpperCase()} (-${ref-i}b): MOV ${type}, 0x${size.toString(16).toUpperCase()}`);
+                            }
+                        }
+                    }
+                }
+            });
+
+            log("\n=== ESTATÍSTICA FINAL (TAMANHOS MAIS PROVÁVEIS) ===");
+            // Ordena por frequência
+            const sortedSizes = Object.keys(sizeHistogram).sort((a,b) => sizeHistogram[b] - sizeHistogram[a]);
             
-            if (foundCount === 0) {
-                log("\n[-] Nenhum ponteiro relativo encontrado.");
-                log("    Conclusão: O binário usa ponteiros absolutos (mas não achamos antes) ou a VTable está comprimida.");
-                log("    Recomendação: Tente procurar a string 'MessagePort' e repetir o processo.");
+            sortedSizes.forEach(s => {
+                const hexSize = parseInt(s).toString(16).toUpperCase();
+                log(`TAMANHO 0x${hexSize} (${s} bytes) apareceu ${sizeHistogram[s]} vezes.`);
+            });
+
+            if(sortedSizes.length > 0) {
+                log(`\n>>> APOSTA RECOMENDADA: 0x${parseInt(sortedSizes[0]).toString(16).toUpperCase()} <<<`);
             } else {
-                log(`\n[SUCESSO] Encontrados ${foundCount} candidatos.`);
-                log("Use o endereço 'VTable em 0x...' como offset estático.");
+                log("[-] Nenhum tamanho padrão encontrado. O objeto pode usar alocador customizado (IsoSubspace).");
             }
+            
+            document.getElementById('status').innerText = "Concluído.";
         }
     </script>
 </body>
