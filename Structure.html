@@ -2,121 +2,107 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 CONSTRUCTOR HUNTER</title>
+    <title>PS4 12.00 FUZZY CONSTRUCTOR HUNTER</title>
     <style>
-        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 900px; margin: 0 auto; border: 1px solid #30363d; padding: 20px; background: #161b22; border-radius: 8px; }
-        textarea { width: 100%; height: 400px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
-        button:hover { background: #2ea043; }
-        .success { color: #2ea043; font-weight: bold; }
-        .info { color: #8b949e; }
+        body { background: #111; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        textarea { width: 95%; height: 500px; background: #000; color: #fff; border: 1px solid #555; margin-top: 10px; font-size: 13px; }
+        button { padding: 15px 30px; background: #004488; color: #fff; border: none; cursor: pointer; font-weight: bold; margin: 10px; }
+        .highlight { color: #ffff00; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>CONSTRUCTOR HUNTER</h1>
-        <p class="info">Rastrear VTable <b>0x3837CC8</b> -> Construtor -> Tamanho Real</p>
-        
-        <input type="file" id="fileInput" />
-        <br><br>
-        <button onclick="startTrace()">RASTREAR CONSTRUTOR</button>
-        <textarea id="output" readonly>Aguardando arquivo...</textarea>
-    </div>
+    <h1>FUZZY CONSTRUCTOR HUNTER</h1>
+    <p>Alvo: Região da VTable <b>0x3837CC8</b></p>
+    <input type="file" id="fileInput" />
+    <br>
+    <button onclick="scanFuzzy()">VARREDURA DE PROXIMIDADE</button>
+    <textarea id="output" readonly>Aguardando...</textarea>
 
     <script>
-        function log(msg) {
-            document.getElementById('output').value += msg + "\n";
-        }
-
-        function startTrace() {
+        function scanFuzzy() {
             const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo ELF!");
+            if(!file) return alert("Selecione o arquivo!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Analisando referências cruzadas (XREFs)...\n";
+            document.getElementById('output').value = "Varrendo código... (Isso é rápido)";
 
             reader.onload = function(e) {
                 const view = new DataView(e.target.result);
                 const len = view.byteLength;
                 
-                // O offset da VTable que encontramos no scan anterior
-                // (Apontava para 0x839874, perto da string SharedWorker)
-                const VTABLE_OFFSET = 0x3837CC8; 
+                // O endereço da VTable que encontramos
+                const VTABLE_TARGET = 0x3837CC8;
                 
-                log(`[1] Alvo VTable: 0x${VTABLE_OFFSET.toString(16).toUpperCase()}`);
-                log(`[2] Procurando código que usa esta VTable (LEA RAX, [RIP+offset])...`);
+                // Margem de erro (Para pegar RTTI ou Offset ajustado)
+                const RANGE = 64; // +/- 64 bytes
+                
+                let log = `=== BUSCA FUZZY (Alvo: 0x${VTABLE_TARGET.toString(16)} +/- ${RANGE}) ===\n\n`;
+                let found = false;
 
-                let foundConstructor = false;
-
-                // Varre a seção de código (primeiros 15MB geralmente)
-                const CODE_LIMIT = Math.min(len, 0x1000000); 
+                // Varre a seção de código (primeiros 10MB)
+                // Procurando instruções LEA (48 8D) ou MOV (48 8B) que usem RIP-Relative
+                const CODE_LIMIT = Math.min(len, 0x1000000);
 
                 for (let i = 0; i < CODE_LIMIT; i++) {
-                    // Instrução LEA R??, [RIP + Disp32]
-                    // Opcode comum: 48 8D (LEA 64-bit)
-                    if (view.getUint8(i) === 0x48 && view.getUint8(i+1) === 0x8D) {
-                        // O offset relativo está no byte 3 (i+3)
-                        const relOffset = view.getInt32(i + 3, true);
+                    const b1 = view.getUint8(i);
+                    const b2 = view.getUint8(i+1);
+                    
+                    // Padrão: 48 8D (LEA) ou 48 8B (MOV)
+                    if (b1 === 0x48 && (b2 === 0x8D || b2 === 0x8B)) {
+                        // Offset 32-bit
+                        const offset = view.getInt32(i + 3, true);
                         const nextInstr = i + 7;
-                        const target = nextInstr + relOffset;
-
-                        if (target === VTABLE_OFFSET) {
-                            foundConstructor = true;
-                            log(`\n>>> CONSTRUTOR ENCONTRADO EM: 0x${i.toString(16).toUpperCase()} <<<`);
-                            log(`    (Instrução LEA carrega a VTable 0x${target.toString(16).toUpperCase()})\n`);
+                        const dest = nextInstr + offset;
+                        
+                        // Verifica se o destino cai na zona da VTable
+                        if (dest >= (VTABLE_TARGET - RANGE) && dest <= (VTABLE_TARGET + RANGE)) {
+                            found = true;
+                            log += `[ENCONTRADO] Código em 0x${i.toString(16).toUpperCase()} aponta para 0x${dest.toString(16).toUpperCase()}\n`;
+                            log += `   (Distância da VTable exata: ${dest - VTABLE_TARGET} bytes)\n`;
                             
-                            // AGORA: Olhamos para trás para achar a alocação
-                            // O padrão é: aloca memória -> chama construtor -> carrega vtable
-                            // Ou: Construtor é chamado -> carrega vtable
-                            
-                            // Vamos analisar os 200 bytes ANTES desta instrução LEA
-                            // Procurando MOV EDI, SIZE (BF XX XX 00 00)
-                            analyzeAllocation(view, i);
+                            // AGORA: Procura o tamanho (MOV EDI, SIZE) nos 100 bytes anteriores
+                            let sizeLog = analyzeSize(view, i);
+                            log(sizeLog);
+                            log("---------------------------------------------------\n");
                         }
                     }
                 }
 
-                if (!foundConstructor) {
-                    log("[-] Nenhuma referência direta à VTable encontrada no código.");
-                    log("    Tente procurar por referências à VTable - 16 bytes (RTTI offset).");
-                }
+                if (!found) log("[-] Nenhuma referência encontrada mesmo com margem.");
+                
+                document.getElementById('output').value = log;
             };
             reader.readAsArrayBuffer(file);
         }
 
-        function analyzeAllocation(view, constructorOffset) {
-            log(`    [3] Buscando Tamanho de Alocação antes de 0x${constructorOffset.toString(16).toUpperCase()}...`);
+        function analyzeSize(view, refOffset) {
+            let msg = "";
+            const start = Math.max(0, refOffset - 100);
             
-            const start = Math.max(0, constructorOffset - 300);
-            let bestCandidate = null;
-
-            for (let i = constructorOffset; i > start; i--) {
-                const b = view.getUint8(i);
+            for (let k = refOffset; k > start; k--) {
+                const b = view.getUint8(k);
                 
-                // MOV EDI, imm32 (BF ...)
+                // BF = MOV EDI (Arg 1)
                 if (b === 0xBF) {
-                    const size = view.getInt32(i + 1, true);
-                    if (size > 0x20 && size <= 0x800) {
-                        log(`       [OPÇÃO] Em 0x${i.toString(16).toUpperCase()}: MOV EDI, 0x${size.toString(16).toUpperCase()} (${size})`);
-                        if (!bestCandidate) bestCandidate = size;
+                    const size = view.getInt32(k+1, true);
+                    if (size >= 0x20 && size <= 0x800) {
+                        msg += `   >>> TAMANHO ENCONTRADO: 0x${size.toString(16).toUpperCase()} (${size} bytes) em 0x${k.toString(16).toUpperCase()}\n`;
                     }
                 }
-                // MOV ESI, imm32 (BE ...) - Às vezes usado em operator new(size, flags)
+                // BE = MOV ESI (Arg 2)
                 else if (b === 0xBE) {
-                    const size = view.getInt32(i + 1, true);
-                    if (size > 0x20 && size <= 0x800) {
-                        log(`       [OPÇÃO] Em 0x${i.toString(16).toUpperCase()}: MOV ESI, 0x${size.toString(16).toUpperCase()} (${size})`);
+                    const size = view.getInt32(k+1, true);
+                    if (size >= 0x20 && size <= 0x800) {
+                        msg += `   >>> Alternativa (ESI): 0x${size.toString(16).toUpperCase()} (${size} bytes)\n`;
                     }
                 }
             }
-
-            if (bestCandidate) {
-                log(`\n    >>> VEREDITO FINAL: O tamanho provável é 0x${bestCandidate.toString(16).toUpperCase()} <<<`);
-                log(`    Use este valor no seu config.js!`);
-            } else {
-                log("    [-] Nenhum tamanho explícito encontrado perto do construtor.");
-            }
+            return msg;
+        }
+        
+        function log(txt) {
+            // Função auxiliar para append string
+            return txt; 
         }
     </script>
 </body>
