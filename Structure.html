@@ -2,94 +2,137 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTABLE PATTERN SCAN</title>
+    <title>PS4 12.00 VTABLE SCANNER (NO-FREEZE)</title>
     <style>
-        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
-        textarea { width: 95%; height: 500px; background: #111; color: #eee; border: 1px solid #444; margin-top: 15px; }
-        button { padding: 15px 40px; background: #550088; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; }
+        body { background-color: #0d0d0d; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; background: #1a1a1a; padding: 20px; border: 1px solid #333; border-radius: 8px; }
+        textarea { width: 95%; height: 500px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 12px; white-space: pre; }
+        button { padding: 12px 30px; background: #006600; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; border-radius: 5px; }
+        button:hover { background: #008800; }
+        
+        #progress-container { width: 100%; background-color: #333; height: 25px; margin-top: 15px; border-radius: 12px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background-color: #00ff00; transition: width 0.1s linear; }
+        #status { margin-top: 5px; color: #ffff00; }
     </style>
 </head>
 <body>
-    <h1>VTABLE PATTERN SCANNER</h1>
-    <p>Busca heurística por tabelas de funções virtuais (EventTarget/Worker)</p>
-    <input type="file" id="fileInput" />
-    <br>
-    <button onclick="scanPatterns()">INICIAR SCAN DE PADRÕES</button>
-    <textarea id="output" readonly>Aguardando...</textarea>
+
+    <div class="container">
+        <h1>VTABLE PATTERN SCANNER (ASYNC)</h1>
+        <p>Busca heurística por tabelas de ponteiros na seção .data</p>
+        
+        <input type="file" id="fileInput" />
+        <br>
+        <div id="progress-container"><div id="progress-bar"></div></div>
+        <div id="status">Aguardando arquivo...</div>
+        
+        <button onclick="initScan()">INICIAR VARREDURA</button>
+        <textarea id="output" readonly></textarea>
+    </div>
 
     <script>
+        let fileBytes = null;
+        let view = null;
+
         function log(msg) {
             document.getElementById('output').value += msg + "\n";
         }
 
-        function scanPatterns() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo!");
+        function initScan() {
+            const input = document.getElementById('fileInput');
+            if (input.files.length === 0) return alert("Selecione o arquivo ELF!");
 
+            const file = input.files[0];
+            document.getElementById('output').value = "=== INICIANDO SCAN ASSÍNCRONO DE VTABLES ===\n";
+            
             const reader = new FileReader();
-            document.getElementById('output').value = "Escaneando padrões de VTable...\n";
-
+            document.getElementById('status').innerText = "Carregando arquivo...";
+            
             reader.onload = function(e) {
-                const view = new DataView(e.target.result);
-                const len = view.byteLength;
-                
-                // Limites aproximados da seção .data / .rdata
-                // Em ELFs grandes, geralmente começa após o código.
-                // Vamos chutar que o código acaba em 20MB e os dados começam lá.
-                const START_SCAN = 0x1000000; 
-                
-                let candidates = [];
+                fileBytes = new Uint8Array(e.target.result);
+                view = new DataView(e.target.result);
+                startAsyncScan();
+            };
+            reader.readAsArrayBuffer(file);
+        }
 
-                // Varre de 8 em 8 bytes (Ponteiros)
-                for (let i = START_SCAN; i < len - 64; i += 8) {
-                    // Heurística de VTable:
-                    // Uma VTable é uma sequência de ponteiros que apontam para a seção de CÓDIGO (Text).
-                    // O Text Segment geralmente vai de 0x0 a 0x2000000 (32MB).
-                    
-                    let isVtable = true;
-                    let ptrs = [];
-                    
-                    // Verifica se os próximos 6 qwords parecem ponteiros de função válidos
-                    for (let k = 0; k < 6; k++) {
-                        const ptr = Number(view.getBigUint64(i + (k*8), true));
-                        // Checa se aponta para uma região de código válida (ex: < 15MB) e é alinhado
-                        if (ptr < 0x400 || ptr > 0x1500000 || (ptr % 2 !== 0)) {
+        async function startAsyncScan() {
+            const len = fileBytes.length;
+            const pBar = document.getElementById('progress-bar');
+            const status = document.getElementById('status');
+            
+            // CONFIGURAÇÃO DA HEURÍSTICA
+            // Onde começam os dados? (Chute seguro: depois de 20MB de código)
+            const DATA_START = 0x1500000; 
+            
+            // O que parece ser um ponteiro de função válido?
+            // Deve apontar para o início do arquivo (onde fica o código .text)
+            // Geralmente entre 0x400 e 0x2000000
+            const CODE_MIN = 0x400;
+            const CODE_MAX = 0x2000000;
+
+            let candidates = [];
+            const CHUNK_SIZE = 100000; // Processa 100kb por vez
+
+            log(`[*] Varrendo de 0x${DATA_START.toString(16)} até o fim...`);
+
+            for (let i = DATA_START; i < len - 64; i += 8) {
+                
+                // Pausa para UI não travar
+                if (i % CHUNK_SIZE === 0) {
+                    const pct = ((i - DATA_START) / (len - DATA_START)) * 100;
+                    pBar.style.width = pct + "%";
+                    status.innerText = `Varrendo: ${pct.toFixed(1)}% (Achados: ${candidates.length})`;
+                    await new Promise(r => setTimeout(r, 0));
+                }
+
+                // HEURÍSTICA DE VTABLE
+                // Uma VTable é uma sequência de ponteiros.
+                // Vamos checar se temos 4 ponteiros seguidos que apontam para a área de código.
+                
+                let isVtable = true;
+                let ptrs = [];
+
+                for (let k = 0; k < 4; k++) {
+                    try {
+                        const val = Number(view.getBigUint64(i + (k*8), true)); // Little Endian
+                        
+                        // Validação:
+                        // 1. Deve ser par (alinhado)
+                        // 2. Deve apontar para a área de código
+                        if (val % 2 !== 0 || val < CODE_MIN || val > CODE_MAX) {
                             isVtable = false;
                             break;
                         }
-                        ptrs.push(ptr);
-                    }
-
-                    if (isVtable) {
-                        // Verifica se os ponteiros estão "próximos" (funções da mesma classe costumam estar perto)
-                        let spread = Math.max(...ptrs) - Math.min(...ptrs);
-                        if (spread < 0x50000) { // Funções espalhadas por no máximo 300KB
-                            candidates.push({ offset: i, ptrs: ptrs });
-                            i += 48; // Pula esta tabela
-                        }
-                    }
+                        ptrs.push(val);
+                    } catch(e) { isVtable = false; break; }
                 }
 
-                log(`Encontrados ${candidates.length} candidatos a VTable.\n`);
-                log("Filtrando pelos candidatos mais prováveis (Perto das strings de Worker)...\n");
-
-                // String Refs conhecidas (do seu scan anterior)
-                const STR_REFS = [0x2B1B91B, 0x2B1B921, 0x2D094F1]; // SharedWorker, Worker, MessagePort
-
-                candidates.forEach(c => {
-                    // Checa se algum dos ponteiros da tabela aponta para código perto das strings?
-                    // Não, a string é dados. O código aponta para a string.
-                    // A VTable aponta para o código.
+                if (isVtable) {
+                    // Filtro extra: Os ponteiros devem estar "perto" uns dos outros (funções da mesma classe)
+                    // Se um aponta para 0x1000 e o outro para 0x900000, provavelmente não é vtable.
+                    let min = Math.min(...ptrs);
+                    let max = Math.max(...ptrs);
                     
-                    // Vamos mostrar apenas as VTables que estão na região de dados comum (ex: 0x2XXXXXX)
-                    if (c.offset > 0x2000000 && c.offset < 0x3000000) {
-                        log(`[CANDIDATO] VTable em: 0x${c.offset.toString(16).toUpperCase()}`);
-                        log(`   Aponta para funções: 0x${c.ptrs[0].toString(16)}, 0x${c.ptrs[1].toString(16)}...`);
-                        log("------------------------------------------------");
+                    if ((max - min) < 0x100000) { // Dispersão máxima de 1MB
+                        candidates.push({ offset: i, ptrs: ptrs });
+                        
+                        // Loga imediatamente para você ver
+                        let msg = `[CANDIDATO] VTable em 0x${i.toString(16).toUpperCase()}`;
+                        msg += ` -> Aponta para: 0x${ptrs[0].toString(16).toUpperCase()} ...`;
+                        log(msg);
+                        
+                        i += 32; // Pula essa tabela para não detectar duplicatas sobrepostas
                     }
-                });
-            };
-            reader.readAsArrayBuffer(file);
+                }
+            }
+
+            pBar.style.width = "100%";
+            status.innerText = "Concluído.";
+            
+            log(`\n=== FIM DO SCAN ===`);
+            log(`Encontrados ${candidates.length} candidatos.`);
+            log(`Procure por endereços que comecem com 0x2... ou 0x3... na lista.`);
         }
     </script>
 </body>
