@@ -2,204 +2,121 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 CHUNKED SIZE SCANNER</title>
+    <title>PS4 12.00 CONSTRUCTOR HUNTER</title>
     <style>
-        body { background-color: #050505; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #111; border-radius: 8px; }
-        textarea { width: 100%; height: 400px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 12px; }
-        button { padding: 15px 40px; background: #006600; color: #fff; border: 1px solid #0f0; cursor: pointer; font-weight: bold; margin-top: 10px; }
-        #progress-container { width: 100%; background: #333; height: 20px; margin-top: 10px; display: none; }
-        #progress-bar { width: 0%; height: 100%; background: #00ff00; transition: width 0.1s; }
-        .highlight { color: #ff00ff; font-weight: bold; }
+        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
+        .container { max-width: 900px; margin: 0 auto; border: 1px solid #30363d; padding: 20px; background: #161b22; border-radius: 8px; }
+        textarea { width: 100%; height: 400px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
+        button { padding: 15px 40px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
+        button:hover { background: #2ea043; }
+        .success { color: #2ea043; font-weight: bold; }
+        .info { color: #8b949e; }
     </style>
 </head>
 <body>
-
     <div class="container">
-        <h1>CHUNKED SIZE SCANNER</h1>
-        <p>Carregue: <b>1200_libSceNKWebKit.sprx.elf</b></p>
+        <h1>CONSTRUCTOR HUNTER</h1>
+        <p class="info">Rastrear VTable <b>0x3837CC8</b> -> Construtor -> Tamanho Real</p>
         
         <input type="file" id="fileInput" />
-        <br>
-        <div id="progress-container"><div id="progress-bar"></div></div>
-        <div id="status" style="margin:10px; color: yellow;">Pronto.</div>
-        
-        <button onclick="initScan()">INICIAR VARREDURA (SEM TRAVAR)</button>
-        <textarea id="output" readonly>Os resultados aparecerão aqui...</textarea>
+        <br><br>
+        <button onclick="startTrace()">RASTREAR CONSTRUTOR</button>
+        <textarea id="output" readonly>Aguardando arquivo...</textarea>
     </div>
 
     <script>
-        let fileBytes = null;
-        
         function log(msg) {
             document.getElementById('output').value += msg + "\n";
         }
 
-        function initScan() {
-            const input = document.getElementById('fileInput');
-            if (input.files.length === 0) return alert("Selecione o arquivo ELF!");
+        function startTrace() {
+            const file = document.getElementById('fileInput').files[0];
+            if(!file) return alert("Selecione o arquivo ELF!");
 
-            const file = input.files[0];
-            document.getElementById('output').value = "=== INICIANDO ANÁLISE ESTATÍSTICA DE ALOCAÇÃO ===\n";
-            document.getElementById('progress-container').style.display = "block";
-            
-            // 1. Primeiro passo: Ler o arquivo inteiro (Blob)
-            // Para arquivos de 70MB, ler como ArrayBuffer direto é seguro em navegadores modernos.
-            // O travamento ocorre no processamento (loop), não na leitura.
-            
             const reader = new FileReader();
-            document.getElementById('status').innerText = "Carregando arquivo na memória...";
-            
+            document.getElementById('output').value = "Analisando referências cruzadas (XREFs)...\n";
+
             reader.onload = function(e) {
-                fileBytes = new Uint8Array(e.target.result);
-                findSharedWorkerRef();
+                const view = new DataView(e.target.result);
+                const len = view.byteLength;
+                
+                // O offset da VTable que encontramos no scan anterior
+                // (Apontava para 0x839874, perto da string SharedWorker)
+                const VTABLE_OFFSET = 0x3837CC8; 
+                
+                log(`[1] Alvo VTable: 0x${VTABLE_OFFSET.toString(16).toUpperCase()}`);
+                log(`[2] Procurando código que usa esta VTable (LEA RAX, [RIP+offset])...`);
+
+                let foundConstructor = false;
+
+                // Varre a seção de código (primeiros 15MB geralmente)
+                const CODE_LIMIT = Math.min(len, 0x1000000); 
+
+                for (let i = 0; i < CODE_LIMIT; i++) {
+                    // Instrução LEA R??, [RIP + Disp32]
+                    // Opcode comum: 48 8D (LEA 64-bit)
+                    if (view.getUint8(i) === 0x48 && view.getUint8(i+1) === 0x8D) {
+                        // O offset relativo está no byte 3 (i+3)
+                        const relOffset = view.getInt32(i + 3, true);
+                        const nextInstr = i + 7;
+                        const target = nextInstr + relOffset;
+
+                        if (target === VTABLE_OFFSET) {
+                            foundConstructor = true;
+                            log(`\n>>> CONSTRUTOR ENCONTRADO EM: 0x${i.toString(16).toUpperCase()} <<<`);
+                            log(`    (Instrução LEA carrega a VTable 0x${target.toString(16).toUpperCase()})\n`);
+                            
+                            // AGORA: Olhamos para trás para achar a alocação
+                            // O padrão é: aloca memória -> chama construtor -> carrega vtable
+                            // Ou: Construtor é chamado -> carrega vtable
+                            
+                            // Vamos analisar os 200 bytes ANTES desta instrução LEA
+                            // Procurando MOV EDI, SIZE (BF XX XX 00 00)
+                            analyzeAllocation(view, i);
+                        }
+                    }
+                }
+
+                if (!foundConstructor) {
+                    log("[-] Nenhuma referência direta à VTable encontrada no código.");
+                    log("    Tente procurar por referências à VTable - 16 bytes (RTTI offset).");
+                }
             };
             reader.readAsArrayBuffer(file);
         }
 
-        function findSharedWorkerRef() {
-            const status = document.getElementById('status');
-            status.innerText = "Localizando 'SharedWorker'...";
+        function analyzeAllocation(view, constructorOffset) {
+            log(`    [3] Buscando Tamanho de Alocação antes de 0x${constructorOffset.toString(16).toUpperCase()}...`);
             
-            const targetStr = "SharedWorker";
-            const targetBytes = new TextEncoder().encode(targetStr);
-            
-            let strOffset = -1;
-            
-            // Busca Rápida
-            for(let i=0; i < fileBytes.length - targetBytes.length; i++) {
-                let match = true;
-                for(let j=0; j < targetBytes.length; j++) {
-                    if(fileBytes[i+j] !== targetBytes[j]) { match = false; break; }
-                }
-                if(match && fileBytes[i+targetBytes.length] === 0) {
-                    strOffset = i;
-                    break;
-                }
-            }
+            const start = Math.max(0, constructorOffset - 300);
+            let bestCandidate = null;
 
-            if (strOffset === -1) {
-                log("[-] String 'SharedWorker' não encontrada.");
-                return;
-            }
-            
-            log(`[+] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
-            
-            // Inicia o processamento pesado em chunks
-            findCodeReferences(strOffset);
-        }
-
-        async function findCodeReferences(strOffset) {
-            const status = document.getElementById('status');
-            const pBar = document.getElementById('progress-bar');
-            const len = fileBytes.length;
-            const view = new DataView(fileBytes.buffer);
-            
-            let codeRefs = [];
-            
-            log("[*] Rastreando referências cruzadas (RIP-Relative)...");
-            
-            // Processamento em Chunks para não travar
-            const CHUNK_SIZE = 500000; // 500KB por frame
-            
-            for (let i = 0; i < len - 7; i += 1) {
-                // Pausa a cada chunk para atualizar UI
-                if (i % CHUNK_SIZE === 0) {
-                    const pct = (i / len) * 100;
-                    pBar.style.width = pct + "%";
-                    status.innerText = `Varrendo: ${pct.toFixed(1)}%`;
-                    await new Promise(r => setTimeout(r, 0));
-                }
-
-                // Verifica LEA/MOV (48 8D / 48 8B)
-                const b1 = fileBytes[i];
-                const b2 = fileBytes[i+1];
+            for (let i = constructorOffset; i > start; i--) {
+                const b = view.getUint8(i);
                 
-                if (b1 === 0x48 && (b2 === 0x8D || b2 === 0x8B)) {
-                    const offset = view.getInt32(i + 3, true);
-                    const dest = i + 7 + offset;
-                    
-                    if (dest === strOffset) {
-                        codeRefs.push(i);
-                        log(`   -> Referência encontrada em: 0x${i.toString(16).toUpperCase()}`);
+                // MOV EDI, imm32 (BF ...)
+                if (b === 0xBF) {
+                    const size = view.getInt32(i + 1, true);
+                    if (size > 0x20 && size <= 0x800) {
+                        log(`       [OPÇÃO] Em 0x${i.toString(16).toUpperCase()}: MOV EDI, 0x${size.toString(16).toUpperCase()} (${size})`);
+                        if (!bestCandidate) bestCandidate = size;
+                    }
+                }
+                // MOV ESI, imm32 (BE ...) - Às vezes usado em operator new(size, flags)
+                else if (b === 0xBE) {
+                    const size = view.getInt32(i + 1, true);
+                    if (size > 0x20 && size <= 0x800) {
+                        log(`       [OPÇÃO] Em 0x${i.toString(16).toUpperCase()}: MOV ESI, 0x${size.toString(16).toUpperCase()} (${size})`);
                     }
                 }
             }
-            
-            pBar.style.width = "100%";
-            status.innerText = "Analisando Tamanhos...";
-            analyzeSizes(codeRefs);
-        }
 
-        function analyzeSizes(refs) {
-            if (refs.length === 0) {
-                log("[-] Nenhuma referência de código encontrada.");
-                return;
-            }
-
-            const view = new DataView(fileBytes.buffer);
-            let sizeHistogram = {};
-
-            log("\n=== ANÁLISE DE ALOCAÇÃO (BACK-TRACING) ===");
-            log("Procurando instruções 'MOV EDI/ESI, SIZE' antes das referências...\n");
-
-            refs.forEach(ref => {
-                // Olha 1000 bytes para trás de cada referência
-                const start = Math.max(0, ref - 1000);
-                
-                for (let i = ref; i > start; i--) {
-                    let size = 0;
-                    let type = "";
-
-                    // MOV EDI, imm32 (BF ...)
-                    if (fileBytes[i] === 0xBF) {
-                        size = view.getInt32(i + 1, true);
-                        type = "EDI (Arg1)";
-                    }
-                    // MOV ESI, imm32 (BE ...)
-                    else if (fileBytes[i] === 0xBE) {
-                        size = view.getInt32(i + 1, true);
-                        type = "ESI (Arg2)";
-                    }
-                    // MOV RDI, imm32 (48 C7 C7 ...)
-                    else if (fileBytes[i] === 0x48 && fileBytes[i+1] === 0xC7 && fileBytes[i+2] === 0xC7) {
-                        size = view.getInt32(i + 3, true);
-                        type = "RDI (Arg1)";
-                    }
-
-                    // Filtra tamanhos válidos para objetos DOM
-                    if (size >= 0x20 && size <= 0x800) {
-                        // Verifica alinhamento
-                        if (size % 8 === 0) {
-                            // Conta frequência
-                            if (!sizeHistogram[size]) sizeHistogram[size] = 0;
-                            sizeHistogram[size]++;
-                            
-                            // Loga se estiver muito perto (< 200 bytes)
-                            if (ref - i < 200) {
-                                log(`[PERTO] Em 0x${i.toString(16).toUpperCase()} (-${ref-i}b): MOV ${type}, 0x${size.toString(16).toUpperCase()}`);
-                            }
-                        }
-                    }
-                }
-            });
-
-            log("\n=== ESTATÍSTICA FINAL (TAMANHOS MAIS PROVÁVEIS) ===");
-            // Ordena por frequência
-            const sortedSizes = Object.keys(sizeHistogram).sort((a,b) => sizeHistogram[b] - sizeHistogram[a]);
-            
-            sortedSizes.forEach(s => {
-                const hexSize = parseInt(s).toString(16).toUpperCase();
-                log(`TAMANHO 0x${hexSize} (${s} bytes) apareceu ${sizeHistogram[s]} vezes.`);
-            });
-
-            if(sortedSizes.length > 0) {
-                log(`\n>>> APOSTA RECOMENDADA: 0x${parseInt(sortedSizes[0]).toString(16).toUpperCase()} <<<`);
+            if (bestCandidate) {
+                log(`\n    >>> VEREDITO FINAL: O tamanho provável é 0x${bestCandidate.toString(16).toUpperCase()} <<<`);
+                log(`    Use este valor no seu config.js!`);
             } else {
-                log("[-] Nenhum tamanho padrão encontrado. O objeto pode usar alocador customizado (IsoSubspace).");
+                log("    [-] Nenhum tamanho explícito encontrado perto do construtor.");
             }
-            
-            document.getElementById('status').innerText = "Concluído.";
         }
     </script>
 </body>
