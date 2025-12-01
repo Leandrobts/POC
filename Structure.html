@@ -2,155 +2,94 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 CONSTRUCTOR HUNTER (ASYNC)</title>
+    <title>PS4 12.00 VTABLE PATTERN SCAN</title>
     <style>
-        body { background: #050505; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        .container { max-width: 900px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #111; }
-        textarea { width: 95%; height: 500px; background: #000; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 30px; background: #440044; color: #fff; border: 1px solid #f0f; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; }
-        #progress-container { width: 100%; background: #333; height: 20px; margin-top: 10px; display: none; }
-        #progress-bar { width: 0%; height: 100%; background: #00ff00; }
-        .highlight { color: #ff00ff; font-weight: bold; }
+        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
+        textarea { width: 95%; height: 500px; background: #111; color: #eee; border: 1px solid #444; margin-top: 15px; }
+        button { padding: 15px 40px; background: #550088; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>CONSTRUCTOR HUNTER (NO-FREEZE)</h1>
-        <p>Alvo VTable: <b>0x3837CC8</b> (Busca Reversa de Tamanho)</p>
-        
-        <input type="file" id="fileInput" />
-        <br>
-        <div id="progress-container"><div id="progress-bar"></div></div>
-        <div id="status" style="margin:10px; color: yellow;">Aguardando...</div>
-        
-        <button onclick="initScan()">RASTREAR CONSTRUTOR</button>
-        <textarea id="output" readonly></textarea>
-    </div>
+    <h1>VTABLE PATTERN SCANNER</h1>
+    <p>Busca heurística por tabelas de funções virtuais (EventTarget/Worker)</p>
+    <input type="file" id="fileInput" />
+    <br>
+    <button onclick="scanPatterns()">INICIAR SCAN DE PADRÕES</button>
+    <textarea id="output" readonly>Aguardando...</textarea>
 
     <script>
-        let isRunning = false;
-
         function log(msg) {
             document.getElementById('output').value += msg + "\n";
         }
 
-        function initScan() {
+        function scanPatterns() {
             const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo ELF!");
-
-            document.getElementById('output').value = "";
-            document.getElementById('progress-container').style.display = "block";
-            isRunning = true;
+            if(!file) return alert("Selecione o arquivo!");
 
             const reader = new FileReader();
+            document.getElementById('output').value = "Escaneando padrões de VTable...\n";
+
             reader.onload = function(e) {
                 const view = new DataView(e.target.result);
-                scanAsync(view);
+                const len = view.byteLength;
+                
+                // Limites aproximados da seção .data / .rdata
+                // Em ELFs grandes, geralmente começa após o código.
+                // Vamos chutar que o código acaba em 20MB e os dados começam lá.
+                const START_SCAN = 0x1000000; 
+                
+                let candidates = [];
+
+                // Varre de 8 em 8 bytes (Ponteiros)
+                for (let i = START_SCAN; i < len - 64; i += 8) {
+                    // Heurística de VTable:
+                    // Uma VTable é uma sequência de ponteiros que apontam para a seção de CÓDIGO (Text).
+                    // O Text Segment geralmente vai de 0x0 a 0x2000000 (32MB).
+                    
+                    let isVtable = true;
+                    let ptrs = [];
+                    
+                    // Verifica se os próximos 6 qwords parecem ponteiros de função válidos
+                    for (let k = 0; k < 6; k++) {
+                        const ptr = Number(view.getBigUint64(i + (k*8), true));
+                        // Checa se aponta para uma região de código válida (ex: < 15MB) e é alinhado
+                        if (ptr < 0x400 || ptr > 0x1500000 || (ptr % 2 !== 0)) {
+                            isVtable = false;
+                            break;
+                        }
+                        ptrs.push(ptr);
+                    }
+
+                    if (isVtable) {
+                        // Verifica se os ponteiros estão "próximos" (funções da mesma classe costumam estar perto)
+                        let spread = Math.max(...ptrs) - Math.min(...ptrs);
+                        if (spread < 0x50000) { // Funções espalhadas por no máximo 300KB
+                            candidates.push({ offset: i, ptrs: ptrs });
+                            i += 48; // Pula esta tabela
+                        }
+                    }
+                }
+
+                log(`Encontrados ${candidates.length} candidatos a VTable.\n`);
+                log("Filtrando pelos candidatos mais prováveis (Perto das strings de Worker)...\n");
+
+                // String Refs conhecidas (do seu scan anterior)
+                const STR_REFS = [0x2B1B91B, 0x2B1B921, 0x2D094F1]; // SharedWorker, Worker, MessagePort
+
+                candidates.forEach(c => {
+                    // Checa se algum dos ponteiros da tabela aponta para código perto das strings?
+                    // Não, a string é dados. O código aponta para a string.
+                    // A VTable aponta para o código.
+                    
+                    // Vamos mostrar apenas as VTables que estão na região de dados comum (ex: 0x2XXXXXX)
+                    if (c.offset > 0x2000000 && c.offset < 0x3000000) {
+                        log(`[CANDIDATO] VTable em: 0x${c.offset.toString(16).toUpperCase()}`);
+                        log(`   Aponta para funções: 0x${c.ptrs[0].toString(16)}, 0x${c.ptrs[1].toString(16)}...`);
+                        log("------------------------------------------------");
+                    }
+                });
             };
             reader.readAsArrayBuffer(file);
-        }
-
-        async function scanAsync(view) {
-            const len = view.byteLength;
-            const status = document.getElementById('status');
-            const pBar = document.getElementById('progress-bar');
-            
-            // VTable encontrada anteriormente
-            const VTABLE_TARGET = 0x3837CC8;
-            
-            log(`=== RASTREAMENTO ASSÍNCRONO ===`);
-            log(`Buscando código que carregue a VTable 0x${VTABLE_TARGET.toString(16).toUpperCase()}...`);
-
-            let foundCount = 0;
-            const CHUNK_SIZE = 200000; // 200KB por tick
-            
-            // Limita a busca à seção de código (.text) para ganhar tempo
-            // Geralmente os primeiros 15MB do arquivo
-            const CODE_LIMIT = Math.min(len, 0x1500000); 
-
-            for (let i = 0; i < CODE_LIMIT; i++) {
-                
-                // Pausa para UI não travar
-                if (i % CHUNK_SIZE === 0) {
-                    const pct = (i / CODE_LIMIT) * 100;
-                    pBar.style.width = pct + "%";
-                    status.innerText = `Varrendo Código: ${pct.toFixed(1)}%`;
-                    await new Promise(r => setTimeout(r, 0));
-                }
-
-                // Procura instrução LEA (48 8D)
-                // LEA REG, [RIP + Offset]
-                const b1 = view.getUint8(i);
-                const b2 = view.getUint8(i+1);
-
-                if (b1 === 0x48 && b2 === 0x8D) {
-                    const offset = view.getInt32(i + 3, true);
-                    const nextInstr = i + 7;
-                    const dest = nextInstr + offset;
-                    
-                    // Margem de erro pequena (+/- 16 bytes) caso aponte para RTTI ou Offset Table
-                    if (Math.abs(dest - VTABLE_TARGET) <= 16) {
-                        foundCount++;
-                        let msg = `\n[CONSTRUTOR LOCALIZADO] Offset 0x${i.toString(16).toUpperCase()}`;
-                        msg += `\n   Aponta para VTable: 0x${dest.toString(16).toUpperCase()}`;
-                        log(msg);
-                        
-                        // ANÁLISE LOCAL DO TAMANHO (Síncrona, pois é curta)
-                        analyzeSizeLocal(view, i);
-                    }
-                }
-            }
-
-            status.innerText = "Concluído.";
-            pBar.style.width = "100%";
-            
-            if (foundCount === 0) {
-                log("\n[-] Nenhuma referência direta encontrada. O código pode usar offsets indiretos.");
-            }
-        }
-
-        function analyzeSizeLocal(view, refOffset) {
-            let msg = "";
-            // Olha 200 bytes para trás
-            const start = Math.max(0, refOffset - 200);
-            
-            log(`   -> Buscando tamanho de alocação (MOV EDI...) nos 200 bytes anteriores...`);
-
-            let bestSize = null;
-
-            for (let k = refOffset; k > start; k--) {
-                const b = view.getUint8(k);
-                
-                // BF = MOV EDI (Arg 1) - Padrão mais comum
-                if (b === 0xBF) {
-                    const size = view.getInt32(k+1, true);
-                    if (size >= 0x20 && size <= 0x800) {
-                        msg += `      [CANDIDATO] Em 0x${k.toString(16).toUpperCase()}: MOV EDI, 0x${size.toString(16).toUpperCase()} (${size} bytes)\n`;
-                        if(!bestSize) bestSize = size; // O mais próximo é o mais provável
-                    }
-                }
-                // BE = MOV ESI (Arg 2)
-                else if (b === 0xBE) {
-                    const size = view.getInt32(k+1, true);
-                    if (size >= 0x20 && size <= 0x800) {
-                        msg += `      [CANDIDATO] Em 0x${k.toString(16).toUpperCase()}: MOV ESI, 0x${size.toString(16).toUpperCase()} (${size} bytes)\n`;
-                    }
-                }
-                // BA = MOV EDX
-                else if (b === 0xBA) {
-                    const size = view.getInt32(k+1, true);
-                    if (size >= 0x20 && size <= 0x800) {
-                         msg += `      [CANDIDATO] Em 0x${k.toString(16).toUpperCase()}: MOV EDX, 0x${size.toString(16).toUpperCase()} (${size} bytes)\n`;
-                    }
-                }
-            }
-            
-            if (bestSize) {
-                msg += `   >>> TAMANHO RECOMENDADO: 0x${bestSize.toString(16).toUpperCase()} <<<\n`;
-            } else {
-                msg += "      [-] Nenhum tamanho padrão encontrado perto daqui.\n";
-            }
-            log(msg);
         }
     </script>
 </body>
