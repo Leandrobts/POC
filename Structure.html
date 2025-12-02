@@ -2,121 +2,137 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 ALLOCATION MAPPER</title>
+    <title>PS4 12.00 ASYNC VTABLE SCANNER</title>
     <style>
-        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
-        textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 12px; }
-        button { padding: 15px 30px; background: #004488; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; }
-        .highlight { color: #ff00ff; font-weight: bold; }
+        body { background-color: #050505; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; background: #1a1a1a; padding: 20px; border: 1px solid #333; border-radius: 8px; }
+        textarea { width: 95%; height: 500px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 12px; white-space: pre; }
+        button { padding: 12px 30px; background: #006600; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; border-radius: 5px; }
+        button:hover { background: #008800; }
+        
+        #progress-container { width: 100%; background-color: #333; height: 25px; margin-top: 15px; border-radius: 12px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background-color: #00ff00; transition: width 0.1s linear; }
+        #status { margin-top: 5px; color: #ffff00; }
     </style>
 </head>
 <body>
-    <h1>ALLOCATION MAPPER</h1>
-    <p>Procurando locais que alocam <b>0xA0</b> (160) ou <b>0xC0</b> (192)</p>
-    <input type="file" id="fileInput" />
-    <br>
-    <button onclick="startScan()">MAPEAMENTO REVERSO</button>
-    <textarea id="output" readonly>Aguardando...</textarea>
+
+    <div class="container">
+        <h1>VTABLE PATTERN SCANNER (NO-FREEZE)</h1>
+        <p>Busca heurística por tabelas de ponteiros na seção .data</p>
+        
+        <input type="file" id="fileInput" />
+        <br>
+        <div id="progress-container"><div id="progress-bar"></div></div>
+        <div id="status">Aguardando arquivo...</div>
+        
+        <button onclick="initScan()">INICIAR VARREDURA</button>
+        <textarea id="output" readonly></textarea>
+    </div>
 
     <script>
-        function startScan() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo!");
+        let fileBytes = null;
+        let view = null;
 
+        function log(msg) {
+            document.getElementById('output').value += msg + "\n";
+        }
+
+        function initScan() {
+            const input = document.getElementById('fileInput');
+            if (input.files.length === 0) return alert("Selecione o arquivo ELF!");
+
+            const file = input.files[0];
+            document.getElementById('output').value = "=== INICIANDO SCAN ASSÍNCRONO DE VTABLES ===\n";
+            
             const reader = new FileReader();
-            document.getElementById('output').value = "Escaneando 70MB por padrões de alocação... (Async)\n";
-
+            document.getElementById('status').innerText = "Carregando arquivo...";
+            
             reader.onload = function(e) {
-                const view = new DataView(e.target.result);
-                const bytes = new Uint8Array(e.target.result);
-                
-                // Ponto de referência do SharedWorker (String XREF)
-                // Sabemos que está por volta de 0x839A98
-                const WORKER_REF = 0x839A98;
-                
-                scanAsync(view, bytes, WORKER_REF);
+                fileBytes = new Uint8Array(e.target.result);
+                view = new DataView(e.target.result);
+                startAsyncScan();
             };
             reader.readAsArrayBuffer(file);
         }
 
-        async function scanAsync(view, bytes, workerRef) {
-            const len = bytes.length;
-            const out = document.getElementById('output');
-            let log = "";
+        async function startAsyncScan() {
+            const len = fileBytes.length;
+            const pBar = document.getElementById('progress-bar');
+            const status = document.getElementById('status');
             
-            // Limita ao Code Segment
-            const LIMIT = Math.min(len, 0x2000000);
-            const CHUNK = 500000;
+            // CONFIGURAÇÃO DA HEURÍSTICA
+            // Suposição: Dados começam após o código. Código WebKit ~25MB.
+            // Vamos começar em 20MB para pular o .text
+            const DATA_START = 0x1400000; 
             
-            let hitsA0 = 0;
-            let hitsC0 = 0;
+            // Um ponteiro de função válido deve apontar para o início do arquivo (onde fica o código)
+            // Entre 0x400 e 0x2000000
+            const CODE_MIN = 0x400;
+            const CODE_MAX = 0x2000000;
+
             let candidates = [];
+            const CHUNK_SIZE = 200000; // Processa 200kb por vez (Bloco)
 
-            for(let i=0; i<LIMIT; i++) {
-                if (i % CHUNK === 0) await new Promise(r => setTimeout(r, 0));
+            log(`[*] Varrendo de 0x${DATA_START.toString(16)} até o fim...`);
 
-                const b = bytes[i];
-                let size = 0;
+            for (let i = DATA_START; i < len - 64; i += 8) {
                 
-                // BF = MOV EDI, imm32
-                if (b === 0xBF) {
-                    size = view.getInt32(i+1, true);
-                } 
-                // BE = MOV ESI, imm32
-                else if (b === 0xBE) {
-                    size = view.getInt32(i+1, true);
+                // PAUSA PARA NÃO TRAVAR (A Mágica)
+                if (i % CHUNK_SIZE === 0) {
+                    const pct = ((i - DATA_START) / (len - DATA_START)) * 100;
+                    pBar.style.width = pct + "%";
+                    status.innerText = `Varrendo: ${pct.toFixed(1)}% (Candidatos: ${candidates.length})`;
+                    await new Promise(r => setTimeout(r, 0)); // Libera a thread UI
                 }
 
-                if (size === 0xA0 || size === 0xC0) {
-                    // Verifica se tem CALL perto (indica malloc)
-                    let hasCall = false;
-                    for(let k=1; k<20; k++) {
-                        if(bytes[i+5+k] === 0xE8) { hasCall = true; break; }
-                    }
+                // HEURÍSTICA DE VTABLE
+                // Uma VTable é uma sequência de ponteiros.
+                // Vamos checar se temos 4 ponteiros seguidos que apontam para a área de código.
+                
+                let isVtable = true;
+                let ptrs = [];
 
-                    if (hasCall) {
-                        if (size === 0xA0) hitsA0++;
-                        if (size === 0xC0) hitsC0++;
-
-                        // Verifica distância do SharedWorker
-                        const dist = Math.abs(workerRef - i);
+                for (let k = 0; k < 4; k++) {
+                    try {
+                        const val = Number(view.getBigUint64(i + (k*8), true)); // Little Endian
                         
-                        // Se estiver perto (< 5000 bytes), é um candidato fortíssimo
-                        if (dist < 5000) {
-                            candidates.push({
-                                offset: i,
-                                size: size,
-                                dist: dist,
-                                hex: size.toString(16).toUpperCase()
-                            });
+                        // Validação Rigorosa:
+                        // 1. Deve ser par (alinhado)
+                        // 2. Deve apontar para a área de código (.text)
+                        if (val % 2 !== 0 || val < CODE_MIN || val > CODE_MAX) {
+                            isVtable = false;
+                            break;
                         }
+                        ptrs.push(val);
+                    } catch(e) { isVtable = false; break; }
+                }
+
+                if (isVtable) {
+                    // Filtro extra: Os ponteiros devem estar "perto" uns dos outros (Locality)
+                    // Funções da mesma classe costumam estar próximas no binário.
+                    let min = Math.min(...ptrs);
+                    let max = Math.max(...ptrs);
+                    
+                    if ((max - min) < 0x200000) { // Dispersão máxima de 2MB
+                        candidates.push({ offset: i, ptrs: ptrs });
+                        
+                        // Loga imediatamente
+                        let msg = `[CANDIDATO] VTable em 0x${i.toString(16).toUpperCase()}`;
+                        msg += ` -> Aponta para: 0x${ptrs[0].toString(16).toUpperCase()} ...`;
+                        log(msg);
+                        
+                        i += 32; // Pula essa tabela para não detectar duplicatas
                     }
                 }
             }
 
-            log += `=== RESULTADO DO MAPEAMENTO ===\n`;
-            log += `Total de alocações 0xA0 no arquivo: ${hitsA0}\n`;
-            log += `Total de alocações 0xC0 no arquivo: ${hitsC0}\n\n`;
+            pBar.style.width = "100%";
+            status.innerText = "Concluído.";
             
-            log(`>>> CANDIDATOS PERTO DE SharedWorker (0x${workerRef.toString(16)}) <<<\n`);
-            
-            if (candidates.length === 0) {
-                log("[-] Nenhuma alocação direta desses tamanhos perto do código do Worker.\n");
-                log("    Isso sugere que o tamanho pode ser herdado (ex: Worklet/EventTarget).\n");
-            } else {
-                candidates.sort((a,b) => a.dist - b.dist); // Mais perto primeiro
-                
-                candidates.forEach(c => {
-                    log(`[ALVO] Offset: 0x${c.offset.toString(16).toUpperCase()}`);
-                    log(`       Tamanho: 0x${c.hex} (${c.size} bytes)`);
-                    log(`       Distância: ${c.dist} bytes`);
-                    log(`       ----------------------------------\n`);
-                });
-                
-                log(`VEREDITO: O tamanho mais provável é o do candidato mais próximo (menor distância).`);
-            }
-
-            out.value = log;
+            log(`\n=== FIM DO SCAN ===`);
+            log(`Encontrados ${candidates.length} candidatos.`);
+            log(`Procure por endereços que comecem com 0x2... ou 0x3... na lista.`);
         }
     </script>
 </body>
