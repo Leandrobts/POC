@@ -2,100 +2,199 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 STRUCT LAYOUT MAPPER</title>
+    <title>PS4 12.00 SIZE HUNTER V4 (ASYNC)</title>
     <style>
-        body { background: #0d1117; color: #58a6ff; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        textarea { width: 95%; height: 500px; background: #000; color: #e6edf3; border: 1px solid #30363d; margin-top: 15px; font-size: 13px; }
-        button { padding: 15px 30px; background: #238636; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 6px; }
+        body { background-color: #0d0d0d; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; background: #1a1a1a; padding: 20px; border: 1px solid #333; border-radius: 8px; }
+        textarea { width: 95%; height: 500px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 13px; white-space: pre; }
+        button { padding: 12px 30px; background: #006600; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; border-radius: 5px; }
+        button:hover { background: #008800; }
+        
+        #progress-container { width: 100%; background-color: #333; height: 25px; margin-top: 15px; border-radius: 12px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background-color: #00ff00; transition: width 0.1s linear; }
+        #status { margin-top: 5px; color: #ffff00; }
     </style>
 </head>
 <body>
-    <h1>STRUCT LAYOUT MAPPER</h1>
-    <p>Objetivo: Mapear offsets internos do SharedWorker (0x839A98)</p>
-    <input type="file" id="fileInput" />
-    <br><br>
-    <button onclick="mapStructure()">MAPEAR ESTRUTURA</button>
-    <textarea id="output" readonly>Aguardando...</textarea>
+
+    <div class="container">
+        <h1>SIZE HUNTER V4 (NO-FREEZE)</h1>
+        <p>Alvo: Alocação de Memória do SharedWorker</p>
+        
+        <input type="file" id="fileInput" />
+        <br>
+        <div id="progress-container"><div id="progress-bar"></div></div>
+        <div id="status">Aguardando arquivo...</div>
+        
+        <button onclick="initScan()">INICIAR VARREDURA POR BLOCOS</button>
+        <textarea id="output" readonly></textarea>
+    </div>
 
     <script>
-        function mapStructure() {
-            const file = document.getElementById('fileInput').files[0];
-            if(!file) return alert("Selecione o arquivo!");
+        let fileBytes = null;
+        let view = null;
 
+        function log(msg) {
+            document.getElementById('output').value += msg + "\n";
+        }
+
+        function initScan() {
+            const input = document.getElementById('fileInput');
+            if (input.files.length === 0) return alert("Selecione o arquivo ELF!");
+
+            const file = input.files[0];
+            document.getElementById('output').value = "=== INICIANDO ANÁLISE ASSÍNCRONA (V4) ===\n";
+            
             const reader = new FileReader();
-            document.getElementById('output').value = "Analisando acessos de memória...";
-
+            document.getElementById('status').innerText = "Carregando arquivo...";
+            
             reader.onload = function(e) {
-                const view = new DataView(e.target.result);
-                const bytes = new Uint8Array(e.target.result);
-                const REF = 0x839A98; // Referência confirmada
-                
-                let log = `=== MAPA DE ACESSO À ESTRUTURA (Baseado em 0x${REF.toString(16)}) ===\n\n`;
-                
-                // Analisa 1000 bytes APÓS a referência (uso do objeto)
-                // Procuramos instruções como: MOV RAX, [RBX + Offset]
-                // Assumindo que RBX ou RDI contém o ponteiro "this" do objeto
-                
-                let offsetsFound = {};
-                
-                // Heurística: Em métodos C++, 'this' geralmente está em RDI (arg0) ou RBX (callee-saved)
-                // Vamos procurar acessos relativos a registradores comuns.
-                
-                for(let i = REF; i < REF + 2000; i++) {
-                    const b = bytes[i];
-                    
-                    // Padrão: MOV Reg, [Reg + Disp8] (48 8B 43 XX)
-                    // Padrão: MOV Reg, [Reg + Disp32] (48 8B 83 XX XX XX XX)
-                    
-                    if (b === 0x48 && bytes[i+1] === 0x8B) { // MOV R64, [M64]
-                        const modrm = bytes[i+2];
-                        
-                        // Decodificação simplificada de ModR/M para achar offsets
-                        // Mod = 01 (Disp8), Mod = 10 (Disp32)
-                        const mod = (modrm >> 6) & 0x03;
-                        
-                        let offset = 0;
-                        let size = 0;
-                        
-                        if (mod === 1) { // Disp8
-                            offset = bytes[i+3];
-                            size = 4;
-                        } else if (mod === 2) { // Disp32
-                            offset = view.getInt32(i+3, true);
-                            size = 7;
-                        }
-                        
-                        if (offset > 0 && offset < 0x200) { // Filtra offsets dentro do tamanho provável (0xC0)
-                            if (!offsetsFound[offset]) offsetsFound[offset] = 0;
-                            offsetsFound[offset]++;
-                            
-                            // log(`[OFFSET +0x${offset.toString(16).toUpperCase()}] Acessado em 0x${i.toString(16)}`);
-                        }
-                    }
-                }
-                
-                log("Offsets mais acessados (Hotspots da Estrutura):\n");
-                const sorted = Object.keys(offsetsFound).sort((a,b) => parseInt(a) - parseInt(b));
-                
-                sorted.forEach(off => {
-                    const hexOff = parseInt(off).toString(16).toUpperCase();
-                    const count = offsetsFound[off];
-                    let note = "";
-                    
-                    if (off == 0) note = " (VTABLE / TypeInfo)";
-                    if (off == 8) note = " (Ref Count / Parent?)";
-                    
-                    log(`+0x${hexOff.padEnd(4)} : ${count} acessos ${note}`);
-                });
-                
-                log("\nINTERPRETAÇÃO:");
-                log("1. O Offset 0x0 é quase sempre a VTable.");
-                log("2. Offsets com muitos acessos são ponteiros vitais.");
-                log("3. Offsets sem acesso (buracos) são seguros para corrupção (Data Fields).");
-
-                document.getElementById('output').value = log;
+                fileBytes = new Uint8Array(e.target.result);
+                view = new DataView(e.target.result);
+                findTargetString();
             };
             reader.readAsArrayBuffer(file);
+        }
+
+        function findTargetString() {
+            const status = document.getElementById('status');
+            status.innerText = "Localizando string 'SharedWorker'...";
+            
+            const targetStr = "SharedWorker";
+            const targetBytes = new TextEncoder().encode(targetStr);
+            
+            let strOffset = -1;
+            
+            // Busca rápida
+            for(let i=0; i < fileBytes.length - targetBytes.length; i++) {
+                let match = true;
+                for(let j=0; j < targetBytes.length; j++) {
+                    if(fileBytes[i+j] !== targetBytes[j]) { match = false; break; }
+                }
+                if(match && fileBytes[i+targetBytes.length] === 0) {
+                    strOffset = i;
+                    break;
+                }
+            }
+
+            if (strOffset === -1) {
+                log("[-] String 'SharedWorker' não encontrada.");
+                status.innerText = "Falha.";
+                return;
+            }
+            
+            log(`[PASSO 1] String encontrada em: 0x${strOffset.toString(16).toUpperCase()}`);
+            
+            // Inicia scan de código
+            scanCodeRefs(strOffset);
+        }
+
+        async function scanCodeRefs(targetOffset) {
+            const status = document.getElementById('status');
+            const pBar = document.getElementById('progress-bar');
+            const len = fileBytes.length;
+            
+            log(`[PASSO 2] Buscando referências de código (XREFs)...`);
+            
+            // Limita a busca ao segmento de código (20MB)
+            const SCAN_LIMIT = Math.min(len, 0x2000000); 
+            const CHUNK_SIZE = 200000; // 200KB por bloco
+            
+            let candidates = [];
+
+            for (let i = 0; i < SCAN_LIMIT; i++) {
+                
+                // Pausa para não travar
+                if (i % CHUNK_SIZE === 0) {
+                    const pct = (i / SCAN_LIMIT) * 100;
+                    pBar.style.width = pct + "%";
+                    status.innerText = `Varrendo Blocos: ${pct.toFixed(1)}%`;
+                    await new Promise(r => setTimeout(r, 0));
+                }
+
+                // Procura LEA/MOV (48 8D / 48 8B)
+                const b1 = fileBytes[i];
+                const b2 = fileBytes[i+1];
+
+                if (b1 === 0x48 && (b2 === 0x8D || b2 === 0x8B)) {
+                    const offset = view.getInt32(i + 3, true);
+                    const dest = i + 7 + offset;
+
+                    if (dest === targetOffset) {
+                        log(`   -> Referência em: 0x${i.toString(16).toUpperCase()}`);
+                        
+                        // ANÁLISE LOCAL DO TAMANHO
+                        let sizeData = analyzeSizeLocal(i);
+                        if (sizeData) candidates.push(sizeData);
+                    }
+                }
+            }
+
+            pBar.style.width = "100%";
+            status.innerText = "Concluído.";
+            
+            log("\n=== RELATÓRIO FINAL DE TAMANHOS ===");
+            if (candidates.length > 0) {
+                // Ordena por "Confiança" (Perto de CALL > Longe)
+                candidates.sort((a, b) => {
+                    if(a.hasCall && !b.hasCall) return -1;
+                    if(!a.hasCall && b.hasCall) return 1;
+                    return 0;
+                });
+
+                candidates.forEach(c => {
+                    let stars = c.hasCall ? "★★★" : "";
+                    log(`[OFFSET 0x${c.loc.toString(16).toUpperCase()}] ${c.type}, 0x${c.size.toString(16).toUpperCase()} (${c.size} bytes) ${stars}`);
+                });
+                
+                log(`\n>>> RECOMENDAÇÃO: 0x${candidates[0].size.toString(16).toUpperCase()} <<<`);
+            } else {
+                log("[-] Nenhum tamanho padrão (MOV EDI/ESI) encontrado perto das referências.");
+            }
+        }
+
+        function analyzeSizeLocal(refOffset) {
+            // Olha 500 bytes para trás
+            const start = Math.max(0, refOffset - 500);
+            
+            // Armazena o melhor candidato deste bloco
+            let best = null;
+
+            for (let k = refOffset; k > start; k--) {
+                const b = fileBytes[k];
+                let size = 0;
+                let type = "";
+                
+                // BF = MOV EDI (Arg 1)
+                if (b === 0xBF) {
+                    size = view.getInt32(k+1, true);
+                    type = "MOV EDI";
+                }
+                // BE = MOV ESI (Arg 2)
+                else if (b === 0xBE) {
+                    size = view.getInt32(k+1, true);
+                    type = "MOV ESI";
+                }
+
+                if (size >= 0x20 && size <= 0x800) {
+                    // Verifica se tem CALL perto (dentro de 20 bytes à frente)
+                    let hasCall = false;
+                    for(let j=0; j<20; j++) {
+                        if (fileBytes[k+5+j] === 0xE8) { // CALL
+                            hasCall = true;
+                            break;
+                        }
+                    }
+
+                    // Se achou um tamanho válido, salva
+                    // Priorizamos o que tiver CALL perto, ou o mais próximo da referência
+                    if (!best || hasCall) {
+                        best = { size: size, type: type, loc: k, hasCall: hasCall };
+                        if(hasCall) break; // Achou o melhor (tamanho -> call), para.
+                    }
+                }
+            }
+            return best;
         }
     </script>
 </body>
