@@ -2,82 +2,121 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 FUNCTION DUMPER</title>
+    <title>PS4 12.00 ALLOCATION MAPPER</title>
     <style>
-        body { background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; text-align: center; }
-        textarea { width: 95%; height: 600px; background: #111; color: #fff; border: 1px solid #555; margin-top: 15px; font-size: 13px; line-height: 1.4; }
-        button { padding: 15px 30px; background: #b30000; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; border-radius: 5px; }
-        .info { color: #aaa; margin-bottom: 20px; }
+        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
+        textarea { width: 95%; height: 500px; background: #111; color: #e0e0e0; border: 1px solid #333; margin-top: 15px; font-size: 12px; }
+        button { padding: 15px 30px; background: #004488; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; }
+        .highlight { color: #ff00ff; font-weight: bold; }
     </style>
 </head>
 <body>
-
-    <h1>FUNCTION RAW DUMPER</h1>
-    <p class="info">Extração de Código de Máquina para Análise Manual</p>
-    <p>Alvo: <b>0x839A98</b> (SharedWorker)</p>
-    
+    <h1>ALLOCATION MAPPER</h1>
+    <p>Procurando locais que alocam <b>0xA0</b> (160) ou <b>0xC0</b> (192)</p>
     <input type="file" id="fileInput" />
-    <br><br>
-    <button onclick="dumpFunction()">EXTRAIR CÓDIGO BRUTO</button>
-    
-    <textarea id="output" readonly>Aguardando arquivo...</textarea>
+    <br>
+    <button onclick="startScan()">MAPEAMENTO REVERSO</button>
+    <textarea id="output" readonly>Aguardando...</textarea>
 
     <script>
-        function dumpFunction() {
+        function startScan() {
             const file = document.getElementById('fileInput').files[0];
             if(!file) return alert("Selecione o arquivo!");
 
             const reader = new FileReader();
-            document.getElementById('output').value = "Lendo...";
+            document.getElementById('output').value = "Escaneando 70MB por padrões de alocação... (Async)\n";
 
             reader.onload = function(e) {
                 const view = new DataView(e.target.result);
                 const bytes = new Uint8Array(e.target.result);
                 
-                // Ponto de referência (String XREF)
-                const REF = 0x839A98;
+                // Ponto de referência do SharedWorker (String XREF)
+                // Sabemos que está por volta de 0x839A98
+                const WORKER_REF = 0x839A98;
                 
-                // 1. Tentar achar o início da função (Prologue)
-                // Padrão comum x64: 55 48 89 E5 (PUSH RBP; MOV RBP, RSP)
-                let funcStart = -1;
-                for(let i = REF; i > REF - 2000; i--) {
-                    if (bytes[i] === 0x55 && bytes[i+1] === 0x48 && bytes[i+2] === 0x89 && bytes[i+3] === 0xE5) {
-                        funcStart = i;
-                        break;
-                    }
-                }
-
-                // Se não achar prólogo padrão, pega um bloco fixo de 500 bytes antes
-                if (funcStart === -1) funcStart = Math.max(0, REF - 500);
-                
-                const endDump = REF + 64; // Um pouco depois da referência
-
-                let log = `=== DUMP DA FUNÇÃO (SharedWorker::create?) ===\n`;
-                log += `Início do Dump: 0x${funcStart.toString(16).toUpperCase()}\n`;
-                log += `Referência:     0x${REF.toString(16).toUpperCase()}\n\n`;
-                
-                log += "OFFSET     | BYTES (Copie tudo isso!)\n";
-                log += "-----------|-------------------------------------------------\n";
-
-                for (let i = funcStart; i < endDump; i += 16) {
-                    const offset = `0x${i.toString(16).toUpperCase().padStart(8, '0')}`;
-                    let hex = "";
-                    
-                    for (let j = 0; j < 16; j++) {
-                        if (i + j < endDump) {
-                            const b = bytes[i + j];
-                            hex += b.toString(16).toUpperCase().padStart(2, '0') + " ";
-                            
-                            // Marcadores visuais para eu achar rápido
-                            if ((i+j) === REF) hex += "[REF] ";
-                        }
-                    }
-                    log += `${offset} | ${hex}\n`;
-                }
-                
-                document.getElementById('output').value = log;
+                scanAsync(view, bytes, WORKER_REF);
             };
             reader.readAsArrayBuffer(file);
+        }
+
+        async function scanAsync(view, bytes, workerRef) {
+            const len = bytes.length;
+            const out = document.getElementById('output');
+            let log = "";
+            
+            // Limita ao Code Segment
+            const LIMIT = Math.min(len, 0x2000000);
+            const CHUNK = 500000;
+            
+            let hitsA0 = 0;
+            let hitsC0 = 0;
+            let candidates = [];
+
+            for(let i=0; i<LIMIT; i++) {
+                if (i % CHUNK === 0) await new Promise(r => setTimeout(r, 0));
+
+                const b = bytes[i];
+                let size = 0;
+                
+                // BF = MOV EDI, imm32
+                if (b === 0xBF) {
+                    size = view.getInt32(i+1, true);
+                } 
+                // BE = MOV ESI, imm32
+                else if (b === 0xBE) {
+                    size = view.getInt32(i+1, true);
+                }
+
+                if (size === 0xA0 || size === 0xC0) {
+                    // Verifica se tem CALL perto (indica malloc)
+                    let hasCall = false;
+                    for(let k=1; k<20; k++) {
+                        if(bytes[i+5+k] === 0xE8) { hasCall = true; break; }
+                    }
+
+                    if (hasCall) {
+                        if (size === 0xA0) hitsA0++;
+                        if (size === 0xC0) hitsC0++;
+
+                        // Verifica distância do SharedWorker
+                        const dist = Math.abs(workerRef - i);
+                        
+                        // Se estiver perto (< 5000 bytes), é um candidato fortíssimo
+                        if (dist < 5000) {
+                            candidates.push({
+                                offset: i,
+                                size: size,
+                                dist: dist,
+                                hex: size.toString(16).toUpperCase()
+                            });
+                        }
+                    }
+                }
+            }
+
+            log += `=== RESULTADO DO MAPEAMENTO ===\n`;
+            log += `Total de alocações 0xA0 no arquivo: ${hitsA0}\n`;
+            log += `Total de alocações 0xC0 no arquivo: ${hitsC0}\n\n`;
+            
+            log(`>>> CANDIDATOS PERTO DE SharedWorker (0x${workerRef.toString(16)}) <<<\n`);
+            
+            if (candidates.length === 0) {
+                log("[-] Nenhuma alocação direta desses tamanhos perto do código do Worker.\n");
+                log("    Isso sugere que o tamanho pode ser herdado (ex: Worklet/EventTarget).\n");
+            } else {
+                candidates.sort((a,b) => a.dist - b.dist); // Mais perto primeiro
+                
+                candidates.forEach(c => {
+                    log(`[ALVO] Offset: 0x${c.offset.toString(16).toUpperCase()}`);
+                    log(`       Tamanho: 0x${c.hex} (${c.size} bytes)`);
+                    log(`       Distância: ${c.dist} bytes`);
+                    log(`       ----------------------------------\n`);
+                });
+                
+                log(`VEREDITO: O tamanho mais provável é o do candidato mais próximo (menor distância).`);
+            }
+
+            out.value = log;
         }
     </script>
 </body>
