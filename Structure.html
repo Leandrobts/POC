@@ -1,139 +1,248 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 12.00 ASYNC VTABLE SCANNER</title>
+    <title>PS4 ELF Gadget Extractor</title>
     <style>
-        body { background-color: #050505; color: #00ff00; font-family: 'Consolas', monospace; text-align: center; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; background: #1a1a1a; padding: 20px; border: 1px solid #333; border-radius: 8px; }
-        textarea { width: 95%; height: 500px; background: #000; color: #e0e0e0; border: 1px solid #444; margin-top: 15px; font-size: 12px; white-space: pre; }
-        button { padding: 12px 30px; background: #006600; color: #fff; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; border-radius: 5px; }
-        button:hover { background: #008800; }
-        
-        #progress-container { width: 100%; background-color: #333; height: 25px; margin-top: 15px; border-radius: 12px; overflow: hidden; }
-        #progress-bar { width: 0%; height: 100%; background-color: #00ff00; transition: width 0.1s linear; }
-        #status { margin-top: 5px; color: #ffff00; }
+        body { background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h2 { border-bottom: 1px solid #444; padding-bottom: 10px; color: #4ec9b0; }
+        #drop-zone {
+            border: 2px dashed #444; padding: 30px; text-align: center; margin-bottom: 20px; cursor: pointer; background: #252526;
+        }
+        #drop-zone:hover { border-color: #4ec9b0; background: #2d2d30; }
+        #log-output {
+            width: 100%; height: 400px; background-color: #000; color: #ce9178; 
+            border: 1px solid #444; font-family: monospace; padding: 10px; resize: vertical;
+        }
+        #progress-bar { width: 100%; height: 20px; background-color: #333; margin-bottom: 10px; }
+        #progress-fill { height: 100%; background-color: #4ec9b0; width: 0%; transition: width 0.1s; }
+        button { padding: 10px 20px; background: #0e639c; color: white; border: none; cursor: pointer; font-size: 16px; }
+        button:hover { background: #1177bb; }
     </style>
 </head>
 <body>
 
-    <div class="container">
-        <h1>VTABLE PATTERN SCANNER (NO-FREEZE)</h1>
-        <p>Busca heurística por tabelas de ponteiros na seção .data</p>
-        
-        <input type="file" id="fileInput" />
-        <br>
-        <div id="progress-container"><div id="progress-bar"></div></div>
-        <div id="status">Aguardando arquivo...</div>
-        
-        <button onclick="initScan()">INICIAR VARREDURA</button>
-        <textarea id="output" readonly></textarea>
+<div class="container">
+    <h2>PS4 ELF Analyzer & Gadget Extractor</h2>
+    <p>Carregue o arquivo .elf ou .sprx (FW 12.00) para extrair os offsets necessários.</p>
+    
+    <div id="drop-zone" onclick="document.getElementById('fileInput').click()">
+        Clique aqui para selecionar o arquivo ou arraste-o.
+        <input type="file" id="fileInput" style="display:none">
     </div>
 
-    <script>
-        let fileBytes = null;
-        let view = null;
+    <div id="status">Aguardando arquivo...</div>
+    <div id="progress-bar"><div id="progress-fill"></div></div>
+    
+    <textarea id="log-output" readonly>Os resultados aparecerão aqui...</textarea>
+    <br>
+    <button onclick="copyLog()">Copiar Log</button>
+</div>
 
-        function log(msg) {
-            document.getElementById('output').value += msg + "\n";
+<script>
+    // Assinaturas de Bytes para Gadgets Comuns (x64)
+    const TARGETS = {
+        // Gadgets Básicos de Argumentos
+        "pop rdi; ret": "5F C3",
+        "pop rsi; ret": "5E C3",
+        "pop rdx; ret": "5A C3",
+        "pop rcx; ret": "59 C3",
+        "pop rax; ret": "58 C3",
+        "pop r8; ret":  "41 58 C3",
+        "pop r9; ret":  "41 59 C3",
+        "pop rsp; ret": "5C C3", // Stack Pivot
+
+        // Movimentação de Memória (Primitives)
+        "mov [rdi], rax; ret": "48 89 07 C3", // Write Primitive
+        "mov rax, [rdi]; ret": "48 8B 07 C3", // Read Primitive
+        "mov [rax], rsi; ret": "48 89 30 C3",
+        
+        // JOP Gadgets (Para o PSFree)
+        "jmp [rsi]": "FF 26", 
+        "jmp [rdi]": "FF 27",
+        "call [rax]": "FF 10",
+
+        // Instruções Especiais
+        "syscall": "0F 05",
+        "ret": "C3"
+    };
+
+    // Converte string hex "5F C3" para array de bytes [0x5F, 0xC3]
+    const GADGET_BYTES = {};
+    for (let key in TARGETS) {
+        GADGET_BYTES[key] = TARGETS[key].split(' ').map(h => parseInt(h, 16));
+    }
+
+    let fileData = null;
+    let textSectionOffset = 0;
+    let textSectionSize = 0;
+
+    document.getElementById('fileInput').addEventListener('change', handleFile);
+
+    function handleFile(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        document.getElementById('status').innerText = `Carregando ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)...`;
+        
+        const reader = new FileReader();
+        reader.onload = function(evt) {
+            fileData = new Uint8Array(evt.target.result);
+            parseELF(file.name);
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    function log(msg) {
+        const area = document.getElementById('log-output');
+        area.value += msg + "\n";
+        area.scrollTop = area.scrollHeight;
+    }
+
+    function parseELF(filename) {
+        document.getElementById('log-output').value = `--- ANÁLISE DE: ${filename} ---\n`;
+        
+        // 1. Validar Magic ELF (0x7F E L F)
+        if (fileData[0] !== 0x7F || fileData[1] !== 0x45 || fileData[2] !== 0x4C || fileData[3] !== 0x46) {
+            log("ERRO: Não é um arquivo ELF válido.");
+            return;
         }
 
-        function initScan() {
-            const input = document.getElementById('fileInput');
-            if (input.files.length === 0) return alert("Selecione o arquivo ELF!");
+        // 2. Achar Seção .text (Código Executável)
+        // Header ELF64: e_phoff em 0x20 (8 bytes), e_phnum em 0x38 (2 bytes)
+        const phOff = read64(0x20);
+        const phNum = read16(0x38);
+        const phEntSize = read16(0x36);
 
-            const file = input.files[0];
-            document.getElementById('output').value = "=== INICIANDO SCAN ASSÍNCRONO DE VTABLES ===\n";
-            
-            const reader = new FileReader();
-            document.getElementById('status').innerText = "Carregando arquivo...";
-            
-            reader.onload = function(e) {
-                fileBytes = new Uint8Array(e.target.result);
-                view = new DataView(e.target.result);
-                startAsyncScan();
-            };
-            reader.readAsArrayBuffer(file);
+        log(`Program Headers: ${phNum} em offset 0x${phOff.toString(16)}`);
+
+        let foundText = false;
+
+        // Varre os Program Headers procurando PT_LOAD (1) com Flag Exec (1 ou 0x5)
+        for (let i = 0; i < phNum; i++) {
+            let offset = phOff + (i * phEntSize);
+            let p_type = read32(offset);
+            let p_flags = read32(offset + 4);
+            let p_offset = read64(offset + 8);
+            let p_filesz = read64(offset + 32);
+
+            // PT_LOAD = 1, PF_X = 1 (Executable)
+            if (p_type === 1 && (p_flags & 1)) {
+                textSectionOffset = Number(p_offset);
+                textSectionSize = Number(p_filesz);
+                log(`SEGMENTO EXECUTÁVEL (.text) encontrado:`);
+                log(`  Offset Arquivo: 0x${textSectionOffset.toString(16)}`);
+                log(`  Tamanho: 0x${textSectionSize.toString(16)} (${textSectionSize} bytes)`);
+                foundText = true;
+                break; // Assume que o primeiro executável é o principal
+            }
         }
 
-        async function startAsyncScan() {
-            const len = fileBytes.length;
-            const pBar = document.getElementById('progress-bar');
-            const status = document.getElementById('status');
-            
-            // CONFIGURAÇÃO DA HEURÍSTICA
-            // Suposição: Dados começam após o código. Código WebKit ~25MB.
-            // Vamos começar em 20MB para pular o .text
-            const DATA_START = 0x1400000; 
-            
-            // Um ponteiro de função válido deve apontar para o início do arquivo (onde fica o código)
-            // Entre 0x400 e 0x2000000
-            const CODE_MIN = 0x400;
-            const CODE_MAX = 0x2000000;
+        if (!foundText) {
+            log("AVISO: Segmento .text não identificado claramente. Escaneando arquivo todo (Lento).");
+            textSectionOffset = 0;
+            textSectionSize = fileData.length;
+        }
 
-            let candidates = [];
-            const CHUNK_SIZE = 200000; // Processa 200kb por vez (Bloco)
+        // Inicia escaneamento em blocos
+        startScanning();
+    }
 
-            log(`[*] Varrendo de 0x${DATA_START.toString(16)} até o fim...`);
+    function startScanning() {
+        const CHUNK_SIZE = 1024 * 512; // 512KB por bloco
+        let currentPos = 0;
+        let foundGadgets = {};
 
-            for (let i = DATA_START; i < len - 64; i += 8) {
+        function processChunk() {
+            let end = Math.min(currentPos + CHUNK_SIZE, textSectionSize);
+            let absoluteStart = textSectionOffset + currentPos;
+            let absoluteEnd = textSectionOffset + end;
+
+            // Atualiza UI
+            let progress = (currentPos / textSectionSize) * 100;
+            document.getElementById('progress-fill').style.width = progress + "%";
+            document.getElementById('status').innerText = `Escaneando: ${Math.floor(progress)}%`;
+
+            // Varredura byte a byte no bloco
+            for (let i = absoluteStart; i < absoluteEnd; i++) {
                 
-                // PAUSA PARA NÃO TRAVAR (A Mágica)
-                if (i % CHUNK_SIZE === 0) {
-                    const pct = ((i - DATA_START) / (len - DATA_START)) * 100;
-                    pBar.style.width = pct + "%";
-                    status.innerText = `Varrendo: ${pct.toFixed(1)}% (Candidatos: ${candidates.length})`;
-                    await new Promise(r => setTimeout(r, 0)); // Libera a thread UI
-                }
+                // Otimização: Só checa se o byte atual for o início de algum gadget conhecido
+                // Para simplificar, checamos todas as assinaturas
+                for (let name in GADGET_BYTES) {
+                    if (foundGadgets[name] && foundGadgets[name].length >= 3) continue; // Limite de 3 por tipo
 
-                // HEURÍSTICA DE VTABLE
-                // Uma VTable é uma sequência de ponteiros.
-                // Vamos checar se temos 4 ponteiros seguidos que apontam para a área de código.
-                
-                let isVtable = true;
-                let ptrs = [];
-
-                for (let k = 0; k < 4; k++) {
-                    try {
-                        const val = Number(view.getBigUint64(i + (k*8), true)); // Little Endian
-                        
-                        // Validação Rigorosa:
-                        // 1. Deve ser par (alinhado)
-                        // 2. Deve apontar para a área de código (.text)
-                        if (val % 2 !== 0 || val < CODE_MIN || val > CODE_MAX) {
-                            isVtable = false;
-                            break;
+                    let bytes = GADGET_BYTES[name];
+                    if (fileData[i] === bytes[0]) { // Match primeiro byte
+                        let match = true;
+                        for (let j = 1; j < bytes.length; j++) {
+                            if (fileData[i + j] !== bytes[j]) {
+                                match = false;
+                                break;
+                            }
                         }
-                        ptrs.push(val);
-                    } catch(e) { isVtable = false; break; }
-                }
 
-                if (isVtable) {
-                    // Filtro extra: Os ponteiros devem estar "perto" uns dos outros (Locality)
-                    // Funções da mesma classe costumam estar próximas no binário.
-                    let min = Math.min(...ptrs);
-                    let max = Math.max(...ptrs);
-                    
-                    if ((max - min) < 0x200000) { // Dispersão máxima de 2MB
-                        candidates.push({ offset: i, ptrs: ptrs });
-                        
-                        // Loga imediatamente
-                        let msg = `[CANDIDATO] VTable em 0x${i.toString(16).toUpperCase()}`;
-                        msg += ` -> Aponta para: 0x${ptrs[0].toString(16).toUpperCase()} ...`;
-                        log(msg);
-                        
-                        i += 32; // Pula essa tabela para não detectar duplicatas
+                        if (match) {
+                            if (!foundGadgets[name]) foundGadgets[name] = [];
+                            // Salva o offset RELATIVO ao início do arquivo (que será o offset da lib)
+                            foundGadgets[name].push(i);
+                        }
                     }
                 }
             }
 
-            pBar.style.width = "100%";
-            status.innerText = "Concluído.";
-            
-            log(`\n=== FIM DO SCAN ===`);
-            log(`Encontrados ${candidates.length} candidatos.`);
-            log(`Procure por endereços que comecem com 0x2... ou 0x3... na lista.`);
+            currentPos = end;
+
+            if (currentPos < textSectionSize) {
+                setTimeout(processChunk, 0); // Próximo bloco
+            } else {
+                finishScan(foundGadgets);
+            }
         }
-    </script>
+
+        processChunk();
+    }
+
+    function finishScan(results) {
+        document.getElementById('progress-fill').style.width = "100%";
+        document.getElementById('status').innerText = "Concluído!";
+        
+        log("\n--- RESULTADOS (Offsets Hex) ---");
+        log("// Copie estes valores para o seu arquivo .mjs");
+        log("const gadget_map = {");
+        
+        for (let name in TARGETS) {
+            if (results[name]) {
+                let offsets = results[name].map(o => "0x" + o.toString(16)).join(", ");
+                log(`    "${name}": ${offsets},`);
+            } else {
+                log(`    "${name}": null, // NÃO ENCONTRADO`);
+            }
+        }
+        log("};");
+    }
+
+    // Helpers de leitura Little Endian
+    function read16(offset) {
+        return fileData[offset] | (fileData[offset+1] << 8);
+    }
+    function read32(offset) {
+        return (fileData[offset] | (fileData[offset+1] << 8) | (fileData[offset+2] << 16) | (fileData[offset+3] << 24)) >>> 0;
+    }
+    function read64(offset) {
+        // Retorna Number (seguro até 53 bits, suficiente para offsets de arquivo)
+        let lo = read32(offset);
+        let hi = read32(offset+4);
+        return lo + (hi * 4294967296);
+    }
+
+    function copyLog() {
+        const copyText = document.getElementById("log-output");
+        copyText.select();
+        document.execCommand("copy");
+        alert("Log copiado!");
+    }
+</script>
+
 </body>
 </html>
