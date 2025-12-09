@@ -2,114 +2,80 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Kernel Heap Spray Test</title>
-    
+    <title>Kernel Panic Isolator</title>
+    <style>
+        body { background-color: #222; color: #fff; font-family: sans-serif; padding: 20px; }
+        button { font-size: 18px; padding: 10px; margin: 10px; width: 100%; cursor: pointer; }
+        .log { background: #000; padding: 10px; border: 1px solid #555; height: 200px; overflow-y: scroll; font-family: monospace; }
+    </style>
 </head>
 <body>
+    <h1>Investigação do Ponto de Falha</h1>
+    <p>Selecione um teste. Se o console chegar a 1000 sem desligar, o teste passou.</p>
 
-    <h1>Kernel Heap Spray + Thread Stress</h1>
-    <p>Objetivo:</p>
+    <button onclick="runTest('A')">Teste A: Worker VAZIO (Testa Criação de Thread)</button>
+    <button onclick="runTest('B')">Teste B: Apenas Recursão (Testa Stack Depth)</button>
+    <button onclick="runTest('C')">Teste C: Apenas Array (Testa Alocação Heap)</button>
 
-    <div class="section">
-        <button onclick="startHeapSpray()">1. Iniciar Heap Spray (Carregar RAM)</button>
-        <button onclick="runRedZoneBypass()" style="border-color: red; color: red;">2. Disparar Thread Panic</button>
-    </div>
-
-    <div id="status">Aguardando...</div>
-    <div id="log"></div>
+    <div id="status">Parado.</div>
+    <div id="log" class="log"></div>
 
     <script>
-        // --- CONFIGURAÇÃO DO SPRAY ---
-        // Padrão que queremos ver no dump de erro (0x41 = 'A')
-         const SPRAY_PATTERN = 0x00000000; // Zeros
-        // Tamanho de cada bloco (1MB)
-        const BLOCK_SIZE = 1024 * 1024; 
-        // Quantidade de memória para tentar alocar (aprox 500MB)
-        // O WebKit do PS4 tem limite, se travar antes do botão 2, diminua isso.
-        const SPRAY_SIZE_MB = 200; 
+        let interval = null;
 
-        var sprayStore = [];
-
-        function log(msg) { 
+        function log(msg) {
             const el = document.getElementById('log');
-            const st = document.getElementById('status');
-            const time = new Date().toLocaleTimeString();
-            el.innerHTML = `<div>[${time}] ${msg}</div>` + el.innerHTML;
-            st.innerText = msg;
+            el.innerHTML = `<div>${msg}</div>` + el.innerHTML;
         }
 
-        // --- PASSO 1: HEAP SPRAY ---
-        // Tenta preencher "buracos" na memória do Kernel/Userland com nosso padrão.
-        function startHeapSpray() {
-            log("Iniciando Heap Spray... (Isso pode travar o navegador por alguns segundos)");
-            
-            setTimeout(() => {
-                try {
-                    for (let i = 0; i < SPRAY_SIZE_MB; i++) {
-                        // Cria um ArrayBuffer de 1MB
-                        let buffer = new ArrayBuffer(BLOCK_SIZE);
-                        let view = new Uint32Array(buffer);
-                        
-                        // Preenche com 0x41414141
-                        for (let j = 0; j < view.length; j++) {
-                            view[j] = SPRAY_PATTERN;
-                        }
-                        
-                        // Salva referência global para o Garbage Collector não limpar
-                        sprayStore.push(view);
-                        
-                        if(i % 50 === 0) log(`Alocados ${i} MB...`);
-                    }
-                    log(`SUCESSO: Heap Spray Finalizado. ~${SPRAY_SIZE_MB}MB alocados com 0x41414141.`);
-                    log("Agora a memória está 'suja' com nosso padrão. Pode disparar o Panic.");
-                } catch (e) {
-                    log("ERRO no Spray (Memória cheia?): " + e.message);
-                }
-            }, 100);
-        }
+        function runTest(type) {
+            if(interval) clearInterval(interval);
+            document.getElementById('status').innerText = `Rodando Teste ${type}...`;
+            log(`--- Iniciando Teste ${type} ---`);
 
-        // --- PASSO 2: O SEU TRIGGER (MODIFICADO) ---
-        // --- PASSO 2: TESTE DE VELOCIDADE (SLOW MODE) ---
-        function runRedZoneBypass() {
-            log("[TESTE] Iniciando criação LENTA de threads...");
-            
-            const workerCode = `
-                function deep(n) {
-                    const v = new Float64Array(32); 
-                    if (n > 0) deep(n-1);
-                }
-                deep(10); 
-                postMessage("Done");
-            `;
+            let workerCode = '';
+
+            // --- DEFINIÇÃO DOS CENÁRIOS ---
+            if (type === 'A') {
+                // CENÁRIO A: Código Mínimo. O Worker nasce e morre.
+                workerCode = `postMessage("Done");`;
+            } 
+            else if (type === 'B') {
+                // CENÁRIO B: Recursão pura, sem alocar memória pesada.
+                workerCode = `
+                    function deep(n) { if (n > 0) deep(n-1); }
+                    deep(50); // Recursão média
+                    postMessage("Done");
+                `;
+            } 
+            else if (type === 'C') {
+                // CENÁRIO C: Alocação de memória, sem recursão.
+                workerCode = `
+                    const v = new Float64Array(1024); // Aloca 8KB
+                    postMessage("Done");
+                `;
+            }
+
             const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            
             let count = 0;
-            
-            // MUDANÇA CRÍTICA AQUI:
-            // Antes: 20 threads a cada 10ms (Violento)
-            // Agora: 1 thread a cada 50ms (Gentil)
-            const interval = setInterval(() => {
-                // Cria apenas 1 por vez
-                new Worker(url).onmessage = () => {}; 
+
+            // Modo "Lento" para garantir que é vazamento e não corrida
+            interval = setInterval(() => {
+                const w = new Worker(url);
+                w.onmessage = () => { w.terminate(); }; // Força terminate explícito para ajudar o GC
                 
                 count++;
-                
-                if(count % 100 === 0) {
-                    document.getElementById('status').innerText = "Threads criadas: " + count;
+                if(count % 50 === 0) {
+                    document.getElementById('status').innerText = `Teste ${type}: ${count} threads`;
                 }
 
-                // Vamos até 2000, o mesmo número que antes causava crash
-                if(count > 2000) {
+                if(count >= 1000) {
                     clearInterval(interval);
-                    log("Teste finalizado. Se o console NÃO desligou, temos um Exploit!");
+                    log(`SUCESSO: Teste ${type} sobreviveu a 1000 iterações.`);
+                    alert(`Teste ${type} PASSOU! O bug não está aqui.`);
                 }
-            }, 50); // Intervalo alto (50ms)
+            }, 50); // 50ms
         }
     </script>
 </body>
 </html>
-
-
-
-
-
