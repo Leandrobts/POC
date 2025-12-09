@@ -2,79 +2,113 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Kernel Panic Isolator</title>
+    <title>PS4 Kernel Fuzzer</title>
     <style>
-        body { background-color: #222; color: #fff; font-family: sans-serif; padding: 20px; }
-        button { font-size: 18px; padding: 10px; margin: 10px; width: 100%; cursor: pointer; }
-        .log { background: #000; padding: 10px; border: 1px solid #555; height: 200px; overflow-y: scroll; font-family: monospace; }
+        body { background-color: #111; color: #0f0; font-family: monospace; padding: 20px; }
+        .control-group { margin-bottom: 15px; border: 1px solid #333; padding: 10px; }
+        label { display: inline-block; width: 200px; color: #fff; }
+        input { background: #333; color: #fff; border: 1px solid #555; padding: 5px; width: 100px; }
+        button { font-size: 20px; padding: 15px; width: 100%; cursor: pointer; background: #900; color: #fff; border: none; margin-top: 20px;}
+        button:hover { background: #f00; }
+        #log { margin-top: 20px; border-top: 1px dashed #555; padding-top: 10px; white-space: pre-wrap; height: 300px; overflow-y: auto;}
     </style>
 </head>
 <body>
-    <h1>Investigação do Ponto de Falha</h1>
-    <p>Selecione um teste. Se o console chegar a 1000 sem desligar, o teste passou.</p>
 
-    <button onclick="runTest('A')">Teste A: Worker VAZIO (Testa Criação de Thread)</button>
-    <button onclick="runTest('B')">Teste B: Apenas Recursão (Testa Stack Depth)</button>
-    <button onclick="runTest('C')">Teste C: Apenas Array (Testa Alocação Heap)</button>
+    <h1>PS4 Kernel Race Fuzzer</h1>
+    <p>Ajuste os parâmetros para encontrar o ponto exato do Panic.</p>
 
-    <div id="status">Parado.</div>
-    <div id="log" class="log"></div>
+    <div class="control-group">
+        <label>Threads por Batch:</label>
+        <input type="number" id="batchSize" value="20"> 
+        <small>(Original: 20. Tente baixar para 5, depois 10...)</small>
+    </div>
+
+    <div class="control-group">
+        <label>Intervalo (ms):</label>
+        <input type="number" id="intervalMs" value="10">
+        <small>(Original: 10ms. Tente aumentar para 50ms)</small>
+    </div>
+
+    <div class="control-group">
+        <label>Recursão (Stack Depth):</label>
+        <input type="number" id="recursionDepth" value="500">
+        <small>(Original: 500. Tente 100)</small>
+    </div>
+
+    <div class="control-group">
+        <label>Array Size (Heap):</label>
+        <input type="number" id="arraySize" value="128">
+        <small>(Original: 128)</small>
+    </div>
+
+    <button onclick="runFuzz()">DISPARAR FUZZER</button>
+    <button onclick="stopFuzz()" style="background: #333; margin-top: 10px;">PARAR TESTE</button>
+
+    <div id="status">Pronto.</div>
+    <div id="log"></div>
 
     <script>
-        let interval = null;
+        let intervalId = null;
 
         function log(msg) {
             const el = document.getElementById('log');
-            el.innerHTML = `<div>${msg}</div>` + el.innerHTML;
+            el.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}\n` + el.innerHTML;
         }
 
-        function runTest(type) {
-            if(interval) clearInterval(interval);
-            document.getElementById('status').innerText = `Rodando Teste ${type}...`;
-            log(`--- Iniciando Teste ${type} ---`);
-
-            let workerCode = '';
-
-            // --- DEFINIÇÃO DOS CENÁRIOS ---
-            if (type === 'A') {
-                // CENÁRIO A: Código Mínimo. O Worker nasce e morre.
-                workerCode = `postMessage("Done");`;
-            } 
-            else if (type === 'B') {
-                // CENÁRIO B: Recursão pura, sem alocar memória pesada.
-                workerCode = `
-                    function deep(n) { if (n > 0) deep(n-1); }
-                    deep(50); // Recursão média
-                    postMessage("Done");
-                `;
-            } 
-            else if (type === 'C') {
-                // CENÁRIO C: Alocação de memória, sem recursão.
-                workerCode = `
-                    const v = new Float64Array(1024); // Aloca 8KB
-                    postMessage("Done");
-                `;
+        function stopFuzz() {
+            if(intervalId) {
+                clearInterval(intervalId);
+                intervalId = null;
+                document.getElementById('status').innerText = "Parado pelo usuário.";
+                log("Teste interrompido.");
             }
+        }
 
+        function runFuzz() {
+            stopFuzz(); // Garante que não tem outro rodando
+
+            // Pega os valores dos inputs
+            const batchSize = parseInt(document.getElementById('batchSize').value);
+            const intervalMs = parseInt(document.getElementById('intervalMs').value);
+            const depth = parseInt(document.getElementById('recursionDepth').value);
+            const arrSize = parseInt(document.getElementById('arraySize').value);
+
+            log(`INICIANDO: Batch=${batchSize} | Ms=${intervalMs} | Deep=${depth} | Arr=${arrSize}`);
+            document.getElementById('status').innerText = "RODANDO...";
+
+            // Gera o código do Worker dinamicamente com os valores
+            const workerCode = `
+                function deep(n) {
+                    const v = new Float64Array(${arrSize}); 
+                    if (n > 0) deep(n-1);
+                }
+                deep(${depth}); 
+                postMessage("Done");
+            `;
             const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            let count = 0;
+            
+            let totalThreads = 0;
+            const LIMIT = 5000; // Limite de segurança para não travar o navegador para sempre
 
-            // Modo "Lento" para garantir que é vazamento e não corrida
-            interval = setInterval(() => {
-                const w = new Worker(url);
-                w.onmessage = () => { w.terminate(); }; // Força terminate explícito para ajudar o GC
+            intervalId = setInterval(() => {
+                for(let i=0; i < batchSize; i++) {
+                    const w = new Worker(url);
+                    // Importante: Não damos terminate() explícito aqui para forçar o Kernel 
+                    // a lidar com a limpeza natural (garbage collection), que é onde o bug mora.
+                    w.onmessage = () => {}; 
+                }
+                totalThreads += batchSize;
                 
-                count++;
-                if(count % 50 === 0) {
-                    document.getElementById('status').innerText = `Teste ${type}: ${count} threads`;
+                if(totalThreads % 100 === 0) {
+                    document.getElementById('status').innerText = `Threads: ${totalThreads}`;
                 }
 
-                if(count >= 1000) {
-                    clearInterval(interval);
-                    log(`SUCESSO: Teste ${type} sobreviveu a 1000 iterações.`);
-                    alert(`Teste ${type} PASSOU! O bug não está aqui.`);
+                if(totalThreads > LIMIT) {
+                    stopFuzz();
+                    log("Limite atingido sem crash. Tente valores mais agressivos.");
                 }
-            }, 50); // 50ms
+            }, intervalMs);
         }
     </script>
 </body>
