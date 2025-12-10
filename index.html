@@ -1,91 +1,140 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Memory Layout Fingerprinter</title>
+    <title>Memory Fingerprinter V2 (Safe)</title>
     <style>
-        body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 20px; }
-        #log { border: 1px solid #30363d; padding: 10px; height: 400px; overflow-y: auto; background: #010409; }
-        .highlight { color: #58a6ff; font-weight: bold; }
-        .warn { color: #d29922; }
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        #log { border: 1px solid #333; padding: 10px; height: 400px; overflow-y: auto; white-space: pre-wrap;}
+        button { font-size: 20px; padding: 15px; background: #222; color: #fff; border: 1px solid #0f0; cursor: pointer; }
+        .highlight { color: #0ff; font-weight: bold; }
+        .warn { color: #ff0; }
+        .fail { color: #f00; }
     </style>
 </head>
 <body>
-    <h2>Memory Layout Fingerprinter</h2>
-    <p>Analisando limites de alocação para inferir Heap Layout.</p>
-    <button onclick="startFingerprint()" style="padding:15px; font-size:18px; cursor:pointer;">INICIAR ANÁLISE</button>
-    <div id="log"></div>
+    <h2>Memory Fingerprinter V2 (Safe Mode)</h2>
+    <p>Análise de Heap com proteção contra OOM (Out of Memory).</p>
+    
+    <button onclick="runSafeAnalysis()">INICIAR ANÁLISE SEGURA</button>
+    <div id="log">Pronto.</div>
 
     <script>
         function log(msg, type='') {
             const el = document.getElementById('log');
+            // Usamos span para colorir partes específicas se necessário
             el.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
             el.scrollTop = el.scrollHeight;
         }
 
-        async function startFingerprint() {
-            log("Iniciando Mapeamento de Limites...", 'highlight');
-            
-            // TESTE 1: Limite de ArrayBuffer (Large Heap)
-            // Tenta achar o maior bloco contíguo permitido.
-            let size = 1024 * 1024 * 10; // Começa com 10MB
-            let maxBuffer = 0;
-            
-            log("--- Teste 1: Limite de ArrayBuffer ---");
-            while(true) {
-                try {
-                    let ab = new ArrayBuffer(size);
-                    maxBuffer = size;
-                    size += 1024 * 1024 * 10; // +10MB
-                    // Limpa para não dar OOM falso
-                    ab = null; 
-                    if (size > 1024 * 1024 * 2048) break; // Limite segurança 2GB
-                } catch(e) {
-                    break;
-                }
-                await new Promise(r => setTimeout(r, 10));
-            }
-            log(`Maior ArrayBuffer único permitido: ${(maxBuffer / 1024 / 1024).toFixed(2)} MB`, 'highlight');
+        async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-            // TESTE 2: Densidade de Alocação (Fragmentação)
-            // Tenta alocar muitos pequenos buffers para ver se o sistema prefere
-            // juntá-los ou espalhá-los (IsoHeap Check).
-            log("--- Teste 2: Densidade (IsoHeap Behavior) ---");
+        // Força GC alocando e liberando buffers grandes
+        async function forceGC() {
+            log("   (Limpando memória...)", 'warn');
+            try {
+                let a = [];
+                for(let i=0; i<100; i++) a.push(new Uint8Array(1024 * 1024)); // 100MB lixo
+                a = null;
+            } catch(e) {}
+            await sleep(500); // Pausa para o sistema respirar
+        }
+
+        async function runSafeAnalysis() {
+            document.getElementById('log').innerHTML = "Iniciando...\n";
+            
+            // --- TESTE 1: BLOCOS CONTÍGUOS (Large Heap) ---
+            log("--- TESTE 1: Limite de Alocação Única ---");
+            // Testamos marcos seguros em vez de loop infinito
+            const sizes = [64, 128, 256, 512, 800]; // MB
+            let maxSafe = 0;
+
+            for (let mb of sizes) {
+                await sleep(100);
+                try {
+                    log(`Tentando alocar ${mb} MB...`);
+                    let ab = new ArrayBuffer(mb * 1024 * 1024);
+                    maxSafe = mb;
+                    
+                    // Verifica se realmente alocou
+                    if (ab.byteLength === (mb * 1024 * 1024)) {
+                        log(`OK: ${mb} MB alocado com sucesso.`);
+                    }
+                    ab = null; // Libera
+                    
+                } catch(e) {
+                    log(`FALHA: Não foi possível alocar ${mb} MB. Limite atingido.`, 'fail');
+                    break; // Para o teste aqui, não insiste
+                }
+                await forceGC();
+            }
+            log(`>> Conclusão Teste 1: Máximo Contíguo ~${maxSafe} MB`, 'highlight');
+
+
+            // --- TESTE 2: VELOCIDADE DE ALOCAÇÃO (IsoHeap) ---
+            log("\n--- TESTE 2: Performance de Alocação (IsoHeap) ---");
+            await sleep(500);
+            
+            let count = 20000; // Reduzido de 50k para 20k para segurança
             let smallBuffers = [];
             let t0 = performance.now();
-            try {
-                for(let i=0; i<50000; i++) {
-                    smallBuffers.push(new Uint8Array(128));
-                }
-            } catch(e) {}
-            let t1 = performance.now();
-            log(`Tempo para 50k alocações pequenas: ${(t1-t0).toFixed(2)}ms`);
             
-            if (t1-t0 < 100) {
-                log(">> ALOCAÇÃO RÁPIDA: Indica fastMalloc/BumpPointer (Bom para exploração)", 'highlight');
-            } else {
-                log(">> ALOCAÇÃO LENTA: Indica Allocator complexo/Seguro (Difícil exploração)", 'warn');
-            }
-
-            // TESTE 3: Detecção de Compressão de Ponteiros (Inferência)
-            // Aloca um array gigante de objetos. Se estourar a memória rápido,
-            // os ponteiros são 64-bit. Se demorar, são 32-bit (Comprimidos).
-            log("--- Teste 3: Pointer Compression Check ---");
-            let ptrArr = [];
-            let count = 0;
             try {
-                // Tenta alocar 5 milhões de referências
-                for(let i=0; i<5000000; i++) {
-                    ptrArr.push({});
-                    count++;
+                for(let i=0; i<count; i++) {
+                    smallBuffers.push(new Uint8Array(64));
                 }
-                log("Conseguiu alocar 5M objetos sem crash.");
-                log(">> Provavelmente POINTER COMPRESSION ATIVO (32-bit Offsets)", 'highlight');
             } catch(e) {
-                log(`Crashou/OOM em ${count} objetos.`);
-                log(">> Provavelmente 64-BIT POINTERS (Sem compressão)", 'warn');
+                log("Erro durante teste 2 (Memória cheia?)", 'fail');
+            }
+            
+            let t1 = performance.now();
+            let duration = t1 - t0;
+            
+            // Limpeza imediata
+            smallBuffers = null;
+            await forceGC();
+
+            log(`Tempo para ${count} objetos: ${duration.toFixed(2)}ms`);
+            if (duration < 50) {
+                log(">> ALOCAÇÃO MUITO RÁPIDA (Heap Simples/Bump Pointer)", 'highlight');
+            } else {
+                log(">> ALOCAÇÃO LENTA (Heap Seguro/IsoHeap)", 'warn');
             }
 
-            log("--- FIM DA ANÁLISE ---");
+
+            // --- TESTE 3: POINTER COMPRESSION (Inferência) ---
+            log("\n--- TESTE 3: Pointer Compression Check ---");
+            // Se houver compressão, ponteiros são 32-bit (4 bytes).
+            // Se não houver, são 64-bit (8 bytes).
+            // Alocar 2 milhão de objetos:
+            // Com compressão: ~8MB de ponteiros + Overhead.
+            // Sem compressão: ~16MB de ponteiros + Overhead.
+            
+            await sleep(500);
+            let ptrArr = [];
+            let ptrCount = 0;
+            const SAFE_LIMIT = 2000000; // 2 Milhões (Seguro)
+
+            t0 = performance.now();
+            try {
+                for(let i=0; i<SAFE_LIMIT; i++) {
+                    ptrArr.push({}); // Objeto vazio
+                    ptrCount++;
+                    // Checagem a cada 100k para não travar UI
+                    if (i % 200000 === 0) await sleep(10); 
+                }
+                log(`Sucesso: ${ptrCount} objetos alocados.`);
+                log(">> O sistema aguentou a carga sem crash.", 'highlight');
+                
+            } catch(e) {
+                log(`OOM atingido em ${ptrCount} objetos.`, 'fail');
+                log(">> O sistema ficou sem memória rapidamente (Indício de 64-bit Pointers).", 'warn');
+            }
+            
+            // Limpeza Final
+            ptrArr = null;
+            await forceGC();
+
+            log("\n--- ANÁLISE CONCLUÍDA ---");
         }
     </script>
 </body>
