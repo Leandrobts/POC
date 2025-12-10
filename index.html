@@ -1,98 +1,91 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>VTable Hunter (ELF Analyzer)</title>
+    <title>Memory Layout Fingerprinter</title>
     <style>
-        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
-        #drop { border: 2px dashed #444; padding: 40px; text-align: center; cursor: pointer; }
-        #log { margin-top: 20px; white-space: pre-wrap; color: cyan; }
-        .success { color: #0f0; font-weight: bold; font-size: 1.2em; }
+        body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 20px; }
+        #log { border: 1px solid #30363d; padding: 10px; height: 400px; overflow-y: auto; background: #010409; }
+        .highlight { color: #58a6ff; font-weight: bold; }
+        .warn { color: #d29922; }
     </style>
 </head>
 <body>
-    <h2>VTable Hunter (HTMLTextAreaElement)</h2>
-    <div id="drop" onclick="document.getElementById('file').click()">
-        Arraste libSceNKWebKit.sprx aqui
-        <input type="file" id="file" style="display:none">
-    </div>
-    <div id="log">Aguardando arquivo...</div>
+    <h2>Memory Layout Fingerprinter</h2>
+    <p>Analisando limites de alocação para inferir Heap Layout.</p>
+    <button onclick="startFingerprint()" style="padding:15px; font-size:18px; cursor:pointer;">INICIAR ANÁLISE</button>
+    <div id="log"></div>
 
     <script>
-        document.getElementById('file').addEventListener('change', processFile);
-        document.getElementById('drop').addEventListener('dragover', e => e.preventDefault());
-        document.getElementById('drop').addEventListener('drop', e => {
-            e.preventDefault();
-            processFile({target: {files: e.dataTransfer.files}});
-        });
-
-        function log(msg, type) {
+        function log(msg, type='') {
             const el = document.getElementById('log');
-            if (type === 'success') msg = `\n>>> ${msg} <<<\n`;
-            el.innerText += msg + "\n";
+            el.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        function processFile(e) {
-            const f = e.target.files[0];
-            if (!f) return;
-            log(`Carregando ${f.name} (${f.size} bytes)...`);
+        async function startFingerprint() {
+            log("Iniciando Mapeamento de Limites...", 'highlight');
             
-            const reader = new FileReader();
-            reader.onload = (evt) => scanForVTable(new Uint8Array(evt.target.result));
-            reader.readAsArrayBuffer(f);
-        }
-
-        function scanForVTable(bytes) {
-            log("Iniciando busca heurística por HTMLTextAreaElement...");
-
-            // 1. Procurar a string "HTMLTextAreaElement"
-            const searchStr = "HTMLTextAreaElement";
-            let nameOffset = -1;
+            // TESTE 1: Limite de ArrayBuffer (Large Heap)
+            // Tenta achar o maior bloco contíguo permitido.
+            let size = 1024 * 1024 * 10; // Começa com 10MB
+            let maxBuffer = 0;
             
-            for (let i = 0; i < bytes.length - searchStr.length; i++) {
-                let match = true;
-                for (let j = 0; j < searchStr.length; j++) {
-                    if (bytes[i+j] !== searchStr.charCodeAt(j)) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match && bytes[i + searchStr.length] === 0) { // Null terminated
-                    nameOffset = i;
+            log("--- Teste 1: Limite de ArrayBuffer ---");
+            while(true) {
+                try {
+                    let ab = new ArrayBuffer(size);
+                    maxBuffer = size;
+                    size += 1024 * 1024 * 10; // +10MB
+                    // Limpa para não dar OOM falso
+                    ab = null; 
+                    if (size > 1024 * 1024 * 2048) break; // Limite segurança 2GB
+                } catch(e) {
                     break;
                 }
+                await new Promise(r => setTimeout(r, 10));
+            }
+            log(`Maior ArrayBuffer único permitido: ${(maxBuffer / 1024 / 1024).toFixed(2)} MB`, 'highlight');
+
+            // TESTE 2: Densidade de Alocação (Fragmentação)
+            // Tenta alocar muitos pequenos buffers para ver se o sistema prefere
+            // juntá-los ou espalhá-los (IsoHeap Check).
+            log("--- Teste 2: Densidade (IsoHeap Behavior) ---");
+            let smallBuffers = [];
+            let t0 = performance.now();
+            try {
+                for(let i=0; i<50000; i++) {
+                    smallBuffers.push(new Uint8Array(128));
+                }
+            } catch(e) {}
+            let t1 = performance.now();
+            log(`Tempo para 50k alocações pequenas: ${(t1-t0).toFixed(2)}ms`);
+            
+            if (t1-t0 < 100) {
+                log(">> ALOCAÇÃO RÁPIDA: Indica fastMalloc/BumpPointer (Bom para exploração)", 'highlight');
+            } else {
+                log(">> ALOCAÇÃO LENTA: Indica Allocator complexo/Seguro (Difícil exploração)", 'warn');
             }
 
-            if (nameOffset === -1) {
-                log("FALHA: String 'HTMLTextAreaElement' não encontrada.");
-                return;
+            // TESTE 3: Detecção de Compressão de Ponteiros (Inferência)
+            // Aloca um array gigante de objetos. Se estourar a memória rápido,
+            // os ponteiros são 64-bit. Se demorar, são 32-bit (Comprimidos).
+            log("--- Teste 3: Pointer Compression Check ---");
+            let ptrArr = [];
+            let count = 0;
+            try {
+                // Tenta alocar 5 milhões de referências
+                for(let i=0; i<5000000; i++) {
+                    ptrArr.push({});
+                    count++;
+                }
+                log("Conseguiu alocar 5M objetos sem crash.");
+                log(">> Provavelmente POINTER COMPRESSION ATIVO (32-bit Offsets)", 'highlight');
+            } catch(e) {
+                log(`Crashou/OOM em ${count} objetos.`);
+                log(">> Provavelmente 64-BIT POINTERS (Sem compressão)", 'warn');
             }
-            log(`String encontrada em: 0x${nameOffset.toString(16)}`);
 
-            // 2. Procurar referências a essa string (Isso nos leva ao RTTI TypeDescriptor)
-            // Em 64-bit, procuramos pelo offset (Little Endian)
-            // Nota: Em PIE/ELF modernos, referências podem ser relativas, mas vamos tentar absolutas ou diretas primeiro.
-            
-            log("Buscando referências à string (RTTI)...");
-            // Esta parte é difícil em JS puro sem desmontador completo, 
-            // mas vamos tentar achar o endereço físico no arquivo.
-            
-            // DICA: Se não acharmos via script, usaremos o placeholder.
-            // Mas tente rodar. Se aparecer "Possível VTable", é vitória.
-            
-            // Simulando busca de ponteiro de 8 bytes
-            // Devido à complexidade de relocação ELF via JS, vamos procurar 
-            // padrões de VTable comuns perto da seção .data.rel.ro
-            
-            // Pattern comum de VTable no WebKit PS4:
-            // [00 00 00 00 00 00 00 00] (Offset to top)
-            // [PTR RTTI]
-            // [PTR Destructor]
-            // [PTR Function...]
-            
-            log("A busca profunda requer análise de relocação complexa.");
-            log("Para o Exploit, se o script JS falhar, o offset padrão 0x2E73C18 (9.00) é o melhor chute inicial.");
-            log("Recomendação: Continue focando em obter RCE (Tela Verde).");
-            log("Assim que tivermos RCE, leremos o VTable direto da RAM, que é 100% preciso.");
+            log("--- FIM DA ANÁLISE ---");
         }
     </script>
 </body>
