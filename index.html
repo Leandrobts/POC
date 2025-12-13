@@ -2,266 +2,289 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Deep Info Leak Suite v28000</title>
+<title>PS4 Real Info Leak Suite v29000</title>
+<style>
+    body { background: #000; color: #0f0; font-family: 'Courier New', monospace; }
+    button { 
+        width: 100%; padding: 15px; margin-bottom: 5px; 
+        background: #002200; color: #0f0; border: 1px solid #0f0; 
+        cursor: pointer; font-weight: bold; text-align: left;
+    }
+    button:hover { background: #004400; color: #fff; }
+    #log { 
+        border: 2px solid #0f0; height: 400px; overflow: auto; 
+        white-space: pre-wrap; font-size: 12px; padding: 10px; 
+        background: #050505; color: #ccc;
+    }
+    .success { color: #00ff00; font-weight: bold; background: #001100; border: 1px solid #0f0; padding: 2px; }
+    .potential { color: #ffff00; font-weight: bold; }
+</style>
 </head>
 <body>
 
-<h1>SUITE V28000: DEEP MEMORY LEAK (JSON TARGETED)</h1>
-<p>Target: Kernel Base (0xffffffff82200000) & VTable Pointers</p>
+<h1>SUITE V29000: REAL INFO LEAK (NO SIMULATION)</h1>
+<p>Target: WebKit Heap & Stack Pointers. Mode: Passive/Read-Only.</p>
 <hr>
 
-<button onclick="leakStringLegacy()">01. String.link() Attribute Confusion (Stack Leak)</button>
+<button onclick="leakArrayReverse()">01. Array.reverse() Sparse Array Backing Store Leak</button>
 
-<button onclick="leakPropGC()">02. Computed Property Key GC Side-Effect (Heap Pointer)</button>
+<button onclick="leakJSONReviver()">02. JSON.parse() Reviver Function Side-Effect Leak</button>
 
-<button onclick="leakFunctionCaller()">03. Function.caller/arguments Stack Walk Leak</button>
+<button onclick="leakSubarray()">03. TypedArray.subarray() Constructor Species Race</button>
 
-<button onclick="leakObjectAssign()">04. Object.assign Target Resize Race (OOB Read)</button>
+<button onclick="leakBindScope()">04. Function.bind() Scope Chain Pointer Leak</button>
 
-<button onclick="leakLastIndexOf()">05. Array.lastIndexOf with Proxy & Resize</button>
+<button onclick="leakProtoPollution()">05. __proto__ Setter Return Value Check</button>
 
-<button onclick="leakURIError()">06. decodeURI Malformed Sequence Error Message Leak</button>
+<button onclick="leakRegExpReplace()">06. String.replace() RegExp LastMatch Overread</button>
 
-<button onclick="leakWeakMap()">07. WeakMap Key Survival (Dangling Pointer Check)</button>
+<button onclick="leakSpliceCount()">07. Array.splice() Large Delete Count Integer Overflow</button>
 
-<button onclick="leakXMLSerializer()">08. XMLSerializer Recursive Mutation Leak</button>
+<button onclick="leakReflectConstruct()">08. Reflect.construct() Target Proxy Trap Leak</button>
 
-<button onclick="leakProtoTransition()">09. __proto__ Transition StructureID Leak</button>
+<button onclick="leakErrorCycle()">09. Error.cause Cyclic Reference Stack Dump</button>
 
-<button onclick="leakNumberToString()">10. Large Number.toString(radix) Buffer Leak</button>
+<button onclick="leakMathPow()">10. Math.pow() Huge Exponent Buffer Residue</button>
 
-<div id="log" style="background: #0d0d0d; color: #00ff00; border: 1px solid #333; height: 400px; overflow: auto; white-space: pre-wrap; font-family: 'Consolas', monospace; font-size: 11px; padding: 10px;"></div>
+<div id="log">Logs will appear here...</div>
 
 <script>
     const LOG = document.getElementById('log');
     
-    function log(msg) {
-        LOG.innerText += `\n[${new Date().toLocaleTimeString()}] ${msg}`;
+    function log(msg, type = 'normal') {
+        const line = document.createElement('div');
+        line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        if (type === 'success') line.className = 'success';
+        if (type === 'potential') line.className = 'potential';
+        LOG.appendChild(line);
         LOG.scrollTop = LOG.scrollHeight;
     }
 
-    function checkPtr(val, source) {
-        if (typeof val === 'string' && (val.indexOf('0x') > -1 || val.indexOf('ffff') > -1)) {
-            log(`[!!!] STRING POINTER (${source}): ${val}`);
-        } else if (typeof val === 'number') {
-            // Checa se parece um ponteiro Userland (pequeno) ou Kernel (negativo/grande)
-            if (val > 0x100000 || val < -0x10000) {
-                log(`[!!!] NUMERIC POINTER (${source}): 0x${val.toString(16)}`);
+    // Função de Análise de Resultados Reais
+    function analyze(val, source) {
+        if (typeof val === 'number') {
+            // Endereços de memória no PS4 são 64-bit.
+            // Podem aparecer como floats grandes ou ints negativos (se interpretados como 32-bit signed).
+            if ((val > 0x100000 && val < 0x1FFFFFFFFFFFFF) || val < -0x10000) {
+                log(`[SUCCESS] ${source} LEAKED POINTER: 0x${Math.abs(val).toString(16)}`, 'success');
+                return;
             }
         }
+        if (typeof val === 'string') {
+            // Procura padrões hexadecimais de 8 ou mais dígitos
+            if (/0x[0-9a-fA-F]{8,}/.test(val)) {
+                log(`[SUCCESS] ${source} LEAKED HEX: ${val}`, 'success');
+                return;
+            }
+        }
+        log(`[Clean] ${source}: ${val} (${typeof val})`);
     }
 
-    // 01. Legacy String Method Leak
-    // Alvo: Métodos HTML antigos de String (anchor, link, fontcolor).
-    // Eles constroem strings na stack C++. Se passarmos objetos com toString() maliciosos,
-    // podemos ler lixo da stack adjacente.
-    function leakStringLegacy() {
-        const s = "leak";
-        const evil = {
-            toString: () => {
-                // Cria pressão na stack
-                const arr = new Uint32Array(100).fill(0xDEADBEEF);
-                return "";
+    // 01. Array.reverse() Sparse Array Backing Store Leak
+    // Alvo: Arrays esparsos (com buracos). 
+    // O algoritmo de reverse pode ler memória não inicializada nos buracos.
+    function leakArrayReverse() {
+        const arr = [1];
+        arr.length = 1000; // Cria buraco gigante
+        arr.reverse();
+        
+        // Verifica se algum buraco foi preenchido com dados
+        let leaked = undefined;
+        for(let i=0; i<arr.length; i++) {
+            if (arr[i] !== undefined && arr[i] !== 1) {
+                leaked = arr[i];
+                break;
             }
-        };
-        try {
-            // Gera <a href="...">leak</a>
-            const res = s.link(evil);
-            // Verifica se vazou algo no atributo
-            if (res.includes("DEAD") || res.length > 100) {
-                log("Legacy String Leak: " + res.substring(0, 50) + "...");
-            } else {
-                log("Legacy String: Safe");
-            }
-        } catch(e) {}
+        }
+        
+        if (leaked !== undefined) analyze(leaked, "Array Reverse");
+        else log("[Clean] Array Reverse Safe");
     }
 
-    // 02. Computed Property Key GC Side-Effect (Heap Pointer)
-    // Alvo: Definição de objetos literais.
-    // O JSC avalia as chaves. Se o GC rodar no meio, a chave anterior pode ter sido movida ou liberada.
-    function leakPropGC() {
+    // 02. JSON.parse() Reviver Function Side-Effect Leak
+    // Alvo: Modificar o objeto enquanto ele está sendo parseado.
+    function leakJSONReviver() {
+        const json = '{"a": 1, "b": 2, "c": 3}';
         let val = 0;
-        const obj = {
-            [new String("key")]: 1,
-            get [(() => {
-                // Força GC massivo durante a definição da chave
-                const trash = [];
-                for(let i=0; i<5000; i++) trash.push({a:i});
-                return "leak";
-            })()]() { return 2; }
-        };
         
-        // Itera para ver se alguma chave virou lixo/ponteiro
-        const keys = Reflect.ownKeys(obj);
-        keys.forEach(k => {
-            if (typeof k !== 'string' || k.length > 10) {
-                checkPtr(k, "Prop Key GC");
+        const res = JSON.parse(json, (key, value) => {
+            if (key === 'b') {
+                // Side-effect: Tenta acessar 'this' (o objeto sendo construído)
+                // e deletar propriedades futuras para ler além do buffer.
+                delete this.c; 
+                // Retorna algo que pode ser confundido com ponteiro
+                return 0x41414141; 
             }
+            return value;
         });
-        log("Prop GC check complete.");
+        
+        // Se 'c' foi lido de memória liberada, pode conter lixo
+        if (res.c !== undefined) analyze(res.c, "JSON Reviver");
+        else log("[Clean] JSON Reviver Safe");
     }
 
-    // 03. Function.caller/arguments Stack Walk Leak
-    // Alvo: Stack Walker do WebKit.
-    // Tenta acessar 'caller' em modo estrito/não-estrito misturado para confundir o walker
-    // e ler o ponteiro do frame de pilha anterior.
-    function leakFunctionCaller() {
-        function inner() {
-            try {
-                // caller é proibido em strict mode, mas se a implementação falhar...
-                const c = inner.caller;
-                if (c) checkPtr(c, "Function.caller");
-                
-                // arguments.callee também
-                const args = arguments.callee;
-                checkPtr(args, "arguments.callee");
-            } catch(e) {
-                // O erro pode conter o endereço da função na stack
-                checkPtr(e.message, "Caller Error");
+    // 03. TypedArray.subarray() Constructor Species Race
+    // Alvo: Usar Symbol.species para enganar o construtor do subarray.
+    function leakSubarray() {
+        class LeakyArray extends Uint32Array {
+            static get [Symbol.species]() {
+                return function(len) {
+                    // Retorna um array menor que o solicitado?
+                    // Ou retorna um array já "sujo"?
+                    const a = new Uint32Array(len);
+                    a[0] = 0xDEADBEEF; // Marcador
+                    return a;
+                }
             }
         }
-        function outer() { inner(); }
-        outer();
+        
+        const original = new LeakyArray(10);
+        original.fill(0);
+        
+        // Subarray chama o construtor falso
+        const sub = original.subarray(0, 5);
+        
+        // Se a implementação nativa copiar dados para o buffer "sujo" sem limpar...
+        analyze(sub[0], "Subarray Species");
     }
 
-    // 04. Object.assign Target Resize Race (OOB Read)
-    // Alvo: Object.assign loop interno.
-    // Usamos um Proxy no 'source' para deletar propriedades do 'target' durante a cópia.
-    function leakObjectAssign() {
-        const target = { a: 1, b: 2, c: 3 };
-        const source = new Proxy({ a: 10, b: 20 }, {
-            ownKeys(t) { return ['a', 'b', 'c']; },
-            get(t, p) {
-                if (p === 'b') {
-                    // Shrink target
-                    delete target.b;
-                    delete target.c;
-                    // Tenta fazer o assign ler memória desalocada do target
-                }
-                return 0x41414141;
+    // 04. Function.bind() Scope Chain Pointer Leak
+    // Alvo: Objetos de escopo interno.
+    function leakBindScope() {
+        const target = function() {};
+        const bound = target.bind({
+            toString: () => {
+                // Tenta inspecionar 'arguments.caller' durante o bind
+                // (Geralmente restrito, mas em crashes antigos vazava)
+                return "marker";
             }
         });
         
         try {
-            Object.assign(target, source);
-            // Verifica se target tem propriedades fantasma
-            log("Assign Result: " + JSON.stringify(target));
-        } catch(e) {}
+            // Tenta forçar a conversão do objeto bound para string/número
+            // esperando vazar o ponteiro do escopo interno
+            const str = "Val: " + bound;
+            analyze(str, "Bind Scope");
+        } catch(e) { log("Bind Scope Safe"); }
     }
 
-    // 05. Array.lastIndexOf with Proxy & Resize
-    // Alvo: Algoritmo de busca reversa em Arrays.
-    function leakLastIndexOf() {
+    // 05. Object Prototype Pollution Read
+    // Alvo: Ler propriedades herdadas inesperadas.
+    function leakProtoPollution() {
+        const o = {};
+        // Tenta ler __proto__ como numérico
+        const p = o.__proto__;
+        
+        // Em alguns exploits, substituir o proto retorna o ponteiro antigo
+        try {
+            const old = Object.setPrototypeOf(o, null);
+            if (old && old !== o) {
+                // Se retornou algo que não é o objeto nem null
+                analyze(old.toString(), "Proto Set");
+            } else {
+                log("[Clean] Proto Set Safe");
+            }
+        } catch(e) { log("Proto Error"); }
+    }
+
+    // 06. String.replace() RegExp LastMatch Overread
+    // Alvo: Buffer interno de RegExp (RegExpStatics).
+    function leakRegExpReplace() {
+        const str = "A".repeat(1000);
+        const re = /A/g;
+        
+        // Executa match
+        re.exec(str);
+        
+        // Tenta ler propriedades estáticas que apontam para o buffer da string
+        // RegExp.input, RegExp.lastMatch, etc.
+        const input = RegExp.input;
+        
+        // Se a string foi liberada mas RegExp mantém referência...
+        if (input.length > 1000 || input.charCodeAt(0) !== 65) {
+            analyze(input, "RegExp Input UAF");
+        } else {
+            log("[Clean] RegExp Input Safe");
+        }
+    }
+
+    // 07. Array.splice() Large Delete Count Integer Overflow
+    // Alvo: Corrupção de Heap via cálculo de tamanho incorreto.
+    function leakSpliceCount() {
         const arr = [1, 2, 3, 4];
-        const p = new Proxy(arr, {
-            get(t, k) {
-                if (k == "length") {
-                    // Retorna tamanho maior para ler OOB
-                    return 100;
-                }
-                return t[k];
+        try {
+            // Delete count maior que tamanho, ou perto de MAX_INT
+            const res = arr.splice(0, 0x7FFFFFFF);
+            // Se retornar um array gigante, vazou memória
+            if (res.length > 4) {
+                analyze(res[5], "Splice Overflow");
+            } else {
+                log("[Clean] Splice Limit Check OK");
+            }
+        } catch(e) { log("Splice Error (Safe)"); }
+    }
+
+    // 08. Reflect.construct() Target Proxy Trap Leak
+    // Alvo: Proxy 'construct' trap retornando objeto não nativo.
+    function leakReflectConstruct() {
+        const P = new Proxy(function(){}, {
+            construct(target, args, newTarget) {
+                // Retorna um objeto que imita um array buffer mas não é
+                return { 
+                    buffer: 0x1337, 
+                    byteLength: 0xFFFFFFFF 
+                };
             }
         });
         
         try {
-            // lastIndexOf lê de trás para frente. Se confiar no length do proxy...
-            const res = Array.prototype.lastIndexOf.call(p, 4);
-            log("LastIndexOf: " + res);
-        } catch(e) { log("LastIndexOf safe"); }
+            const o = Reflect.construct(Uint8Array, [], P);
+            // Se Uint8Array aceitar o objeto falso como 'this', podemos ler memória
+            analyze(o.length, "Reflect Construct");
+        } catch(e) { log("Reflect Error (Safe)"); }
     }
 
-    // 06. decodeURI Malformed Sequence Error Message Leak
-    // Alvo: Manipulação de strings de erro.
-    function leakURIError() {
+    // 09. Error.cause Cyclic Reference Stack Dump
+    // Alvo: Serialização de erros com causas cíclicas.
+    function leakErrorCycle() {
+        const errA = new Error("A");
+        const errB = new Error("B");
+        errA.cause = errB;
+        errB.cause = errA; // Ciclo
+        
         try {
-            // Sequência UTF-8 inválida que força erro no parser URI
-            decodeURI("%E0%A4%A"); 
+            // Força conversão para string, que pode tentar desenrolar o ciclo
+            // e vazar ponteiros de recursão
+            const s = errA.toString();
+            log("[Clean] Error Cycle Handled");
         } catch(e) {
-            // Verifica se a mensagem de erro contém o hex do byte inválido ou endereço
-            // ex: "URI malformed at address 0x..."
-            if (e.message.includes("0x")) {
-                checkPtr(e.message, "URI Error");
+            // Erros de "Maximum call stack" às vezes vazam endereços no stack trace
+            if (e.stack.includes("0x")) {
+                analyze(e.stack, "Error Cycle Stack");
             } else {
-                log("URI Error message clean.");
+                log("Error Cycle: Safe");
             }
         }
     }
 
-    // 07. WeakMap Key Survival (Dangling Pointer Check)
-    // Alvo: Garbage Collector.
-    // Verifica se conseguimos manter uma referência fraca viva mais tempo que o objeto.
-    function leakWeakMap() {
-        let key = { id: 1 };
-        const wm = new WeakMap();
-        wm.set(key, 123);
+    // 10. Math.pow() Huge Exponent Buffer Residue
+    // Alvo: Biblioteca de números grandes (BigInt ou Double).
+    function leakMathPow() {
+        // Exponenciação que resulta em Infinity ou NaN, mas força cálculo interno
+        const res = Math.pow(1.0000001, 1e9); 
         
-        // Remove referência forte
-        const ptr = key; // Mantém ref para teste
-        key = null;
+        // Checa se o resultado "sujou" a memória de ponto flutuante
+        const f64 = new Float64Array(1);
+        f64[0] = res;
+        const u32 = new Uint32Array(f64.buffer);
         
-        // Tenta GC
-        const junk = new Array(10000).fill(1);
-        
-        // Se ainda estiver lá, o GC não coletou (ok).
-        // Se conseguirmos acessar propriedades de 'ptr' e der erro de acesso, é UAF.
-        if (wm.has(ptr)) {
-            log("WeakMap key still alive (Expected).");
+        // Infinity é 0x7FF0000000000000. Qualquer outra coisa estranha é interessante.
+        if (u32[1] !== 0x7FF00000 && u32[1] !== 0) {
+             // Parte alta do double
+             analyze(u32[1], "Math.pow High Bits");
+        } else {
+            log("[Clean] Math.pow Result Safe");
         }
-    }
-
-    // 08. XMLSerializer Recursive Mutation Leak
-    // Alvo: Serializador de árvore DOM.
-    function leakXMLSerializer() {
-        const xs = new XMLSerializer();
-        const root = document.createElement("div");
-        
-        // Getter que altera o DOM durante a serialização
-        Object.defineProperty(root, "id", {
-            get: () => {
-                root.innerHTML = "<span>changed</span>";
-                return "test";
-            }
-        });
-        
-        try {
-            const s = xs.serializeToString(root);
-            // Se o serializador mantiver ponteiros para os filhos antigos...
-            if (s.includes("span")) log("XMLSerializer mutated correctly.");
-            else log("XMLSerializer: " + s);
-        } catch(e) {}
-    }
-
-    // 09. __proto__ Transition StructureID Leak
-    // Alvo: JSC Structure ID.
-    function leakProtoTransition() {
-        const o = { a: 1 };
-        // Mudança de protótipo altera drasticamente a estrutura do objeto na memória
-        const oldProto = o.__proto__;
-        o.__proto__ = null;
-        
-        // Tenta ler propriedade oculta ou padding
-        try {
-            const leak = o[0]; // Indexed access on non-array
-            if (leak !== undefined) checkPtr(leak, "Proto Transition");
-            else log("Proto transition safe.");
-        } catch(e) {}
-    }
-
-    // 10. Large Number.toString(radix) Buffer Leak
-    // Alvo: Conversão de número para string com radix exótico (ex: 36).
-    // Pode usar buffers estáticos no heap C++.
-    function leakNumberToString() {
-        // Número que gera string longa
-        const num = 1.1e100;
-        try {
-            const s = num.toString(36);
-            // Verifica se há lixo no final da string
-            if (s.length > 100 && /[^0-9a-z]/.test(s)) {
-                checkPtr(s, "Number toString");
-            } else {
-                log("Number toString safe.");
-            }
-        } catch(e) {}
     }
 
 </script>
