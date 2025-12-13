@@ -1,246 +1,60 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-<meta charset="UTF-8">
-<title>PS4 Deep State Leak v35000</title>
-<style>
-    body { background: #020202; color: #bbb; font-family: 'Consolas', monospace; padding: 20px; }
-    h1 { color: #fff; border-bottom: 2px solid #444; text-transform: uppercase; font-size: 18px; padding-bottom: 10px; }
-    button { 
-        width: 100%; padding: 15px; margin-bottom: 10px; 
-        background: #111; color: #00ff00; border: 1px solid #222; 
-        cursor: pointer; text-align: left; font-weight: bold; font-size: 12px;
-        transition: all 0.2s;
-    }
-    button:hover { background: #222; border-color: #00ff00; padding-left: 20px; }
-    #log { 
-        border: 1px solid #333; height: 350px; overflow-y: scroll; 
-        background: #000; padding: 15px; margin-top: 15px; 
-        white-space: pre-wrap; font-size: 11px;
-    }
-    .clean { color: #555; }
-    .success { 
-        color: #000; background-color: #00ff00; 
-        font-weight: 900; border: 3px solid #fff; padding: 5px; 
-        box-shadow: 0 0 10px #00ff00; display: block;
-    }
-    .ptr { color: #00ffff; font-weight: bold; }
-</style>
+<meta charset="UTF-8" />
+<title>PS4 WebKit – JSON.stringify Replacer Mutation Test</title>
+
 </head>
 <body>
 
-<h1>SUITE V35000: DEEP STATE LEAK (TYPE CONFUSION)</h1>
-<p>Method: Dynamic Type Mutation during Native Iteration.</p>
+<h1>JSON.stringify – Replacer Mutation (Isolated)</h1>
+<p>Objetivo: verificar comportamento inconsistente quando o <code>replacer</code> (array) é mutado via <code>Proxy</code> durante a serialização.</p>
 
-<button onclick="testMathTypeConfusion()">01. Math.min/max Type Confusion (Int -> Double Read)</button>
-
-<button onclick="testIteratorDetach()">02. TypedArray.from Buffer Detach (Use-After-Free Read)</button>
-
-<button onclick="testConcatSpreadable()">03. Array.concat Symbol.isConcatSpreadable Resize</button>
-
-<button onclick="testSparseConversion()">04. Sparse Array -> TypedArray Construction (Hole Leak)</button>
-
-<button onclick="testRegExpResidue()">05. RegExp.lastMatch Buffer Residue Scan</button>
-
-<div id="log">System Ready. Waiting for trigger...</div>
+<button onclick="runTest()">Executar teste</button>
+<div id="log">Aguardando execução…</div>
 
 <script>
-    const LOG = document.getElementById('log');
+  const LOG = document.getElementById('log');
+  function log(msg, cls='ok') {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
+    LOG.appendChild(d);
+    LOG.scrollTop = LOG.scrollHeight;
+  }
 
-    function log(msg, type = 'clean') {
-        const div = document.createElement('div');
-        div.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
-        div.className = type;
-        LOG.appendChild(div);
-        LOG.scrollTop = LOG.scrollHeight;
-    }
+  function runTest() {
+    LOG.textContent = '';
+    log('Iniciando JSON.stringify com replacer mutável…');
 
-    // Analisador de Leitura de Memória (Forensics)
-    function inspect(val, context) {
-        if (val === undefined || val === null) {
-            log(`${context}: Undefined/Null (Clean)`);
-            return;
+    const target = { a: 1, b: 2, c: 3 };
+    const replacer = [0, 1, 2];
+
+    // Proxy intercepta leitura dos índices do replacer
+    const p = new Proxy(replacer, {
+      get(t, k) {
+        if (k === '1') {
+          // Mutação estrutural DURANTE a serialização
+          t.length = 0;
         }
+        return Reflect.get(t, k);
+      }
+    });
 
-        if (typeof val === 'number') {
-            if (Number.isInteger(val)) {
-                // Ponteiros Userland geralmente > 0x10000
-                // Ponteiros Kernel (signed) < -0x10000
-                if (Math.abs(val) > 0x10000) {
-                    log(`[SUCCESS] ${context} LEAKED INT PTR: 0x${Math.abs(val).toString(16)}`, 'success');
-                } else {
-                    log(`${context}: Integer ${val} (Clean)`);
-                }
-            } else {
-                // Float Analysis: Ponteiros mascarados de floats
-                if (isNaN(val)) {
-                    log(`[SUCCESS] ${context} LEAKED NaN (Potential Pointer)`, 'success');
-                } else if (!Number.isFinite(val)) {
-                    log(`${context}: Infinity (Clean)`);
-                } else {
-                    // Floats muito pequenos (denormais) costumam ser ponteiros
-                    if (Math.abs(val) < 1e-100 && val !== 0) {
-                        log(`[SUCCESS] ${context} LEAKED DENORMAL FLOAT: ${val}`, 'success');
-                        // Tenta extrair raw bytes
-                        const buf = new ArrayBuffer(8);
-                        new Float64Array(buf)[0] = val;
-                        const u32 = new Uint32Array(buf);
-                        log(`    -> Raw Hex: 0x${u32[1].toString(16)}${u32[0].toString(16)}`, 'ptr');
-                    } else {
-                        log(`${context}: Float ${val} (Clean)`);
-                    }
-                }
-            }
-            return;
-        }
+    try {
+      const json = JSON.stringify(target, p);
+      log('Resultado JSON: ' + json);
 
-        if (typeof val === 'string') {
-            if (/[\x00-\x08\x0E-\x1F]/.test(val)) {
-                log(`[SUCCESS] ${context} LEAKED BINARY STRING (Len: ${val.length})`, 'success');
-            } else {
-                log(`${context}: String "${val.substring(0,20)}..." (Clean)`);
-            }
-        }
+      // Detecção de anomalia semântica (não é OOB / não é info leak)
+      if (json.includes('undefined') || json.length < 5) {
+        log('Anomalia de comportamento detectada (inconsistência de serialização).', 'bad');
+      } else {
+        log('Comportamento consistente com a especificação.', 'warn');
+      }
+    } catch (e) {
+      log('Exceção lançada: ' + e.message, 'warn');
     }
-
-    // TESTE 01: Math.min/max Type Confusion
-    // ALVO: Otimização de Arrays (Int32 vs Double).
-    // LÓGICA: Math.min itera sobre o array. No meio, usamos um objeto com valueOf para mudar o tipo do array
-    // de Inteiros para Doubles. O motor pode continuar lendo como se fossem inteiros, lendo lixo.
-    function testMathTypeConfusion() {
-        try {
-            // Array inicial de inteiros (SMI)
-            const arr = [1, 2, 3];
-            const evil = {
-                valueOf: () => {
-                    // MUTATION: Converte o array para Doubles colocando um float
-                    arr[0] = 1.1; 
-                    // E aumenta o tamanho para tentar ler OOB
-                    return 0;
-                }
-            };
-            // O argumento 'evil' é processado no meio.
-            // A engine JSCore pode ter cacheado o ponteiro do array como SMI.
-            const res = Math.min(evil, arr[0]);
-            
-            // Se o resultado for algo que não é 0 nem 1.1, vazou.
-            if (res !== 0 && res !== 1.1 && res !== 1) {
-                inspect(res, "Math TypeConfusion");
-            } else {
-                log("Math TypeConfusion Safe");
-            }
-        } catch(e) { log("Math Safe: " + e.message); }
-    }
-
-    // TESTE 02: TypedArray.from Buffer Detach (UAF)
-    // ALVO: Alocação de TypedArray baseada em iterador.
-    // LÓGICA: TypedArray.from aceita um iterador. Durante a iteração, "desligamos" (detach) o buffer de origem
-    // ou tentamos manipular a memória.
-    function testIteratorDetach() {
-        try {
-            const arr = [1, 2, 3, 4];
-            // Proxy no iterador
-            arr[Symbol.iterator] = function*() {
-                yield 1;
-                // MUTATION: Apaga o conteúdo do array original ou tenta forçar GC
-                arr.length = 0;
-                // Retorna valores marcadores para encher linguiça
-                yield 2; yield 3; yield 4;
-            };
-            
-            // Uint32Array.from aloca memória baseada no length estimado, depois roda o iterador.
-            // Se o length mudar, a alocação pode estar errada?
-            const res = Uint32Array.from(arr);
-            
-            // Verifica se lemos lixo
-            if (res.length > 0 && res[0] !== 1) {
-                inspect(res[0], "Iterator Detach");
-            } else {
-                log("Iterator Detach Safe");
-            }
-        } catch(e) { log("Iterator Error (Safe)"); }
-    }
-
-    // TESTE 03: Array.concat Symbol.isConcatSpreadable Resize
-    // ALVO: Otimização de Concatenação (Flattening).
-    // LÓGICA: Array.concat checa `isConcatSpreadable`. Usamos um getter para mudar o array original
-    // logo antes da cópia.
-    function testConcatSpreadable() {
-        const target = [1, 2];
-        const evil = {
-            length: 1,
-            0: 123,
-            get [Symbol.isConcatSpreadable]() {
-                // MUTATION: Encolhe o array alvo drasticamente
-                target.length = 0; 
-                return true;
-            }
-        };
-        
-        // Concatena target (agora vazio) com evil.
-        // Se a engine já tinha calculado o tamanho total e o offset de memória...
-        const res = target.concat(evil);
-        
-        // Se o resultado contiver dados inesperados no início (onde 'target' deveria estar)
-        if (res.length > 0 && res[0] !== 123 && res[0] !== 1) {
-            inspect(res[0], "Concat Spreadable");
-        } else {
-            log("Concat Spreadable Safe");
-        }
-    }
-
-    // TESTE 04: Sparse Array -> TypedArray Construction (Hole Leak)
-    // ALVO: Conversão de Hole (Empty) para Número.
-    // LÓGICA: Arrays JS podem ter buracos. TypedArrays são contíguos.
-    // A conversão deve tratar buracos como undefined -> 0/NaN.
-    // Implementações rápidas às vezes leem a memória "por baixo" do buraco.
-    function testSparseConversion() {
-        const sparse = [1];
-        sparse.length = 5000; // Buraco grande
-        sparse[4999] = 2;
-        
-        // Converte para Float64Array
-        const f64 = new Float64Array(sparse);
-        
-        // Procura por não-zeros e não-NaNs nos buracos (índice 1 a 4998)
-        let leak = 0;
-        for(let i=1; i<4999; i+=100) { // Amostragem
-            if (f64[i] !== 0 && !isNaN(f64[i])) {
-                leak = f64[i];
-                break;
-            }
-        }
-        
-        if (leak !== 0) inspect(leak, "Sparse Conversion");
-        else log("Sparse Conversion Safe (Zeroed)");
-    }
-
-    // TESTE 05: RegExp.lastMatch Buffer Residue Scan
-    // ALVO: Buffer estático de RegExp global.
-    // LÓGICA: Executamos match numa string grande. Depois tentamos ler `lastMatch` ou `input`
-    // manipulando o RegExp global.
-    function testRegExpResidue() {
-        const large = "A".repeat(1024);
-        const re = /A/;
-        
-        // 1. Popula o buffer
-        re.exec(large);
-        
-        // 2. Tenta "confundir" o buffer estático rodando outra regex pequena
-        const smallRe = /B/;
-        smallRe.exec("B");
-        
-        // 3. Lê propriedade estática global. Ela deveria apontar para 'B' ou ser limpa.
-        // Em casos de erro, ela aponta para o buffer antigo 'large' mas com offset errado, lendo lixo.
-        const leak = RegExp.lastMatch; // ou RegExp['$&']
-        
-        if (leak !== "B" && leak !== "A" && leak !== "") {
-            inspect(leak, "RegExp Residue");
-        } else {
-            log("RegExp Buffer Clean");
-        }
-    }
-
+  }
 </script>
 
 </body>
