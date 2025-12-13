@@ -1,238 +1,249 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>PS4 Deep Analysis Suite v14000</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PS4 Binary ELF Extractor (Non-Blocking)</title>
+    <style>
+        body { background-color: #121212; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; }
+        h1 { border-bottom: 2px solid #00ff00; padding-bottom: 10px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .drop-zone {
+            border: 2px dashed #444; padding: 40px; text-align: center; margin-bottom: 20px;
+            background: #1e1e1e; cursor: pointer; transition: 0.3s;
+        }
+        .drop-zone:hover { border-color: #00ff00; background: #252525; }
+        #log {
+            background: #000; border: 1px solid #333; height: 300px; overflow-y: auto;
+            padding: 10px; font-size: 12px; white-space: pre-wrap; color: #ccc;
+        }
+        button {
+            padding: 15px 30px; background: #004400; color: #fff; border: 1px solid #00ff00;
+            font-weight: bold; cursor: pointer; font-size: 16px; width: 100%; margin-top: 10px;
+        }
+        button:hover { background: #00ff00; color: #000; }
+        .progress-bar { width: 100%; background: #333; height: 20px; margin-bottom: 10px; display: none;}
+        .progress-fill { height: 100%; background: #00ff00; width: 0%; transition: width 0.2s; }
+        .stat-box { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 14px;}
+    </style>
 </head>
 <body>
 
-<h1>SUITE V14000: RESOURCE EXHAUSTION & STACK SMASH</h1>
-<p>Status: Ready. Target: Kernel Stack & Memory Limits.</p>
-<hr>
+<div class="container">
+    <h1>ELF BINARY EXTRACTOR v1.0</h1>
+    <p>Selecione os arquivos <strong>libSceNKWebKit.sprx</strong>, <strong>libkernel.sprx</strong>, etc. O processamento é local.</p>
+    
+    <input type="file" id="fileInput" multiple style="display:none" onchange="handleFiles(this.files)">
+    <div class="drop-zone" onclick="document.getElementById('fileInput').click()">
+        Clique para carregar os arquivos ELF / SPRX (Múltiplos permitidos)
+    </div>
 
-<button onclick="crashSVGUseRecursion()">01. SVG &lt;use&gt; Element Infinite Recursion (Layout Crash)</button>
+    <div class="progress-bar" id="pBar"><div class="progress-fill" id="pFill"></div></div>
+    
+    <div class="stat-box">
+        <span id="status">Aguardando arquivos...</span>
+        <span id="fileCount">0 arquivos</span>
+    </div>
 
-<button onclick="crashCanvasLineDash()">02. Canvas setLineDash Huge Array Buffer Overflow (Driver Panic)</button>
-
-<button onclick="crashXHRHeaderFlood()">03. XMLHttpRequest setRequestHeader Flood (NetStack Panic)</button>
-
-<button onclick="crashDOMSubtreeLoop()">04. DOMSubtreeModified Event Infinite Loop (Stack Exhaustion)</button>
-
-<button onclick="crashArraySpreadBomb()">05. Array Spread Syntax (...) Memory Bomb (OOM)</button>
-
-<button onclick="crashCSSCalcDepth()">06. CSS calc() Deep Nesting Stack Overflow</button>
-
-<button onclick="crashChannelSplitterCount()">07. ChannelSplitterNode Max Channel Overflow (DSP Crash)</button>
-
-<button onclick="crashURLProtocolFuzz()">08. URL Protocol Handler Buffer Overflow</button>
-
-<button onclick="crashTextNodeSplit()">09. TextNode.splitText() Offset Boundary Race</button>
-
-<button onclick="crashRegExpCompile()">10. RegExp Compilation Buffer Overflow (YARR Engine)</button>
-
-<div id="log"></div>
+    <div id="log">Logs de extração aparecerão aqui...</div>
+    
+    <button id="downloadBtn" onclick="downloadJSON()" style="display:none; opacity: 0.5; pointer-events: none;">BAIXAR LOG JSON COMPLETO</button>
+</div>
 
 <script>
+    const LOG = document.getElementById('log');
+    const STATUS = document.getElementById('status');
+    const PFILL = document.getElementById('pFill');
+    const PBAR = document.getElementById('pBar');
+    const DL_BTN = document.getElementById('downloadBtn');
+
+    let extractedData = {
+        meta: { timestamp: new Date().toISOString(), platform: "PS4/Orbis" },
+        binaries: []
+    };
+
     function log(msg) {
-        document.getElementById('log').innerText += "\n" + msg;
+        LOG.innerText += `> ${msg}\n`;
+        LOG.scrollTop = LOG.scrollHeight;
     }
 
-    // 01. SVG Use Recursion
-    // Alvo: WebCore SVG Render Tree
-    // Lógica: O elemento <use> clona elementos. Se <use> apontar para si mesmo
-    // ou criar uma cadeia circular (A->B->A), o motor de renderização entra em loop infinito.
-    function crashSVGUseRecursion() {
-        const svgNS = "http://www.w3.org/2000/svg";
-        const svg = document.createElementNS(svgNS, "svg");
-        
-        const defs = document.createElementNS(svgNS, "defs");
-        const g = document.createElementNS(svgNS, "g");
-        g.id = "crash-cycle";
-        
-        const use = document.createElementNS(svgNS, "use");
-        // Aponta para o pai (g), que contém o próprio use. Ciclo mortal.
-        use.setAttributeNS("http://www.w3.org/1999/xlink", "href", "#crash-cycle");
-        
-        g.appendChild(use);
-        defs.appendChild(g);
-        svg.appendChild(defs);
-        
-        // Renderiza o SVG para forçar o cálculo da árvore
-        const useRender = document.createElementNS(svgNS, "use");
-        useRender.setAttributeNS("http://www.w3.org/1999/xlink", "href", "#crash-cycle");
-        svg.appendChild(useRender);
-        
-        document.body.appendChild(svg);
-    }
+    async function handleFiles(files) {
+        if (files.length === 0) return;
+        extractedData.binaries = []; // Reset
+        document.getElementById('fileCount').innerText = `${files.length} arquivos`;
+        PBAR.style.display = 'block';
+        DL_BTN.style.display = 'none';
+        LOG.innerText = "";
 
-    // 02. Canvas setLineDash Huge Array
-    // Alvo: 2D Graphics Driver (Command Buffer)
-    // Lógica: setLineDash aceita um array. Se passarmos um array gigantesco,
-    // o driver tenta copiar esses valores para o buffer de comando da GPU.
-    function crashCanvasLineDash() {
-        const c = document.createElement('canvas');
-        const ctx = c.getContext('2d');
-        
-        // Cria array massivo (1 milhão de elementos)
-        // Isso pode estourar o buffer de comando IPC entre WebKit e GPU
-        const hugeDash = new Array(1000000).fill(1);
-        
-        try {
-            ctx.setLineDash(hugeDash);
-            ctx.strokeRect(0,0,100,100); // Força processamento
-        } catch(e) {}
-    }
-
-    // 03. XMLHttpRequest setRequestHeader Flood
-    // Alvo: Kernel Network Stack (Mbuf Headers)
-    // Lógica: Cada header HTTP consome memória no kernel socket buffer.
-    // Adicionar milhares de headers grandes fragmenta a memória de rede.
-    function crashXHRHeaderFlood() {
-        const xhr = new XMLHttpRequest();
-        xhr.open("GET", "/");
-        
-        const hugeVal = "A".repeat(1024); // 1KB value
-        
-        try {
-            // Tenta injetar 50MB de headers
-            for(let i=0; i<50000; i++) {
-                xhr.setRequestHeader("X-Crash-" + i, hugeVal);
-            }
-            xhr.send();
-        } catch(e) {}
-    }
-
-    // 04. DOMSubtreeModified Event Infinite Loop
-    // Alvo: WebCore DOM Event Dispatcher
-    // Lógica: Evento de mutação síncrono. Se o handler modificar o DOM, o evento dispara novamente.
-    // Isso consome a stack C++ até o limite do processo.
-    function crashDOMSubtreeLoop() {
-        const div = document.createElement('div');
-        document.body.appendChild(div);
-        
-        let i = 0;
-        div.addEventListener('DOMSubtreeModified', () => {
-            // Modifica o DOM dentro do evento de modificação
-            if(i++ < 100000) {
-                div.setAttribute('data-flood', i);
-            }
-        });
-        
-        // Trigger inicial
-        div.setAttribute('data-start', '1');
-    }
-
-    // 05. Array Spread Syntax Memory Bomb
-    // Alvo: JSC Heap Allocator
-    // Lógica: Spread (...) na stack tenta alocar todos os argumentos de uma vez.
-    // PS4 tem limite de stack. Tentar espalhar um array gigante numa função causa OOM/Crash.
-    function crashArraySpreadBomb() {
-        // Array com 500k elementos
-        const a = new Array(500000).fill(1);
-        try {
-            // Tenta passar 500k argumentos via stack
-            Math.max(...a);
-        } catch(e) {
-            // Se falhar o stack, tenta heap bomb
-            const b = [...a, ...a, ...a, ...a]; // 2 milhões
-        }
-    }
-
-    // 06. CSS calc() Deep Nesting Stack Overflow
-    // Alvo: CSS Parser
-    // Lógica: Recursividade profunda em calc()
-    function crashCSSCalcDepth() {
-        const div = document.createElement('div');
-        let style = "10px";
-        // Aninhamento profundo
-        for(let i=0; i<5000; i++) {
-            style = `calc(1px + ${style})`;
-        }
-        try {
-            div.style.height = style;
-            // Acesso força o parser a resolver a expressão
-            const h = div.style.height;
-        } catch(e) {}
-    }
-
-    // 07. ChannelSplitterNode Max Channel Overflow
-    // Alvo: Audio DSP Kernel
-    // Lógica: ChannelSplitter/Merger tem um limite de canais (geralmente 32).
-    // Tentar forçar um número absurdo pode causar buffer overflow no alocador DSP.
-    function crashChannelSplitterCount() {
-        if(!window.AudioContext) return;
-        const ctx = new AudioContext();
-        try {
-            // Tenta criar node com canais acima do suportado
-            // Se o check for fraco, aloca buffer inválido
-            const split = ctx.createChannelSplitter(0xFFFFFFFF); // Max int
-            split.connect(ctx.destination);
-        } catch(e) {
-            // Fallback: Tenta criar muitos nodes válidos para exaurir recursos de áudio
-            for(let i=0; i<1000; i++) {
-                try { ctx.createChannelSplitter(32); } catch(ex){}
-            }
-        }
-    }
-
-    // 08. URL Protocol Fuzzing
-    // Alvo: WebKit URL Parser
-    // Lógica: Passar caracteres de controle e null bytes no protocolo da URL.
-    function crashURLProtocolFuzz() {
-        const payloads = [
-            "http://%00%00.com",
-            "file:///etc/passwd%00.png",
-            "A".repeat(5000) + "://crash",
-            "javascript:void(" + "A".repeat(5000) + ")"
-        ];
-        
-        for(let p of payloads) {
+        for (let i = 0; i < files.length; i++) {
+            STATUS.innerText = `Processando ${files[i].name} (${i+1}/${files.length})...`;
+            PFILL.style.width = `${((i / files.length) * 100)}%`;
+            
             try {
-                // Tenta parsear e navegar (histórico)
-                window.history.pushState({}, "", p);
-                new URL(p);
-            } catch(e) {}
+                const data = await processFile(files[i]);
+                extractedData.binaries.push(data);
+            } catch (e) {
+                log(`[ERRO] Falha em ${files[i].name}: ${e.message}`);
+            }
+            
+            // Pausa para renderização da UI (Anti-Freeze)
+            await new Promise(r => requestAnimationFrame(r));
         }
+
+        PFILL.style.width = "100%";
+        STATUS.innerText = "Concluído.";
+        log("\n--- EXTRAÇÃO FINALIZADA ---");
+        log("Clique no botão abaixo para baixar o JSON e me envie o conteúdo.");
+        
+        DL_BTN.style.display = 'block';
+        DL_BTN.style.opacity = '1';
+        DL_BTN.style.pointerEvents = 'auto';
+        DL_BTN.innerText = `BAIXAR JSON (${(JSON.stringify(extractedData).length / 1024).toFixed(2)} KB)`;
     }
 
-    // 09. TextNode.splitText() Offset Boundary Race
-    // Alvo: WebCore DOM TextNode
-    // Lógica: splitText divide um nó de texto. Se alterarmos o texto
-    // (via innerHTML do pai) exatamente quando splitText calcula o offset...
-    function crashTextNodeSplit() {
-        const div = document.createElement('div');
-        const text = document.createTextNode("A".repeat(10000));
-        div.appendChild(text);
-        document.body.appendChild(div);
-        
-        // Race condition simulada
-        // Precisaria de workers para ser perfeito, mas a lógica sequencial
-        // pode falhar se o texto for muito grande (realloc)
-        try {
-            // Tenta dividir num offset que pode não existir mais após uma mutação
-            // Simulamos mutação síncrona via event handler se possível, 
-            // ou apenas boundary check stress
-            text.splitText(9999);
-            text.splitText(0);
-            text.splitText(text.length); // Boundary
-        } catch(e) {}
+    function readFileAsync(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => resolve(e.target.result);
+            reader.onerror = reject;
+            reader.readAsArrayBuffer(file);
+        });
     }
 
-    // 10. RegExp Compilation Buffer Overflow
-    // Alvo: YARR (Regex Engine)
-    // Lógica: Criar uma regex com grupos de captura aninhados absurdamente.
-    // Isso estoura o buffer de bytecode da regex.
-    function crashRegExpCompile() {
-        let pattern = "a";
-        // Aninha grupos: (((((...)))))
-        for(let i=0; i<5000; i++) {
-            pattern = "(" + pattern + ")";
-        }
+    async function processFile(file) {
+        log(`Lendo binário: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+        const buffer = await readFileAsync(file);
+        const view = new DataView(buffer);
         
+        // Verifica Magic ELF (0x7F 'E' 'L' 'F')
+        if (view.getUint32(0, false) !== 0x7F454C46) {
+            log("  [!] Aviso: Assinatura ELF inválida. Tentando analisar mesmo assim...");
+        }
+
+        const is64 = view.getUint8(4) === 2; // Class 2 = 64-bit
+        const isLittle = view.getUint8(5) === 1; // Data 1 = Little Endian
+        
+        log(`  Tipo: ${is64 ? "64-bit" : "32-bit"} | Endian: ${isLittle ? "Little" : "Big"}`);
+
+        // Parse Header
+        const e_shoff = Number(view.getBigUint64(40, isLittle)); // Section Header Offset
+        const e_shentsize = view.getUint16(58, isLittle);
+        const e_shnum = view.getUint16(60, isLittle);
+        const e_shstrndx = view.getUint16(62, isLittle); // Section Header String Table Index
+
+        log(`  Seções: ${e_shnum} (Offset: ${e_shoff})`);
+
+        // Get Section Names String Table
+        let shStrTabOffset = 0;
+        if (e_shstrndx !== 0xFFFF) {
+            const shHeaderOffset = e_shoff + (e_shstrndx * e_shentsize);
+            shStrTabOffset = Number(view.getBigUint64(shHeaderOffset + 24, isLittle)); // sh_offset
+        }
+
+        const sections = [];
+        let symTabSection = null;
+        let dynSymSection = null;
+        let strTabSection = null;
+        let dynStrSection = null;
+
+        // Loop assíncrono para processar seções
+        const CHUNK_SIZE = 100;
+        for (let i = 0; i < e_shnum; i++) {
+            if (i % CHUNK_SIZE === 0) await new Promise(r => setTimeout(r, 0)); // Yield
+
+            const offset = e_shoff + (i * e_shentsize);
+            const sh_name_idx = view.getUint32(offset, isLittle);
+            const sh_type = view.getUint32(offset + 4, isLittle);
+            const sh_flags = Number(view.getBigUint64(offset + 8, isLittle));
+            const sh_addr = Number(view.getBigUint64(offset + 16, isLittle)); // Virtual Address
+            const sh_offset = Number(view.getBigUint64(offset + 24, isLittle)); // File Offset
+            const sh_size = Number(view.getBigUint64(offset + 32, isLittle));
+            const sh_link = view.getUint32(offset + 40, isLittle);
+
+            // Read Name
+            const name = readString(view, shStrTabOffset + sh_name_idx);
+            
+            const sectionInfo = { index: i, name, type: sh_type, addr: sh_addr, offset: sh_offset, size: sh_size };
+            sections.push(sectionInfo);
+
+            if (sh_type === 2) symTabSection = sectionInfo; // SHT_SYMTAB
+            if (sh_type === 11) dynSymSection = sectionInfo; // SHT_DYNSYM
+            if (sh_type === 3 && name === ".strtab") strTabSection = sectionInfo;
+            if (sh_type === 3 && name === ".dynstr") dynStrSection = sectionInfo;
+        }
+
+        // Extract Symbols (Import/Export)
+        const symbols = { exports: [], imports: [] };
+        
+        // Prefer Dynamic Symbols for libraries
+        const targetSym = dynSymSection || symTabSection;
+        const targetStr = dynStrSection || strTabSection;
+
+        if (targetSym && targetStr) {
+            log(`  Analisando Tabela de Símbolos: ${targetSym.name} (${targetSym.size} bytes)...`);
+            
+            const symEntSize = 24; // Elf64_Sym size
+            const count = targetSym.size / symEntSize;
+            
+            for (let i = 0; i < count; i++) {
+                if (i % 2000 === 0) await new Promise(r => setTimeout(r, 0)); // Yield heavy processing
+
+                const offset = targetSym.offset + (i * symEntSize);
+                const st_name = view.getUint32(offset, isLittle);
+                const st_info = view.getUint8(offset + 4);
+                // const st_other = view.getUint8(offset + 5);
+                // const st_shndx = view.getUint16(offset + 6, isLittle);
+                const st_value = Number(view.getBigUint64(offset + 8, isLittle));
+                // const st_size = Number(view.getBigUint64(offset + 16, isLittle));
+
+                const bind = st_info >> 4;
+                // const type = st_info & 0xF;
+
+                if (st_name === 0) continue;
+
+                const symName = readString(view, targetStr.offset + st_name);
+                
+                // Heuristic: If value is 0 and it's global, likely an import. If value > 0, likely export.
+                if (st_value !== 0) {
+                    symbols.exports.push({ name: symName, addr: "0x" + st_value.toString(16) });
+                } else if (bind !== 0) { // Not LOCAL
+                    symbols.imports.push(symName);
+                }
+            }
+            log(`  > ${symbols.exports.length} Exports encontrados.`);
+            log(`  > ${symbols.imports.length} Imports encontrados.`);
+        } else {
+            log("  [!] Tabela de símbolos dinâmica não encontrada.");
+        }
+
+        return {
+            filename: file.name,
+            sections: sections.map(s => ({ name: s.name, type: s.type, addr: "0x"+s.addr.toString(16), size: s.size })),
+            symbols: symbols
+        };
+    }
+
+    function readString(view, offset) {
+        let str = "";
+        let charCode;
         try {
-            const re = new RegExp(pattern);
-            re.test("a");
-        } catch(e) {}
+            while ((charCode = view.getUint8(offset++)) !== 0) {
+                str += String.fromCharCode(charCode);
+                if (str.length > 200) break; // Safety break
+            }
+        } catch(e) { return "(err)"; }
+        return str;
+    }
+
+    function downloadJSON() {
+        const blob = new Blob([JSON.stringify(extractedData, null, 2)], {type: "application/json"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "ps4_binary_analysis.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
     }
 </script>
 
