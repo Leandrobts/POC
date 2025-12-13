@@ -1,194 +1,227 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 ELF Extractor v5.0 (Memory Mapper & Info Leak)</title>
-    <style>
-        body { background: #000; color: #00ffff; font-family: monospace; padding: 20px; }
-        .drop { border: 2px dashed #00ffff; padding: 40px; text-align: center; cursor: pointer; background: #111; margin-bottom: 20px; }
-        .drop:hover { background: #222; }
-        #log { height: 400px; overflow-y: auto; border: 1px solid #333; padding: 10px; background: #050505; color: #ccc; margin-bottom: 10px; white-space: pre; }
-        button { width: 100%; padding: 15px; background: #003333; color: #00ffff; border: 1px solid #00ffff; cursor: pointer; font-weight: bold; }
-        .bar-bg { width: 100%; background: #333; height: 10px; margin-bottom: 5px; }
-        .bar-fg { width: 0%; background: #00ffff; height: 100%; }
-    </style>
+<meta charset="UTF-8">
+<title>PS4 Memory Info Leak Suite v25000</title>
 </head>
 <body>
 
-    <h1>ELF EXTRACTOR v5.0: THE MEMORY MAPPER</h1>
-    <p>Foco: VTable Detection, GOT Offsets & Pointer Chains (ASLR Bypass).</p>
+<h1>SUITE V25000: INFO LEAK & KERNEL READ</h1>
+<p>Target: OOB Read & Kernel Base 0xffffffff82200000</p>
+<hr>
 
-    <input type="file" id="files" multiple style="display:none" onchange="start(this.files)">
-    <div class="drop" onclick="document.getElementById('files').click()">
-        [ ARRASTE libSceNKWebKit.sprx E libkernel.sprx AQUI ]
-    </div>
+<button onclick="leakArrayOOB()">01. Array Out-of-Bounds Read (Stack/Heap Leak)</button>
 
-    <div id="status">Pronto.</div>
-    <div class="bar-bg"><div class="bar-fg" id="bar"></div></div>
-    <div id="log">Logs de memória...</div>
-    
-    <button id="dl" style="display:none" onclick="download()">BAIXAR MAPA DE MEMÓRIA (JSON)</button>
+<button onclick="readKernelBase()">02. TypedArray Kernel Base Pointer Trap (0xffffffff82200000)</button>
+
+<button onclick="leakStringLocale()">03. String.localeCompare Stack Leak</button>
+
+<button onclick="leakRegExp()">04. RegExp.lastIndex Object Address Leak</button>
+
+<button onclick="leakMapIterator()">05. Map Iterator Internal Pointer Leak</button>
+
+<button onclick="leakErrorStack()">06. Error.stack Frame Pointer Leak</button>
+
+<button onclick="leakDataView()">07. DataView Bounds Check Bypass (Memory Scanning)</button>
+
+<button onclick="leakSealedObject()">08. Object.seal/freeze Property Map Leak</button>
+
+<button onclick="leakJSONRecursion()">09. JSON.stringify Deep Recursion Stack Dump</button>
+
+<button onclick="leakLargeArray()">10. Huge TypedArray Allocation Metadata Leak</button>
+
+<div id="log" style="border: 1px solid #000; height: 300px; overflow: auto; white-space: pre-wrap; font-family: monospace; font-size: 12px;"></div>
 
 <script>
-    const LOG = document.getElementById('log');
-    const BAR = document.getElementById('bar');
-    const STAT = document.getElementById('status');
-    const DL = document.getElementById('dl');
-    
-    let REPORT = { tool: "v5.0_InfoLeak", binaries: [] };
+    function log(msg) {
+        document.getElementById('log').innerText += "\n[LEAK] " + msg;
+    }
 
-    function log(m) { LOG.innerText += `\n> ${m}`; LOG.scrollTop = LOG.scrollHeight; }
-    function hex(n) { return "0x" + BigInt(n).toString(16); }
+    // Converta BigInt para Hex string segura
+    function hex(bi) {
+        try { return "0x" + bi.toString(16); } catch(e) { return bi; }
+    }
 
-    async function start(files) {
-        if(!files.length) return;
-        REPORT.binaries = [];
-        DL.style.display = 'none';
+    // 01. Array Out-of-Bounds Read (Stack/Heap Leak)
+    // Tenta confundir o otimizador (se houver JIT loop) ou usar índices negativos
+    // para ler memória antes do início do array.
+    function leakArrayOOB() {
+        const arr = [1.1, 2.2, 3.3];
+        // Tenta acessar índices que normalmente retornam 'undefined',
+        // mas em caso de falha de verificação de limites, retornam bytes da memória vizinha.
         
-        for(let i=0; i<files.length; i++) {
-            STAT.innerText = `Mapeando: ${files[i].name}...`;
-            try {
-                const res = await analyze(files[i]);
-                REPORT.binaries.push(res);
-            } catch(e) { log(`Erro: ${e.message}`); }
+        // Tentativa 1: Índice negativo grande (Underflow)
+        const v1 = arr[-1];
+        
+        // Tentativa 2: Índice logo após o fim (Overflow)
+        const v2 = arr[100];
+        
+        // Tentativa 3: String key numérica mágica
+        const v3 = arr["3221225472"]; // 3GB offset
+        
+        log(`OOB Probe: ${v1} | ${v2} | ${v3}`);
+        
+        if (v1 !== undefined || v2 !== undefined) {
+            log("!!! POSSIBLE LEAK DETECTED !!!");
         }
-        
-        STAT.innerText = "Finalizado.";
-        BAR.style.width = "100%";
-        DL.style.display = 'block';
     }
 
-    function read(file, off, len) {
-        return new Promise((r, j) => {
-            const fr = new FileReader();
-            fr.onload = e => r(e.target.result);
-            fr.onerror = j;
-            fr.readAsArrayBuffer(file.slice(off, off+len));
-        });
+    // 02. TypedArray Kernel Base Pointer Trap
+    // Baseado no endereço confirmado no JSON: 0xffffffff82200000
+    // Tenta criar uma "janela" para o Kernel.
+    function readKernelBase() {
+        try {
+            // Em Userland, não podemos mapear isso diretamente.
+            // Mas podemos tentar criar um ArrayBuffer com um byteLength que,
+            // somado ao endereço base do heap, dê wrap-around para o Kernel.
+            
+            // Endereço alvo aproximado em decimal
+            const kernel = 18446744071600013312n; // 0xffffffff82200000
+            
+            // Tentativa de alocação provocativa
+            const buf = new ArrayBuffer(8);
+            const view = new DataView(buf);
+            
+            // Tenta definir um ponteiro interno (se houvesse um bug de setUint64 arbitrário)
+            // Isso é apenas um teste de estabilidade contra endereços restritos
+            view.setBigUint64(0, kernel, true); 
+            
+            log("Kernel ptr written to buffer safely.");
+        } catch(e) {
+            log("Kernel access safe: " + e.message);
+        }
     }
 
-    async function analyze(file) {
-        log(`Abrindo ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)...`);
+    // 03. String.localeCompare Stack Leak
+    // Vulnerabilidade antiga do WebKit onde localeCompare podia ler bytes extras da stack.
+    function leakStringLocale() {
+        const a = "A".repeat(1000);
+        const b = "B".repeat(1000);
         
-        // 1. Parse ELF Header
-        const headBuf = await read(file, 0, 64);
-        const dv = new DataView(headBuf);
-        if(dv.getUint32(0) !== 0x7F454C46) throw new Error("Não é ELF.");
+        try {
+            // Usa um locale exótico ou malformado para tentar crashar o parser de locale
+            // e vazar informações de erro
+            const res = a.localeCompare(b, "zh-Hans-CN-u-co-pinyin");
+            log("Locale Result: " + res);
+        } catch(e) {
+            log("Locale Error: " + e.message);
+        }
+    }
+
+    // 04. RegExp.lastIndex Object Address Leak
+    // Em algumas versões do JSC, lastIndex pode ser usado para inferir endereços de objetos.
+    function leakRegExp() {
+        const re = /a/g;
+        const obj = { toString: () => "marker" };
         
-        const endian = dv.getUint8(5) === 1; // 1=Little
-        const e_phoff = Number(dv.getBigUint64(32, endian));
-        const e_phnum = dv.getUint16(56, endian);
+        re.lastIndex = obj; // Atribui objeto ao índice (Type Confusion)
         
-        let bin = { 
-            filename: file.name,
-            segments: [],
-            vtables: [], // Candidatos a VTable
-            got_entries: [], // Global Offset Table
-            string_refs: []  // Ponteiros para strings
-        };
+        // O valor é convertido de volta para número?
+        const leaked = re.lastIndex;
+        log("RegExp lastIndex type: " + typeof leaked);
+        if (typeof leaked === 'object') {
+            log("Object retained in property (Normal)");
+        } else {
+            log("Object converted to number: " + leaked + " (Potential Address Leak?)");
+        }
+    }
 
-        // 2. Mapear Segmentos
-        log("  Mapeando segmentos...");
-        const phBuf = await read(file, e_phoff, e_phnum * 56);
-        const phDv = new DataView(phBuf);
+    // 05. Map Iterator Internal Pointer Leak
+    // Tenta ler o ponteiro interno do iterador após invalidar o mapa.
+    function leakMapIterator() {
+        const m = new Map();
+        m.set({}, 1);
+        const iter = m.keys();
         
-        let textSeg = null; // Código (R-X)
-        let dataSeg = null; // Dados (RW-)
-        let rodataSeg = null; // Read-Only Data (R--)
+        m.clear(); // Esvazia o mapa, invalidando o iterador?
+        
+        try {
+            const res = iter.next();
+            log("Iterator after clear: " + JSON.stringify(res));
+        } catch(e) {
+            log("Iterator invalidated properly.");
+        }
+    }
 
-        for(let i=0; i<e_phnum; i++) {
-            const off = i * 56;
-            const type = phDv.getUint32(off, endian);
-            const flags = phDv.getUint32(off+4, endian);
-            const offset = Number(phDv.getBigUint64(off+8, endian));
-            const vaddr = Number(phDv.getBigUint64(off+16, endian));
-            const filesz = Number(phDv.getBigUint64(off+32, endian));
-
-            const seg = { type, flags, vaddr: hex(vaddr), offset, size: filesz };
-            bin.segments.push(seg);
-
-            if(type === 1) { // PT_LOAD
-                if(flags === 5) textSeg = seg; // RX
-                if(flags === 6) dataSeg = seg; // RW
-                if(flags === 4) rodataSeg = seg; // R
+    // 06. Error.stack Frame Pointer Leak
+    // Tenta extrair endereços de memória brutos da string de stack trace.
+    function leakErrorStack() {
+        try {
+            throw new Error("LeakMe");
+        } catch(e) {
+            const stack = e.stack;
+            // Procura por padrões hexadecimais na stack (0x...)
+            const match = stack.match(/0x[0-9a-fA-F]+/g);
+            if (match) {
+                log("Stack Pointers found: " + match.join(", "));
+            } else {
+                log("No raw pointers in stack trace.");
             }
         }
-
-        // 3. Caçar VTables (VTable Hunter)
-        // VTables geralmente ficam em .rodata (Flags 4) e contêm ponteiros para .text (Flags 5)
-        if(rodataSeg && textSeg) {
-            log(`  Varrendo .rodata (${(rodataSeg.size/1024).toFixed(0)}KB) por VTables...`);
-            await scanVTables(file, rodataSeg, textSeg, bin, endian);
-        }
-
-        // 4. Analisar Relocations (GOT)
-        // Precisamos encontrar onde estão as seções de relocação. 
-        // Em vez de parsear Section Headers (que podem estar stripados), vamos varrer Dynamic Tags se possível
-        // Simplificação: Scan heurístico por tabela GOT em Data Segment
-        if(dataSeg) {
-            log("  Procurando GOT Entries no Data Segment...");
-            // await scanGOT(file, dataSeg, bin, endian); // (Implementação simplificada abaixo)
-        }
-
-        return bin;
     }
 
-    async function scanVTables(file, rodata, text, bin, endian) {
-        const CHUNK = 1024 * 1024;
-        let processed = 0;
-        let vtableChain = 0;
-        let vtableStart = 0;
-        
-        const textStart = BigInt(text.vaddr);
-        const textEnd = textStart + BigInt(text.size);
+    // 07. DataView Bounds Check Bypass (Memory Scanning)
+    // Tenta criar um DataView com offset/tamanho que engane a verificação de limites.
+    function leakDataView() {
+        const ab = new ArrayBuffer(16);
+        try {
+            // Offset negativo ou tamanho que causa overflow
+            const view = new DataView(ab, 0, 0xFFFFFFFF);
+            const leak = view.getUint8(100); // Lendo fora do buffer real (16 bytes)
+            log("DataView Bypass Success! Value: " + leak);
+        } catch(e) {
+            log("DataView bounds check OK.");
+        }
+    }
 
-        while(processed < rodata.size) {
-            const size = Math.min(CHUNK, rodata.size - processed);
-            const buf = await read(file, rodata.offset + processed, size);
-            const dv = new DataView(buf);
-            
-            // Lendo de 8 em 8 bytes (Ponteiros 64-bit)
-            for(let i=0; i < size; i+=8) {
-                if(i + 8 > size) break;
-                
-                const ptr = dv.getBigUint64(i, endian);
-                
-                // Verifica se o ponteiro aponta para dentro do segmento de TEXTO (.text)
-                if(ptr >= textStart && ptr < textEnd) {
-                    if(vtableChain === 0) vtableStart = rodata.vaddr + processed + i;
-                    vtableChain++;
-                } else {
-                    // Se a cadeia quebrou e era longa o suficiente (> 4 métodos), é provável vtable
-                    if(vtableChain >= 4) {
-                        if(bin.vtables.length < 50) { // Limita output
-                            bin.vtables.push({
-                                offset: hex(vtableStart),
-                                length: vtableChain,
-                                first_method: hex(ptr) // Na verdade o anterior, mas serve ref
-                            });
-                        }
-                    }
-                    vtableChain = 0;
-                }
+    // 08. Object.seal Type Confusion
+    // Tenta mudar o tipo de uma propriedade de um objeto selado para causar confusão no mapa de propriedades.
+    function leakSealedObject() {
+        const obj = { a: 1.1 };
+        Object.seal(obj);
+        
+        try {
+            // Tenta transformar float em objeto pointer sem atualizar o mapa
+            obj.a = { b: 1 }; 
+            log("Sealed write successful.");
+        } catch(e) {
+            log("Sealed write failed.");
+        }
+    }
+
+    // 09. JSON.stringify Deep Recursion Stack Dump
+    // Cria uma estrutura profunda para tentar ler dados da stack no erro de overflow.
+    function leakJSONRecursion() {
+        let o = { a: 1 };
+        for(let i=0; i<3000; i++) o = { next: o };
+        
+        try {
+            JSON.stringify(o);
+        } catch(e) {
+            // O erro contém dados úteis?
+            log("Recursion Error: " + e.message.substring(0, 50));
+        }
+    }
+
+    // 10. Huge TypedArray Allocation Metadata Leak
+    // Tenta alocar array gigante e checar se o sistema retorna metadados em vez de memória zerada.
+    function leakLargeArray() {
+        try {
+            // Aloca 100MB
+            const arr = new Uint8Array(1024 * 1024 * 100);
+            // Checa se os primeiros bytes são zero (seguro) ou ruído (leak)
+            let dirty = false;
+            for(let i=0; i<100; i++) {
+                if (arr[i] !== 0) { dirty = true; break; }
             }
             
-            processed += size;
-            BAR.style.width = `${(processed / rodata.size) * 100}%`;
-            await new Promise(r => requestAnimationFrame(r));
+            if (dirty) log("!!! DIRTY MEMORY ALLOCATED (LEAK) !!!");
+            else log("Allocated memory is clean (Zeroed).");
+        } catch(e) {
+            log("Allocation failed.");
         }
-        log(`  > ${bin.vtables.length} possíveis VTables encontradas.`);
     }
 
-    function download() {
-        const json = JSON.stringify(REPORT, (k,v) => typeof v === 'bigint' ? "0x"+v.toString(16) : v, 2);
-        const blob = new Blob([json], {type:'application/json'});
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = "ps4_memory_map.json";
-        document.body.appendChild(a);
-        a.click();
-    }
 </script>
 
 </body>
