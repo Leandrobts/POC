@@ -2,285 +2,297 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 RAW Info Leak v30000</title>
+<title>PS4 Invariant Violation Suite v31000</title>
 <style>
-    body { background: #000; color: #ddd; font-family: 'Courier New', monospace; padding: 10px; }
-    h1 { color: #f00; border-bottom: 1px solid #f00; }
-    button { 
-        width: 100%; padding: 12px; margin-bottom: 5px; 
-        background: #111; color: #0f0; border: 1px solid #333; 
-        cursor: pointer; text-align: left; font-weight: bold;
-    }
-    button:hover { background: #222; border-color: #0f0; }
-    #console { 
-        border: 1px solid #444; height: 400px; overflow-y: scroll; 
-        white-space: pre-wrap; font-size: 11px; padding: 5px; background: #050505;
-    }
-    .leak { color: #ff00ff; font-weight: bold; background: #220022; }
-    .ptr { color: #00ffff; font-weight: bold; }
+    body { background: #111; color: #ddd; font-family: monospace; padding: 10px; }
+    button { width: 100%; padding: 10px; margin: 5px 0; background: #222; color: #fff; border: 1px solid #555; cursor: pointer; }
+    #log { border: 1px solid #777; height: 400px; overflow-y: auto; background: #000; padding: 10px; white-space: pre-wrap; }
+    .clean { color: #888; }
+    .leak { color: #0f0; font-weight: bold; border: 1px solid #0f0; padding: 2px; }
 </style>
 </head>
 <body>
 
-<h1>SUITE V30000: RAW MEMORY LEAK (NO SIMULATION)</h1>
-<p>Target: WebKit Butterfly & StructureID. Method: Sparse Arrays & Type Confusion.</p>
+<h1>SUITE V31000: INVARIANT VIOLATIONS</h1>
+<p>Methodology: 1. Legitimate Source -> 2. Native Op -> 3. Unexpected Mutation -> 4. Stale Read</p>
 
-<div id="console">Ready...</div>
+<div id="log">Ready...</div>
 
-<button onclick="leakSparseSort()">01. Sparse Array Sort (Reading Uninitialized Holes)</button>
+<button onclick="testIteratorDetach()">01. TypedArray(Iterator) -> Detach Buffer Middle</button>
 
-<button onclick="leakButterfly()">02. Array.shift() Butterfly Pointer Leak</button>
+<button onclick="testConcatSpecies()">02. Array.concat -> Species Resize Trap</button>
 
-<button onclick="leakHiddenKeys()">03. Object.keys() on Proxy with Proto Confusion</button>
+<button onclick="testRegExpSideEffect()">03. String.replace -> RegExp LastIndex Mutation</button>
 
-<button onclick="leakBoundFunction()">04. Double Bound Function Scope Pointer</button>
+<button onclick="testAssignShrink()">04. Object.assign -> Getter Deletes Properties</button>
 
-<button onclick="leakStackDepth()">05. Error.stackTraceLimit Recursion Leak</button>
+<button onclick="testFilterResize()">05. Array.filter -> Resize during Iteration</button>
 
-<button onclick="leakRegExpSymbol()">06. RegExp [Symbol.match] Internal Slot Read</button>
+<button onclick="testJSONLayout()">06. JSON.stringify -> Proxy Layout Mutation</button>
 
-<button onclick="leakMapShrink()">07. Map Resize/Shrink Old Buffer Read</button>
+<button onclick="testHugeAlloc()">07. Huge Array Allocation -> Read Hole (No Fill)</button>
 
-<button onclick="leakStringNormalize()">08. String.normalize() Internal ICU Buffer Leak</button>
+<button onclick="testMapRehash()">08. Map Set/Delete -> Force Rehash during Iteration</button>
 
-<button onclick="leakTypedArraySet()">09. TypedArray.set() Self-Overlap Race</button>
+<button onclick="testStackResidue()">09. Error.stack -> Recursion Depth Limit Check</button>
 
-<button onclick="leakWeakRef()">10. WeakRef.deref() Pointer Survival Check</button>
+<button onclick="testEntropy()">10. Math.random() -> Entropy/Seeding Check</button>
 
 <script>
-    const CONSOLE = document.getElementById('console');
+    const LOG = document.getElementById('log');
 
-    function log(msg, type='') {
+    function log(msg, type = 'clean') {
         const div = document.createElement('div');
-        div.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
-        if(type) div.className = type;
-        CONSOLE.appendChild(div);
-        CONSOLE.scrollTop = CONSOLE.scrollHeight;
+        div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        div.className = type;
+        LOG.appendChild(div);
+        LOG.scrollTop = LOG.scrollHeight;
     }
 
-    // Analisador de Ponteiros (Sem valores falsos)
-    function inspect(val, src) {
+    // Validador Rigoroso: Só é leak se for dados "sujos" não escritos por nós
+    function analyze(val, context) {
+        if (val === undefined || val === null || val === 0) {
+            log(`${context}: Clean (${val})`);
+            return;
+        }
+        
+        // Se for número: procuramos números que não são 0, nem inteiros pequenos lógicos
         if (typeof val === 'number') {
-            // Filtra números pequenos comuns
-            if (val > 0x10000 || val < -0x10000) {
-                // Se for float muito específico ou int gigante
-                if (!Number.isInteger(val) || Math.abs(val) > 0xFFFFFFFF) {
-                    log(`[!] ${src} returned suspicious number: ${val}`, 'leak');
-                    log(`    Hex: 0x${Math.abs(Math.floor(val)).toString(16)}`, 'ptr');
-                }
+            if (Number.isInteger(val) && val < 1000 && val > -1000) {
+                 log(`${context}: Logical Return (${val})`, 'clean');
+            } else {
+                 // Float estranho ou Inteiro gigante = Vazamento de memória não inicializada ou ponteiro
+                 log(`[!!!] LEAK CANDIDATE (${context}): ${val}`, 'leak');
             }
-        } else if (typeof val === 'string') {
-            // Procura lixo de memória na string
+            return;
+        }
+
+        // Se for string: procuramos caracteres de controle ou lixo de memória
+        if (typeof val === 'string') {
+            // Regex para caracteres não imprimíveis (excluindo espaço simples)
             if (/[\x00-\x08\x0E-\x1F]/.test(val)) {
-                log(`[!] ${src} returned string with control chars`, 'leak');
+                log(`[!!!] STRING LEAK (${context}): HexDump needed`, 'leak');
+            } else {
+                log(`${context}: String Clean`, 'clean');
             }
         }
     }
 
-    // 01. Sparse Array Sort (Reading Uninitialized Holes)
-    // Arrays com buracos não têm memória inicializada nesses índices.
-    // O sort tenta mover elementos. Se falhar em checar o buraco, lê o que estava lá antes.
-    function leakSparseSort() {
+    // 01. TypedArray Constructor Iterator Detach
+    // Invariante: O construtor calcula o tamanho baseado no iterável, aloca, e DEPOIS itera.
+    // Violação: Durante a iteração, "desligamos" (detach) o buffer de destino ou origem.
+    function testIteratorDetach() {
         try {
-            // Cria array com buracos: [1, <empty x 100>, 2]
-            const arr = [1];
-            arr.length = 100;
-            arr[99] = 2;
+            const iter = {
+                *[Symbol.iterator]() {
+                    yield 1;
+                    yield 2;
+                    yield 3;
+                    // MUTATION: Detach buffer no meio da construção
+                    // (Simulado via worker transfer se SAB não disponível, ou lógica pura se suportado)
+                    // Aqui usamos um truque de lógica:
+                    // Se o motor alocou memória para 5 itens, e nós paramos de dar itens...
+                    // O resto da memória fica suja?
+                }
+            };
             
-            // Custom comparator que força GC
-            arr.sort((a, b) => {
-                const trash = new Array(1000).fill(1); // Force GC pressure
-                return a - b;
-            });
+            // Tenta criar array de tamanho fixo mas iterador termina cedo ou faz algo estranho
+            // Em JS puro sem SAB, focamos em descompasso de tamanho
+            const arr = new Uint32Array(iter); 
+            // Se o construtor alocou espaço para X mas o iterador yieldou Y...
+            // JS moderno lida bem, mas WebKit antigo vazava stack.
             
-            // Verifica se algum buraco (índice 1 a 98) agora tem valor
-            for(let i=1; i<99; i++) {
-                if(arr[i] !== undefined) {
-                    inspect(arr[i], `Sparse Sort index ${i}`);
+            if (arr.length > 0) analyze(arr[arr.length-1], "Iterator End");
+        } catch(e) { log("Iterator Safe"); }
+    }
+
+    // 02. Array.concat Species Resize
+    // Invariante: Concat espera que o array resultante seja soma dos tamanhos.
+    // Violação: O construtor da espécie retorna um array menor.
+    function testConcatSpecies() {
+        class Leaky extends Array {
+            static get [Symbol.species]() {
+                return function(n) {
+                    // Engine pede array de tamanho N
+                    // Nós damos um array de tamanho 0, mas "mentimos" sobre a capacidade?
+                    const a = new Array(n);
+                    // Força array esparso (Hole)
+                    return a; 
                 }
             }
-            log("Sparse Sort Check Complete");
-        } catch(e) { log("Error: " + e.message); }
-    }
-
-    // 02. Array.shift() Butterfly Leak
-    // Butterfly é o ponteiro para os dados do array no WebKit.
-    // Shift move o ponteiro start. Se fizermos shift além do limite...
-    function leakButterfly() {
-        const arr = [1.1, 2.2, 3.3];
-        // Tenta confundir o tamanho do array
-        const p = new Proxy(arr, {
-            get(t, k) { return t[k]; }
-        });
-        
-        // Operação massiva de shift
-        for(let i=0; i<100; i++) arr.push(i + 0.1);
-        
-        // Agora remove tudo e tenta ler além
-        for(let i=0; i<105; i++) arr.shift();
-        
-        // Acesso direto ao índice 0 que agora deve apontar para memória anterior ao array
-        const val = arr[0];
-        if (val !== undefined) inspect(val, "Butterfly Shift");
-        else log("Butterfly Shift Safe");
-    }
-
-    // 03. Object.keys() on Proxy with Proto Confusion
-    // Tenta fazer Object.keys retornar propriedades do protótipo (que não deveriam aparecer)
-    // revelando estrutura interna.
-    function leakHiddenKeys() {
-        const proto = { hidden: 1337 };
-        const obj = Object.create(proto);
-        obj.a = 1;
-        
-        const p = new Proxy(obj, {
-            ownKeys(target) {
-                // Retorna chaves que não existem no objeto
-                return ['a', 'hidden', 'memory'];
-            },
-            getOwnPropertyDescriptor(target, prop) {
-                return { configurable: true, enumerable: true, value: 1 };
-            }
-        });
-        
-        const keys = Object.keys(p);
-        log("Keys: " + keys.join(', '));
-    }
-
-    // 04. Double Bound Function Scope Pointer
-    // Funções .bind() criam objetos de escopo na heap.
-    function leakBoundFunction() {
-        const target = function() { return 1; };
-        // Bind duplo cria cadeia de escopos
-        const b1 = target.bind({});
-        const b2 = b1.bind({});
-        
-        // Tenta coagir b2 para string para ver se vaza endereço do b1
-        const s = "Val: " + b2;
-        if (s.includes("native code")) log("Bound: Native Code (Safe)");
-        else inspect(s, "Bound Function");
-    }
-
-    // 05. Error.stackTraceLimit Recursion Leak
-    // Manipula o limite da stack trace para tentar ler frames além do permitido.
-    function leakStackDepth() {
-        const old = Error.stackTraceLimit;
-        Error.stackTraceLimit = 10000; // Valor alto
-        
-        try {
-            // Recursão profunda
-            const r = (n) => {
-                if (n===0) throw new Error("Deep");
-                r(n-1);
-            };
-            r(1000);
-        } catch(e) {
-            // Procura por linhas malformadas na stack
-            const lines = e.stack.split('\n');
-            if (lines.length > 0) {
-                // Verifica a última linha por endereços
-                const last = lines[lines.length-1];
-                if (last.includes("0x")) inspect(last, "Stack Trace Bottom");
-                else log("Stack Trace Depth: " + lines.length);
-            }
         }
-        Error.stackTraceLimit = old;
+        
+        const arr = new Leaky(10);
+        arr.fill(1);
+        const res = arr.concat([2,3]);
+        
+        // Verifica se lemos buracos (holes) que contêm dados antigos
+        // Em vez de undefined, lemos lixo?
+        if (res.length > 0) analyze(res[0], "Concat Species");
     }
 
-    // 06. RegExp [Symbol.match] Internal Slot Read
-    // Tenta acessar slots internos chamando Symbol.match diretamente em objetos incompatíveis.
-    function leakRegExpSymbol() {
-        const fakeRe = {
-            exec: () => { return null; },
-            toString: () => { return "0x414141"; } // Retorno benigno apenas para teste de fluxo
+    // 03. String.replace RegExp Side-Effect
+    // Invariante: A string fonte é imutável durante o replace.
+    // Violação: Usamos um objeto com toString no argumento de replace para mudar o RegExp global.
+    function testRegExpSideEffect() {
+        const str = "A".repeat(100);
+        const re = /A/g;
+        
+        const replacement = {
+            toString: () => {
+                // MUTATION: Altera lastIndex ou recompila o RegExp no meio do loop de replace
+                re.compile("B"); 
+                return "X";
+            }
         };
         
         try {
-            // Chama o método nativo RegExp.prototype[Symbol.match] com 'this' incorreto
-            // Se o motor não verificar o tipo, lê memória do fakeRe como se fosse RegExp
-            const res = RegExp.prototype[Symbol.match].call(fakeRe, "test");
-            inspect(res, "RegExp Symbol");
-        } catch(e) {
-            log("RegExp Type Check Caught");
-        }
+            const res = str.replace(re, replacement);
+            // Se a engine continuar lendo o buffer da string antiga usando offsets da nova regex...
+            analyze(res.length, "RegExp SideEffect");
+        } catch(e) { log("RegExp Safe"); }
     }
 
-    // 07. Map Resize/Shrink Old Buffer Read
-    // Mapas crescem e diminuem. Quando diminuem, o buffer antigo deve ser limpo.
-    function leakMapShrink() {
-        const m = new Map();
-        // Enche
-        for(let i=0; i<1000; i++) m.set(i, i);
-        // Esvazia
-        for(let i=0; i<1000; i++) m.delete(i);
+    // 04. Object.assign Getter Shrink
+    // Invariante: Iterar sobre chaves e copiar valores.
+    // Violação: O getter de uma chave deleta chaves subsequentes do objeto fonte.
+    function testAssignShrink() {
+        const source = {
+            get a() {
+                // MUTATION: Deleta 'b' enquanto 'assign' ainda vai tentar ler 'b'
+                delete this.b;
+                return 1;
+            },
+            b: 2,
+            c: 0x41 // Valor marcador limpo
+        };
         
-        // O mapa deve ter encolhido (realloc).
-        // Tenta ler índices que existiam antes
-        // Não há acesso direto por índice em Map, mas iteradores podem estar "velhos"
-        const iter = m.entries();
-        const res = iter.next();
+        const target = {};
+        Object.assign(target, source);
         
-        if (!res.done) inspect(res.value, "Map Shrink Residue");
-        else log("Map Shrink Safe");
+        // Se 'b' foi copiado APÓS ser deletado, o que foi lido?
+        // JS padrão define undefined, mas engines otimizadas podem ler memória desalocada (stale pointer)
+        analyze(target.b, "Assign Shrink");
     }
 
-    // 08. String.normalize() Internal ICU Buffer Leak
-    // Normalização Unicode usa buffers temporários na biblioteca ICU.
-    function leakStringNormalize() {
-        // String que expande muito em normalização NFKC
-        const s = "\uFDFA".repeat(100); 
+    // 05. Array.filter Resize
+    // Invariante: Array não muda de tamanho durante filter.
+    // Violação: Callback muda length para 0.
+    function testFilterResize() {
+        const arr = [1, 2, 3, 4, 5];
+        const res = arr.filter((v, i, a) => {
+            if (i === 2) {
+                // MUTATION: Zera o array
+                a.length = 0; 
+                // Tenta forçar realloc
+                a.push(9); 
+            }
+            return true;
+        });
+        
+        // O filter continuou iterando sobre a memória antiga?
+        // Se sim, 'res' terá valores lixo nos índices finais
+        if (res.length > 3) analyze(res[3], "Filter Resize");
+        else log("Filter Safe");
+    }
+
+    // 06. JSON.stringify Proxy Layout Change
+    // Invariante: O layout do objeto (offsets das propriedades) é estável.
+    // Violação: Proxy deleta propriedade durante a leitura.
+    function testJSONLayout() {
+        const target = { a: 1, b: 2, c: 3 };
+        const p = new Proxy(target, {
+            get(t, k) {
+                if (k === 'b') {
+                    // MUTATION: Muda o "shape" do objeto (deleta propriedade do meio)
+                    delete t.c;
+                    // Adiciona nova para mudar offset
+                    t.d = 4;
+                }
+                return Reflect.get(t, k);
+            }
+        });
+        
         try {
-            const norm = s.normalize("NFKC");
-            // Se houver bug na alocação do buffer de destino...
-            // Apenas checa se o tamanho faz sentido
-            if (norm.length > s.length * 20) {
-                inspect(norm.length, "Normalize Expansion");
-            } else {
-                log("Normalize Length OK: " + norm.length);
-            }
-        } catch(e) { log("Normalize Error"); }
+            // Stringify lê sequencialmente baseando-se em Hidden Class/Structure ID
+            const s = JSON.stringify(p);
+            // Se leu a memória de 'c' (que foi deletado), vazou?
+            log("JSON: " + s, 'clean');
+        } catch(e) {}
     }
 
-    // 09. TypedArray.set() Self-Overlap Race
-    // Copiar um array para ele mesmo com offset pode causar condições de corrida em cópia de memória.
-    function leakTypedArraySet() {
-        const arr = new Uint8Array(1024);
-        arr.fill(0xAA);
+    // 07. Huge Array Allocation -> Read Hole (No Fill)
+    // Invariante: Memória alocada deve ser zerada (bzero).
+    // Violação: Carga alta no sistema impede bzero (Race no Kernel/MMU).
+    function testHugeAlloc() {
+        try {
+            // Tenta alocar 50MB
+            // Em sistemas *BSD, alocações grandes usam mmap direto.
+            // Se o kernel der uma página "suja" de outro processo...
+            const arr = new Uint32Array(1024 * 1024 * 10);
+            
+            // Amostragem estatística (não ler tudo para não travar)
+            let dirty = 0;
+            for(let i=0; i<arr.length; i+=4096) { // Pula páginas (4KB)
+                if (arr[i] !== 0) {
+                    dirty = arr[i];
+                    break;
+                }
+            }
+            
+            analyze(dirty, "Huge Alloc Hole");
+        } catch(e) { log("Alloc Failed"); }
+    }
+
+    // 08. Map Set/Delete -> Force Rehash during Iteration
+    // Invariante: Iterador deve ser robusto a rehashing.
+    // Violação: Deletar e Inserir massivamente muda o ponteiro do backing store do Map.
+    function testMapRehash() {
+        const m = new Map();
+        for(let i=0; i<100; i++) m.set(i, i);
         
-        // set() com overlap (copia de si mesmo para si mesmo)
-        // WebKit deve usar memmove (seguro) e não memcpy.
-        // Se usar memcpy em overlap, corrompe dados.
-        arr.set(arr.subarray(0, 512), 1);
+        const iter = m.entries();
+        iter.next(); // Inicia estado
         
-        if (arr[0] !== 0xAA || arr[1] !== 0xAA) {
-            inspect(arr[1], "Memcpy Overlap Corruption");
-        } else {
-            log("TypedArray Overlap Safe");
+        // MUTATION: Força resize interno
+        for(let i=0; i<100; i++) m.delete(i);
+        for(let i=0; i<200; i++) m.set("n"+i, i);
+        
+        // O iterador ainda aponta para a tabela antiga desalocada?
+        try {
+            const res = iter.next();
+            if (!res.done) analyze(res.value[1], "Map Rehash");
+            else log("Map Rehash Safe");
+        } catch(e) { log("Map Error Safe"); }
+    }
+
+    // 09. Error.stack -> Recursion Depth Limit Check
+    // Invariante: Stack trace deve parar em um limite seguro.
+    // Violação: Recursão exata no limite da stack frame.
+    function testStackResidue() {
+        try {
+            const overflow = () => overflow();
+            overflow();
+        } catch(e) {
+            // Em WebKit antigo, a string do stack trace às vezes incluía
+            // bytes da stack frame anterior se o buffer não fosse null-terminated
+            if (e.stack && e.stack.length > 0) {
+                // Procura por sequências que não são nomes de função ou números de linha
+                // (Heurística visual no log)
+                const lastLine = e.stack.split('\n').pop();
+                analyze(lastLine, "Stack Residue");
+            }
         }
     }
 
-    // 10. WeakRef.deref() Pointer Survival Check
-    // Tenta pegar o objeto logo antes de morrer.
-    function leakWeakRef() {
-        if (!window.WeakRef) return log("WeakRef not supported");
-        
-        let target = { id: 1 };
-        const ref = new WeakRef(target);
-        target = null; // Solta referência forte
-        
-        // Tenta dereferenciar massivamente
-        const t0 = performance.now();
-        while (performance.now() - t0 < 100) {
-            const o = ref.deref();
-            if (o) {
-                // Objeto ainda vivo.
-                // Em exploits avançados, tenta-se corromper 'o' aqui.
-            } else {
-                log("WeakRef Collected");
-                return;
-            }
-        }
-        log("WeakRef survived loop");
+    // 10. Math.random() -> Entropy/Seeding Check
+    // Invariante: Random deve ser pseudo-aleatório seguro.
+    // Violação: Se o estado interno vazar, podemos prever endereços (ASLR bypass indireto).
+    // (Apenas checagem de sanidade)
+    function testEntropy() {
+        const v1 = Math.random();
+        const v2 = Math.random();
+        log(`Entropy: ${v1.toFixed(10)} | ${v2.toFixed(10)}`, 'clean');
     }
 
 </script>
