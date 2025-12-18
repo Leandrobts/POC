@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>PS4 SharedWorker UAF – Sanity Check</title>
+</head>
+<body>
+
+<h2>SharedWorker – Teste de Sanidade (UAF)</h2>
+
+<button onclick="startTest()">Iniciar</button>
+<button onclick="stopTest()">Parar</button>
+
+<p>Status: <span id="status">Parado</span></p>
+
+<div id="log"></div>
+
+<script>
+let running = false;
+let iteration = 0;
+
+function log(msg, cls="ok") {
+    const d = document.getElementById("log");
+    d.innerHTML = `<div class="${cls}">[${performance.now().toFixed(2)}] ${msg}</div>` + d.innerHTML;
+}
+
+const workerCode = `
+let alive = true;
+let tick = 0;
+
+onmessage = (e) => {
+    if (e.data === "destroy") {
+        alive = false;
+        return;
+    }
+
+    const port = e.ports[0];
+
+    function loop() {
+        tick++;
+
+        // ENVIA ESTADO PARA O MAIN THREAD
+        try {
+            port.postMessage({
+                tick,
+                alive,
+                time: performance.now()
+            });
+        } catch (e) {
+            // silêncio proposital
+        }
+
+        setTimeout(loop, 1);
+    }
+
+    loop();
+};
+`;
+
+const workerURL = URL.createObjectURL(
+    new Blob([workerCode], { type: "text/javascript" })
+);
+
+let sw, mc;
+let closeTime = 0;
+
+function startTest() {
+    if (running) return;
+    running = true;
+    iteration = 0;
+
+    document.getElementById("status").innerText = "Rodando";
+
+    mc = new MessageChannel();
+    sw = new SharedWorker(workerURL, "uaf_test");
+
+    sw.port.start();
+
+    sw.port.onmessage = (e) => {
+        const { tick, alive, time } = e.data;
+
+        if (!alive && time > closeTime) {
+            log(
+                "EXECUÇÃO APÓS DESTRUIÇÃO (alive=false)",
+                "bad"
+            );
+        } else {
+            log(
+                "tick=" + tick + " alive=" + alive,
+                "ok"
+            );
+        }
+    };
+
+    // Inicia o loop no worker
+    sw.port.postMessage("init", [mc.port2]);
+
+    // FECHAMENTO CONTROLADO
+    setTimeout(() => {
+        log("Fechando porta (close)", "bad");
+
+        closeTime = performance.now();
+
+        // Marca como destruído
+        sw.port.postMessage("destroy");
+
+        // Fecha os canais
+        mc.port1.close();
+        sw.port.close();
+
+    }, 200);
+}
+
+function stopTest() {
+    running = false;
+    document.getElementById("status").innerText = "Parado";
+    try {
+        sw.port.close();
+        mc.port1.close();
+    } catch(e){}
+}
+</script>
+
+</body>
+</html>
