@@ -2,96 +2,216 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>TEST 07 – DOM Node UAF Verification</title>
+<title>DOM UAF / State Corruption Verifier</title>
+<style>
+body { font-family: monospace; background:#111; color:#0f0; }
+.pass { color:#0f0; }
+.fail { color:#f00; }
+.warn { color:#ff0; }
+</style>
 </head>
 <body>
 
-<button onclick="runTest07()">Executar TESTE 07 Refinado</button>
+<h2>DOM State Corruption Verification Suite</h2>
+<button onclick="runTest()">RUN FULL VERIFICATION</button>
 <pre id="log"></pre>
 
 <script>
-function log(msg) {
-    document.getElementById('log').textContent += msg + "\n";
+const logEl = document.getElementById("log");
+function log(msg, cls="") {
+    const d = document.createElement("div");
+    d.textContent = msg;
+    if (cls) d.className = cls;
+    logEl.appendChild(d);
 }
 
-function heapPressure() {
-    const trash = [];
-    for (let i = 0; i < 2000; i++) {
-        trash.push(new ArrayBuffer(4096));
-    }
+/* ===============================
+   GLOBALS
+================================ */
+let node, marker;
+let mutationLog = [];
+let observer;
+let results = {
+    invariant:false,
+    api:false,
+    mutation:false,
+    identity:false,
+    gc:false,
+    cross:false,
+    final:false
+};
+
+/* ===============================
+   STEP 1 – INVARIANT CHECK
+================================ */
+function checkInvariants(stage) {
+    let ok = true;
+
+    if (node.parentNode !== null) ok = false;
+    if (node.isConnected !== false) ok = false;
+    if (document.contains(node)) ok = false;
+
+    const pos = node.compareDocumentPosition(document);
+    if (!(pos & Node.DOCUMENT_POSITION_DISCONNECTED)) ok = false;
+
+    const root = node.getRootNode();
+    if (root !== node && root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) ok = false;
+
+    log(`[Invariant ${stage}] parentNode=${node.parentNode} isConnected=${node.isConnected} contains=${document.contains(node)} pos=0x${pos.toString(16)}`);
+    return ok;
 }
 
-function runTest07() {
-    log("=== TESTE 07 – DOM UAF (Refinado) ===");
+/* ===============================
+   STEP 2 – API TRIANGULATION
+================================ */
+function apiTriangulation() {
+    let errors = 0;
 
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-
-    const victim = document.createElement("span");
-    victim.textContent = "VICTIM";
-    container.appendChild(victim);
-
-    // Garantia de estado inicial
-    if (victim.parentNode !== container || !victim.isConnected) {
-        log("Estado inicial inválido");
-        return;
+    try {
+        const r = document.createRange();
+        r.selectNode(node);
+        log("[API] Range.selectNode ACCEPTED removed node", "fail");
+        errors++;
+    } catch {
+        log("[API] Range.selectNode rejected", "pass");
     }
 
-    // Remoção real do DOM
-    container.remove();
-    log("Nó removido do DOM");
-
-    // Pressão de heap + yield
-    heapPressure();
-
-    queueMicrotask(() => {
-        let findings = 0;
-
-        // Verificação 1: parentNode
-        if (victim.parentNode !== null) {
-            log("[FAIL] parentNode resurrected");
-            findings++;
-        }
-
-        // Verificação 2: isConnected
-        if (victim.isConnected === true) {
-            log("[FAIL] isConnected true after removal");
-            findings++;
-        }
-
-        // Verificação 3: Range API
-        try {
-            const range = document.createRange();
-            range.selectNode(victim);
-            log("[FAIL] Range.selectNode succeeded on removed node");
-            findings++;
-        } catch(e) {
-            log("[OK] Range.selectNode threw exception");
-        }
-
-        // Verificação 4: NodeIterator
-        try {
-            const iter = document.createNodeIterator(
-                document,
-                NodeFilter.SHOW_ELEMENT
-            );
-            let node;
-            while ((node = iter.nextNode())) {
-                if (node === victim) {
-                    log("[FAIL] NodeIterator reached removed node");
-                    findings++;
-                    break;
-                }
+    try {
+        const it = document.createNodeIterator(document, NodeFilter.SHOW_ALL);
+        let cur;
+        while (cur = it.nextNode()) {
+            if (cur === node) {
+                log("[API] NodeIterator returned removed node", "fail");
+                errors++;
+                break;
             }
-        } catch(e) {}
-
-        // Resultado final
-        if (findings > 0) {
-            log("=== RESULTADO: CORRUPÇÃO REAL DETECTADA ===");
-        } else {
-            log("=== RESULTADO: comportamento consistente ===");
         }
+    } catch {}
+
+    try {
+        const tw = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
+        let cur;
+        while (cur = tw.nextNode()) {
+            if (cur === node) {
+                log("[API] TreeWalker returned removed node", "fail");
+                errors++;
+                break;
+            }
+        }
+    } catch {}
+
+    return errors > 0;
+}
+
+/* ===============================
+   STEP 3 – MUTATION OBSERVER
+================================ */
+function setupObserver() {
+    observer = new MutationObserver(muts => {
+        muts.forEach(m => {
+            m.removedNodes.forEach(n => {
+                if (n === node) mutationLog.push("removed");
+            });
+            m.addedNodes.forEach(n => {
+                if (n === node) mutationLog.push("added");
+            });
+        });
     });
+    observer.observe(document.body, { childList:true, subtree:true });
+}
+
+/* ===============================
+   STEP 4 – IDENTITY MARKER
+================================ */
+function markIdentity() {
+    marker = Symbol("identity");
+    node[marker] = 0x1337;
+}
+
+function checkIdentity() {
+    return node && node[marker] === 0x1337;
+}
+
+/* ===============================
+   STEP 5 – GC PRESSURE
+================================ */
+function forceGC() {
+    let junk = [];
+    for (let i=0;i<20000;i++) {
+        junk.push(new ArrayBuffer(1024));
+    }
+    junk = null;
+}
+
+/* ===============================
+   STEP 6 – CROSS CONTEXT (iframe)
+================================ */
+function crossContextCheck(cb) {
+    const iframe = document.createElement("iframe");
+    iframe.onload = () => {
+        try {
+            const seen = iframe.contentWindow.document.contains(node);
+            cb(seen);
+        } catch {
+            cb(false);
+        }
+        iframe.remove();
+    };
+    document.body.appendChild(iframe);
+}
+
+/* ===============================
+   RUN ALL
+================================ */
+function runTest() {
+    logEl.textContent = "";
+    mutationLog = [];
+
+    setupObserver();
+
+    node = document.createElement("div");
+    node.textContent = "TESTNODE";
+    document.body.appendChild(node);
+
+    markIdentity();
+
+    document.body.removeChild(node);
+
+    results.invariant = !checkInvariants("POST-REMOVE");
+
+    results.api = apiTriangulation();
+
+    results.mutation = mutationLog.length === 1 && mutationLog[0] === "removed";
+
+    results.identity = checkIdentity();
+
+    forceGC();
+
+    results.gc = checkIdentity();
+
+    crossContextCheck(seen => {
+        results.cross = seen;
+
+        finalize();
+    });
+}
+
+/* ===============================
+   FINAL DECISION
+================================ */
+function finalize() {
+    log("================================");
+
+    Object.entries(results).forEach(([k,v])=>{
+        log(`${k}: ${v}`, v ? "fail" : "pass");
+    });
+
+    if (results.api || results.identity || results.cross) {
+        log("BUG CONFIRMADO: DOM STATE CORRUPTION / UAF", "fail");
+        results.final = true;
+    } else {
+        log("NÃO CONFIRMADO", "pass");
+    }
 }
 </script>
 
