@@ -2,146 +2,99 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit Double Verification Tests</title>
+<title>TEST 07 – DOM Node UAF Verification</title>
 </head>
 <body>
-<h2>Double Verification – Tests 01, 02, 04, 07</h2>
-<button onclick="dv_test01()">DV TEST 01 – ArrayBuffer Detach</button>
-<button onclick="dv_test02()">DV TEST 02 – TypedArray.sort</button>
-<button onclick="dv_test04()">DV TEST 04 – MessagePort</button>
-<button onclick="dv_test07()">DV TEST 07 – DOM Node</button>
+
+<button onclick="runTest07()">Executar TESTE 07 Refinado</button>
 <pre id="log"></pre>
 
 <script>
-function log(m){logEl.textContent+=m+"\n";}
-const logEl=document.getElementById("log");
-
-/* =======================
-   DV TEST 01 – ArrayBuffer
-   ======================= */
-function dv_test01(){
- log("[01] VP: detach + post-write");
- let ab=new ArrayBuffer(0x1000);
- let ta=new Uint32Array(ab);
- ta[0]=0x1337;
-
- let w=new Worker(URL.createObjectURL(new Blob([`onmessage=e=>postMessage(1);`])));
- w.postMessage(ab,[ab]);
-
- let vp=false, vs=false;
-
- try{
-   ta[0]=0x41414141;
-   vp=true;
- }catch(e){}
-
- // VS: byteLength MUST be zero after detach
- if(vp){
-   if(ab.byteLength!==0){
-     vs=true;
-     log("[01] VS FAIL: byteLength != 0 (real corruption)");
-   }else{
-     log("[01] VS OK: normal detach behavior");
-   }
- }
-
- log(vp && vs ? "[01] REAL SUCCESS" : "[01] FALSE POSITIVE");
- w.terminate();
+function log(msg) {
+    document.getElementById('log').textContent += msg + "\n";
 }
 
-/* ==========================
-   DV TEST 02 – TypedArray.sort
-   ========================== */
-function dv_test02(){
- log("[02] VP: reentrant sort + detach");
- let ab=new ArrayBuffer(0x2000);
- let fa=new Float64Array(ab);
- for(let i=0;i<fa.length;i++)fa[i]=Math.random();
-
- let w=new Worker(URL.createObjectURL(new Blob([`onmessage=e=>postMessage(1);`])));
- let detached=false, vp=false, vs=false;
-
- try{
-   fa.sort((a,b)=>{
-     if(!detached){
-       w.postMessage(ab,[ab]);
-       detached=true;
-     }
-     try{ fa[0]=13.37; vp=true; }catch(e){}
-     return a-b;
-   });
- }catch(e){}
-
- // VS: reading metadata after detach MUST fail
- try{
-   if(fa.length!==0){
-     vs=true;
-     log("[02] VS FAIL: TypedArray length alive after detach");
-   }
- }catch(e){}
-
- log(vp && vs ? "[02] REAL SUCCESS" : "[02] FALSE POSITIVE");
- w.terminate();
+function heapPressure() {
+    const trash = [];
+    for (let i = 0; i < 2000; i++) {
+        trash.push(new ArrayBuffer(4096));
+    }
 }
 
-/* ==========================
-   DV TEST 04 – MessagePort
-   ========================== */
-function dv_test04(){
- log("[04] VP: MessagePort post-close activity");
- let mc=new MessageChannel();
- let vp=false, vs=false;
+function runTest07() {
+    log("=== TESTE 07 – DOM UAF (Refinado) ===");
 
- mc.port1.onmessage=_=>vp=true;
- mc.port1.start();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
 
- mc.port1.close();
- try{ mc.port1.postMessage("x"); }catch(e){}
+    const victim = document.createElement("span");
+    victim.textContent = "VICTIM";
+    container.appendChild(victim);
 
- // VS: closed port must be neutered
- try{
-   mc.port1.onmessage=null;
-   mc.port1.postMessage("y");
-   vs=true;
-   log("[04] VS FAIL: closed port still usable");
- }catch(e){}
+    // Garantia de estado inicial
+    if (victim.parentNode !== container || !victim.isConnected) {
+        log("Estado inicial inválido");
+        return;
+    }
 
- log(vp && vs ? "[04] REAL SUCCESS" : "[04] FALSE POSITIVE");
-}
+    // Remoção real do DOM
+    container.remove();
+    log("Nó removido do DOM");
 
-/* ==========================
-   DV TEST 07 – DOM Node UAF
-   ========================== */
-function dv_test07(){
- log("[07] VP: access after removal");
- let d=document.createElement("div");
- let s=document.createElement("span");
- s.textContent="X";
- d.appendChild(s);
- document.body.appendChild(d);
- document.body.removeChild(d);
+    // Pressão de heap + yield
+    heapPressure();
 
- let vp=false, vs=false;
+    queueMicrotask(() => {
+        let findings = 0;
 
- try{
-   s.textContent="Y";
-   vp=true;
- }catch(e){}
+        // Verificação 1: parentNode
+        if (victim.parentNode !== null) {
+            log("[FAIL] parentNode resurrected");
+            findings++;
+        }
 
- // VS: force GC pressure and re-check
- let spray=[];
- for(let i=0;i<2000;i++)spray.push(new ArrayBuffer(0x1000));
+        // Verificação 2: isConnected
+        if (victim.isConnected === true) {
+            log("[FAIL] isConnected true after removal");
+            findings++;
+        }
 
- try{
-   if(s.parentNode!==null){
-     vs=true;
-     log("[07] VS FAIL: parentNode resurrected");
-   }
- }catch(e){}
+        // Verificação 3: Range API
+        try {
+            const range = document.createRange();
+            range.selectNode(victim);
+            log("[FAIL] Range.selectNode succeeded on removed node");
+            findings++;
+        } catch(e) {
+            log("[OK] Range.selectNode threw exception");
+        }
 
- log(vp && vs ? "[07] REAL SUCCESS" : "[07] FALSE POSITIVE");
+        // Verificação 4: NodeIterator
+        try {
+            const iter = document.createNodeIterator(
+                document,
+                NodeFilter.SHOW_ELEMENT
+            );
+            let node;
+            while ((node = iter.nextNode())) {
+                if (node === victim) {
+                    log("[FAIL] NodeIterator reached removed node");
+                    findings++;
+                    break;
+                }
+            }
+        } catch(e) {}
+
+        // Resultado final
+        if (findings > 0) {
+            log("=== RESULTADO: CORRUPÇÃO REAL DETECTADA ===");
+        } else {
+            log("=== RESULTADO: comportamento consistente ===");
+        }
+    });
 }
 </script>
+
 </body>
 </html>
 
