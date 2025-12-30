@@ -7,7 +7,18 @@
 <body>
     <h1>PS4 WebKit Memory Corruption Tests (31-40)</h1>
     <h2>Advanced Exploitation Vectors</h2>
+<button onclick="test21_AudioContextCorrupt()">TEST 21: AudioContext Corrupt</button>
+    <button onclick="test22_CSSOMCorruption()">TEST 22: CSSOM Corruption</button>
+    <button onclick="test23_MutationObserverUAF()">TEST 23: MutationObserver UAF</button>
+    <button onclick="test24_SelectionRangeCorrupt()">TEST 24: Selection Range Corrupt</button>
+    <button onclick="test25_StorageQuotaRace()">TEST 25: Storage Quota Race</button>
+    <button onclick="test26_URLObjectCorrupt()">TEST 26: URL Object Corrupt</button>
+    <button onclick="test27_CryptoBufferUAF()">TEST 27: Crypto Buffer UAF</button>
+    <button onclick="test28_FontFaceCorrupt()">TEST 28: FontFace Corrupt</button>
+    <button onclick="test29_PerformanceEntryUAF()">TEST 29: PerformanceEntry UAF</button>
+    <button onclick="test30_VideoMetadataCorrupt()">TEST 30: Video Metadata Corrupt</button>
 
+    
     <button onclick="test31_HistoryStateCorrupt()">TEST 31: History State Corrupt</button>
     <button onclick="test32_DocumentWriteUAF()">TEST 32: Document Write UAF</button>
     <button onclick="test33_IntersectionObserverRace()">TEST 33: IntersectionObserver Race</button>
@@ -924,7 +935,765 @@
             }
         }
 
-        log('PS4 WebKit Tests 31-40 Loaded', 'INFO');
+
+
+
+    
+        function test21_AudioContextCorrupt() {
+            log('TEST 21: AudioContext Corrupt', 'RUNNING');
+            try {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                if (!AudioContext) {
+                    log('TEST 21: AudioContext not available', 'FAIL');
+                    return;
+                }
+                
+                const contexts = [];
+                const buffers = [];
+                const sources = [];
+                
+                for (let i = 0; i < 15; i++) {
+                    const ctx = new AudioContext();
+                    contexts.push(ctx);
+                    
+                    const buffer = ctx.createBuffer(2, 44100, 44100);
+                    const channel0 = buffer.getChannelData(0);
+                    const channel1 = buffer.getChannelData(1);
+                    
+                    for (let j = 0; j < channel0.length; j++) {
+                        channel0[j] = Math.sin(j * 0.01);
+                        channel1[j] = Math.cos(j * 0.01);
+                    }
+                    
+                    buffers.push(buffer);
+                }
+                
+                for (let round = 0; round < 50; round++) {
+                    for (let i = 0; i < contexts.length; i++) {
+                        const ctx = contexts[i];
+                        const buf = buffers[i];
+                        
+                        const source = ctx.createBufferSource();
+                        source.buffer = buf;
+                        source.connect(ctx.destination);
+                        sources.push(source);
+                        
+                        try {
+                            source.start(0);
+                        } catch(e) {}
+                        
+                        setTimeout(() => {
+                            try {
+                                source.stop();
+                            } catch(e) {}
+                        }, 10);
+                        
+                        const channel0 = buf.getChannelData(0);
+                        channel0[0] = 0xDEAD;
+                        
+                        if (channel0[0] === 0xDEAD) {
+                            const newSource = ctx.createBufferSource();
+                            newSource.buffer = buf;
+                            
+                            try {
+                                newSource.start(0);
+                                log('TEST 21: AudioBuffer modified while playing', 'SUCCESS');
+                                contexts.forEach(c => c.close());
+                                return;
+                            } catch(e) {}
+                        }
+                    }
+                }
+                
+                contexts.forEach(ctx => ctx.close());
+                log('TEST 21: No AudioContext corruption', 'FAIL');
+                
+            } catch(e) {
+                log('TEST 21: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test22_CSSOMCorruption() {
+            log('TEST 22: CSSOM Corruption', 'RUNNING');
+            try {
+                const styles = [];
+                const sheets = [];
+                
+                for (let i = 0; i < 20; i++) {
+                    const style = document.createElement('style');
+                    document.head.appendChild(style);
+                    styles.push(style);
+                    sheets.push(style.sheet);
+                }
+                
+                for (let i = 0; i < sheets.length; i++) {
+                    const sheet = sheets[i];
+                    
+                    for (let j = 0; j < 30; j++) {
+                        try {
+                            sheet.insertRule('.class' + i + '_' + j + ' { color: red; }', sheet.cssRules.length);
+                        } catch(e) {}
+                    }
+                }
+                
+                for (let round = 0; round < 100; round++) {
+                    for (let i = 0; i < sheets.length; i++) {
+                        const sheet = sheets[i];
+                        
+                        while (sheet.cssRules.length > 0) {
+                            try {
+                                sheet.deleteRule(0);
+                            } catch(e) {}
+                        }
+                        
+                        for (let j = 0; j < 10; j++) {
+                            try {
+                                sheet.insertRule('.dynamic' + round + '_' + j + ' { background: blue; }', 0);
+                            } catch(e) {}
+                        }
+                        
+                        try {
+                            document.head.removeChild(styles[i]);
+                            document.head.appendChild(styles[i]);
+                        } catch(e) {}
+                        
+                        try {
+                            const rules = sheet.cssRules;
+                            if (rules.length > 50) {
+                                log('TEST 22: CSSOM rules corrupted', 'SUCCESS');
+                                return;
+                            }
+                            
+                            for (let k = 0; k < rules.length; k++) {
+                                const rule = rules[k];
+                                if (!rule.selectorText) {
+                                    log('TEST 22: CSS rule corruption detected', 'SUCCESS');
+                                    return;
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                }
+                
+                log('TEST 22: No CSSOM corruption', 'FAIL');
+                
+            } catch(e) {
+                log('TEST 22: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test23_MutationObserverUAF() {
+            log('TEST 23: MutationObserver UAF', 'RUNNING');
+            try {
+                const observers = [];
+                const targets = [];
+                const mutations = [];
+                
+                for (let i = 0; i < 25; i++) {
+                    const target = document.createElement('div');
+                    target.id = 'target_' + i;
+                    document.body.appendChild(target);
+                    targets.push(target);
+                    
+                    const observer = new MutationObserver((mutationsList) => {
+                        for (let mutation of mutationsList) {
+                            mutations.push({
+                                type: mutation.type,
+                                target: mutation.target,
+                                timestamp: Date.now()
+                            });
+                            
+                            if (mutation.target.parentNode === null) {
+                                log('TEST 23: Mutation on disconnected node', 'SUCCESS');
+                            }
+                        }
+                    });
+                    
+                    observer.observe(target, {
+                        attributes: true,
+                        childList: true,
+                        subtree: true,
+                        characterData: true
+                    });
+                    
+                    observers.push(observer);
+                }
+                
+                for (let round = 0; round < 100; round++) {
+                    for (let i = 0; i < targets.length; i++) {
+                        const target = targets[i];
+                        
+                        target.setAttribute('data-round', round.toString());
+                        
+                        const child = document.createElement('span');
+                        child.textContent = 'Child ' + round;
+                        target.appendChild(child);
+                        
+                        if (round % 3 === 0) {
+                            try {
+                                document.body.removeChild(target);
+                            } catch(e) {}
+                            
+                            target.setAttribute('data-uaf', 'test');
+                            
+                            try {
+                                document.body.appendChild(target);
+                            } catch(e) {}
+                        }
+                        
+                        if (round % 5 === 0) {
+                            observers[i].disconnect();
+                            
+                            try {
+                                observers[i].observe(target, {attributes: true});
+                            } catch(e) {}
+                        }
+                    }
+                }
+                
+                setTimeout(() => {
+                    if (mutations.length > 0) {
+                        for (let i = 0; i < mutations.length; i++) {
+                            try {
+                                const mut = mutations[i];
+                                if (mut.target && !mut.target.parentNode) {
+                                    log('TEST 23: Mutation record holds freed node', 'SUCCESS');
+                                    return;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    
+                    observers.forEach(o => o.disconnect());
+                    log('TEST 23: No MutationObserver UAF', 'FAIL');
+                }, 200);
+                
+            } catch(e) {
+                log('TEST 23: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test24_SelectionRangeCorrupt() {
+            log('TEST 24: Selection Range Corrupt', 'RUNNING');
+            try {
+                const containers = [];
+                const ranges = [];
+                
+                for (let i = 0; i < 20; i++) {
+                    const container = document.createElement('div');
+                    container.contentEditable = true;
+                    container.innerHTML = 'Text content ' + i + ' with multiple words for testing range operations.';
+                    document.body.appendChild(container);
+                    containers.push(container);
+                }
+                
+                for (let i = 0; i < containers.length; i++) {
+                    const range = document.createRange();
+                    const textNode = containers[i].firstChild;
+                    
+                    if (textNode) {
+                        range.setStart(textNode, 5);
+                        range.setEnd(textNode, 15);
+                        ranges.push(range);
+                    }
+                }
+                
+                const selection = window.getSelection();
+                
+                for (let round = 0; round < 100; round++) {
+                    for (let i = 0; i < ranges.length; i++) {
+                        const range = ranges[i];
+                        const container = containers[i];
+                        
+                        try {
+                            selection.removeAllRanges();
+                            selection.addRange(range);
+                            
+                            const extracted = range.extractContents();
+                            
+                            container.innerHTML = 'New content ' + round;
+                            
+                            try {
+                                range.setStart(container.firstChild, 0);
+                                range.setEnd(container.firstChild, 5);
+                            } catch(e) {}
+                            
+                            if (extracted.childNodes.length > 0) {
+                                const fragmentText = extracted.textContent;
+                                
+                                container.innerHTML = '';
+                                container.appendChild(extracted);
+                                
+                                const cloned = range.cloneContents();
+                                if (cloned.textContent === fragmentText) {
+                                    log('TEST 24: Range preserved after extract', 'SUCCESS');
+                                    return;
+                                }
+                            }
+                            
+                            document.body.removeChild(container);
+                            
+                            try {
+                                range.deleteContents();
+                                log('TEST 24: Range operation on removed container', 'SUCCESS');
+                                return;
+                            } catch(e) {}
+                            
+                            document.body.appendChild(container);
+                            
+                        } catch(e) {}
+                    }
+                }
+                
+                log('TEST 24: No Selection Range corruption', 'FAIL');
+                
+            } catch(e) {
+                log('TEST 24: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test25_StorageQuotaRace() {
+            log('TEST 25: Storage Quota Race', 'RUNNING');
+            try {
+                const keys = [];
+                const values = [];
+                
+                for (let i = 0; i < 50; i++) {
+                    const key = 'test_key_' + i;
+                    const value = 'X'.repeat(1000) + i;
+                    keys.push(key);
+                    values.push(value);
+                }
+                
+                for (let round = 0; round < 100; round++) {
+                    for (let i = 0; i < keys.length; i++) {
+                        try {
+                            localStorage.setItem(keys[i], values[i]);
+                        } catch(e) {}
+                        
+                        try {
+                            const retrieved = localStorage.getItem(keys[i]);
+                            if (retrieved !== values[i]) {
+                                log('TEST 25: LocalStorage value mismatch', 'SUCCESS');
+                                return;
+                            }
+                        } catch(e) {}
+                        
+                        if (round % 10 === 0) {
+                            try {
+                                localStorage.removeItem(keys[i]);
+                            } catch(e) {}
+                        }
+                    }
+                    
+                    try {
+                        const allKeys = Object.keys(localStorage);
+                        
+                        for (let i = 0; i < allKeys.length; i++) {
+                            const key = allKeys[i];
+                            if (key.startsWith('test_key_')) {
+                                const value = localStorage.getItem(key);
+                                
+                                localStorage.setItem(key, value + '_modified');
+                                
+                                const check = localStorage.getItem(key);
+                                if (!check.endsWith('_modified')) {
+                                    log('TEST 25: Storage modification lost', 'SUCCESS');
+                                    return;
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+                
+                try {
+                    for (let i = 0; i < keys.length; i++) {
+                        localStorage.removeItem(keys[i]);
+                    }
+                } catch(e) {}
+                
+                log('TEST 25: No Storage corruption', 'FAIL');
+                
+            } catch(e) {
+                log('TEST 25: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test26_URLObjectCorrupt() {
+            log('TEST 26: URL Object Corrupt', 'RUNNING');
+            try {
+                const urls = [];
+                const blobs = [];
+                
+                for (let i = 0; i < 30; i++) {
+                    const data = new Uint8Array(4096);
+                    data.fill(i % 256);
+                    
+                    const blob = new Blob([data.buffer], {type: 'application/octet-stream'});
+                    blobs.push(blob);
+                    
+                    const url = URL.createObjectURL(blob);
+                    urls.push(url);
+                }
+                
+                for (let round = 0; round < 100; round++) {
+                    for (let i = 0; i < urls.length; i++) {
+                        const url = urls[i];
+                        
+                        try {
+                            const parsedURL = new URL(url);
+                            
+                            if (parsedURL.protocol !== 'blob:') {
+                                log('TEST 26: URL protocol corrupted', 'SUCCESS');
+                                return;
+                            }
+                            
+                            if (round % 5 === 0 && i < urls.length - 1) {
+                                URL.revokeObjectURL(urls[i]);
+                                
+                                try {
+                                    const afterRevoke = new URL(urls[i]);
+                                    const xhr = new XMLHttpRequest();
+                                    xhr.open('GET', urls[i], false);
+                                    xhr.send();
+                                    
+                                    if (xhr.status === 200) {
+                                        log('TEST 26: Revoked URL still accessible', 'SUCCESS');
+                                        return;
+                                    }
+                                } catch(e) {}
+                                
+                                urls[i] = URL.createObjectURL(blobs[i]);
+                            }
+                            
+                            const searchParams = new URLSearchParams();
+                            searchParams.append('test', 'value' + i);
+                            
+                            const modifiedURL = url + '?' + searchParams.toString();
+                            const reparsed = new URL(modifiedURL);
+                            
+                            if (reparsed.search !== '?test=value' + i) {
+                                log('TEST 26: URL search params corrupted', 'SUCCESS');
+                                return;
+                            }
+                            
+                        } catch(e) {}
+                    }
+                }
+                
+                urls.forEach(url => {
+                    try {
+                        URL.revokeObjectURL(url);
+                    } catch(e) {}
+                });
+                
+                log('TEST 26: No URL corruption', 'FAIL');
+                
+            } catch(e) {
+                log('TEST 26: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test27_CryptoBufferUAF() {
+            log('TEST 27: Crypto Buffer UAF', 'RUNNING');
+            try {
+                if (!window.crypto || !window.crypto.getRandomValues) {
+                    log('TEST 27: Crypto API not available', 'FAIL');
+                    return;
+                }
+                
+                const buffers = [];
+                const views = [];
+                
+                for (let i = 0; i < 30; i++) {
+                    const buffer = new ArrayBuffer(1024);
+                    const view = new Uint8Array(buffer);
+                    
+                    crypto.getRandomValues(view);
+                    
+                    buffers.push(buffer);
+                    views.push(view);
+                }
+                
+                const workerCode = `
+                    onmessage = function(e) {
+                        const view = new Uint8Array(e.data);
+                        postMessage(view[0]);
+                    };
+                `;
+                
+                const worker = new Worker(URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"})));
+                
+                for (let i = 0; i < buffers.length; i++) {
+                    const originalFirst = views[i][0];
+                    
+                    worker.postMessage(buffers[i], [buffers[i]]);
+                    
+                    setTimeout(() => {
+                        try {
+                            views[i][0] = 0xFF;
+                            
+                            if (views[i][0] === 0xFF) {
+                                log('TEST 27: Crypto buffer writable after transfer', 'SUCCESS');
+                                worker.terminate();
+                                return;
+                            }
+                            
+                            crypto.getRandomValues(views[i]);
+                            log('TEST 27: getRandomValues on transferred buffer', 'SUCCESS');
+                            worker.terminate();
+                            return;
+                        } catch(e) {}
+                    }, i * 10);
+                }
+                
+                setTimeout(() => {
+                    worker.terminate();
+                    log('TEST 27: No Crypto buffer UAF', 'FAIL');
+                }, 800);
+                
+            } catch(e) {
+                log('TEST 27: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test28_FontFaceCorrupt() {
+            log('TEST 28: FontFace Corrupt', 'RUNNING');
+            try {
+                if (!document.fonts || !window.FontFace) {
+                    log('TEST 28: FontFace API not available', 'FAIL');
+                    return;
+                }
+                
+                const fonts = [];
+                const fontData = 'data:font/woff2;base64,d09GMgABAAAAAAFgAAoAAAAAAwgAAAEWAAEAAAAA';
+                
+                for (let i = 0; i < 20; i++) {
+                    try {
+                        const font = new FontFace('TestFont' + i, 'url(' + fontData + ')');
+                        fonts.push(font);
+                        
+                        font.load().then(loadedFont => {
+                            document.fonts.add(loadedFont);
+                        }).catch(e => {});
+                        
+                    } catch(e) {}
+                }
+                
+                setTimeout(() => {
+                    for (let round = 0; round < 50; round++) {
+                        for (let i = 0; i < fonts.length; i++) {
+                            try {
+                                const font = fonts[i];
+                                
+                                if (font.status === 'loaded') {
+                                    document.fonts.delete(font);
+                                    
+                                    const testDiv = document.createElement('div');
+                                    testDiv.style.fontFamily = 'TestFont' + i;
+                                    testDiv.textContent = 'Test';
+                                    document.body.appendChild(testDiv);
+                                    
+                                    const computedStyle = window.getComputedStyle(testDiv);
+                                    const fontFamily = computedStyle.fontFamily;
+                                    
+                                    if (fontFamily.includes('TestFont' + i)) {
+                                        log('TEST 28: Deleted font still applied', 'SUCCESS');
+                                        document.body.removeChild(testDiv);
+                                        return;
+                                    }
+                                    
+                                    document.body.removeChild(testDiv);
+                                    
+                                    document.fonts.add(font);
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    
+                    log('TEST 28: No FontFace corruption', 'FAIL');
+                }, 1000);
+                
+            } catch(e) {
+                log('TEST 28: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test29_PerformanceEntryUAF() {
+            log('TEST 29: PerformanceEntry UAF', 'RUNNING');
+            try {
+                if (!window.performance || !performance.mark) {
+                    log('TEST 29: Performance API not available', 'FAIL');
+                    return;
+                }
+                
+                const marks = [];
+                const measures = [];
+                
+                for (let i = 0; i < 50; i++) {
+                    const markName = 'mark_' + i;
+                    performance.mark(markName);
+                    marks.push(markName);
+                }
+                
+                for (let i = 0; i < marks.length - 1; i++) {
+                    try {
+                        const measureName = 'measure_' + i;
+                        performance.measure(measureName, marks[i], marks[i + 1]);
+                        measures.push(measureName);
+                    } catch(e) {}
+                }
+                
+                for (let round = 0; round < 100; round++) {
+                    const entries = performance.getEntriesByType('mark');
+                    
+                    for (let i = 0; i < entries.length; i++) {
+                        const entry = entries[i];
+                        
+                        try {
+                            const name = entry.name;
+                            const startTime = entry.startTime;
+                            const duration = entry.duration;
+                            
+                            if (typeof startTime !== 'number') {
+                                log('TEST 29: Performance entry corrupted', 'SUCCESS');
+                                return;
+                            }
+                        } catch(e) {}
+                    }
+                    
+                    if (round % 10 === 0) {
+                        performance.clearMarks();
+                        performance.clearMeasures();
+                        
+                        try {
+                            const afterClear = performance.getEntriesByType('mark');
+                            if (afterClear.length > 0) {
+                                log('TEST 29: Marks remain after clear', 'SUCCESS');
+                                return;
+                            }
+                        } catch(e) {}
+                        
+                        for (let i = 0; i < 10; i++) {
+                            performance.mark('new_mark_' + round + '_' + i);
+                        }
+                    }
+                }
+                
+                performance.clearMarks();
+                performance.clearMeasures();
+                log('TEST 29: No PerformanceEntry UAF', 'FAIL');
+                
+            } catch(e) {
+                log('TEST 29: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+        function test30_VideoMetadataCorrupt() {
+            log('TEST 30: Video Metadata Corrupt', 'RUNNING');
+            try {
+                const videos = [];
+                const sources = [];
+                
+                for (let i = 0; i < 10; i++) {
+                    const video = document.createElement('video');
+                    video.width = 320;
+                    video.height = 240;
+                    video.preload = 'metadata';
+                    videos.push(video);
+                    
+                    const source = document.createElement('source');
+                    source.src = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAs1tZGF0';
+                    source.type = 'video/mp4';
+                    sources.push(source);
+                    
+                    video.appendChild(source);
+                    document.body.appendChild(video);
+                }
+                
+                for (let i = 0; i < videos.length; i++) {
+                    const video = videos[i];
+                    
+                    video.onloadedmetadata = function() {
+                        try {
+                            const duration = video.duration;
+                            const width = video.videoWidth;
+                            const height = video.videoHeight;
+                            
+                            if (isNaN(duration) || duration < 0) {
+                                log('TEST 30: Video duration corrupted', 'SUCCESS');
+                            }
+                            
+                            if (width === 0 && height === 0) {
+                                video.width = 640;
+                                video.height = 480;
+                            }
+                        } catch(e) {}
+                    };
+                    
+                    video.onerror = function() {
+                        try {
+                            const networkState = video.networkState;
+                            const readyState = video.readyState;
+                            
+                            if (networkState === undefined || readyState === undefined) {
+                                log('TEST 30: Video state undefined after error', 'SUCCESS');
+                            }
+                        } catch(e) {}
+                    };
+                }
+                
+                for (let round = 0; round < 50; round++) {
+                    for (let i = 0; i < videos.length; i++) {
+                        const video = videos[i];
+                        
+                        try {
+                            video.load();
+                            
+                            video.currentTime = 0;
+                            
+                            const textTrack = video.addTextTrack('subtitles', 'English', 'en');
+                            
+                            if (round % 5 === 0) {
+                                document.body.removeChild(video);
+                                
+                                try {
+                                    video.play();
+                                    log('TEST 30: Video play on removed element', 'SUCCESS');
+                                    return;
+                                } catch(e) {}
+                                
+                                document.body.appendChild(video);
+                            }
+                            
+                            while (video.textTracks.length > 3) {
+                                const tracks = video.textTracks;
+                                for (let j = tracks.length - 1; j >= 0; j--) {
+                                    tracks[j].mode = 'disabled';
+                                }
+                            }
+                            
+                        } catch(e) {}
+                    }
+                }
+                
+                setTimeout(() => {
+                    videos.forEach(v => {
+                        try {
+                            if (v.parentNode) {
+                                document.body.removeChild(v);
+                            }
+                        } catch(e) {}
+                    });
+                    log('TEST 30: No Video corruption', 'FAIL');
+                }, 1000);
+                
+            } catch(e) {
+                log('TEST 30: Exception - ' + e.message, 'SUCCESS');
+            }
+        }
+
+             log('PS4 WebKit Tests 31-40 Loaded', 'INFO');
     </script>
 </body>
-</html>
+</html>   
