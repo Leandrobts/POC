@@ -2,89 +2,131 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Debugger V5: FORCE GC</title>
+<title>UAF Sanity & Verification Test</title>
 <style>
-    body { background-color: #200; color: #f55; font-family: monospace; text-align: center; padding: 20px; }
-    button { background: #800; color: white; border: 2px solid #f55; padding: 20px 40px; font-size: 1.5em; cursor: pointer; margin: 10px; }
-    #log { text-align: left; margin: 20px auto; border: 1px solid #f55; padding: 10px; height: 300px; overflow-y: scroll; background: #000; }
+  body { font-family: monospace; }
+  .ok { color: green; }
+  .fail { color: red; }
 </style>
 </head>
 <body>
 
-<h1>DEBUGGER V5: FORCE GARBAGE COLLECTION</h1>
-<p>Estratégia: Criar buracos e PRESSIONAR a memória para reciclar.</p>
-
-<button onclick="step1()">1. ALOCAR (BEACON)</button>
-<br>
-<button onclick="step2()">2. GATILHO (OPTIONS)</button>
-
-<div id="log">Logs...</div>
+<h2>UAF Sanity & Verification Test</h2>
+<button onclick="runTest()">RUN VERIFICATION</button>
+<pre id="log"></pre>
 
 <script>
-    const Log = document.getElementById('log');
-    function log(txt) { Log.innerHTML += ">> " + txt + "<br>"; Log.scrollTop = Log.scrollHeight;}
+const logEl = document.getElementById('log');
+function log(msg, cls="") {
+  logEl.innerHTML += (cls ? `[${cls}] ` : "") + msg + "\n";
+}
 
-    const BEACON_VAL = 0xDEADBEEF; 
-    const POISON_VAL = 0x41414141; 
+function forceHeapPressure() {
+  const junk = [];
+  for (let i = 0; i < 2000; i++) {
+    junk.push(new ArrayBuffer(1024 * 32));
+  }
+}
 
-    let victims = [];
-    let spray_storage = [];
-    const COUNT = 40000; 
+function runTest() {
+  logEl.textContent = "";
+  log("Starting UAF verification...\n");
 
-    // Função dedicada para irritar o Garbage Collector
-    function forceGC() {
-        log("⚠️ FORÇANDO LIMPEZA DE MEMÓRIA (GC)...");
-        for (let i = 0; i < 200; i++) {
-            // Aloca blocos grandes (64KB) e joga fora imediatamente
-            new ArrayBuffer(0x10000); 
-        }
+  // === SETUP DOM ===
+  const container = document.createElement("div");
+  for (let i = 0; i < 5; i++) {
+    const s = document.createElement("span");
+    s.textContent = "X" + i;
+    container.appendChild(s);
+  }
+  document.body.appendChild(container);
+
+  // SNAPSHOT STRONG REF
+  const snapshot = document.evaluate(
+    "//span",
+    container,
+    null,
+    XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+    null
+  );
+
+  const victim = snapshot.snapshotItem(0);
+
+  // IDENTITY BASELINE
+  const baseline = {
+    type: victim.nodeType,
+    ctor: victim.constructor.name,
+    proto: Object.getPrototypeOf(victim)
+  };
+
+  // REMOVE + GC PRESSURE
+  document.body.removeChild(container);
+  forceHeapPressure();
+
+  // === CHECK 1: IDENTITY VIOLATION ===
+  try {
+    if (
+      victim.nodeType !== baseline.type ||
+      victim.constructor.name !== baseline.ctor ||
+      Object.getPrototypeOf(victim) !== baseline.proto
+    ) {
+      log("IDENTITY VIOLATION detected", "FAIL");
+      log("UAF REAL (identity corrupted)", "FAIL");
+      return;
+    } else {
+      log("Identity stable (expected)", "ok");
     }
+  } catch (e) {
+    log("Exception during identity check", "FAIL");
+    log("UAF REAL (invalid access)", "FAIL");
+    return;
+  }
 
-    function step1() {
-        log("Alocando 40.000 arrays...");
-        for(let i=0; i<COUNT; i++) {
-            let v = new Uint32Array(32);
-            v.fill(BEACON_VAL);
-            v[0] = i; 
-            victims.push(v);
-        }
-        log("MEMÓRIA PRONTA! Faça o Scan de 'EFBEADDE'.");
+  // === CHECK 2: VIRTUAL METHOD CONSISTENCY ===
+  try {
+    const pos = victim.compareDocumentPosition(document.body);
+    if (typeof pos !== "number" || pos < 0 || pos > 0x40) {
+      log("Invalid compareDocumentPosition result", "FAIL");
+      log("UAF REAL (virtual method corrupted)", "FAIL");
+      return;
+    } else {
+      log("Virtual methods consistent", "ok");
     }
+  } catch (e) {
+    log("Exception in virtual method", "FAIL");
+    log("UAF REAL (method after free)", "FAIL");
+    return;
+  }
 
-    function step2() {
-        log("Gatilho armado...");
-        const doc = document.documentElement;
-        if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-        else if (doc.requestFullscreen) doc.requestFullscreen();
+  // === CHECK 3: BACKING STORE REUSE ===
+  try {
+    victim.textContent = "MARKER";
+    forceHeapPressure();
 
-        window.onblur = function() {
-            log("BLUR! Iniciando sequência crítica...");
-            document.body.style.background = "#f00";
+    const span = document.createElement("span");
+    span.textContent = "NEW";
+    document.body.appendChild(span);
 
-            // 1. FREE (Queijo Suíço)
-            log("Liberando metade dos arrays...");
-            for(let i=0; i<COUNT; i+=2) {
-                victims[i] = null; 
-            }
-
-            // 2. FORCE GC (A novidade)
-            // Tenta forçar o navegador a processar os 'nulls' acima
-            forceGC(); 
-
-            // 3. SPRAY
-            log("Injetando Spray nos buracos reciclados...");
-            try {
-                for(let i=0; i<COUNT/2 + 2000; i++) {
-                    let s = new Uint32Array(32); 
-                    s.fill(POISON_VAL);
-                    spray_storage.push(s);
-                }
-            } catch(e) {}
-
-            log("PROCESSO CONCLUÍDO!");
-            log("Verifique se a contagem caiu de 1.2M para ~600k.");
-        };
+    if (span.textContent === "MARKER") {
+      log("Backing store reused across objects", "FAIL");
+      log("UAF REAL (memory reuse)", "FAIL");
+      return;
+    } else {
+      log("No backing store reuse", "ok");
     }
+  } catch (e) {
+    log("Exception during backing store test", "FAIL");
+    log("UAF REAL", "FAIL");
+    return;
+  }
+
+  // === FINAL VERDICT ===
+  log("\nFINAL RESULT:", "ok");
+  log("No UAF detected", "ok");
+  log("Behavior = detached DOM object with live JS reference");
+}
 </script>
+
 </body>
 </html>
+
