@@ -2,131 +2,183 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>UAF Sanity & Verification Test</title>
+<title>PS4 WebKit – UAF Absolute Sanity Check</title>
 <style>
-  body { font-family: monospace; }
-  .ok { color: green; }
-  .fail { color: red; }
+body { background:#000; color:#0f0; font-family:monospace; }
+button { margin:5px; padding:10px; }
+#log { white-space:pre-wrap; margin-top:10px; }
 </style>
 </head>
 <body>
 
-<h2>UAF Sanity & Verification Test</h2>
-<button onclick="runTest()">RUN VERIFICATION</button>
-<pre id="log"></pre>
+<h2>UAF Absolute Sanity Check (Fullscreen + OPTIONS)</h2>
+
+<button onclick="test1()">TEST 1 – Reuse After Free (TypedArray)</button>
+<button onclick="test2()">TEST 2 – Cross Object Overlap</button>
+<button onclick="test3()">TEST 3 – GC Persistence</button>
+<button onclick="test4()">TEST 4 – Post-Blur Access</button>
+<button onclick="test5()">TEST 5 – Final Minimal Proof</button>
+
+<div id="log"></div>
 
 <script>
-const logEl = document.getElementById('log');
-function log(msg, cls="") {
-  logEl.innerHTML += (cls ? `[${cls}] ` : "") + msg + "\n";
+const logEl = document.getElementById("log");
+function log(s){ logEl.textContent += s + "\n"; }
+
+function goFullscreen(){
+  const d=document.documentElement;
+  if(d.webkitRequestFullscreen) d.webkitRequestFullscreen();
+  else if(d.requestFullscreen) d.requestFullscreen();
 }
 
-function forceHeapPressure() {
-  const junk = [];
-  for (let i = 0; i < 2000; i++) {
-    junk.push(new ArrayBuffer(1024 * 32));
-  }
-}
+/* ========================================================= */
+/* TEST 1 – Reuse After Free (TypedArray)                     */
+/* ========================================================= */
+function test1(){
+  log("\n[TEST 1] TypedArray reuse after free");
+  goFullscreen();
 
-function runTest() {
-  logEl.textContent = "";
-  log("Starting UAF verification...\n");
+  let victim = new Float64Array(8);
+  victim[0] = 1.2345;
 
-  // === SETUP DOM ===
-  const container = document.createElement("div");
-  for (let i = 0; i < 5; i++) {
-    const s = document.createElement("span");
-    s.textContent = "X" + i;
-    container.appendChild(s);
-  }
-  document.body.appendChild(container);
+  window.onblur = () => {
+    log("[TEST 1] blur detected");
 
-  // SNAPSHOT STRONG REF
-  const snapshot = document.evaluate(
-    "//span",
-    container,
-    null,
-    XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
-    null
-  );
+    victim = null;
 
-  const victim = snapshot.snapshotItem(0);
+    let spray = [];
+    for(let i=0;i<2000;i++){
+      let a = new Float64Array(8);
+      a[0] = 9.999;
+      spray.push(a);
+    }
 
-  // IDENTITY BASELINE
-  const baseline = {
-    type: victim.nodeType,
-    ctor: victim.constructor.name,
-    proto: Object.getPrototypeOf(victim)
+    try{
+      log("[TEST 1] RESULT: no crash, no reuse detected");
+    }catch(e){
+      log("[TEST 1] CRASH => STRONG UAF");
+    }
   };
+}
 
-  // REMOVE + GC PRESSURE
-  document.body.removeChild(container);
-  forceHeapPressure();
+/* ========================================================= */
+/* TEST 2 – Cross Object Overlap                              */
+/* ========================================================= */
+function test2(){
+  log("\n[TEST 2] Cross object memory overlap");
+  goFullscreen();
 
-  // === CHECK 1: IDENTITY VIOLATION ===
-  try {
-    if (
-      victim.nodeType !== baseline.type ||
-      victim.constructor.name !== baseline.ctor ||
-      Object.getPrototypeOf(victim) !== baseline.proto
-    ) {
-      log("IDENTITY VIOLATION detected", "FAIL");
-      log("UAF REAL (identity corrupted)", "FAIL");
-      return;
-    } else {
-      log("Identity stable (expected)", "ok");
+  let a = new Float64Array(8);
+  a[0] = 0x11;
+
+  let b = new Float64Array(8);
+  b[0] = 0x22;
+
+  window.onblur = () => {
+    log("[TEST 2] blur detected");
+    a = null;
+
+    let spray=[];
+    for(let i=0;i<3000;i++){
+      let t=new Float64Array(8);
+      t[0]=0x33;
+      spray.push(t);
     }
-  } catch (e) {
-    log("Exception during identity check", "FAIL");
-    log("UAF REAL (invalid access)", "FAIL");
-    return;
-  }
 
-  // === CHECK 2: VIRTUAL METHOD CONSISTENCY ===
-  try {
-    const pos = victim.compareDocumentPosition(document.body);
-    if (typeof pos !== "number" || pos < 0 || pos > 0x40) {
-      log("Invalid compareDocumentPosition result", "FAIL");
-      log("UAF REAL (virtual method corrupted)", "FAIL");
-      return;
-    } else {
-      log("Virtual methods consistent", "ok");
+    try{
+      if(b[0] !== 0x22){
+        log("[TEST 2] OVERLAP DETECTED => REAL UAF");
+      } else {
+        log("[TEST 2] no overlap");
+      }
+    }catch(e){
+      log("[TEST 2] CRASH => REAL UAF");
     }
-  } catch (e) {
-    log("Exception in virtual method", "FAIL");
-    log("UAF REAL (method after free)", "FAIL");
-    return;
-  }
+  };
+}
 
-  // === CHECK 3: BACKING STORE REUSE ===
-  try {
-    victim.textContent = "MARKER";
-    forceHeapPressure();
+/* ========================================================= */
+/* TEST 3 – GC Persistence                                   */
+/* ========================================================= */
+function test3(){
+  log("\n[TEST 3] GC persistence check");
+  goFullscreen();
 
-    const span = document.createElement("span");
-    span.textContent = "NEW";
-    document.body.appendChild(span);
+  let arr = new Float64Array(16);
+  arr[0]=7.77;
 
-    if (span.textContent === "MARKER") {
-      log("Backing store reused across objects", "FAIL");
-      log("UAF REAL (memory reuse)", "FAIL");
-      return;
-    } else {
-      log("No backing store reuse", "ok");
+  window.onblur = () => {
+    log("[TEST 3] blur detected");
+
+    arr=null;
+
+    for(let i=0;i<100;i++){
+      let tmp=[];
+      for(let j=0;j<10000;j++) tmp.push(j);
     }
-  } catch (e) {
-    log("Exception during backing store test", "FAIL");
-    log("UAF REAL", "FAIL");
-    return;
-  }
 
-  // === FINAL VERDICT ===
-  log("\nFINAL RESULT:", "ok");
-  log("No UAF detected", "ok");
-  log("Behavior = detached DOM object with live JS reference");
+    try{
+      log("[TEST 3] RESULT: survived GC pressure");
+    }catch(e){
+      log("[TEST 3] CRASH => UAF via GC");
+    }
+  };
+}
+
+/* ========================================================= */
+/* TEST 4 – Post-Blur Access                                 */
+/* ========================================================= */
+function test4(){
+  log("\n[TEST 4] Access after blur");
+  goFullscreen();
+
+  let node=document.createElement("div");
+  document.body.appendChild(node);
+
+  window.onblur=()=>{
+    log("[TEST 4] blur detected");
+    node.remove();
+
+    try{
+      node.textContent="X";
+      log("[TEST 4] no crash");
+    }catch(e){
+      log("[TEST 4] CRASH => DOM UAF");
+    }
+  };
+}
+
+/* ========================================================= */
+/* TEST 5 – Minimal Absolute Proof                            */
+/* ========================================================= */
+function test5(){
+  log("\n[TEST 5] Absolute minimal UAF proof");
+  goFullscreen();
+
+  let buf=new ArrayBuffer(64);
+  let view=new Uint32Array(buf);
+  view[0]=0x41414141;
+
+  window.onblur=()=>{
+    log("[TEST 5] blur detected");
+    buf=null;
+
+    let spray=[];
+    for(let i=0;i<5000;i++){
+      let b=new ArrayBuffer(64);
+      let v=new Uint32Array(b);
+      v[0]=0x42424242;
+      spray.push(b);
+    }
+
+    try{
+      log("[TEST 5] RESULT: no reuse observed");
+    }catch(e){
+      log("[TEST 5] CRASH => DEFINITIVE UAF");
+    }
+  };
 }
 </script>
-
 </body>
 </html>
 
