@@ -2,183 +2,178 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – UAF Absolute Sanity Check</title>
+<title>PS4 WebKit UAF Sanity Check</title>
 <style>
-body { background:#000; color:#0f0; font-family:monospace; }
-button { margin:5px; padding:10px; }
-#log { white-space:pre-wrap; margin-top:10px; }
+body { font-family: monospace; background:#111; color:#0f0; }
+button { font-size:18px; padding:10px; margin:10px 0; }
+#log { white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
-<h2>UAF Absolute Sanity Check (Fullscreen + OPTIONS)</h2>
+<h2>PS4 WebKit – UAF Absolute Sanity Check</h2>
 
-<button onclick="test1()">TEST 1 – Reuse After Free (TypedArray)</button>
-<button onclick="test2()">TEST 2 – Cross Object Overlap</button>
-<button onclick="test3()">TEST 3 – GC Persistence</button>
-<button onclick="test4()">TEST 4 – Post-Blur Access</button>
-<button onclick="test5()">TEST 5 – Final Minimal Proof</button>
+<button onclick="start()">INICIAR SANITY CHECK</button>
 
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(s){ logEl.textContent += s + "\n"; }
-
-function goFullscreen(){
-  const d=document.documentElement;
-  if(d.webkitRequestFullscreen) d.webkitRequestFullscreen();
-  else if(d.requestFullscreen) d.requestFullscreen();
+function log(msg) {
+    logEl.textContent += msg + "\n";
+    console.log(msg);
 }
 
-/* ========================================================= */
-/* TEST 1 – Reuse After Free (TypedArray)                     */
-/* ========================================================= */
-function test1(){
-  log("\n[TEST 1] TypedArray reuse after free");
-  goFullscreen();
+/* ===============================
+   GLOBAL STATE
+================================*/
+let heartbeat = 0;
+let heartbeatTimer = null;
 
-  let victim = new Float64Array(8);
-  victim[0] = 1.2345;
+let victim = null;
+let victimRef = null;
+let invariantBefore = {};
+let invariantAfter = {};
 
-  window.onblur = () => {
-    log("[TEST 1] blur detected");
+let blurTime = 0;
+let postBlurChecks = 0;
 
-    victim = null;
-
-    let spray = [];
-    for(let i=0;i<2000;i++){
-      let a = new Float64Array(8);
-      a[0] = 9.999;
-      spray.push(a);
-    }
-
-    try{
-      log("[TEST 1] RESULT: no crash, no reuse detected");
-    }catch(e){
-      log("[TEST 1] CRASH => STRONG UAF");
-    }
-  };
+/* ===============================
+   HEARTBEAT (SC-1)
+================================*/
+function startHeartbeat() {
+    heartbeatTimer = setInterval(() => {
+        heartbeat++;
+    }, 100);
 }
 
-/* ========================================================= */
-/* TEST 2 – Cross Object Overlap                              */
-/* ========================================================= */
-function test2(){
-  log("\n[TEST 2] Cross object memory overlap");
-  goFullscreen();
-
-  let a = new Float64Array(8);
-  a[0] = 0x11;
-
-  let b = new Float64Array(8);
-  b[0] = 0x22;
-
-  window.onblur = () => {
-    log("[TEST 2] blur detected");
-    a = null;
-
-    let spray=[];
-    for(let i=0;i<3000;i++){
-      let t=new Float64Array(8);
-      t[0]=0x33;
-      spray.push(t);
-    }
-
-    try{
-      if(b[0] !== 0x22){
-        log("[TEST 2] OVERLAP DETECTED => REAL UAF");
-      } else {
-        log("[TEST 2] no overlap");
-      }
-    }catch(e){
-      log("[TEST 2] CRASH => REAL UAF");
-    }
-  };
+/* ===============================
+   INVARIANT SNAPSHOT
+================================*/
+function snapshot(obj) {
+    return {
+        isArray: Array.isArray(obj),
+        type: typeof obj,
+        tag: Object.prototype.toString.call(obj),
+        length: obj.length,
+        proto: Object.getPrototypeOf(obj)
+    };
 }
 
-/* ========================================================= */
-/* TEST 3 – GC Persistence                                   */
-/* ========================================================= */
-function test3(){
-  log("\n[TEST 3] GC persistence check");
-  goFullscreen();
+/* ===============================
+   START
+================================*/
+function start() {
+    log("=== SANITY CHECK INICIADO ===");
 
-  let arr = new Float64Array(16);
-  arr[0]=7.77;
+    // SC-1: Liveness baseline
+    startHeartbeat();
 
-  window.onblur = () => {
-    log("[TEST 3] blur detected");
+    // Criamos um objeto simples (NÃO explorável)
+    victim = new Float64Array(16);
+    for (let i = 0; i < victim.length; i++) victim[i] = i + 0.5;
 
-    arr=null;
+    victimRef = victim;
 
-    for(let i=0;i<100;i++){
-      let tmp=[];
-      for(let j=0;j<10000;j++) tmp.push(j);
-    }
+    invariantBefore = snapshot(victim);
 
-    try{
-      log("[TEST 3] RESULT: survived GC pressure");
-    }catch(e){
-      log("[TEST 3] CRASH => UAF via GC");
-    }
-  };
+    log("[PRE] Invariantes capturadas");
+    log(JSON.stringify(invariantBefore, null, 2));
+
+    // Fullscreen (necessário para OPTIONS no PS4)
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    else if (doc.requestFullscreen) doc.requestFullscreen();
+
+    log(">>> Aperte OPTIONS agora <<<");
+
+    window.onblur = onBlurHandler;
 }
 
-/* ========================================================= */
-/* TEST 4 – Post-Blur Access                                 */
-/* ========================================================= */
-function test4(){
-  log("\n[TEST 4] Access after blur");
-  goFullscreen();
+/* ===============================
+   BLUR HANDLER
+================================*/
+function onBlurHandler() {
+    blurTime = performance.now();
+    log("=== BLUR DETECTADO ===");
 
-  let node=document.createElement("div");
-  document.body.appendChild(node);
+    // NÃO liberamos nada ainda (SC-2 control)
+    log("[BLUR] Nenhum free executado");
 
-  window.onblur=()=>{
-    log("[TEST 4] blur detected");
-    node.remove();
-
-    try{
-      node.textContent="X";
-      log("[TEST 4] no crash");
-    }catch(e){
-      log("[TEST 4] CRASH => DOM UAF");
-    }
-  };
+    // Pós-blur checks (SC-3)
+    postBlurCheck();
 }
 
-/* ========================================================= */
-/* TEST 5 – Minimal Absolute Proof                            */
-/* ========================================================= */
-function test5(){
-  log("\n[TEST 5] Absolute minimal UAF proof");
-  goFullscreen();
+/* ===============================
+   POST-BLUR CHECK LOOP
+================================*/
+function postBlurCheck() {
+    setTimeout(() => {
+        postBlurChecks++;
 
-  let buf=new ArrayBuffer(64);
-  let view=new Uint32Array(buf);
-  view[0]=0x41414141;
+        // SC-1: heartbeat continua?
+        log(`[CHECK ${postBlurChecks}] Heartbeat=${heartbeat}`);
 
-  window.onblur=()=>{
-    log("[TEST 5] blur detected");
-    buf=null;
+        // SC-4: invariantes
+        try {
+            invariantAfter = snapshot(victimRef);
+            log(`[CHECK ${postBlurChecks}] Invariantes atuais:`);
+            log(JSON.stringify(invariantAfter, null, 2));
+        } catch (e) {
+            log(`[CHECK ${postBlurChecks}] EXCEPTION ao acessar vítima: ${e}`);
+        }
 
-    let spray=[];
-    for(let i=0;i<5000;i++){
-      let b=new ArrayBuffer(64);
-      let v=new Uint32Array(b);
-      v[0]=0x42424242;
-      spray.push(b);
+        // SC-3: executa várias vezes ANTES de refresh
+        if (postBlurChecks < 5) {
+            postBlurCheck();
+        } else {
+            finalize();
+        }
+
+    }, 0);
+}
+
+/* ===============================
+   FINAL ANALYSIS
+================================*/
+function finalize() {
+    log("=== FINALIZANDO SANITY CHECK ===");
+
+    // SC-1
+    if (heartbeat > 0) {
+        log("[SC-1] JS continua vivo após blur ✅");
+    } else {
+        log("[SC-1] JS NÃO está vivo ❌ (contexto suspenso)");
     }
 
-    try{
-      log("[TEST 5] RESULT: no reuse observed");
-    }catch(e){
-      log("[TEST 5] CRASH => DEFINITIVE UAF");
+    // SC-4: invariantes
+    const invariantChanged =
+        invariantBefore.isArray !== invariantAfter.isArray ||
+        invariantBefore.tag !== invariantAfter.tag ||
+        invariantBefore.length !== invariantAfter.length ||
+        invariantBefore.proto !== invariantAfter.proto;
+
+    if (invariantChanged) {
+        log("[SC-4] Invariantes mudaram ANTES do refresh ⚠️");
+    } else {
+        log("[SC-4] Invariantes intactos (comportamento normal)");
     }
-  };
+
+    log("=== INTERPRETAÇÃO ===");
+
+    if (!invariantChanged) {
+        log("✔ Nenhuma evidência de UAF vivo.");
+        log("✔ Qualquer crash posterior indica TEARDOWN / SHUTDOWN BUG.");
+    } else {
+        log("⚠ POSSÍVEL bug lógico.");
+        log("⚠ Necessário confirmar SEM refresh.");
+    }
+
+    log("=== NÃO ATUALIZE AINDA ===");
+    log("Se só crashar AO ATUALIZAR → NÃO é UAF vivo.");
 }
 </script>
+
 </body>
 </html>
 
