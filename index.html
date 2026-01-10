@@ -2,215 +2,147 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit Advanced Heap Techniques v1.0</title>
+<title>PS4 WebKit - T6 T7 T8 Structured Clone Stress</title>
 <style>
-body {
-    background: #000;
-    color: #0f0;
-    font-family: monospace;
-}
-button {
-    margin: 5px;
-    padding: 8px;
-}
-#log {
-    white-space: pre-wrap;
-    margin-top: 10px;
-}
+body { font-family: monospace; background:#000; color:#0f0; }
+button { margin: 5px; padding: 10px; }
+#log { white-space: pre-wrap; }
 </style>
 </head>
+
 <body>
 
-<h2>PS4 WebKit – Advanced Heap Techniques</h2>
+<h2>PS4 WebKit – Structured Clone Advanced Tests</h2>
 
-<button onclick="tech1()">T1 – Heap Spray Fingerprint</button>
-<button onclick="tech2()">T2 – Heap Feng Shui</button>
-<button onclick="tech3()">T3 – pushState Boundary Stress</button>
-<button onclick="tech4()">T4 – GC Pressure + Access</button>
-<button onclick="tech5()">T5 – Cross-Structure Probe</button>
+<button onclick="runT6()">T6 – Getter Reentrancy</button>
+<button onclick="runT7()">T7 – ArrayBuffer / DataView Clone</button>
+<button onclick="runT8()">T8 – pushState + history.back Interleave</button>
 
 <div id="log"></div>
 
 <script>
-const logDiv = document.getElementById("log");
-
-function log(msg) {
-    logDiv.textContent += msg + "\n";
+const logEl = document.getElementById("log");
+function log(m) {
+    logEl.textContent += m + "\n";
 }
 
-function separator(name) {
-    log("\n==================== " + name + " ====================");
+/* =======================
+   COMMON BASELINE
+======================= */
+
+function baselineSizes(iter) {
+    return 977 + (14461 * iter);
 }
 
-/* -------------------------------------------------- */
-/* T1 – Heap Spray + Fingerprint agressivo             */
-/* -------------------------------------------------- */
-function tech1() {
-    separator("T1 START");
+/* =======================
+   T6 – Getter Reentrancy
+======================= */
 
-    try {
-        let arrs = [];
-        for (let i = 0; i < 3000; i++) {
-            let a = new Uint32Array(256);
-            for (let j = 0; j < a.length; j++) {
-                a[j] = 0xdead0000 ^ j ^ i;
+function runT6() {
+    log("===== T6 START (Getter Reentrancy) =====");
+
+    for (let i = 0; i < 50; i++) {
+        let size = baselineSizes(i);
+        log(`[T6] ITER ${i} size=${size}`);
+
+        let evil = {
+            idx: i,
+            get payload() {
+                log(`[T6] >>> getter HIT @ ITER ${i}`);
+                let spray = new Array(200);
+                for (let j = 0; j < spray.length; j++) {
+                    spray[j] = "G".repeat(1024);
+                }
+                log(`[T6] >>> getter returning payload length=${size}`);
+                return "A".repeat(size);
             }
-            arrs.push(a);
-            if (i % 250 === 0)
-                log("[T1] Allocated chunk " + i);
-        }
+        };
 
-        let fp = 0;
-        for (let k = 0; k < arrs.length; k++) {
-            fp ^= arrs[k][0];
-        }
+        log("[T6] pushState()");
+        history.pushState(evil, "", "#T6_" + i);
 
-        log("[T1] Fingerprint XOR = 0x" + fp.toString(16));
-        log("[T1] Completed without exception");
-
-    } catch (e) {
-        log("[T1][EXCEPTION] " + e);
+        log("[T6] replaceState()");
+        history.replaceState(evil, "", "#T6r_" + i);
     }
 
-    log("[T1] END");
+    log("===== T6 END =====");
 }
 
-/* -------------------------------------------------- */
-/* T2 – Heap Feng Shui controlado                      */
-/* -------------------------------------------------- */
-function tech2() {
-    separator("T2 START");
+/* =======================
+   T7 – ArrayBuffer / DataView
+======================= */
 
-    try {
-        let pool = [];
+function runT7() {
+    log("===== T7 START (ArrayBuffer/DataView) =====");
 
-        for (let i = 0; i < 1000; i++) {
-            pool.push(new Array(1024).fill(i));
+    for (let i = 0; i < 50; i++) {
+        let size = baselineSizes(i);
+        log(`[T7] ITER ${i} size=${size}`);
+
+        log("[T7] Allocating ArrayBuffer");
+        let ab = new ArrayBuffer(size);
+        let dv = new DataView(ab);
+
+        for (let j = 0; j < Math.min(64, size); j++) {
+            dv.setUint8(j, 0x41);
         }
-        log("[T2] Initial allocation done");
 
-        pool.splice(200, 400);
-        log("[T2] Middle free done");
+        let obj = {
+            iter: i,
+            buf: ab,
+            view: dv,
+            marker: "B".repeat(64)
+        };
 
-        for (let i = 0; i < 500; i++) {
-            pool.push(new Uint8Array(2048));
-        }
-        log("[T2] Reallocation done");
+        log("[T7] pushState()");
+        history.pushState(obj, "", "#T7_" + i);
 
-        let checksum = 0;
-        pool.forEach((o, i) => {
-            if (o && o.length)
-                checksum ^= o.length;
-        });
-
-        log("[T2] Checksum = " + checksum);
-
-    } catch (e) {
-        log("[T2][EXCEPTION] " + e);
+        log("[T7] replaceState()");
+        history.replaceState(obj, "", "#T7r_" + i);
     }
 
-    log("[T2] END");
+    log("===== T7 END =====");
 }
 
-/* -------------------------------------------------- */
-/* T3 – pushState boundary stress                      */
-/* -------------------------------------------------- */
-function tech3() {
-    separator("T3 START");
+/* =======================
+   T8 – pushState + back Interleave
+======================= */
 
-    try {
-        for (let iter = 40; iter <= 55; iter++) {
-            let size = 622800 + (iter - 43) * 14461;
-            log("[T3] ITER " + iter + " size=" + size);
+function runT8() {
+    log("===== T8 START (Interleaved back) =====");
 
-            let payload = "A".repeat(size);
-            history.pushState({i: iter, p: payload}, "");
+    for (let i = 0; i < 50; i++) {
+        let size = baselineSizes(i);
+        log(`[T8] ITER ${i} size=${size}`);
 
-            log("[T3] pushState OK @ ITER " + iter);
+        let payload = {
+            i: i,
+            data: "C".repeat(size),
+            flag: true
+        };
+
+        log("[T8] pushState()");
+        history.pushState(payload, "", "#T8_" + i);
+
+        log("[T8] replaceState()");
+        history.replaceState(payload, "", "#T8r_" + i);
+
+        if (i % 3 === 0) {
+            log("[T8] history.back() ASYNC scheduled");
+            setTimeout(() => {
+                history.back();
+            }, 0);
         }
-
-    } catch (e) {
-        log("[T3][EXCEPTION] " + e);
     }
 
-    log("[T3] END");
+    log("===== T8 END =====");
 }
 
-/* -------------------------------------------------- */
-/* T4 – GC pressure + post-access                     */
-/* -------------------------------------------------- */
-function tech4() {
-    separator("T4 START");
+/* =======================
+   LOAD
+======================= */
 
-    try {
-        let victims = [];
-        for (let i = 0; i < 2000; i++) {
-            victims.push(new Uint8Array(512));
-        }
-
-        log("[T4] Victims allocated");
-
-        victims.length = 0;
-        log("[T4] Victims released");
-
-        let pressure = [];
-        for (let i = 0; i < 10000; i++) {
-            pressure.push({i, data: new Array(100)});
-        }
-
-        log("[T4] GC pressure objects allocated");
-
-        let probe = new Uint32Array(128);
-        let sum = 0;
-        for (let i = 0; i < probe.length; i++) {
-            sum ^= probe[i];
-        }
-
-        log("[T4] Post-GC probe XOR = " + sum);
-
-    } catch (e) {
-        log("[T4][EXCEPTION] " + e);
-    }
-
-    log("[T4] END");
-}
-
-/* -------------------------------------------------- */
-/* T5 – Cross-structure corruption probe               */
-/* -------------------------------------------------- */
-function tech5() {
-    separator("T5 START");
-
-    try {
-        let arr = [1.1, 2.2, 3.3, 4.4];
-        let ta = new Uint32Array(16);
-
-        log("[T5] Initial structures created");
-
-        arr.length = 0x100000;
-        log("[T5] Array length expanded");
-
-        for (let i = 0; i < ta.length; i++) {
-            ta[i] = 0x41414141;
-        }
-
-        let drift = false;
-        for (let i = 0; i < ta.length; i++) {
-            if (ta[i] !== 0x41414141) {
-                drift = true;
-                log("[T5] Drift detected at index " + i);
-                break;
-            }
-        }
-
-        log("[T5] Drift detected? " + drift);
-
-    } catch (e) {
-        log("[T5][EXCEPTION] " + e);
-    }
-
-    log("[T5] END");
-}
+log("Page loaded. Ready.");
 </script>
 
 </body>
