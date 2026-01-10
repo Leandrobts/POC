@@ -2,153 +2,156 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit History.pushState – Step 7 Validation</title>
+<title>PS4 WebKit – Passo 8 (A/B/C)</title>
 <style>
-body {
-    background: #000;
-    color: #0f0;
-    font-family: monospace;
-}
-button {
-    font-size: 16px;
-    margin: 5px;
-}
-#log {
-    white-space: pre-wrap;
-    margin-top: 10px;
-}
+  body { font-family: monospace; background:#000; color:#0f0; }
+  button { margin:6px; padding:6px 10px; }
+  pre { white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
-<h2>PS4 WebKit – Step 7: Structural Corruption Validation</h2>
+<h2>PS4 WebKit – Passo 8: Observabilidade Pós-Corrupção</h2>
+<p>
+Base: <b>history.pushState + replaceState + back</b><br>
+Boundary conhecido: <b>977 + 14461</b><br>
+Execução segura: <b>49 iterações</b>
+</p>
 
-<button onclick="testOptionA()">Option A – Sentinel Corruption</button>
-<button onclick="testOptionB()">Option B – Delayed Use (UAF)</button>
-<button onclick="testOptionC()">Option C – Cross-Object Impact</button>
+<button onclick="runA()">Caminho A — Length Confusion</button>
+<button onclick="runB()">Caminho B — Pointer Drift (DataView)</button>
+<button onclick="runC()">Caminho C — History Reuse Inconsistente</button>
 
-<div id="log"></div>
+<pre id="log"></pre>
 
 <script>
-function log(msg) {
-    document.getElementById("log").textContent += msg + "\n";
+const logEl = document.getElementById('log');
+function log(m){ logEl.textContent += m + "\n"; }
+function clearLog(){ logEl.textContent = ""; }
+
+// ====== Sequência Base (49 iterações, sem crash) ======
+function baseHistorySequence(iterations=49){
+  let size = 977;
+  for(let i=0;i<iterations;i++){
+    const payload = "A".repeat(size);
+    history.pushState({i}, "", "#"+payload);
+    history.replaceState({i, r:true}, "", "#"+payload.slice(0, payload.length>>1));
+    if(i % 5 === 0) setTimeout(()=>history.back(), 0);
+    size += 14461;
+  }
 }
 
-/* ===============================
-   COMMON PAYLOAD GENERATOR
-   =============================== */
-function makePayload(size) {
-    return {
-        data: "A".repeat(size),
-        nested: { x: 1 }
-    };
+// =====================================================
+// Caminho A — Length Confusion
+// Objetivo: detectar alteração impossível de length/capacity
+// =====================================================
+function runA(){
+  clearLog();
+  log("[A] Iniciando Caminho A — Length Confusion");
+  try{
+    baseHistorySequence(49);
+
+    // Alocação controlada pós-sequência
+    const buf = new ArrayBuffer(0x100);
+    const u8  = new Uint8Array(buf);
+
+    const expected = u8.length;
+    // Escritas válidas
+    for(let i=0;i<u8.length;i++) u8[i]=0x41;
+
+    // Observações
+    log("[A] length esperado = " + expected);
+    log("[A] length observado = " + u8.length);
+
+    // Leitura fora do padrão lógico (não deve mudar)
+    let anomaly = false;
+    try{
+      // acesso de verificação (não OOB explícito)
+      const probe = u8[u8.length-1];
+      if(probe !== 0x41) anomaly = true;
+    }catch(e){
+      anomaly = true;
+    }
+
+    log("[A] Anomalia detectada? " + anomaly);
+    log("[A] Finalizado");
+  }catch(e){
+    log("[A] Exception: " + e);
+  }
 }
 
-/* ===============================
-   OPTION A – SENTINEL CORRUPTION
-   =============================== */
-function testOptionA() {
-    log("\n[Option A] Sentinel Heap Corruption Test");
+// =====================================================
+// Caminho B — Pointer Drift (DataView)
+// Objetivo: detectar leitura incoerente/deriva lógica
+// =====================================================
+function runB(){
+  clearLog();
+  log("[B] Iniciando Caminho B — Pointer Drift");
+  try{
+    baseHistorySequence(49);
 
-    let sentinel = new Uint32Array(16);
-    for (let i = 0; i < sentinel.length; i++) {
-        sentinel[i] = 0x41414141;
+    const buf = new ArrayBuffer(0x80);
+    const dv  = new DataView(buf);
+
+    // Inicialização conhecida
+    for(let i=0;i<0x80;i+=4) dv.setUint32(i, 0x41414141, true);
+
+    // Leitura coerente esperada
+    let incoherent = false;
+    for(let i=0;i<0x80;i+=4){
+      const v = dv.getUint32(i, true);
+      if(v !== 0x41414141){
+        incoherent = true;
+        log("[B] Drift em offset " + i + ": 0x" + v.toString(16));
+        break;
+      }
     }
 
-    log("Sentinel allocated");
+    log("[B] Incoerência detectada? " + incoherent);
+    log("[B] Finalizado");
+  }catch(e){
+    log("[B] Exception: " + e);
+  }
+}
 
-    try {
-        let payload = makePayload(695105);
-        history.pushState(payload, "", "#A" + payload.data);
-        history.replaceState(payload, "", "#B" + payload.data);
-    } catch (e) {
-        log("Exception during push/replace: " + e);
-    }
+// =====================================================
+// Caminho C — History Reuse Inconsistente
+// Objetivo: verificar estado reaproveitado com valores impossíveis
+// =====================================================
+function runC(){
+  clearLog();
+  log("[C] Iniciando Caminho C — History Reuse");
+  try{
+    baseHistorySequence(49);
 
-    let corrupted = false;
-    for (let i = 0; i < sentinel.length; i++) {
-        if (sentinel[i] !== 0x41414141) {
-            corrupted = true;
-            log("CORRUPTION DETECTED at index " + i +
-                " value=0x" + sentinel[i].toString(16));
+    // Inserir estado sentinela
+    history.pushState({sentinel:0x1337}, "", "#SENTINEL");
+    history.back();
+
+    // Aguardar navegação
+    setTimeout(()=>{
+      const st = history.state;
+      let inconsistent = false;
+
+      if(st && typeof st === "object"){
+        // Valor impossível indica reuse/corrupção
+        if(st.sentinel !== undefined && st.sentinel !== 0x1337){
+          inconsistent = true;
         }
-    }
+      }
 
-    if (!corrupted) {
-        log("No sentinel corruption observed");
-    }
+      log("[C] history.state = " + JSON.stringify(st));
+      log("[C] Inconsistência detectada? " + inconsistent);
+      log("[C] Finalizado");
+    }, 50);
+
+  }catch(e){
+    log("[C] Exception: " + e);
+  }
 }
 
-/* ===============================
-   OPTION B – DELAYED USE (UAF)
-   =============================== */
-function testOptionB() {
-    log("\n[Option B] Delayed Use / UAF Test");
-
-    let payload = makePayload(695105);
-
-    try {
-        history.pushState(payload, "", "#UAF" + payload.data);
-        history.replaceState(payload, "", "#UAF2" + payload.data);
-    } catch (e) {
-        log("Exception during push/replace: " + e);
-    }
-
-    log("State stored, waiting before reuse...");
-
-    setTimeout(function () {
-        try {
-            log("Re-accessing payload after delay");
-            payload.nested.x += 1;
-            log("Payload still accessible, x=" + payload.nested.x);
-        } catch (e) {
-            log("UAF-like failure detected: " + e);
-        }
-    }, 800);
-}
-
-/* ===============================
-   OPTION C – CROSS-OBJECT IMPACT
-   =============================== */
-function testOptionC() {
-    log("\n[Option C] Cross-Object Heap Impact Test");
-
-    try {
-        let payload = makePayload(695105);
-        history.pushState(payload, "", "#C" + payload.data);
-        history.replaceState(payload, "", "#C2" + payload.data);
-    } catch (e) {
-        log("Exception during push/replace: " + e);
-    }
-
-    log("Triggering external allocations");
-
-    let victims = [];
-    for (let i = 0; i < 100; i++) {
-        victims.push(new Uint32Array(256));
-    }
-
-    try {
-        for (let i = 0; i < victims.length; i++) {
-            victims[i][0] = 0x13371337;
-        }
-        log("Victim objects accessed successfully");
-    } catch (e) {
-        log("Cross-object corruption detected: " + e);
-    }
-
-    victims = null;
-
-    try {
-        for (let i = 0; i < 10; i++) {
-            new ArrayBuffer(1024 * 1024);
-        }
-        log("GC pressure applied");
-    } catch (e) {
-        log("Crash during GC pressure: " + e);
-    }
-}
+log("Pronto. Selecione um caminho.");
 </script>
-
 </body>
 </html>
+
