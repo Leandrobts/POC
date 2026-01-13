@@ -2,90 +2,176 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit UAF Audit – Fullscreen + Blur 22222</title>
+<title>PS4 WebKit – Teardown Subsystem Audit Framework</title>
+<style>
+body { font-family: monospace; background:#000; color:#0f0; }
+button { font-size:16px; padding:10px; margin:5px; }
+#log { white-space: pre-wrap; border-top:1px solid #0f0; margin-top:10px; padding-top:10px; }
+iframe { width:0; height:0; border:0; }
+</style>
 </head>
+
 <body>
 
-<h1>P (No Teardown) 55555</h1>
+<h2>PS4 WebKit – Subsystem Teardown Audit</h2>
 
-<button onclick="startTest()">START TEST</button>
-<pre id="log"></pre>
+<button onclick="start()">START FRAMEWORK</button>
+
+<div id="log"></div>
+
+<iframe id="sandbox"></iframe>
 
 <script>
-const log = (m) => {
-    document.getElementById("log").textContent += m + "\n";
-};
-
-let victims = [];
-let spray = [];
-let corruptedIndex = -1;
-
-function startTest() {
-    log("[*] Initializing test");
-
-    victims = [];
-    spray = [];
-    corruptedIndex = -1;
-
-    // Step 1: Allocate victim arrays
-    for (let i = 0; i < 4000; i++) {
-        let a = new Float64Array(8);
-        a[0] = i + 0.123;
-        victims.push(a);
-    }
-
-    log("[+] Victim Float64Arrays allocated: " + victims.length);
-
-    // Step 2: Enter fullscreen
-    document.documentElement.webkitRequestFullscreen();
-    log("[*] Fullscreen requested");
-
-    // Step 3: Blur handler ONLY
-    window.onblur = () => {
-        log("[*] Blur event triggered");
-
-        // Step 4: Spray AFTER blur
-        for (let i = 0; i < 8000; i++) {
-            let s = new Float64Array(8);
-            s.fill(2.121995791e-314); // 0x4141414141414141
-            spray.push(s);
-        }
-
-        log("[+] Spray executed: " + spray.length);
-
-        // Step 5: Delayed verification (no teardown)
-        setTimeout(verify, 200);
-    };
+const logEl = document.getElementById("log");
+function log(m) {
+    logEl.textContent += m + "\n";
 }
 
-function verify() {
-    log("[*] Verifying victim integrity");
+let iframe = document.getElementById("sandbox");
 
-    for (let i = 0; i < victims.length; i++) {
-        if (victims[i][0] === 2.121995791e-314) {
-            corruptedIndex = i;
-            break;
-        }
+/* ================================
+   SUBSYSTEM HOLDERS
+================================ */
+let canvasRef = null;
+let ctxRef = null;
+
+let audioCtx = null;
+let osc = null;
+
+let videoEl = null;
+
+let fontFace = null;
+
+let historyMarker = null;
+
+/* ================================
+   SETUP SUBSYSTEMS
+================================ */
+function setupSubsystems() {
+    log("[*] Setting up subsystems");
+
+    /* Canvas */
+    try {
+        canvasRef = document.createElement("canvas");
+        canvasRef.width = 256;
+        canvasRef.height = 256;
+        ctxRef = canvasRef.getContext("2d");
+        ctxRef.fillStyle = "red";
+        ctxRef.fillRect(0,0,256,256);
+        log("[+] Canvas initialized");
+    } catch(e) {
+        log("[-] Canvas init failed");
     }
 
-    if (corruptedIndex === -1) {
-        log("[-] NO CORRUPTION DETECTED");
-        log("[!] This indicates NO UAF on Float64Array backing store");
-    } else {
-        log("[!!!] POSSIBLE UAF DETECTED");
-        log("[+] Victim index: " + corruptedIndex);
-
-        for (let i = 0; i < 8; i++) {
-            let buf = new ArrayBuffer(8);
-            new Float64Array(buf)[0] = victims[corruptedIndex][i];
-            let hex = new BigUint64Array(buf)[0].toString(16);
-            log("    [" + i + "] = 0x" + hex);
-        }
+    /* Audio */
+    try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        osc = audioCtx.createOscillator();
+        osc.connect(audioCtx.destination);
+        osc.start();
+        log("[+] AudioContext initialized");
+    } catch(e) {
+        log("[-] AudioContext init failed");
     }
 
-    log("[*] Test completed WITHOUT teardown");
+    /* Video */
+    try {
+        videoEl = document.createElement("video");
+        videoEl.src = "";
+        log("[+] Video element created");
+    } catch(e) {
+        log("[-] Video init failed");
+    }
+
+    /* FontFace */
+    try {
+        fontFace = new FontFace("TestFont", "url(data:font/woff;base64,d09GRgABAAAAAA==)");
+        document.fonts.add(fontFace);
+        fontFace.load();
+        log("[+] FontFace created");
+    } catch(e) {
+        log("[-] FontFace init failed");
+    }
+
+    /* History */
+    try {
+        historyMarker = { tag: "HISTORY_OBJ" };
+        history.pushState(historyMarker, "", "#audit");
+        log("[+] History entry pushed");
+    } catch(e) {
+        log("[-] History push failed");
+    }
 }
-</script>
 
-</body>
-</html>
+/* ================================
+   POST-BLUR ACCESS TEST
+================================ */
+function testAccess(label, fn) {
+    try {
+        fn();
+        log("[OK] " + label + " access survived");
+    } catch(e) {
+        log("[FAIL] " + label + " access error");
+    }
+}
+
+/* ================================
+   IFRAME TEARDOWN
+================================ */
+function teardownIframe() {
+    log("[*] Tearing down iframe (document.write inside iframe only)");
+
+    iframe.contentWindow.document.open();
+    iframe.contentWindow.document.write("<html><body>iframe teardown</body></html>");
+    iframe.contentWindow.document.close();
+}
+
+/* ================================
+   MAIN ENTRY
+================================ */
+function start() {
+    log("======================================");
+    log("[*] Framework started");
+    log("[*] Enter fullscreen, then press OPTIONS");
+    log("======================================");
+
+    setupSubsystems();
+
+    /* Enter fullscreen */
+    const el = document.documentElement;
+    if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (el.requestFullscreen) el.requestFullscreen();
+
+    window.onblur = function() {
+        log("======================================");
+        log("[!] BLUR EVENT DETECTED");
+        log("======================================");
+
+        /* Isolated teardown */
+        teardownIframe();
+
+        /* ACCESS TESTS – BEFORE ANY CRASH */
+        log("[*] Testing post-blur access (NO reload)");
+
+        testAccess("Canvas draw", () => {
+            ctxRef.fillRect(10,10,50,50);
+        });
+
+        testAccess("Audio oscillator frequency", () => {
+            osc.frequency.value = 880;
+        });
+
+        testAccess("Video element property", () => {
+            let x = videoEl.currentTime;
+        });
+
+        testAccess("FontFace status", () => {
+            let s = fontFace.status;
+        });
+
+        testAccess("History state", () => {
+            let s = history.state;
+        });
+
+        log("======================================");
+        lo
