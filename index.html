@@ -1,173 +1,334 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>PS4 WebKit – E/F/G (Buttons in Iframe, Log in Parent) FIX</title>
+  <meta charset="utf-8">
+  <title>PS4 Fullscreen+Blur Teardown Harness (Parent Logger + Iframe UI)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { margin:0; font-family: monospace; background:#0b0b0b; color:#d7ffd7; }
+    .wrap { padding: 10px; }
+    .hdr { border-bottom: 1px solid #2a2a2a; padding-bottom: 8px; margin-bottom: 8px; }
+    .log { white-space: pre-wrap; word-break: break-word; background:#050505; border:1px solid #2a2a2a; padding:10px; height: 55vh; overflow:auto; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; }
+    iframe { width: 100%; height: 38vh; border: 1px solid #2a2a2a; background: #000; }
+    button { font-family: monospace; }
+    .pill { display:inline-block; padding:2px 6px; border:1px solid #2a2a2a; border-radius: 6px; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hdr">
+      <div><span class="pill">PARENT</span> Logger (somente aqui)</div>
+      <div style="opacity:.85">Sequência: START (no iframe) → fullscreen → OPTIONS (blur) → fases → document.write (mata iframe)</div>
+      <div class="row" style="margin-top:6px;">
+        <button onclick="clearLog()">Clear log</button>
+        <button onclick="recreateIframe()">Recreate iframe</button>
+      </div>
+    </div>
+
+    <div id="log" class="log">[PARENT] Loaded\n</div>
+
+    <iframe id="t"></iframe>
+  </div>
+
+<script>
+(function(){
+  const logEl = document.getElementById('log');
+  function log(line){
+    logEl.textContent += line + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  window.__PARENT_LOG__ = log;
+
+  window.addEventListener("message", (e) => {
+    // aceita somente strings simples para evitar confusão
+    if (typeof e.data === "string") {
+      log("[MSG] " + e.data);
+    }
+  });
+
+  window.clearLog = function(){
+    logEl.textContent = "[PARENT] Loaded\n";
+  };
+
+  window.recreateIframe = function(){
+    const old = document.getElementById('t');
+    const p = old.parentNode;
+    p.removeChild(old);
+    const nf = document.createElement('iframe');
+    nf.id = 't';
+    p.appendChild(nf);
+    injectIframe(nf);
+    log("[PARENT] iframe recreated");
+  };
+
+  function injectIframe(frame){
+    frame.srcdoc = getIframeHTML();
+  }
+
+  function getIframeHTML(){
+    // UI e execução ficam 100% dentro do iframe
+    return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IFRAME UI</title>
 <style>
-  body { background:#000; color:#0f0; font-family:monospace; margin:0; padding:10px; }
-  #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; height:320px; overflow:auto; }
-  iframe { width:100%; height:420px; border:1px solid #0f0; margin-top:10px; background:#000; }
+  body{ margin:0; font-family: monospace; background:#000; color:#0f0; }
+  .wrap{ padding: 10px; }
+  .box{ border:1px solid #0f0; padding:10px; margin-bottom:10px; }
+  .row{ display:flex; gap:10px; flex-wrap: wrap; align-items:center; }
+  select,input,label,button{ font-family: monospace; }
+  input[type="number"]{ width: 110px; }
+  button{ padding:8px 10px; background:#0f0; color:#000; border:0; font-weight:bold; cursor:pointer; }
+  button:disabled{ background:#333; color:#777; cursor:not-allowed; }
+  .hint{ color:#9f9; opacity:.9; }
+  .warn{ color:#ff0; }
 </style>
 </head>
 <body>
+<div class="wrap">
+  <div class="box">
+    <div><b>IFRAME</b> UI (botões aqui dentro)</div>
+    <div class="hint">Escolha o teste e clique START. Depois abra OPTIONS (blur).</div>
+  </div>
 
-<h3>PARENT LOGGER (only log stays outside)</h3>
-<div id="log"></div>
+  <div class="box">
+    <div class="row">
+      <label>Teste:
+        <select id="testSel">
+          <option value="A">A - Baseline Float64Array</option>
+          <option value="B">B - Float64Array + DataView/Uint8 alias</option>
+          <option value="C">C - Float64Array + postMessage transfer (neuter)</option>
+        </select>
+      </label>
 
-<iframe id="frame"></iframe>
+      <label>Qtd arrays:
+        <input id="countSel" type="number" min="0" max="50000" value="1">
+      </label>
+
+      <label>Len Float64:
+        <input id="lenSel" type="number" min="1" max="1024" value="8">
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:8px;">
+      <label><input type="checkbox" id="phRemoveHandlers" checked> Phase 1: remove handlers</label>
+      <label><input type="checkbox" id="phExitFS" checked> Phase 2: exit fullscreen</label>
+      <label><input type="checkbox" id="phDocWrite" checked> Phase 3: document.write teardown</label>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <button id="startBtn">START</button>
+      <button id="stopBtn" disabled>STOP (disarm)</button>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="warn"><b>Sequência</b>: START → fullscreen → OPTIONS (blur) → fases → document.write</div>
+    <div class="hint">Este harness mede eventos/estados e diferenças de comportamento sem depender de refresh.</div>
+  </div>
+</div>
 
 <script>
-function plog(m) {
-  var el = document.getElementById('log');
-  el.textContent += m + "\n";
-  el.scrollTop = el.scrollHeight;
-}
+(function(){
+  function send(s){ parent.postMessage(String(s), "*"); }
+  function now(){ try { return (new Date()).toLocaleTimeString(); } catch(e){ return ""; } }
+  function log(s){ send(s); }
 
-plog("[PARENT] Loaded");
+  // Estado e contadores
+  const counts = { blur:0, visibility:0, fullscreen:0, pagehide:0 };
+  let armed = false;
+  let didRun = false;
 
-window.addEventListener("message", function(e) {
-  try {
-    if (e && e.data && e.data.log) plog("[MSG] " + e.data.log);
-    else plog("[MSG] " + e.data);
-  } catch (err) {
-    plog("[MSG] (parse error)");
-  }
-}, false);
-
-function writeIntoIframe(fr) {
-  try {
-    var d = fr.contentDocument || fr.contentWindow.document;
-    d.open();
-    d.write(IFRAME_HTML);
-    d.close();
-    plog("[PARENT] iframe content written");
-  } catch (e) {
-    plog("[PARENT] iframe write failed: " + e);
-  }
-}
-
-function injectIframe() {
-  var fr = document.getElementById("frame");
-
-  // Força um "load real" (mudando a URL) para o onload disparar no PS4
-  fr.onload = function() {
-    plog("[PARENT] iframe onload fired");
-    writeIntoIframe(fr);
+  // Objetos sob teste
+  let keep = {
+    arrays: null,
+    f64: null,
+    u8: null,
+    dv: null,
+    ab: null
   };
 
-  // Mude a URL sempre para garantir load (hash rand já basta)
-  fr.src = "about:blank#" + (new Date().getTime());
+  // UI
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn  = document.getElementById("stopBtn");
 
-  // Fallback: se onload não disparar, escreve mesmo assim
-  setTimeout(function() {
-    plog("[PARENT] fallback write attempt");
-    writeIntoIframe(fr);
-  }, 200);
-}
+  startBtn.onclick = () => start();
+  stopBtn.onclick  = () => disarm();
 
-var IFRAME_HTML =
-'<!DOCTYPE html><html><head><meta charset="UTF-8"></head>' +
-'<body style="background:#000;color:#0f0;font-family:monospace;margin:0;padding:12px;">' +
+  // Eventos para telemetria (não “provam” corrupção; ajudam a bisseção)
+  window.addEventListener("blur", () => { counts.blur++; log("[EVENT] blur #" + counts.blur); if (armed) onTrigger("blur"); }, true);
+  document.addEventListener("visibilitychange", () => { counts.visibility++; log("[EVENT] visibilitychange -> " + (document.hidden ? "hidden":"visible")); }, true);
+  window.addEventListener("pagehide", () => { counts.pagehide++; log("[EVENT] pagehide"); }, true);
+  document.addEventListener("fullscreenchange", () => { counts.fullscreen++; log("[EVENT] fullscreenchange active=" + !!document.fullscreenElement); }, true);
 
-'<h3 style="margin:0 0 10px 0;">IFRAME – Select Test, then press OPTIONS after fullscreen</h3>' +
+  function snapshot(tag){
+    const f64 = keep.f64;
+    const ab  = keep.ab;
+    log("[SNAPSHOT] " + tag);
+    try { log("  f64.length=" + (f64 ? f64.length : "null")); } catch(e){ log("  f64.length=<err>"); }
+    try { log("  f64.byteLength=" + (f64 ? f64.byteLength : "null")); } catch(e){ log("  f64.byteLength=<err>"); }
+    try { log("  ab.byteLength=" + (ab ? ab.byteLength : "null")); } catch(e){ log("  ab.byteLength=<err>"); }
+    try { log("  f64[0]=" + (f64 ? f64[0] : "null")); } catch(e){ log("  f64[0]=<err>"); }
+    log("[COUNTS] " + JSON.stringify(counts));
+  }
 
-'<div style="margin-bottom:10px;">' +
-'  <button onclick="startTest(\\'E\\')" style="font-size:16px;padding:8px 12px;margin-right:6px;">TEST E (no document.write)</button>' +
-'  <button onclick="startTest(\\'F\\')" style="font-size:16px;padding:8px 12px;margin-right:6px;">TEST F (delayed document.write)</button>' +
-'  <button onclick="startTest(\\'G\\')" style="font-size:16px;padding:8px 12px;">TEST G (array AFTER blur)</button>' +
-'</div>' +
+  function start(){
+    if (armed) return;
+    didRun = false;
+    armed = true;
 
-'<div style="border:1px solid #0f0;padding:10px;">' +
-'  <div><b>Sequence:</b> click a test → fullscreen → press OPTIONS (blur) → observe parent log.</div>' +
-'  <div style="margin-top:8px;color:#aaa;font-size:13px;">(Iframe may be torn down in F; E keeps it alive.)</div>' +
-'</div>' +
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
 
-'<script>' +
-'function send(m){ try{ parent.postMessage({log:m},"*"); }catch(e){} }' +
+    const test = document.getElementById("testSel").value;
+    const n = parseInt(document.getElementById("countSel").value, 10) || 0;
+    const len = parseInt(document.getElementById("lenSel").value, 10) || 8;
 
-'var currentTest = null;' +
-'var f64 = null;' +
-'var buffer = null;' +
-'var spray = [];' +
-'var started = false;' +
+    log("=== START TEST " + test + " ===");
+    log("[STATE] armed=true");
+    log("[PARAM] count=" + n + " len=" + len);
 
-'send("[IFRAME] Loaded (buttons should be visible)");' +
+    // 1) Preparar objetos conforme teste
+    if (test === "A") setupA(n, len);
+    if (test === "B") setupB(n, len);
+    if (test === "C") setupC(n, len);
 
-'function snapshot(tag){' +
-'  send("[SNAPSHOT] " + tag);' +
-'  try {' +
-'    send(" f64.length=" + (f64 ? f64.length : "null"));' +
-'    send(" f64[0]=" + (f64 ? f64[0] : "null"));' +
-'    send(" buffer.byteLength=" + (buffer ? buffer.byteLength : "null"));' +
-'    send(" spray.alive=" + (spray ? spray.length : 0));' +
-'  } catch(e) {' +
-'    send(" snapshot exception");' +
-'  }' +
-'}' +
+    snapshot("before fullscreen");
 
-'function allocPreBlur(){' +
-'  buffer = new ArrayBuffer(64);' +
-'  f64 = new Float64Array(buffer);' +
-'  f64[0] = 13.37;' +
-'  for (var i=0;i<500;i++) spray.push(new Float64Array(8));' +
-'  send("[ALLOC] PRE-BLUR Float64Array length=" + f64.length + " spray=" + spray.length);' +
-'}' +
+    // 2) Pedir fullscreen
+    requestFS();
+    log("[STATE] fullscreen requested");
+    log("[HINT] Abra OPTIONS agora (trigger blur)");
+  }
 
-'function allocAfterBlur(){' +
-'  buffer = new ArrayBuffer(64);' +
-'  f64 = new Float64Array(buffer);' +
-'  f64[0] = 13.37;' +
-'  for (var i=0;i<500;i++) spray.push(new Float64Array(8));' +
-'  send("[ALLOC] AFTER-BLUR Float64Array length=" + f64.length + " spray=" + spray.length);' +
-'}' +
+  function disarm(){
+    armed = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    log("[STATE] disarmed (STOP)");
+  }
 
-'function startTest(t){' +
-'  if (started) { send("[WARN] already started; reload page to re-run cleanly"); return; }' +
-'  started = true;' +
-'  currentTest = t;' +
-'  send("=== START TEST " + t + " ===");' +
+  function requestFS(){
+    const el = document.documentElement;
+    try {
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    } catch(e) {
+      log("[ERR] requestFullscreen failed: " + e);
+    }
+  }
 
-'  if (t !== "G") {' +
-'    allocPreBlur();' +
-'  } else {' +
-'    send("[G] will allocate AFTER blur");' +
-'  }' +
+  function onTrigger(source){
+    if (!armed) return;
+    if (didRun) return; // roda uma vez por start
+    didRun = true;
 
-'  snapshot("before fullscreen");' +
-'  send("[STATE] requesting fullscreen");' +
-'  try { document.documentElement.webkitRequestFullscreen(); } catch(e) { send("[ERROR] fullscreen request failed"); }' +
-'}' +
+    log("========================================");
+    log("[TRIGGER] " + source + " detected");
+    log("========================================");
 
-'window.onblur = function(){' +
-'  if (!started) { send("[EVENT] blur detected (but not started)"); return; }' +
-'  send("[EVENT] blur detected");' +
+    snapshot("after trigger");
 
-'  if (currentTest === "G") {' +
-'    allocAfterBlur();' +
-'  }' +
+    // Fases (bisseção)
+    const ph1 = document.getElementById("phRemoveHandlers").checked;
+    const ph2 = document.getElementById("phExitFS").checked;
+    const ph3 = document.getElementById("phDocWrite").checked;
 
-'  snapshot("after blur");' +
+    // Phase 1: remover handlers (reduz interferência)
+    if (ph1) {
+      log("[PHASE1] remove handlers");
+      try {
+        window.onblur = null;
+      } catch(e){}
+      snapshot("phase1");
+    }
 
-'  if (currentTest === "E") {' +
-'    send("[TEST E] keeping iframe alive (NO document.write)");' +
-'    return;' +
-'  }' +
+    // Phase 2: sair do fullscreen (se aplicável)
+    if (ph2) {
+      log("[PHASE2] exit fullscreen");
+      try {
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      } catch(e){
+        log("[WARN] exitFullscreen failed: " + e);
+      }
+      snapshot("phase2");
+    }
 
-'  if (currentTest === "F") {' +
-'    send("[TEST F] scheduling document.write in 150ms");' +
-'    setTimeout(function(){' +
-'      send("[TEARDOWN] document.write iframe");' +
-'      try { document.open(); document.write("<h3>teardown</h3>"); document.close(); } catch(e) {}' +
-'    }, 150);' +
-'    return;' +
-'  }' +
-'};' +
-'<\/script>' +
+    // Phase 3: teardown do iframe via document.write
+    if (ph3) {
+      log("[PHASE3] document.write teardown (kill iframe)");
+      // Delay curto para garantir logs antes do teardown
+      setTimeout(() => {
+        try {
+          document.open();
+          document.write("<!doctype html><html><body><pre>IFRAME TORN DOWN</pre></body></html>");
+          document.close();
+        } catch(e) {
+          // se falhar, ao menos reporta
+          log("[ERR] document.write failed: " + e);
+        }
+      }, 50);
+    } else {
+      log("[DONE] teardown disabled");
+    }
+  }
 
-'</body></html>';
+  // Test A: baseline Float64Array(s)
+  function setupA(n, len){
+    keep.arrays = [];
+    for (let i=0; i<n; i++){
+      const f64 = new Float64Array(len);
+      f64[0] = 13.37;
+      keep.arrays.push(f64);
+    }
+    keep.f64 = keep.arrays[0] || null;
+    keep.ab  = keep.f64 ? keep.f64.buffer : null;
+    log("[ALLOC] Float64Array x" + n + " (kept alive)");
+  }
 
-injectIframe();
+  // Test B: aliasing via DataView/Uint8Array
+  function setupB(n, len){
+    setupA(n, len);
+    if (keep.ab) {
+      try {
+        keep.dv = new DataView(keep.ab);
+        keep.u8 = new Uint8Array(keep.ab);
+        log("[REGISTER] DataView + Uint8Array alias created");
+      } catch(e){
+        log("[WARN] DataView/Uint8 alias failed: " + e);
+      }
+    }
+  }
+
+  // Test C: transfer/neuter (se suportado)
+  function setupC(n, len){
+    setupA(n, len);
+    if (!keep.ab) return;
+    try {
+      // tenta transferir o buffer: em alguns engines isso "neutra" no remetente
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => {};
+      ch.port2.postMessage({tag:"x"}, [keep.ab]);
+      log("[REGISTER] postMessage transfer attempted (buffer may be neutered)");
+    } catch(e){
+      log("[WARN] postMessage transfer failed: " + e);
+    }
+  }
+
+  log("[IFRAME] Loaded");
+})();
+<\/script>
+</body>
+</html>`;
+  }
+
+  // init
+  injectIframe(document.getElementById('t'));
+})();
 </script>
-
 </body>
 </html>
