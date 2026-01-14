@@ -1,86 +1,173 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>PS4 Fullscreen+Blur Teardown Harness (Parent Logger + Iframe UI)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { margin:0; font-family: monospace; background:#0b0b0b; color:#d7ffd7; }
-    .wrap { padding: 10px; }
-    .hdr { border-bottom: 1px solid #2a2a2a; padding-bottom: 8px; margin-bottom: 8px; }
-    .log { white-space: pre-wrap; word-break: break-word; background:#050505; border:1px solid #2a2a2a; padding:10px; height: 55vh; overflow:auto; }
-    .row { display:flex; gap:10px; flex-wrap: wrap; }
-    iframe { width: 100%; height: 38vh; border: 1px solid #2a2a2a; background: #000; }
-    button { font-family: monospace; }
-    .pill { display:inline-block; padding:2px 6px; border:1px solid #2a2a2a; border-radius: 6px; margin-right: 6px; }
-  </style>
+<meta charset="utf-8">
+<title>PS4 Fullscreen+Blur Matrix Runner (Buttons in Iframe, Log in Parent)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{ margin:0; font-family:monospace; background:#0b0b0b; color:#d7ffd7; }
+  .wrap{ padding:10px; }
+  .hdr{ border-bottom:1px solid #2a2a2a; padding-bottom:8px; margin-bottom:8px; }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .log{ white-space:pre-wrap; word-break:break-word; background:#050505; border:1px solid #2a2a2a; padding:10px; height:55vh; overflow:auto; }
+  iframe{ width:100%; height:38vh; border:1px solid #2a2a2a; background:#000; }
+  button{ font-family:monospace; }
+  .pill{ display:inline-block; padding:2px 6px; border:1px solid #2a2a2a; border-radius:6px; margin-right:6px; }
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="hdr">
-      <div><span class="pill">PARENT</span> Logger (somente aqui)</div>
-      <div style="opacity:.85">Sequência: START (no iframe) → fullscreen → OPTIONS (blur) → fases → document.write (mata iframe)</div>
-      <div class="row" style="margin-top:6px;">
-        <button onclick="clearLog()">Clear log</button>
-        <button onclick="recreateIframe()">Recreate iframe</button>
-      </div>
+<div class="wrap">
+  <div class="hdr">
+    <div><span class="pill">PARENT</span> Logger (somente aqui)</div>
+    <div style="opacity:.85">START (no iframe) → fullscreen → OPTIONS (blur) → fases → (opcional) document.write</div>
+    <div class="row" style="margin-top:8px;">
+      <button onclick="clearLog()">Clear log</button>
+      <button onclick="stopAuto()">Stop Auto</button>
+      <button onclick="recreateIframe()">Recreate iframe</button>
     </div>
-
-    <div id="log" class="log">[PARENT] Loaded\n</div>
-
-    <iframe id="t"></iframe>
   </div>
+
+  <div id="log" class="log">[PARENT] Loaded\n</div>
+  <iframe id="t"></iframe>
+</div>
 
 <script>
 (function(){
   const logEl = document.getElementById('log');
-  function log(line){
-    logEl.textContent += line + "\n";
+  function plog(s){
+    logEl.textContent += s + "\n";
     logEl.scrollTop = logEl.scrollHeight;
   }
-  window.__PARENT_LOG__ = log;
+  window.__PARENT_LOG__ = plog;
 
-  window.addEventListener("message", (e) => {
-    // aceita somente strings simples para evitar confusão
-    if (typeof e.data === "string") {
-      log("[MSG] " + e.data);
+  // ---------- Auto-run state (kept in parent) ----------
+  let AUTO = {
+    enabled: false,
+    idx: 0,
+    plan: [],        // [{mode:'A|B|C', combo:1..4, count, len}]
+    lastKickTs: 0
+  };
+
+  function buildPlan(count, len){
+    const modes = ["A","B","C"];
+    const combos = [1,2,3,4];
+    const out = [];
+    for (let m of modes){
+      for (let c of combos){
+        out.push({mode:m, combo:c, count:count, len:len});
+      }
     }
-  });
-
-  window.clearLog = function(){
-    logEl.textContent = "[PARENT] Loaded\n";
-  };
-
-  window.recreateIframe = function(){
-    const old = document.getElementById('t');
-    const p = old.parentNode;
-    p.removeChild(old);
-    const nf = document.createElement('iframe');
-    nf.id = 't';
-    p.appendChild(nf);
-    injectIframe(nf);
-    log("[PARENT] iframe recreated");
-  };
-
-  function injectIframe(frame){
-    frame.srcdoc = getIframeHTML();
+    return out;
   }
 
-  function getIframeHTML(){
-    // UI e execução ficam 100% dentro do iframe
+  function clearLog(){ logEl.textContent = "[PARENT] Loaded\n"; }
+  window.clearLog = clearLog;
+
+  function stopAuto(){
+    AUTO.enabled = false;
+    plog("[PARENT] Auto-run stopped");
+  }
+  window.stopAuto = stopAuto;
+
+  function recreateIframe(){
+    const old = document.getElementById("t");
+    const p = old.parentNode;
+    p.removeChild(old);
+    const nf = document.createElement("iframe");
+    nf.id = "t";
+    p.appendChild(nf);
+    injectIframe(nf, null);
+    plog("[PARENT] iframe recreated");
+  }
+  window.recreateIframe = recreateIframe;
+
+  // ---------- Message handling ----------
+  window.addEventListener("message", (e) => {
+    if (typeof e.data === "string"){
+      plog("[MSG] " + e.data);
+
+      // Auto-run protocol
+      if (e.data.startsWith("[AUTO] BEGIN")){
+        // parse params from message
+        // format: [AUTO] BEGIN count=... len=...
+        try {
+          const parts = e.data.split(" ");
+          let count = 1, len = 8;
+          for (const p of parts){
+            if (p.startsWith("count=")) count = parseInt(p.slice(6),10) || 1;
+            if (p.startsWith("len="))   len   = parseInt(p.slice(4),10) || 8;
+          }
+          AUTO.enabled = true;
+          AUTO.idx = 0;
+          AUTO.plan = buildPlan(count, len);
+          plog("[PARENT] Auto-run plan=" + AUTO.plan.length + " runs (A/B/C x 4 combos)");
+          stepAuto(); // immediately start first step
+        } catch(err){
+          plog("[PARENT] Auto-run parse error: " + err);
+        }
+      }
+
+      if (e.data.startsWith("[AUTO] DONE")){
+        // iframe finished a run (may have document.write’d). advance
+        if (AUTO.enabled) {
+          // small delay to allow teardown settle, then next
+          setTimeout(stepAuto, 250);
+        }
+      }
+
+      if (e.data.startsWith("[AUTO] REQUEST_NEXT")){
+        // iframe asks parent to inject next step (when it stays alive)
+        if (AUTO.enabled) setTimeout(stepAuto, 50);
+      }
+
+      if (e.data.startsWith("[AUTO] ABORT")){
+        AUTO.enabled = false;
+        plog("[PARENT] Auto-run aborted by iframe");
+      }
+    }
+  }, false);
+
+  function stepAuto(){
+    if (!AUTO.enabled) return;
+    if (AUTO.idx >= AUTO.plan.length){
+      plog("[PARENT] Auto-run complete");
+      AUTO.enabled = false;
+      // leave iframe with normal UI
+      recreateIframe();
+      return;
+    }
+    const run = AUTO.plan[AUTO.idx++];
+    plog("------------------------------------------------------------");
+    plog("[PARENT] AUTO STEP " + AUTO.idx + "/" + AUTO.plan.length +
+         " mode=" + run.mode + " combo=" + run.combo + " count=" + run.count + " len=" + run.len);
+    injectIframe(document.getElementById("t"), run);
+    AUTO.lastKickTs = Date.now();
+  }
+
+  // ---------- Iframe injection ----------
+  function injectIframe(frame, preset){
+    // preset: {mode, combo, count, len} or null
+    frame.srcdoc = iframeHTML(preset);
+  }
+
+  function iframeHTML(preset){
+    // preset values
+    const pMode  = preset ? preset.mode  : "A";
+    const pCombo = preset ? preset.combo : 1;
+    const pCount = preset ? preset.count : 1;
+    const pLen   = preset ? preset.len   : 8;
+    const pAuto  = preset ? "true" : "false";
+
     return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IFRAME UI</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IFRAME Matrix UI</title>
 <style>
-  body{ margin:0; font-family: monospace; background:#000; color:#0f0; }
-  .wrap{ padding: 10px; }
+  body{ margin:0; font-family:monospace; background:#000; color:#0f0; }
+  .wrap{ padding:10px; }
   .box{ border:1px solid #0f0; padding:10px; margin-bottom:10px; }
-  .row{ display:flex; gap:10px; flex-wrap: wrap; align-items:center; }
-  select,input,label,button{ font-family: monospace; }
-  input[type="number"]{ width: 110px; }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  select,input,label,button{ font-family:monospace; }
+  input[type=number]{ width:110px; }
   button{ padding:8px 10px; background:#0f0; color:#000; border:0; font-weight:bold; cursor:pointer; }
   button:disabled{ background:#333; color:#777; cursor:not-allowed; }
   .hint{ color:#9f9; opacity:.9; }
@@ -90,244 +177,311 @@
 <body>
 <div class="wrap">
   <div class="box">
-    <div><b>IFRAME</b> UI (botões aqui dentro)</div>
-    <div class="hint">Escolha o teste e clique START. Depois abra OPTIONS (blur).</div>
+    <div><b>IFRAME UI</b> (botões aqui dentro)</div>
+    <div class="hint">Selecione modo e combinação. Clique START. Depois abra OPTIONS (blur).</div>
   </div>
 
   <div class="box">
     <div class="row">
-      <label>Teste:
-        <select id="testSel">
+      <label>Modo:
+        <select id="modeSel">
           <option value="A">A - Baseline Float64Array</option>
-          <option value="B">B - Float64Array + DataView/Uint8 alias</option>
-          <option value="C">C - Float64Array + postMessage transfer (neuter)</option>
+          <option value="B">B - + DataView/Uint8 alias</option>
+          <option value="C">C - postMessage transfer (neuter)</option>
         </select>
       </label>
-
-      <label>Qtd arrays:
-        <input id="countSel" type="number" min="0" max="50000" value="1">
-      </label>
-
-      <label>Len Float64:
-        <input id="lenSel" type="number" min="1" max="1024" value="8">
+      <label>Combinação:
+        <select id="comboSel">
+          <option value="1">1) Blur only (no exitFS, no write)</option>
+          <option value="2">2) Blur + exitFullscreen</option>
+          <option value="3">3) Blur + document.write</option>
+          <option value="4">4) Blur + exitFullscreen + document.write</option>
+        </select>
       </label>
     </div>
 
     <div class="row" style="margin-top:8px;">
-      <label><input type="checkbox" id="phRemoveHandlers" checked> Phase 1: remove handlers</label>
-      <label><input type="checkbox" id="phExitFS" checked> Phase 2: exit fullscreen</label>
-      <label><input type="checkbox" id="phDocWrite" checked> Phase 3: document.write teardown</label>
+      <label>Qtd arrays:
+        <input id="countSel" type="number" min="0" max="50000" value="${pCount}">
+      </label>
+      <label>Len Float64:
+        <input id="lenSel" type="number" min="1" max="1024" value="${pLen}">
+      </label>
     </div>
 
     <div class="row" style="margin-top:10px;">
-      <button id="startBtn">START</button>
+      <button id="startBtn">START (manual)</button>
       <button id="stopBtn" disabled>STOP (disarm)</button>
+      <button id="autoBtn">AUTO RUN ALL (A/B/C x 4)</button>
     </div>
-  </div>
 
-  <div class="box">
-    <div class="warn"><b>Sequência</b>: START → fullscreen → OPTIONS (blur) → fases → document.write</div>
-    <div class="hint">Este harness mede eventos/estados e diferenças de comportamento sem depender de refresh.</div>
+    <div class="warn" style="margin-top:10px;">
+      <b>Sequência:</b> START → fullscreen → OPTIONS (blur) → fases → (opcional) document.write
+    </div>
+    <div class="hint">O log aparece no PARENT. O iframe pode morrer quando document.write estiver ativo.</div>
   </div>
 </div>
 
 <script>
 (function(){
   function send(s){ parent.postMessage(String(s), "*"); }
-  function now(){ try { return (new Date()).toLocaleTimeString(); } catch(e){ return ""; } }
   function log(s){ send(s); }
 
-  // Estado e contadores
-  const counts = { blur:0, visibility:0, fullscreen:0, pagehide:0 };
+  // --- UI elements ---
+  const modeSel  = document.getElementById("modeSel");
+  const comboSel = document.getElementById("comboSel");
+  const countSel = document.getElementById("countSel");
+  const lenSel   = document.getElementById("lenSel");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn  = document.getElementById("stopBtn");
+  const autoBtn  = document.getElementById("autoBtn");
+
+  // preset from parent (auto mode)
+  const PRESET_MODE  = "${pMode}";
+  const PRESET_COMBO = "${pCombo}";
+  const PRESET_AUTO  = ${pAuto};
+
+  modeSel.value = PRESET_MODE;
+  comboSel.value = String(PRESET_COMBO);
+
+  // --- run state ---
+  let runId = 0;
   let armed = false;
   let didRun = false;
 
-  // Objetos sob teste
-  let keep = {
-    arrays: null,
-    f64: null,
-    u8: null,
-    dv: null,
-    ab: null
-  };
+  // counters reset per START (fix contamination)
+  let counts = { blur:0, visibility:0, fullscreen:0, pagehide:0 };
 
-  // UI
-  const startBtn = document.getElementById("startBtn");
-  const stopBtn  = document.getElementById("stopBtn");
+  // objects under test
+  let keep = { arrays:null, f64:null, ab:null, dv:null, u8:null };
 
-  startBtn.onclick = () => start();
-  stopBtn.onclick  = () => disarm();
+  // events
+  window.addEventListener("blur", () => {
+    counts.blur++;
+    log("[EVENT] blur #" + counts.blur + " runId=" + runId);
+    if (armed) onTrigger();
+  }, true);
 
-  // Eventos para telemetria (não “provam” corrupção; ajudam a bisseção)
-  window.addEventListener("blur", () => { counts.blur++; log("[EVENT] blur #" + counts.blur); if (armed) onTrigger("blur"); }, true);
-  document.addEventListener("visibilitychange", () => { counts.visibility++; log("[EVENT] visibilitychange -> " + (document.hidden ? "hidden":"visible")); }, true);
-  window.addEventListener("pagehide", () => { counts.pagehide++; log("[EVENT] pagehide"); }, true);
-  document.addEventListener("fullscreenchange", () => { counts.fullscreen++; log("[EVENT] fullscreenchange active=" + !!document.fullscreenElement); }, true);
+  document.addEventListener("visibilitychange", () => {
+    counts.visibility++;
+    log("[EVENT] visibilitychange -> " + (document.hidden ? "hidden":"visible") + " runId=" + runId);
+  }, true);
+
+  document.addEventListener("fullscreenchange", () => {
+    counts.fullscreen++;
+    log("[EVENT] fullscreenchange active=" + (!!document.fullscreenElement) + " runId=" + runId);
+  }, true);
+
+  window.addEventListener("pagehide", () => {
+    counts.pagehide++;
+    log("[EVENT] pagehide runId=" + runId);
+  }, true);
 
   function snapshot(tag){
-    const f64 = keep.f64;
-    const ab  = keep.ab;
-    log("[SNAPSHOT] " + tag);
-    try { log("  f64.length=" + (f64 ? f64.length : "null")); } catch(e){ log("  f64.length=<err>"); }
-    try { log("  f64.byteLength=" + (f64 ? f64.byteLength : "null")); } catch(e){ log("  f64.byteLength=<err>"); }
-    try { log("  ab.byteLength=" + (ab ? ab.byteLength : "null")); } catch(e){ log("  ab.byteLength=<err>"); }
-    try { log("  f64[0]=" + (f64 ? f64[0] : "null")); } catch(e){ log("  f64[0]=<err>"); }
-    log("[COUNTS] " + JSON.stringify(counts));
+    log("[SNAPSHOT] " + tag + " runId=" + runId);
+    try{ log("  f64.length=" + (keep.f64 ? keep.f64.length : "null")); }catch(e){ log("  f64.length=<err>"); }
+    try{ log("  f64.byteLength=" + (keep.f64 ? keep.f64.byteLength : "null")); }catch(e){ log("  f64.byteLength=<err>"); }
+    try{ log("  ab.byteLength=" + (keep.ab ? keep.ab.byteLength : "null")); }catch(e){ log("  ab.byteLength=<err>"); }
+    try{ log("  f64[0]=" + (keep.f64 ? keep.f64[0] : "null")); }catch(e){ log("  f64[0]=<err>"); }
+    log("[COUNTS] " + JSON.stringify(counts) + " runId=" + runId);
   }
 
-  function start(){
+  function setupA(n, len){
+    keep.arrays = [];
+    for (let i=0;i<n;i++){
+      const f = new Float64Array(len);
+      f[0] = 13.37;
+      keep.arrays.push(f);
+    }
+    keep.f64 = keep.arrays[0] || null;
+    keep.ab = keep.f64 ? keep.f64.buffer : null;
+    log("[ALLOC] Float64Array x" + n + " len=" + len + " (kept alive) runId=" + runId);
+  }
+
+  function setupB(n, len){
+    setupA(n, len);
+    if (keep.ab){
+      try{
+        keep.dv = new DataView(keep.ab);
+        keep.u8 = new Uint8Array(keep.ab);
+        log("[REGISTER] DataView+Uint8 alias created runId=" + runId);
+      }catch(e){
+        log("[WARN] alias failed: " + e + " runId=" + runId);
+      }
+    }
+  }
+
+  function setupC(n, len){
+    setupA(n, len);
+    if (!keep.ab) return;
+    try{
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => {};
+      ch.port2.postMessage({tag:"x"}, [keep.ab]);
+      log("[REGISTER] postMessage transfer attempted (buffer may neuter) runId=" + runId);
+    }catch(e){
+      log("[WARN] transfer failed: " + e + " runId=" + runId);
+    }
+  }
+
+  function requestFS(){
+    const el = document.documentElement;
+    try{
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else log("[WARN] no fullscreen API runId=" + runId);
+    }catch(e){
+      log("[ERR] requestFullscreen failed: " + e + " runId=" + runId);
+    }
+  }
+
+  function exitFS_then(cb){
+    // exit is async; wait a bit so we can snapshot accurately
+    try{
+      if (document.exitFullscreen) document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      else log("[WARN] no exitFullscreen API runId=" + runId);
+    }catch(e){
+      log("[WARN] exitFullscreen threw: " + e + " runId=" + runId);
+    }
+    setTimeout(cb, 80);
+  }
+
+  function startRun(autoTriggered){
     if (armed) return;
-    didRun = false;
+    runId++;
     armed = true;
+    didRun = false;
+
+    // reset counters per run (fix)
+    counts = { blur:0, visibility:0, fullscreen:0, pagehide:0 };
 
     startBtn.disabled = true;
     stopBtn.disabled = false;
 
-    const test = document.getElementById("testSel").value;
-    const n = parseInt(document.getElementById("countSel").value, 10) || 0;
-    const len = parseInt(document.getElementById("lenSel").value, 10) || 8;
+    const mode = modeSel.value;
+    const combo = parseInt(comboSel.value, 10) || 1;
+    const n = parseInt(countSel.value, 10) || 0;
+    const len = parseInt(lenSel.value, 10) || 8;
 
-    log("=== START TEST " + test + " ===");
-    log("[STATE] armed=true");
-    log("[PARAM] count=" + n + " len=" + len);
+    log("=== START mode=" + mode + " combo=" + combo + " runId=" + runId + " ===");
+    log("[STATE] armed=true runId=" + runId);
+    log("[PARAM] count=" + n + " len=" + len + " runId=" + runId);
 
-    // 1) Preparar objetos conforme teste
-    if (test === "A") setupA(n, len);
-    if (test === "B") setupB(n, len);
-    if (test === "C") setupC(n, len);
+    // setup
+    keep = { arrays:null, f64:null, ab:null, dv:null, u8:null };
+    if (mode === "A") setupA(n, len);
+    if (mode === "B") setupB(n, len);
+    if (mode === "C") setupC(n, len);
 
     snapshot("before fullscreen");
-
-    // 2) Pedir fullscreen
     requestFS();
-    log("[STATE] fullscreen requested");
-    log("[HINT] Abra OPTIONS agora (trigger blur)");
+    log("[STATE] fullscreen requested runId=" + runId);
+    log("[HINT] Abra OPTIONS agora (blur) runId=" + runId);
+
+    if (autoTriggered){
+      // Nothing else; user still must press OPTIONS
+    }
   }
 
   function disarm(){
     armed = false;
     startBtn.disabled = false;
     stopBtn.disabled = true;
-    log("[STATE] disarmed (STOP)");
+    log("[STATE] disarmed runId=" + runId);
   }
 
-  function requestFS(){
-    const el = document.documentElement;
-    try {
-      if (el.requestFullscreen) el.requestFullscreen();
-      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-    } catch(e) {
-      log("[ERR] requestFullscreen failed: " + e);
-    }
-  }
-
-  function onTrigger(source){
-    if (!armed) return;
-    if (didRun) return; // roda uma vez por start
+  function onTrigger(){
+    if (!armed || didRun) return;
     didRun = true;
 
+    const combo = parseInt(comboSel.value, 10) || 1;
+
     log("========================================");
-    log("[TRIGGER] " + source + " detected");
+    log("[TRIGGER] blur detected combo=" + combo + " runId=" + runId);
     log("========================================");
+    snapshot("after blur");
 
-    snapshot("after trigger");
+    // resolve which phases based on combo
+    const doExit  = (combo === 2 || combo === 4);
+    const doWrite = (combo === 3 || combo === 4);
 
-    // Fases (bisseção)
-    const ph1 = document.getElementById("phRemoveHandlers").checked;
-    const ph2 = document.getElementById("phExitFS").checked;
-    const ph3 = document.getElementById("phDocWrite").checked;
-
-    // Phase 1: remover handlers (reduz interferência)
-    if (ph1) {
-      log("[PHASE1] remove handlers");
-      try {
-        window.onblur = null;
-      } catch(e){}
-      snapshot("phase1");
-    }
-
-    // Phase 2: sair do fullscreen (se aplicável)
-    if (ph2) {
-      log("[PHASE2] exit fullscreen");
-      try {
-        if (document.exitFullscreen) document.exitFullscreen();
-        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-      } catch(e){
-        log("[WARN] exitFullscreen failed: " + e);
+    function phaseWrite(){
+      if (!doWrite){
+        log("[DONE] no document.write combo=" + combo + " runId=" + runId);
+        // Tell parent to proceed to next auto step without killing iframe
+        log("[AUTO] REQUEST_NEXT");
+        // disarm for manual runs
+        disarm();
+        return;
       }
-      snapshot("phase2");
-    }
-
-    // Phase 3: teardown do iframe via document.write
-    if (ph3) {
-      log("[PHASE3] document.write teardown (kill iframe)");
-      // Delay curto para garantir logs antes do teardown
+      log("[PHASE3] document.write teardown (kill iframe) runId=" + runId);
+      // Tell parent we're finishing this run
+      log("[AUTO] DONE runId=" + runId);
       setTimeout(() => {
-        try {
+        try{
           document.open();
           document.write("<!doctype html><html><body><pre>IFRAME TORN DOWN</pre></body></html>");
           document.close();
-        } catch(e) {
-          // se falhar, ao menos reporta
-          log("[ERR] document.write failed: " + e);
-        }
+        }catch(e){}
       }, 50);
-    } else {
-      log("[DONE] teardown disabled");
     }
-  }
 
-  // Test A: baseline Float64Array(s)
-  function setupA(n, len){
-    keep.arrays = [];
-    for (let i=0; i<n; i++){
-      const f64 = new Float64Array(len);
-      f64[0] = 13.37;
-      keep.arrays.push(f64);
-    }
-    keep.f64 = keep.arrays[0] || null;
-    keep.ab  = keep.f64 ? keep.f64.buffer : null;
-    log("[ALLOC] Float64Array x" + n + " (kept alive)");
-  }
-
-  // Test B: aliasing via DataView/Uint8Array
-  function setupB(n, len){
-    setupA(n, len);
-    if (keep.ab) {
-      try {
-        keep.dv = new DataView(keep.ab);
-        keep.u8 = new Uint8Array(keep.ab);
-        log("[REGISTER] DataView + Uint8Array alias created");
-      } catch(e){
-        log("[WARN] DataView/Uint8 alias failed: " + e);
+    function phaseExit(){
+      if (!doExit){
+        log("[PHASE2] skipped exitFullscreen combo=" + combo + " runId=" + runId);
+        phaseWrite();
+        return;
       }
+      log("[PHASE2] exit fullscreen combo=" + combo + " runId=" + runId);
+      exitFS_then(() => {
+        snapshot("after exitFullscreen");
+        phaseWrite();
+      });
     }
+
+    // combo 1 = blur only
+    // combo 2 = blur + exitFS
+    // combo 3 = blur + write
+    // combo 4 = blur + exitFS + write
+    phaseExit();
   }
 
-  // Test C: transfer/neuter (se suportado)
-  function setupC(n, len){
-    setupA(n, len);
-    if (!keep.ab) return;
-    try {
-      // tenta transferir o buffer: em alguns engines isso "neutra" no remetente
-      const ch = new MessageChannel();
-      ch.port1.onmessage = () => {};
-      ch.port2.postMessage({tag:"x"}, [keep.ab]);
-      log("[REGISTER] postMessage transfer attempted (buffer may be neutered)");
-    } catch(e){
-      log("[WARN] postMessage transfer failed: " + e);
-    }
-  }
+  // UI bindings
+  startBtn.onclick = () => startRun(false);
+  stopBtn.onclick = () => disarm();
+
+  autoBtn.onclick = () => {
+    const c = parseInt(countSel.value,10) || 1;
+    const l = parseInt(lenSel.value,10) || 8;
+    log("[AUTO] BEGIN count=" + c + " len=" + l);
+    // parent will inject next iframes in preset mode; do not start here
+  };
 
   log("[IFRAME] Loaded");
+
+  // If injected by parent as auto step, auto-start immediately
+  if (PRESET_AUTO){
+    // lock UI to current preset (avoid drift)
+    modeSel.disabled = true;
+    comboSel.disabled = true;
+    countSel.disabled = true;
+    lenSel.disabled = true;
+    autoBtn.disabled = true;
+
+    // Auto: start immediately
+    setTimeout(() => startRun(true), 50);
+  }
 })();
 <\/script>
-</body>
-</html>`;
+</body></html>`;
   }
 
-  // init
-  injectIframe(document.getElementById('t'));
+  // initial iframe
+  injectIframe(document.getElementById("t"), null);
+
+  // expose for parent UI buttons
+  window.stopAuto = stopAuto;
 })();
 </script>
 </body>
