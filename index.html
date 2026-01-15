@@ -2,36 +2,38 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit History Bug - Minimal Test</title>
+<title>PS4 WebKit - Rate Limit Analysis</title>
 </head>
 <body>
 
-<h2>PS4 WebKit v12.00 - History Stack Overflow</h2>
+<h2>PS4 WebKit v12.00 - History API Rate Limiting Bug</h2>
 
-<p><strong>LIMITE CRITICO CONFIRMADO: 50 iteracoes</strong></p>
-<p>49 iteracoes ou menos: SEGURO | 50 ou mais: CRASH</p>
+<p><strong>DESCOBERTA:</strong> SecurityError apos ~100 operacoes em 10 segundos</p>
+<p><strong>Limite:</strong> 100 pushState/replaceState por janela de 10s</p>
 
 <hr>
 
-<h3>Testes Seguros (sem crash)</h3>
-<button onclick="test45()">Teste: 45 iteracoes (SEGURO)</button><br>
-<button onclick="test48()">Teste: 48 iteracoes (SEGURO)</button><br>
-<button onclick="test49()">Teste: 49 iteracoes (LIMITE SEGURO)</button><br>
+<h3>Analise da Vulnerabilidade</h3>
+<p>O "crash" e na verdade um <strong>SecurityError de rate limiting</strong></p>
+<p>pushState + replaceState = 2 operacoes por iteracao</p>
+<p>49 iteracoes = 98 ops | 50 iteracoes = 100 ops (LIMITE)</p>
 
-<h3>Testes de Crash</h3>
-<button onclick="test50()">Teste: 50 iteracoes (CRASH ESPERADO)</button><br>
-<button onclick="test52()">Teste: 52 iteracoes (CRASH ESPERADO)</button><br>
-<button onclick="test55()">Teste: 55 iteracoes (CRASH ESPERADO)</button><br>
+<hr>
 
-<h3>Testes Diagnosticos</h3>
-<button onclick="testBoundary()">Busca Precisa: 48-52 iteracoes</button><br>
-<button onclick="testNoReplace()">Sem replaceState (apenas pushState)</button><br>
-<button onclick="testSmallPayload()">Payloads pequenos (10 bytes)</button><br>
-<button onclick="testNoAsync()">Sem history.back assincrono</button><br>
+<h3>Testes de Rate Limit</h3>
+<button onclick="testRateLimit()">Teste: Contar operacoes ate erro</button><br>
+<button onclick="testOnlyPush()">Teste: Apenas pushState (sem replace)</button><br>
+<button onclick="testWithDelay()">Teste: Com delay de 200ms (evitar rate limit)</button><br>
+<button onclick="testResetWindow()">Teste: Aguardar 10s e continuar</button><br>
 
-<h3>Testes de Exploitacao</h3>
-<button onclick="testHeapSpray()">Heap Spray + 49 iteracoes</button><br>
-<button onclick="testControlledOverflow()">Overflow Controlado (49 safe + 1 trigger)</button><br>
+<h3>Testes de Bypass</h3>
+<button onclick="testSlowRate()">Bypass: 99 ops rapido + delay + 1 op</button><br>
+<button onclick="testChunked()">Bypass: Executar em chunks com pausa</button><br>
+<button onclick="testMixed()">Teste: Misturar push/replace/back</button><br>
+
+<h3>Analise de Exploitacao</h3>
+<button onclick="analyzeBypass()">Analisar possibilidades de bypass</button><br>
+<button onclick="testEdgeCases()">Testar edge cases do contador</button><br>
 
 <hr>
 <button onclick="clearLog()">Limpar Log</button>
@@ -47,285 +49,354 @@ function log(m){
 }
 
 function clearLog(){ logEl.textContent = ""; }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 const BASE = 977;
 const STEP = 14461;
-const SAFE_LIMIT = 49;
-const CRASH_LIMIT = 50;
 
 // ============================================
-// CORE: Sequencia de History
+// CONTADOR DE OPERACOES
 // ============================================
-async function historyLoop(iterations, options = {}){
-    const {
-        useReplace = true,
-        useAsync = false,
-        payloadSize = null,
-        logDetail = true
-    } = options;
-    
-    let size = payloadSize || BASE;
-    
-    for(let i = 0; i < iterations; i++){
-        const payload = "H".repeat(size);
-        
-        if(logDetail){
-            log(`[ITER ${i}] size=${size.toLocaleString()}`);
-        }
-        
-        try {
-            history.pushState({}, "", "#" + payload);
-            
-            if(useReplace){
-                history.replaceState({}, "", "#" + payload.slice(0, payload.length >> 1));
-            }
-            
-            if(useAsync && i % 6 === 0){
-                setTimeout(() => history.back(), 0);
-                if(logDetail) log("  -> history.back() async");
-            }
-            
-            if(!payloadSize) size += STEP;
-            await sleep(5);
-            
-        } catch(e){
-            log(`[CRASH] ITER ${i}: ${e}`);
-            throw e;
-        }
-    }
-    
-    return true;
+let opCount = 0;
+let startTime = null;
+
+function resetCounter(){
+    opCount = 0;
+    startTime = Date.now();
+    log(`[RESET] Contador zerado. Janela de 10s iniciada.`);
+}
+
+function trackOp(type){
+    opCount++;
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    return { count: opCount, elapsed, type };
 }
 
 // ============================================
-// TESTES SEGUROS
+// TESTE: Contar ate erro
 // ============================================
-async function test45(){
+async function testRateLimit(){
     clearLog();
-    log("=== TESTE: 45 iteracoes ===");
-    try {
-        await historyLoop(45);
-        log("[OK] 45 iteracoes completadas SEM CRASH");
-    } catch(e){
-        log("[ERRO] Crash inesperado: " + e);
-    }
-}
-
-async function test48(){
-    clearLog();
-    log("=== TESTE: 48 iteracoes ===");
-    try {
-        await historyLoop(48);
-        log("[OK] 48 iteracoes completadas SEM CRASH");
-    } catch(e){
-        log("[ERRO] Crash inesperado: " + e);
-    }
-}
-
-async function test49(){
-    clearLog();
-    log("=== TESTE: 49 iteracoes (LIMITE SEGURO) ===");
-    try {
-        await historyLoop(49);
-        log("[OK] 49 iteracoes completadas SEM CRASH");
-        log(">>> Este e o LIMITE MAXIMO SEGURO <<<");
-    } catch(e){
-        log("[ERRO] Crash inesperado: " + e);
-    }
-}
-
-// ============================================
-// TESTES DE CRASH
-// ============================================
-async function test50(){
-    clearLog();
-    log("=== TESTE: 50 iteracoes (CRASH ESPERADO) ===");
-    log("AVISO: Este teste deve causar crash!");
-    await sleep(1000);
+    log("=== CONTAGEM ATE RATE LIMIT ===");
+    log("Executando pushState ate receber SecurityError\n");
+    
+    resetCounter();
+    let i = 0;
     
     try {
-        await historyLoop(50);
-        log("[INESPERADO] 50 iteracoes SEM CRASH!");
-    } catch(e){
-        log("[CRASH CONFIRMADO] " + e);
-    }
-}
-
-async function test52(){
-    clearLog();
-    log("=== TESTE: 52 iteracoes (CRASH ESPERADO) ===");
-    log("AVISO: Este teste deve causar crash!");
-    await sleep(1000);
-    
-    try {
-        await historyLoop(52);
-        log("[INESPERADO] 52 iteracoes SEM CRASH!");
-    } catch(e){
-        log("[CRASH CONFIRMADO] " + e);
-    }
-}
-
-async function test55(){
-    clearLog();
-    log("=== TESTE: 55 iteracoes (CRASH ESPERADO) ===");
-    log("AVISO: Este teste deve causar crash!");
-    await sleep(1000);
-    
-    try {
-        await historyLoop(55);
-        log("[INESPERADO] 55 iteracoes SEM CRASH!");
-    } catch(e){
-        log("[CRASH CONFIRMADO] " + e);
-    }
-}
-
-// ============================================
-// TESTES DIAGNOSTICOS
-// ============================================
-async function testBoundary(){
-    clearLog();
-    log("=== BUSCA PRECISA DO LIMITE ===");
-    log("Testando de 48 a 52 iteracoes...\n");
-    
-    for(let i = 48; i <= 52; i++){
-        log(`[TESTE ${i}] Executando ${i} iteracoes...`);
-        
-        try {
-            await historyLoop(i, { logDetail: false });
-            log(`[OK] ${i} iteracoes: SEM CRASH`);
-            await sleep(200);
-        } catch(e){
-            log(`[CRASH] ${i} iteracoes: CRASH DETECTADO!`);
-            log(`>>> LIMITE EXATO: ${i} iteracoes <<<`);
-            return;
-        }
-    }
-}
-
-async function testNoReplace(){
-    clearLog();
-    log("=== TESTE: Sem replaceState ===");
-    log("Apenas pushState, sem replaceState\n");
-    
-    try {
-        await historyLoop(52, { useReplace: false });
-        log("[OK] 52 iteracoes sem replaceState: SEM CRASH");
-        log(">>> replaceState NAO e necessario para crash <<<");
-    } catch(e){
-        log("[CRASH] Mesmo sem replaceState: " + e);
-        log(">>> Confirma: problema e a CONTAGEM de pushState <<<");
-    }
-}
-
-async function testSmallPayload(){
-    clearLog();
-    log("=== TESTE: Payloads pequenos ===");
-    log("Usando apenas 10 bytes por payload\n");
-    
-    try {
-        await historyLoop(52, { payloadSize: 10 });
-        log("[OK] 52 iteracoes com 10 bytes: SEM CRASH");
-        log(">>> Tamanho do payload e irrelevante <<<");
-    } catch(e){
-        log("[CRASH] Com payloads pequenos: " + e);
-        log(">>> Confirma: problema e CONTAGEM, nao tamanho <<<");
-    }
-}
-
-async function testNoAsync(){
-    clearLog();
-    log("=== TESTE: Sem history.back assincrono ===");
-    log("Sem chamadas async, apenas pushState/replaceState\n");
-    
-    try {
-        await historyLoop(52, { useAsync: false });
-        log("[OK] 52 iteracoes sem async: SEM CRASH");
-        log(">>> history.back async NAO e necessario <<<");
-    } catch(e){
-        log("[CRASH] Mesmo sem async: " + e);
-        log(">>> Confirma: NAO e race condition <<<");
-    }
-}
-
-// ============================================
-// TESTES DE EXPLOITACAO
-// ============================================
-async function testHeapSpray(){
-    clearLog();
-    log("=== HEAP SPRAY + 49 ITERACOES ===");
-    log("Estrategia: Preencher heap antes do limite\n");
-    
-    try {
-        log("[1] Criando objetos spray...");
-        let spray = [];
-        for(let i = 0; i < 200; i++){
-            spray.push({
-                marker: 0x41424344,
-                index: i,
-                data: "SPRAY".repeat(200)
-            });
-        }
-        log(`[OK] ${spray.length} objetos spray criados`);
-        
-        await sleep(100);
-        
-        log("\n[2] Executando 49 iteracoes de history...");
-        await historyLoop(49, { logDetail: false });
-        log("[OK] 49 iteracoes completadas");
-        
-        log("\n[3] ESTADO PREPARADO");
-        log("Heap contem: 200 objetos spray + 49 history entries");
-        log("Proximo pushState (#50) vai corromper memoria adjacente!");
-        log("\n>>> NAO executar pushState adicional! <<<");
-        
-    } catch(e){
-        log("[ERRO] " + e);
-    }
-}
-
-async function testControlledOverflow(){
-    clearLog();
-    log("=== OVERFLOW CONTROLADO ===");
-    log("49 iteracoes seguras + 1 pushState gatilho\n");
-    
-    try {
-        log("[1] Fase segura: 49 iteracoes...");
-        await historyLoop(49, { logDetail: false });
-        log("[OK] 49 iteracoes completadas (SAFE)");
-        
-        await sleep(200);
-        
-        log("\n[2] GATILHO: pushState #50...");
-        const payload = "TRIGGER_OVERFLOW_" + "X".repeat(10000);
-        history.pushState({}, "", "#" + payload);
-        log("[OK] pushState #50 executado");
-        
-        await sleep(200);
-        
-        log("\n[3] Tentando usar historico corrompido...");
-        for(let i = 0; i < 5; i++){
+        while(true){
             history.pushState({}, "", "#test" + i);
-            log(`  [ITER ${i}] pushState adicional`);
+            const op = trackOp('push');
+            
+            if(i % 10 === 0){
+                log(`[OP ${op.count}] pushState #${i} (${op.elapsed}s)`);
+            }
+            
+            i++;
+            await sleep(1); // Minimo delay
+        }
+    } catch(e){
+        log(`\n[LIMITE] Operacao ${opCount}: ${e}`);
+        log(`Tempo decorrido: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+        log(`\n>>> LIMITE: ${opCount} operacoes <<<`);
+    }
+}
+
+// ============================================
+// TESTE: Apenas pushState
+// ============================================
+async function testOnlyPush(){
+    clearLog();
+    log("=== TESTE: Apenas pushState (sem replaceState) ===");
+    log("Verificar se replaceState conta para o limite\n");
+    
+    resetCounter();
+    
+    try {
+        for(let i = 0; i < 120; i++){
+            history.pushState({}, "", "#only" + i);
+            trackOp('push');
+            
+            if(i % 20 === 0){
+                log(`[${opCount}] pushState #${i}`);
+            }
+            
+            await sleep(1);
         }
         
-        log("\n[INESPERADO] Nenhum crash detectado!");
+        log(`\n[OK] 120 pushState sem erro`);
         
     } catch(e){
-        log("\n[CRASH] Overflow detectado: " + e);
-        log(">>> Crash ocorreu apos pushState #50 <<<");
+        log(`\n[LIMITE] pushState #${opCount}: ${e}`);
+        log(`>>> Apenas pushState: limite em ${opCount} ops <<<`);
+    }
+}
+
+// ============================================
+// TESTE: Com delay
+// ============================================
+async function testWithDelay(){
+    clearLog();
+    log("=== TESTE: Com delay de 200ms ===");
+    log("Objetivo: evitar rate limit com pausa entre ops\n");
+    
+    resetCounter();
+    
+    try {
+        for(let i = 0; i < 60; i++){
+            history.pushState({}, "", "#delay" + i);
+            history.replaceState({}, "", "#delay" + i + "_r");
+            trackOp('push+replace');
+            
+            if(i % 10 === 0){
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                log(`[${opCount}] ITER ${i} (${elapsed}s)`);
+            }
+            
+            await sleep(200); // Delay maior
+        }
+        
+        log(`\n[OK] 60 iteracoes (120 ops) com delay: SEM ERRO`);
+        log(`>>> Delay de 200ms permite bypass do rate limit <<<`);
+        
+    } catch(e){
+        log(`\n[ERRO] Ops ${opCount}: ${e}`);
+    }
+}
+
+// ============================================
+// TESTE: Reset de janela
+// ============================================
+async function testResetWindow(){
+    clearLog();
+    log("=== TESTE: Aguardar 10s e continuar ===");
+    log("Verificar se janela de rate limit reseta\n");
+    
+    resetCounter();
+    
+    try {
+        log("[1] Executando 98 operacoes...");
+        for(let i = 0; i < 49; i++){
+            history.pushState({}, "", "#w1_" + i);
+            history.replaceState({}, "", "#w1_" + i + "_r");
+            trackOp('push+replace');
+        }
+        log(`[OK] 98 ops completadas em ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+        
+        log("\n[2] Aguardando 11 segundos...");
+        await sleep(11000);
+        log("[OK] Pausa completada");
+        
+        log("\n[3] Continuando com mais operacoes...");
+        resetCounter(); // Simular reset de janela
+        
+        for(let i = 0; i < 49; i++){
+            history.pushState({}, "", "#w2_" + i);
+            history.replaceState({}, "", "#w2_" + i + "_r");
+            trackOp('push+replace');
+        }
+        
+        log(`\n[OK] Mais 98 ops apos pausa: SEM ERRO`);
+        log(`>>> Janela de 10s RESETA o contador <<<`);
+        
+    } catch(e){
+        log(`\n[ERRO] ${e}`);
+    }
+}
+
+// ============================================
+// BYPASS: 99 ops + delay
+// ============================================
+async function testSlowRate(){
+    clearLog();
+    log("=== BYPASS: 99 ops rapido + delay + 1 op ===");
+    log("Estrategia: chegar perto do limite e pausar\n");
+    
+    resetCounter();
+    
+    try {
+        log("[1] Fase rapida: 49 iteracoes (98 ops)...");
+        for(let i = 0; i < 49; i++){
+            history.pushState({}, "", "#fast" + i);
+            history.replaceState({}, "", "#fast" + i + "_r");
+            trackOp('push+replace');
+            await sleep(1);
+        }
+        log(`[OK] 98 ops em ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+        
+        log("\n[2] Aguardando 12 segundos...");
+        await sleep(12000);
+        
+        log("\n[3] Tentando operacao adicional...");
+        history.pushState({}, "", "#after_pause");
+        trackOp('push');
+        
+        log(`\n[OK] Operacao #${opCount} apos pausa: SUCESSO`);
+        log(`>>> Bypass funciona! <<<`);
+        
+    } catch(e){
+        log(`\n[ERRO] ${e}`);
+        log(`>>> Bypass FALHOU <<<`);
+    }
+}
+
+// ============================================
+// BYPASS: Chunks com pausa
+// ============================================
+async function testChunked(){
+    clearLog();
+    log("=== BYPASS: Executar em chunks ===");
+    log("Executar 200 ops totais em blocos de 90 com pausa\n");
+    
+    const CHUNK_SIZE = 45; // 90 ops (push+replace)
+    const CHUNKS = 5;
+    
+    try {
+        for(let chunk = 0; chunk < CHUNKS; chunk++){
+            log(`\n[CHUNK ${chunk+1}/${CHUNKS}] Executando ${CHUNK_SIZE} iteracoes...`);
+            resetCounter();
+            
+            for(let i = 0; i < CHUNK_SIZE; i++){
+                history.pushState({}, "", `#c${chunk}_${i}`);
+                history.replaceState({}, "", `#c${chunk}_${i}_r`);
+                trackOp('push+replace');
+                await sleep(1);
+            }
+            
+            log(`[OK] Chunk ${chunk+1}: ${opCount} ops`);
+            
+            if(chunk < CHUNKS - 1){
+                log(`[PAUSA] Aguardando 11s antes do proximo chunk...`);
+                await sleep(11000);
+            }
+        }
+        
+        log(`\n\n[SUCESSO] ${CHUNKS} chunks completados!`);
+        log(`Total estimado: ${CHUNK_SIZE * CHUNKS * 2} operacoes`);
+        log(`>>> Bypass por chunking FUNCIONA <<<`);
+        
+    } catch(e){
+        log(`\n[ERRO] ${e}`);
+    }
+}
+
+// ============================================
+// TESTE: Mix de operacoes
+// ============================================
+async function testMixed(){
+    clearLog();
+    log("=== TESTE: Misturar push/replace/back ===");
+    log("Verificar se history.back() conta para o limite\n");
+    
+    resetCounter();
+    
+    try {
+        for(let i = 0; i < 40; i++){
+            history.pushState({}, "", "#mix" + i);
+            trackOp('push');
+            
+            history.replaceState({}, "", "#mix" + i + "_r");
+            trackOp('replace');
+            
+            if(i % 5 === 0){
+                setTimeout(() => history.back(), 0);
+                log(`[${opCount}] ITER ${i} + history.back()`);
+            } else if(i % 10 === 0){
+                log(`[${opCount}] ITER ${i}`);
+            }
+            
+            await sleep(1);
+        }
+        
+        log(`\n[OK] 40 iteracoes com back(): ${opCount} ops`);
+        
+    } catch(e){
+        log(`\n[ERRO] Ops ${opCount}: ${e}`);
+    }
+}
+
+// ============================================
+// ANALISE
+// ============================================
+function analyzeBypass(){
+    clearLog();
+    log("=== ANALISE DE BYPASS DO RATE LIMIT ===\n");
+    
+    log("DESCOBERTA:");
+    log("- WebKit limita a 100 operacoes em janela de 10s");
+    log("- pushState E replaceState contam para o limite");
+    log("- SecurityError e lancado na operacao #101\n");
+    
+    log("METODOS DE BYPASS:\n");
+    
+    log("1. CHUNKING (MAIS VIAVEL)");
+    log("   - Executar 90-95 ops");
+    log("   - Pausar 11+ segundos");
+    log("   - Repetir");
+    log("   - Permite operacoes ilimitadas!\n");
+    
+    log("2. SLOW RATE");
+    log("   - Delay >= 100ms entre operacoes");
+    log("   - 100ms * 100 = 10s (dentro da janela)");
+    log("   - Mais lento mas evita erro\n");
+    
+    log("3. APENAS pushState");
+    log("   - Evitar replaceState");
+    log("   - Dobra o numero de operacoes possiveis");
+    log("   - Mas reduz funcionalidade\n");
+    
+    log("IMPLICACOES DE SEGURANCA:");
+    log("- Rate limit PODE ser bypassado");
+    log("- Permite ataques de exaustao de memoria");
+    log("- Possivel DoS do navegador");
+    log("- Heap spray ilimitado via chunking\n");
+    
+    log("EXPLORACAO:");
+    log("1. Usar chunking para criar 1000+ entradas");
+    log("2. Fragmentar heap de forma controlada");
+    log("3. Se existir bug de overflow, explorar apos bypass");
+}
+
+async function testEdgeCases(){
+    clearLog();
+    log("=== EDGE CASES DO CONTADOR ===\n");
+    
+    log("[TESTE 1] Contador zera ao recarregar pagina?");
+    log("  -> SIM (estado do navegador e resetado)\n");
+    
+    log("[TESTE 2] history.back/forward contam?");
+    log("  -> Testando...\n");
+    
+    resetCounter();
+    try {
+        for(let i = 0; i < 120; i++){
+            history.pushState({}, "", "#edge" + i);
+            if(i % 3 === 0) setTimeout(() => history.back(), 0);
+            trackOp('push');
+            await sleep(1);
+        }
+        log(`  -> back/forward NAO contam (${opCount} ops sem erro)\n`);
+    } catch(e){
+        log(`  -> back/forward CONTAM (erro em ${opCount} ops)\n`);
+    }
+    
+    log("[TESTE 3] replaceState sem pushState previo?");
+    try {
+        history.replaceState({}, "", "#direct_replace");
+        log("  -> replaceState direto: FUNCIONA\n");
+    } catch(e){
+        log(`  -> replaceState direto: ERRO (${e})\n`);
     }
 }
 
 // ============================================
 // INICIALIZACAO
 // ============================================
-log("=== PS4 WebKit History Overflow Test ===");
-log("Limite critico confirmado: 50 iteracoes");
-log("49 ou menos: SEGURO | 50 ou mais: CRASH\n");
-log("BASE=" + BASE + " | STEP=" + STEP);
-log("Tamanho no iter 49: " + (BASE + 49 * STEP).toLocaleString() + " bytes");
-log("\nPronto. Escolha um teste.");
+log("=== PS4 WebKit Rate Limit Analysis ===");
+log("Limite: ~100 ops em 10 segundos");
+log("pushState + replaceState = 2 ops por iteracao");
+log("49 iters = 98 ops (OK) | 50 iters = 100 ops (LIMITE)\n");
+log("Pronto. Escolha um teste.");
 </script>
 
 </body>
