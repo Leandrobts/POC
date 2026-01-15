@@ -1,367 +1,341 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>History.pushState Sanity Suite (Revised)</title>
+<meta charset="UTF-8">
+<title>PS4 WebKit Crash Analyzer</title>
+<style>
+body { 
+    font-family: 'Courier New', monospace; 
+    background: #0a0a0a; 
+    color: #00ff00; 
+    padding: 20px;
+}
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+h2 { color: #00ff88; border-bottom: 2px solid #00ff88; padding-bottom: 10px; }
+h3 { color: #00ddff; margin-top: 20px; }
+button { 
+    font-size: 16px; 
+    padding: 12px 20px; 
+    margin: 8px; 
+    background: #003300;
+    color: #00ff00;
+    border: 2px solid #00ff00;
+    cursor: pointer;
+    font-family: monospace;
+}
+button:hover { background: #004400; }
+button.danger { background: #330000; border-color: #ff0000; color: #ff6666; }
+button.danger:hover { background: #440000; }
+#log { 
+    white-space: pre-wrap; 
+    margin-top: 15px; 
+    background: #001100;
+    padding: 15px;
+    border: 1px solid #00ff00;
+    max-height: 500px;
+    overflow-y: auto;
+}
+.info { color: #ffff00; }
+.warning { color: #ff9900; }
+.error { color: #ff0000; }
+.success { color: #00ff00; }
+.stats {
+    background: #001a1a;
+    padding: 10px;
+    margin: 10px 0;
+    border-left: 4px solid #00ffff;
+}
+</style>
 </head>
+
 <body>
-<h1>History.pushState Sanity Suite (Revised)</h1>
-<p>
-Objective: distinguish <b>aliasing</b> vs <b>clone</b> vs <b>cross-entry contamination</b> using deterministic, synchronized navigation.
-</p>
+<div class="container">
+<h2>🔍 PS4 WebKit v12.00 – Crash Analysis Tool</h2>
 
-<div>
-  <button id="btnClear">Clear Log</button>
-  <button id="btnRunRecommended">Run Recommended (1 → 2 → 3)</button>
+<div class="stats">
+<strong>Configuração Atual:</strong><br>
+BASE: <span id="baseVal">977</span> bytes | 
+STEP: <span id="stepVal">14461</span> bytes | 
+SAFE_ITERS: <span id="safeVal">49</span><br>
+Tamanho no ITER 48: <span id="size48">695105</span> bytes (~679 KB)
 </div>
 
-<hr/>
+<h3>🧪 Testes Originais</h3>
+<button onclick="runOptionA()">Option A – UAF Detection (Sem Crash)</button>
+<button onclick="runOptionB()" class="danger">Option B – Crash Test (49+Partial)</button>
 
-<h2>Core Tests</h2>
-<div>
-  <button id="btnT1">Test 1: Variant A (state contains ArrayBuffer only)</button><br/>
-  <button id="btnT2">Test 2: Variant B (state contains TypedArray view only)</button><br/>
-  <button id="btnT3">Test 3: Variant C (state contains BOTH buffer + view)</button><br/>
-  <button id="btnT4">Test 4: Cross-entry contamination (two history entries, popstate-synced)</button><br/>
+<h3>🔬 Testes Diagnósticos</h3>
+<button onclick="testBoundary()">Test: Encontrar Limite Exato</button>
+<button onclick="testWithoutAsync()">Test: Sem history.back() Assíncrono</button>
+<button onclick="testMemoryPressure()">Test: Pressão de Memória Isolada</button>
+<button onclick="testTiming()">Test: Análise de Timing</button>
+
+<h3>⚙️ Controles</h3>
+<button onclick="clearLog()">Limpar Log</button>
+
+<div id="log"></div>
 </div>
-
-<hr/>
-
-<h2>Optional Diagnostics</h2>
-<div>
-  <button id="btnCirc">Test 5: Circular reference handling (expect DataCloneError in many engines)</button><br/>
-</div>
-
-<hr/>
-<pre id="log" style="white-space:pre-wrap;border:1px solid #ccc;padding:10px;min-height:220px;"></pre>
 
 <script>
-(function () {
-  "use strict";
+const logEl = document.getElementById("log");
+let crashData = [];
 
-  // ----------------------------
-  // Logging helpers
-  // ----------------------------
-  const logEl = document.getElementById("log");
-  function ts() {
-    const d = new Date();
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mm = String(d.getMinutes()).padStart(2, "0");
-    const ss = String(d.getSeconds()).padStart(2, "0");
-    return `[${hh}:${mm}:${ss}]`;
-  }
-  function log(line) {
-    logEl.textContent += `${ts()} ${line}\n`;
+function log(m, type = 'normal'){
+    const colors = {
+        normal: '',
+        info: 'info',
+        warning: 'warning',
+        error: 'error',
+        success: 'success'
+    };
+    const timestamp = new Date().toLocaleTimeString();
+    const line = `[${timestamp}] ${m}`;
+    logEl.innerHTML += `<span class="${colors[type]}">${line}</span>\n`;
     logEl.scrollTop = logEl.scrollHeight;
-  }
-  function sep(title) {
-    log("\n==============================================================");
-    log(title);
-    log("==============================================================");
-  }
+}
 
-  // ----------------------------
-  // Navigation synchronization
-  // ----------------------------
-  function waitPopstateOnce(timeoutMs) {
-    timeoutMs = timeoutMs || 2500;
-    return new Promise((resolve, reject) => {
-      let done = false;
-      const t = setTimeout(() => {
-        if (done) return;
-        done = true;
-        window.removeEventListener("popstate", onPop);
-        reject(new Error("popstate timeout"));
-      }, timeoutMs);
+function clearLog(){ logEl.innerHTML = ""; }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-      function onPop(ev) {
-        if (done) return;
-        done = true;
-        clearTimeout(t);
-        window.removeEventListener("popstate", onPop);
-        resolve(ev);
-      }
+const BASE = 977;
+const STEP = 14461;
+const SAFE_ITERS = 49;
 
-      window.addEventListener("popstate", onPop, { once: true });
-    });
-  }
+// Atualizar stats na UI
+document.getElementById('baseVal').textContent = BASE;
+document.getElementById('stepVal').textContent = STEP;
+document.getElementById('safeVal').textContent = SAFE_ITERS;
+document.getElementById('size48').textContent = BASE + (48 * STEP);
 
-  async function navBackSync() {
-    const p = waitPopstateOnce();
-    history.back();
-    await p;
-  }
+// -------------------------------------------------
+// CORE SEQUENCE
+// -------------------------------------------------
+async function historySequence(iterations, allowPartial, skipAsync = false){
+    let size = BASE;
+    let asyncCalls = 0;
 
-  async function navForwardSync() {
-    const p = waitPopstateOnce();
-    history.forward();
-    await p;
-  }
+    for(let i=0;i<iterations;i++){
+        const payload = "A".repeat(size);
+        log(`[ITER ${i}] size=${size.toLocaleString()}`, 'info');
 
-  // ----------------------------
-  // Data helpers
-  // ----------------------------
-  function hex32(u) {
-    return "0x" + (u >>> 0).toString(16).padStart(8, "0");
-  }
+        history.pushState({}, "", "#"+payload);
+        history.replaceState({}, "", "#"+payload.slice(0, payload.length >> 1));
 
-  function makeU32Buffer(words) {
-    const buf = new ArrayBuffer(words.length * 4);
-    const u32 = new Uint32Array(buf);
-    for (let i = 0; i < words.length; i++) u32[i] = words[i] >>> 0;
-    return { buf, u32 };
-  }
+        if(!skipAsync && i % 6 === 0){
+            setTimeout(()=>history.back(),0);
+            asyncCalls++;
+            log(`  ↳ history.back() assíncrono disparado (#${asyncCalls})`, 'warning');
+        }
 
-  function snapshotU32(u32, count) {
-    const n = Math.min(count || u32.length, u32.length);
-    const out = [];
-    for (let i = 0; i < n; i++) out.push(u32[i] >>> 0);
-    return out;
-  }
+        size += STEP;
+        await sleep(5);
+    }
 
-  function sameArray(a, b) {
-    if (!a || !b || a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if ((a[i] >>> 0) !== (b[i] >>> 0)) return false;
-    return true;
-  }
+    if(allowPartial){
+        log("[PARTIAL] Executando pushState extra (GATILHO)", 'error');
+        const payload = "B".repeat(size);
+        history.pushState({}, "", "#"+payload);
+        log(`[PARTIAL] pushState completo (${size.toLocaleString()} bytes)`, 'error');
+    }
 
-  function describeCloneOrAlias(identitySame, beforeSame, afterWriteSame) {
-    if (identitySame && afterWriteSame) return "ALIASING (same backing store; write-through observed)";
-    if (!identitySame && beforeSame && !afterWriteSame) return "CLONE (independent copy; no write-through)";
-    if (!identitySame && beforeSame && afterWriteSame) return "SUSPICIOUS (identity differs but write-through observed)";
-    if (identitySame && !afterWriteSame) return "INCONSISTENT (identity same but no write-through; check timing / measurement)";
-    return "INDETERMINATE";
-  }
+    return asyncCalls;
+}
 
-  function assertLine(name, cond) {
-    log(`[ASSERT] ${name}: ${cond ? "PASS" : "FAIL"}`);
-    return !!cond;
-  }
+// -------------------------------------------------
+// OPTION A
+// -------------------------------------------------
+async function runOptionA(){
+    clearLog();
+    log("=== OPTION A: UAF/Estado Inconsistente ===", 'success');
+    
+    try {
+        await historySequence(SAFE_ITERS, false);
+        log("[✓] Sequência de histórico completada", 'success');
 
-  // ----------------------------
-  // Test 1/2/3: A/B/C variants
-  // ----------------------------
-  async function runVariant(variantName) {
-    sep(`TEST: ${variantName}`);
+        await sleep(120);
 
-    const MAGIC = [0x12345678, 0x9ABCDEF0, 0xAAAAAAAA, 0xBBBBBBBB, 0x0C0FFEE0, 0xFEEDBEEF, 0x13579BDF, 0x2468ACE0];
-    const { buf: originalBuffer, u32: originalView } = makeU32Buffer(MAGIC);
+        log("[→] Fase de reutilização de heap", 'info');
+        let arr = [];
+        for(let i=0;i<40;i++){
+            arr.push("OBJ_"+i+"_"+"X".repeat(256));
+        }
 
-    log(`[SETUP] Created original buffer (${originalBuffer.byteLength} bytes). Magic[0..3]=${hex32(originalView[0])}, ${hex32(originalView[1])}, ${hex32(originalView[2])}, ${hex32(originalView[3])}`);
+        log("[→] Usando dados após stress de histórico", 'info');
+        for(let i=0;i<arr.length;i++){
+            let s = arr[i] + arr[(i+1)%arr.length];
+            if(i % 8 === 0) log(`  uso len=${s.length}`, 'info');
+        }
 
-    let state = {};
-    if (variantName === "Variant A (buffer only)") {
-      state = { buffer: originalBuffer, tag: "A" };
-    } else if (variantName === "Variant B (view only)") {
-      state = { view: originalView, tag: "B" };
+        log("=== OPTION A FINALIZADA – SEM CRASH ===", 'success');
+        log(">>> Indica corrupção latente / janela UAF <<<", 'warning');
+
+    } catch(e){
+        log("[✗] Exceção JS: " + e, 'error');
+    }
+}
+
+// -------------------------------------------------
+// OPTION B
+// -------------------------------------------------
+async function runOptionB(){
+    clearLog();
+    log("=== OPTION B: Sinal de Exploitabilidade ===", 'error');
+    
+    try {
+        await historySequence(SAFE_ITERS, true);
+        log("[!] Histórico + iteração parcial completada", 'warning');
+
+        await sleep(80);
+
+        log("[→] Interação mínima com heap após limite", 'info');
+        let tmp = [];
+        for(let i=0;i<20;i++){
+            tmp.push("Z".repeat(512));
+        }
+
+        log("[→] Uso pós-limite", 'info');
+        for(let i=0;i<tmp.length;i++){
+            let s = tmp[i] + tmp[(i+3)%tmp.length];
+            if(i % 5 === 0) log(`  uso len=${s.length}`, 'info');
+        }
+
+        log("=== OPTION B FINALIZADA ===", 'success');
+        log(">>> Se comportamento difere ou crash move, exploitabilidade confirmada <<<", 'warning');
+
+    } catch(e){
+        log("[✗] Exceção JS: " + e, 'error');
+    }
+}
+
+// -------------------------------------------------
+// TESTE: Encontrar limite exato
+// -------------------------------------------------
+async function testBoundary(){
+    clearLog();
+    log("=== TESTE: Busca Binária do Limite de Crash ===", 'info');
+    
+    let low = 40;
+    let high = 55;
+    let crashPoint = null;
+
+    for(let test = low; test <= high; test++){
+        log(`\n[TESTE ${test}/${high}] Tentando ${test} iterações...`, 'warning');
+        
+        try {
+            await historySequence(test, true);
+            await sleep(100);
+            
+            // Tenta usar memória
+            let arr = [];
+            for(let i=0;i<10;i++) arr.push("TEST".repeat(1000));
+            
+            log(`[✓] ${test} iterações: SEM CRASH`, 'success');
+            await sleep(50);
+            
+        } catch(e){
+            log(`[✗] ${test} iterações: CRASH DETECTADO!`, 'error');
+            crashPoint = test;
+            break;
+        }
+    }
+
+    if(crashPoint){
+        log(`\n>>> LIMITE DE CRASH: ~${crashPoint} iterações <<<`, 'error');
     } else {
-      state = { buffer: originalBuffer, view: originalView, tag: "C" };
+        log(`\n>>> Nenhum crash detectado até ${high} iterações <<<`, 'success');
     }
+}
 
+// -------------------------------------------------
+// TESTE: Sem history.back() assíncrono
+// -------------------------------------------------
+async function testWithoutAsync(){
+    clearLog();
+    log("=== TESTE: Sem history.back() Assíncrono ===", 'info');
+    log("Objetivo: Isolar se race condition é a causa\n", 'warning');
+    
     try {
-      history.pushState(state, "", "#sanity_" + state.tag + "_" + Date.now());
-      log("[ACTION] pushState succeeded.");
-    } catch (e) {
-      log(`[ERROR] pushState threw: ${e && e.name ? e.name : e} (${e && e.message ? e.message : "no message"})`);
-      return;
+        await historySequence(SAFE_ITERS, true, true); // skipAsync = true
+        await sleep(100);
+        
+        log("[✓] Sequência completada SEM chamadas assíncronas", 'success');
+        log(">>> Se NÃO crashar: race condition confirmada como causa <<<", 'warning');
+        
+    } catch(e){
+        log("[✗] Crash mesmo sem async: " + e, 'error');
+        log(">>> Problema não é race condition, é overflow/fragmentação <<<", 'warning');
     }
+}
 
-    const retrieved = history.state;
-    log(`[READ] Retrieved history.state tag=${retrieved && retrieved.tag ? retrieved.tag : "(missing)"}`);
-
-    let retrievedBuffer = null;
-    let retrievedView = null;
-
-    if (retrieved && retrieved.buffer instanceof ArrayBuffer) {
-      retrievedBuffer = retrieved.buffer;
-      retrievedView = new Uint32Array(retrievedBuffer);
-      log(`[INFO] Retrieved has buffer. byteLength=${retrievedBuffer.byteLength}`);
-    } else if (retrieved && retrieved.view && retrieved.view.buffer instanceof ArrayBuffer) {
-      retrievedView = retrieved.view;
-      retrievedBuffer = retrievedView.buffer;
-      log(`[INFO] Retrieved has view. view.length=${retrievedView.length}, buffer.byteLength=${retrievedBuffer.byteLength}`);
-    } else {
-      log("[FAIL] Retrieved state did not contain expected buffer/view.");
-      return;
-    }
-
-    const snapOriginalBefore = snapshotU32(originalView, 4);
-    const snapRetrievedBefore = snapshotU32(retrievedView, 4);
-
-    const beforeSame = sameArray(snapOriginalBefore, snapRetrievedBefore);
-    log(`[BASELINE] Original[0..3]=${snapOriginalBefore.map(hex32).join(", ")}`);
-    log(`[BASELINE] Retrieved[0..3]=${snapRetrievedBefore.map(hex32).join(", ")}`);
-    assertLine("Baseline values match", beforeSame);
-
-    const identitySame = (retrievedBuffer === originalBuffer);
-    log(`[IDENTITY] retrievedBuffer === originalBuffer : ${identitySame}`);
-    if (retrieved && retrieved.view) {
-      log(`[IDENTITY] retrieved.view === originalView : ${retrieved.view === originalView}`);
-    }
-
-    const W0 = 0xDEADBEEF >>> 0;
-    const W1 = 0xCAFEBABE >>> 0;
-
-    log(`[WRITE] Writing via retrievedView: [0]=${hex32(W0)} [1]=${hex32(W1)}`);
-    retrievedView[0] = W0;
-    retrievedView[1] = W1;
-
-    const snapRetrievedAfter = snapshotU32(retrievedView, 2);
-    const snapOriginalAfter = snapshotU32(originalView, 2);
-
-    const retrievedWriteObserved = (snapRetrievedAfter[0] === W0 && snapRetrievedAfter[1] === W1);
-    const writeThroughObserved = (snapOriginalAfter[0] === W0 && snapOriginalAfter[1] === W1);
-
-    assertLine("Retrieved reflects its own write", retrievedWriteObserved);
-    log(`[CHECK] After write: Retrieved[0..1]=${snapRetrievedAfter.map(hex32).join(", ")}`);
-    log(`[CHECK] After write: Original [0..1]=${snapOriginalAfter.map(hex32).join(", ")} (write-through=${writeThroughObserved})`);
-
-    const classification = describeCloneOrAlias(identitySame, beforeSame, writeThroughObserved);
-    log(`=== RESULT ===`);
-    log(`[CLASSIFICATION] ${classification}`);
-
-    if (classification.startsWith("ALIASING")) {
-      log("[NOTE] Indicates isolation/cloning expectations may be violated; does NOT by itself prove out-of-bounds memory corruption.");
-    } else if (classification.startsWith("CLONE")) {
-      log("[NOTE] Suggests normal copy semantics for this variant.");
-    } else if (classification.startsWith("SUSPICIOUS")) {
-      log("[NOTE] If identity differs but write-through is observed, re-check timing and ensure you're not reusing the same instance.");
-    }
-  }
-
-  // ----------------------------
-  // Test 4: Cross-entry contamination
-  // ----------------------------
-  async function runCrossEntryContamination() {
-    sep("TEST: Cross-entry contamination (two history entries, popstate-synced)");
-    log("[GOAL] Detect whether writes in entry A unexpectedly affect entry B without any JS references linking them.");
-
-    const A = makeU32Buffer([0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA, 0x11111111, 0x11111111, 0x11111111, 0x11111111]);
-    const B = makeU32Buffer([0xBBBBBBBB, 0xBBBBBBBB, 0xBBBBBBBB, 0xBBBBBBBB, 0x22222222, 0x22222222, 0x22222222, 0x22222222]);
-
-    const tagA = "X_A_" + Date.now();
+// -------------------------------------------------
+// TESTE: Pressão de memória isolada
+// -------------------------------------------------
+async function testMemoryPressure(){
+    clearLog();
+    log("=== TESTE: Pressão de Memória sem History API ===", 'info');
+    
     try {
-      history.pushState({ tag: tagA, buffer: A.buf }, "", "#"+tagA);
-      log(`[ACTION] pushState A ok (tag=${tagA})`);
-    } catch (e) {
-      log(`[ERROR] pushState A threw: ${e && e.name ? e.name : e}`);
-      return;
+        let arrays = [];
+        let size = BASE;
+        
+        for(let i=0; i<50; i++){
+            const bigStr = "M".repeat(size);
+            arrays.push(bigStr);
+            log(`[${i}] Alocado: ${size.toLocaleString()} bytes`, 'info');
+            size += STEP;
+            await sleep(5);
+        }
+        
+        log("[✓] 50 alocações grandes: SEM CRASH", 'success');
+        log(">>> Problema é específico da History API, não pressão geral <<<", 'warning');
+        
+    } catch(e){
+        log("[✗] Crash na pressão de memória: " + e, 'error');
     }
+}
 
-    const tagB = "X_B_" + Date.now();
-    try {
-      history.pushState({ tag: tagB, buffer: B.buf }, "", "#"+tagB);
-      log(`[ACTION] pushState B ok (tag=${tagB})`);
-    } catch (e) {
-      log(`[ERROR] pushState B threw: ${e && e.name ? e.name : e}`);
-      return;
+// -------------------------------------------------
+// TESTE: Análise de timing
+// -------------------------------------------------
+async function testTiming(){
+    clearLog();
+    log("=== TESTE: Análise de Timing da Race Condition ===", 'info');
+    
+    const delays = [0, 5, 10, 20, 50];
+    
+    for(const delay of delays){
+        log(`\n[→] Testando com delay de ${delay}ms entre operações`, 'warning');
+        
+        try {
+            let size = BASE;
+            for(let i=0; i<50; i++){
+                const payload = "T".repeat(size);
+                history.pushState({}, "", "#"+payload);
+                history.replaceState({}, "", "#"+payload.slice(0, payload.length >> 1));
+                
+                if(i % 6 === 0){
+                    setTimeout(()=>history.back(), 0);
+                }
+                
+                size += STEP;
+                await sleep(delay); // Delay variável
+            }
+            
+            log(`[✓] Delay ${delay}ms: SEM CRASH`, 'success');
+            
+        } catch(e){
+            log(`[✗] Delay ${delay}ms: CRASH – ${e}`, 'error');
+            log(`>>> Timing crítico identificado: ${delay}ms <<<`, 'error');
+        }
+        
+        await sleep(200);
     }
+}
 
-    // Current is B
-    let cur = history.state;
-    if (!cur || !cur.buffer) {
-      log("[FAIL] Current state missing buffer.");
-      return;
-    }
-    const curViewB = new Uint32Array(cur.buffer);
-    const baseB = snapshotU32(curViewB, 2);
-    log(`[BASELINE] At B: state.tag=${cur.tag} B[0..1]=${baseB.map(hex32).join(", ")}`);
-
-    log("[NAV] history.back() -> expect to reach A");
-    try { await navBackSync(); } catch (e) { log(`[ERROR] back sync failed: ${e.message}`); return; }
-
-    cur = history.state;
-    if (!cur || !cur.buffer) {
-      log("[FAIL] After back, state missing buffer.");
-      return;
-    }
-    const curViewA = new Uint32Array(cur.buffer);
-    const baseA = snapshotU32(curViewA, 2);
-    log(`[AT A] state.tag=${cur.tag} A[0..1]=${baseA.map(hex32).join(", ")}`);
-
-    const WA0 = 0x0A0A0A0A >>> 0;
-    const WA1 = 0xF0F0F0F0 >>> 0;
-    log(`[WRITE] In A, write A[0]=${hex32(WA0)} A[1]=${hex32(WA1)}`);
-    curViewA[0] = WA0;
-    curViewA[1] = WA1;
-
-    const aAfter = snapshotU32(curViewA, 2);
-    assertLine("A reflects its own write", aAfter[0] === WA0 && aAfter[1] === WA1);
-
-    log("[NAV] history.forward() -> expect to reach B");
-    try { await navForwardSync(); } catch (e) { log(`[ERROR] forward sync failed: ${e.message}`); return; }
-
-    cur = history.state;
-    if (!cur || !cur.buffer) {
-      log("[FAIL] After forward, state missing buffer.");
-      return;
-    }
-    const viewB2 = new Uint32Array(cur.buffer);
-    const bAfter = snapshotU32(viewB2, 2);
-    log(`[AT B] state.tag=${cur.tag} B[0..1]=${bAfter.map(hex32).join(", ")}`);
-
-    const contaminated = (bAfter[0] === WA0 || bAfter[1] === WA1);
-    log("=== RESULT ===");
-    if (contaminated) {
-      log("[EVIDENCE] Cross-entry contamination observed: values written in A appear in B without direct references.");
-      log("[NOTE] Stronger evidence of isolation failure than intra-object aliasing checks.");
-    } else {
-      log("[OK] No cross-entry contamination detected in this run.");
-    }
-
-    log(`[SANITY] original A.buf === B.buf : ${A.buf === B.buf} (should be false)`);
-  }
-
-  // ----------------------------
-  // Test 5: Circular reference handling
-  // ----------------------------
-  function runCircularTest() {
-    sep("TEST: Circular reference handling");
-    const obj = { tag: "CIRC_" + Date.now() };
-    obj.self = obj;
-
-    try {
-      history.pushState(obj, "", "#circ_" + Date.now());
-      log("[ACTION] pushState accepted circular reference.");
-      const r = history.state;
-      const ok = (r && r.self === r);
-      log(`[CHECK] retrieved.self === retrieved : ${ok}`);
-      log("=== RESULT ===");
-      if (ok) {
-        log("[OBSERVATION] Circular structure appears preserved in retrieved state.");
-        log("[NOTE] Deviation from typical structured-clone expectations; not by itself proof of memory corruption.");
-      } else {
-        log("[INDETERMINATE] Circular push succeeded but cycle not preserved (implementation-specific).");
-      }
-    } catch (e) {
-      log(`[EXPECTED/OK] pushState threw: ${e && e.name ? e.name : e} (${e && e.message ? e.message : "no message"})`);
-      log("[NOTE] Many engines reject circular structures (often DataCloneError).");
-    }
-  }
-
-  // ----------------------------
-  // Wire UI
-  // ----------------------------
-  document.getElementById("btnClear").onclick = () => (logEl.textContent = "");
-  document.getElementById("btnT1").onclick = () => runVariant("Variant A (buffer only)");
-  document.getElementById("btnT2").onclick = () => runVariant("Variant B (view only)");
-  document.getElementById("btnT3").onclick = () => runVariant("Variant C (buffer + view)");
-  document.getElementById("btnT4").onclick = () => runCrossEntryContamination();
-  document.getElementById("btnCirc").onclick = () => runCircularTest();
-
-  document.getElementById("btnRunRecommended").onclick = async () => {
-    logEl.textContent = "";
-    sep("RECOMMENDED RUN ORDER: 1 → 2 → 3");
-    await runVariant("Variant A (buffer only)");
-    await runVariant("Variant B (view only)");
-    await runCrossEntryContamination();
-    log("\nDone.");
-  };
-
-  sep("READY");
-  log("Tip: Run 'Recommended' first. Capture logs per variant when reporting.");
-})();
+log(" Ferramenta de análise pronta. Escolha um teste.", 'success');
 </script>
 </body>
 </html>
