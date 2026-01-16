@@ -2,401 +2,692 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 WebKit - Rate Limit Analysis</title>
+<title>PS4 WebKit Fuzzer v1.0</title>
 </head>
 <body>
 
-<h2>PS4 WebKit v12.00 - History API Rate Limiting Bug</h2>
+<h2>PS4 WebKit Fuzzer v1.0</h2>
+<p>Fuzzing automatico de APIs vulneraveis do WebKit PS4 v12.00</p>
 
-<p><strong>DESCOBERTA:</strong> SecurityError apos ~100 operacoes em 10 segundos</p>
-<p><strong>Limite:</strong> 100 pushState/replaceState por janela de 10s</p>
+<h3>Configuracao</h3>
+<label>Iteracoes por teste: <input type="number" id="iterations" value="1000"></label><br>
+<label>Delay entre testes (ms): <input type="number" id="delay" value="10"></label><br>
+<label>Auto-save crashes: <input type="checkbox" id="autosave" checked></label><br>
 
-<hr>
+<h3>Alvos de Fuzzing</h3>
+<button onclick="fuzzHistory()">Fuzz: History API</button>
+<button onclick="fuzzTypedArrays()">Fuzz: TypedArrays</button>
+<button onclick="fuzzCanvas()">Fuzz: Canvas/WebGL</button><br>
+<button onclick="fuzzIndexedDB()">Fuzz: IndexedDB</button>
+<button onclick="fuzzWebWorkers()">Fuzz: Web Workers</button>
+<button onclick="fuzzPromises()">Fuzz: Promises/Async</button><br>
+<button onclick="fuzzJIT()">Fuzz: JIT Compiler</button>
+<button onclick="fuzzDOM()">Fuzz: DOM Manipulation</button>
+<button onclick="fuzzAll()">FUZZ ALL (Modo Agressivo)</button><br>
 
-<h3>Analise da Vulnerabilidade</h3>
-<p>O "crash" e na verdade um <strong>SecurityError de rate limiting</strong></p>
-<p>pushState + replaceState = 2 operacoes por iteracao</p>
-<p>49 iteracoes = 98 ops | 50 iteracoes = 100 ops (LIMITE)</p>
-
-<hr>
-
-<h3>Testes de Rate Limit</h3>
-<button onclick="testRateLimit()">Teste: Contar operacoes ate erro</button><br>
-<button onclick="testOnlyPush()">Teste: Apenas pushState (sem replace)</button><br>
-<button onclick="testWithDelay()">Teste: Com delay de 200ms (evitar rate limit)</button><br>
-<button onclick="testResetWindow()">Teste: Aguardar 10s e continuar</button><br>
-
-<h3>Testes de Bypass</h3>
-<button onclick="testSlowRate()">Bypass: 99 ops rapido + delay + 1 op</button><br>
-<button onclick="testChunked()">Bypass: Executar em chunks com pausa</button><br>
-<button onclick="testMixed()">Teste: Misturar push/replace/back</button><br>
-
-<h3>Analise de Exploitacao</h3>
-<button onclick="analyzeBypass()">Analisar possibilidades de bypass</button><br>
-<button onclick="testEdgeCases()">Testar edge cases do contador</button><br>
-
-<hr>
+<h3>Controles</h3>
+<button onclick="stopFuzzing()">Parar Fuzzing</button>
 <button onclick="clearLog()">Limpar Log</button>
+<button onclick="exportCrashes()">Exportar Crashes</button>
 
-<pre id="log"></pre>
+<h3>Status</h3>
+<div id="status">
+  Iteracoes: <span id="iter">0</span> | 
+  Crashes: <span id="crashes">0</span> | 
+  Exceptions: <span id="exceptions">0</span> | 
+  Estado: <span id="state">Aguardando</span>
+</div>
+
+<h3>Log de Crashes</h3>
+<pre id="log" style="height:400px; overflow-y:scroll; background:#000; color:#0f0; padding:10px;"></pre>
 
 <script>
+let running = false;
+let iterCount = 0;
+let crashCount = 0;
+let exceptionCount = 0;
+let crashLog = [];
+
 const logEl = document.getElementById("log");
+const statusEl = document.getElementById("state");
 
-function log(m){ 
-    const ts = new Date().toLocaleTimeString();
-    logEl.textContent += `[${ts}] ${m}\n`; 
-}
-
-function clearLog(){ logEl.textContent = ""; }
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-const BASE = 977;
-const STEP = 14461;
-
-// ============================================
-// CONTADOR DE OPERACOES
-// ============================================
-let opCount = 0;
-let startTime = null;
-
-function resetCounter(){
-    opCount = 0;
-    startTime = Date.now();
-    log(`[RESET] Contador zerado. Janela de 10s iniciada.`);
-}
-
-function trackOp(type){
-    opCount++;
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    return { count: opCount, elapsed, type };
-}
-
-// ============================================
-// TESTE: Contar ate erro
-// ============================================
-async function testRateLimit(){
-    clearLog();
-    log("=== CONTAGEM ATE RATE LIMIT ===");
-    log("Executando pushState ate receber SecurityError\n");
+function log(msg, type = "info") {
+    const timestamp = new Date().toISOString();
+    const prefix = {
+        "info": "[INFO]",
+        "crash": "[CRASH]",
+        "exception": "[EXCEPTION]",
+        "success": "[SUCCESS]"
+    }[type] || "[INFO]";
     
-    resetCounter();
-    let i = 0;
+    const line = `[${timestamp}] ${prefix} ${msg}\n`;
+    logEl.textContent += line;
+    logEl.scrollTop = logEl.scrollHeight;
     
-    try {
-        while(true){
-            history.pushState({}, "", "#test" + i);
-            const op = trackOp('push');
+    if (type === "crash") {
+        crashLog.push({timestamp, msg});
+        document.getElementById("crashes").textContent = crashCount;
+    }
+}
+
+function updateStatus(state) {
+    statusEl.textContent = state;
+}
+
+function updateCounters() {
+    document.getElementById("iter").textContent = iterCount;
+    document.getElementById("crashes").textContent = crashCount;
+    document.getElementById("exceptions").textContent = exceptionCount;
+}
+
+function clearLog() {
+    logEl.textContent = "";
+    iterCount = 0;
+    crashCount = 0;
+    exceptionCount = 0;
+    crashLog = [];
+    updateCounters();
+}
+
+function stopFuzzing() {
+    running = false;
+    updateStatus("Parado");
+    log("Fuzzing interrompido pelo usuario");
+}
+
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+// ============================================
+// GERADORES DE DADOS ALEATÓRIOS
+// ============================================
+
+function randomInt(min = 0, max = 0xFFFFFFFF) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function randomString(maxLen = 1000) {
+    const len = randomInt(0, maxLen);
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:',.<>?/`~";
+    let result = "";
+    for (let i = 0; i < len; i++) {
+        result += chars[randomInt(0, chars.length - 1)];
+    }
+    return result;
+}
+
+function randomBytes(len) {
+    const arr = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        arr[i] = randomInt(0, 255);
+    }
+    return arr;
+}
+
+function randomURL() {
+    const schemes = ["#", "http://", "https://", "file://", "data:", "javascript:", "blob:"];
+    const scheme = schemes[randomInt(0, schemes.length - 1)];
+    return scheme + randomString(randomInt(10, 10000));
+}
+
+function randomObject(depth = 0) {
+    if (depth > 5) return null;
+    
+    const types = [
+        () => randomInt(),
+        () => randomString(),
+        () => null,
+        () => undefined,
+        () => true,
+        () => false,
+        () => new Array(randomInt(0, 100)),
+        () => randomBytes(randomInt(0, 1000)),
+        () => ({a: randomObject(depth + 1), b: randomObject(depth + 1)})
+    ];
+    
+    return types[randomInt(0, types.length - 1)]();
+}
+
+// ============================================
+// FUZZER 1: HISTORY API
+// ============================================
+async function fuzzHistory() {
+    running = true;
+    updateStatus("Fuzzing History API");
+    log("Iniciando fuzzing de History API...", "info");
+    
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
+    
+    const mutations = [
+        // Tamanhos extremos
+        () => history.pushState({}, "", randomURL()),
+        () => history.replaceState({}, "", randomURL()),
+        
+        // Objetos malformados
+        () => history.pushState(randomObject(), randomString(), randomURL()),
+        () => history.replaceState(null, null, null),
+        
+        // Loops aninhados
+        () => {
+            for (let i = 0; i < randomInt(1, 100); i++) {
+                history.pushState({}, "", "#" + i);
+            }
+        },
+        
+        // Race conditions
+        () => {
+            setTimeout(() => history.back(), 0);
+            setTimeout(() => history.forward(), 0);
+            history.pushState({}, "", randomURL());
+        },
+        
+        // Payloads gigantes
+        () => history.pushState({}, "", "#" + "A".repeat(randomInt(1000000, 10000000))),
+        
+        // Caracteres especiais
+        () => history.pushState({}, "", "#\x00\x01\xFF\xFE" + String.fromCharCode(randomInt(0, 0xFFFF))),
+        
+        // URLs malformadas
+        () => history.pushState({}, "", "javascript:alert(1)" + randomString()),
+        () => history.pushState({}, "", "data:text/html," + randomString()),
+    ];
+    
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
+        
+        try {
+            const mutation = mutations[randomInt(0, mutations.length - 1)];
+            mutation();
             
-            if(i % 10 === 0){
-                log(`[OP ${op.count}] pushState #${i} (${op.elapsed}s)`);
+            if (i % 100 === 0) {
+                log(`History fuzzing: ${i}/${iterations} iteracoes`);
+                updateCounters();
             }
             
-            i++;
-            await sleep(1); // Minimo delay
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH em iteracao ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
         }
-    } catch(e){
-        log(`\n[LIMITE] Operacao ${opCount}: ${e}`);
-        log(`Tempo decorrido: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
-        log(`\n>>> LIMITE: ${opCount} operacoes <<<`);
+        
+        await sleep(delay);
     }
+    
+    updateStatus("Concluido");
+    log(`History fuzzing completo: ${iterations} iteracoes, ${crashCount} crashes`, "success");
 }
 
 // ============================================
-// TESTE: Apenas pushState
+// FUZZER 2: TYPED ARRAYS
 // ============================================
-async function testOnlyPush(){
-    clearLog();
-    log("=== TESTE: Apenas pushState (sem replaceState) ===");
-    log("Verificar se replaceState conta para o limite\n");
+async function fuzzTypedArrays() {
+    running = true;
+    updateStatus("Fuzzing TypedArrays");
+    log("Iniciando fuzzing de TypedArrays...", "info");
     
-    resetCounter();
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
     
-    try {
-        for(let i = 0; i < 120; i++){
-            history.pushState({}, "", "#only" + i);
-            trackOp('push');
+    const arrayTypes = [
+        Int8Array, Uint8Array, Uint8ClampedArray,
+        Int16Array, Uint16Array,
+        Int32Array, Uint32Array,
+        Float32Array, Float64Array
+    ];
+    
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
+        
+        try {
+            const ArrayType = arrayTypes[randomInt(0, arrayTypes.length - 1)];
+            const size = randomInt(0, 0xFFFFFFFF);
             
-            if(i % 20 === 0){
-                log(`[${opCount}] pushState #${i}`);
+            // Mutações
+            const mutations = [
+                () => new ArrayType(size),
+                () => {
+                    const arr = new ArrayType(10);
+                    arr[randomInt(-1000, 1000)] = randomInt();
+                },
+                () => {
+                    const arr = new ArrayType(10);
+                    arr.length = randomInt(0, 0xFFFFFFFF);
+                },
+                () => {
+                    const arr = new ArrayType(10);
+                    Object.defineProperty(arr, 'length', {value: randomInt()});
+                },
+                () => {
+                    const arr1 = new ArrayType(10);
+                    const arr2 = new ArrayType(arr1.buffer);
+                    arr1[0] = randomInt();
+                },
+            ];
+            
+            const mutation = mutations[randomInt(0, mutations.length - 1)];
+            mutation();
+            
+            if (i % 100 === 0) {
+                log(`TypedArray fuzzing: ${i}/${iterations}`);
+                updateCounters();
             }
             
-            await sleep(1);
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH TypedArray ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
         }
         
-        log(`\n[OK] 120 pushState sem erro`);
-        
-    } catch(e){
-        log(`\n[LIMITE] pushState #${opCount}: ${e}`);
-        log(`>>> Apenas pushState: limite em ${opCount} ops <<<`);
+        await sleep(delay);
     }
+    
+    updateStatus("Concluido");
+    log(`TypedArray fuzzing completo: ${crashCount} crashes`, "success");
 }
 
 // ============================================
-// TESTE: Com delay
+// FUZZER 3: CANVAS/WEBGL
 // ============================================
-async function testWithDelay(){
-    clearLog();
-    log("=== TESTE: Com delay de 200ms ===");
-    log("Objetivo: evitar rate limit com pausa entre ops\n");
+async function fuzzCanvas() {
+    running = true;
+    updateStatus("Fuzzing Canvas/WebGL");
+    log("Iniciando fuzzing de Canvas...", "info");
     
-    resetCounter();
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
     
-    try {
-        for(let i = 0; i < 60; i++){
-            history.pushState({}, "", "#delay" + i);
-            history.replaceState({}, "", "#delay" + i + "_r");
-            trackOp('push+replace');
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
+        
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = randomInt(1, 10000);
+            canvas.height = randomInt(1, 10000);
             
-            if(i % 10 === 0){
-                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-                log(`[${opCount}] ITER ${i} (${elapsed}s)`);
+            const mutations = [
+                () => {
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillRect(randomInt(), randomInt(), randomInt(), randomInt());
+                },
+                () => {
+                    const ctx = canvas.getContext('2d');
+                    const imgData = ctx.createImageData(randomInt(1, 10000), randomInt(1, 10000));
+                    ctx.putImageData(imgData, randomInt(), randomInt());
+                },
+                () => {
+                    const gl = canvas.getContext('webgl');
+                    if (gl) {
+                        const buffer = gl.createBuffer();
+                        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+                        gl.bufferData(gl.ARRAY_BUFFER, randomBytes(randomInt(1000, 1000000)), gl.STATIC_DRAW);
+                    }
+                },
+                () => {
+                    canvas.toDataURL('image/png');
+                },
+                () => {
+                    canvas.toBlob(blob => {});
+                },
+            ];
+            
+            const mutation = mutations[randomInt(0, mutations.length - 1)];
+            mutation();
+            
+            if (i % 50 === 0) {
+                log(`Canvas fuzzing: ${i}/${iterations}`);
+                updateCounters();
             }
             
-            await sleep(200); // Delay maior
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH Canvas ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
         }
         
-        log(`\n[OK] 60 iteracoes (120 ops) com delay: SEM ERRO`);
-        log(`>>> Delay de 200ms permite bypass do rate limit <<<`);
-        
-    } catch(e){
-        log(`\n[ERRO] Ops ${opCount}: ${e}`);
+        await sleep(delay);
     }
+    
+    updateStatus("Concluido");
+    log(`Canvas fuzzing completo: ${crashCount} crashes`, "success");
 }
 
 // ============================================
-// TESTE: Reset de janela
+// FUZZER 4: INDEXEDDB
 // ============================================
-async function testResetWindow(){
-    clearLog();
-    log("=== TESTE: Aguardar 10s e continuar ===");
-    log("Verificar se janela de rate limit reseta\n");
+async function fuzzIndexedDB() {
+    running = true;
+    updateStatus("Fuzzing IndexedDB");
+    log("Iniciando fuzzing de IndexedDB...", "info");
     
-    resetCounter();
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
     
-    try {
-        log("[1] Executando 98 operacoes...");
-        for(let i = 0; i < 49; i++){
-            history.pushState({}, "", "#w1_" + i);
-            history.replaceState({}, "", "#w1_" + i + "_r");
-            trackOp('push+replace');
-        }
-        log(`[OK] 98 ops completadas em ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
         
-        log("\n[2] Aguardando 11 segundos...");
-        await sleep(11000);
-        log("[OK] Pausa completada");
-        
-        log("\n[3] Continuando com mais operacoes...");
-        resetCounter(); // Simular reset de janela
-        
-        for(let i = 0; i < 49; i++){
-            history.pushState({}, "", "#w2_" + i);
-            history.replaceState({}, "", "#w2_" + i + "_r");
-            trackOp('push+replace');
-        }
-        
-        log(`\n[OK] Mais 98 ops apos pausa: SEM ERRO`);
-        log(`>>> Janela de 10s RESETA o contador <<<`);
-        
-    } catch(e){
-        log(`\n[ERRO] ${e}`);
-    }
-}
-
-// ============================================
-// BYPASS: 99 ops + delay
-// ============================================
-async function testSlowRate(){
-    clearLog();
-    log("=== BYPASS: 99 ops rapido + delay + 1 op ===");
-    log("Estrategia: chegar perto do limite e pausar\n");
-    
-    resetCounter();
-    
-    try {
-        log("[1] Fase rapida: 49 iteracoes (98 ops)...");
-        for(let i = 0; i < 49; i++){
-            history.pushState({}, "", "#fast" + i);
-            history.replaceState({}, "", "#fast" + i + "_r");
-            trackOp('push+replace');
-            await sleep(1);
-        }
-        log(`[OK] 98 ops em ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
-        
-        log("\n[2] Aguardando 12 segundos...");
-        await sleep(12000);
-        
-        log("\n[3] Tentando operacao adicional...");
-        history.pushState({}, "", "#after_pause");
-        trackOp('push');
-        
-        log(`\n[OK] Operacao #${opCount} apos pausa: SUCESSO`);
-        log(`>>> Bypass funciona! <<<`);
-        
-    } catch(e){
-        log(`\n[ERRO] ${e}`);
-        log(`>>> Bypass FALHOU <<<`);
-    }
-}
-
-// ============================================
-// BYPASS: Chunks com pausa
-// ============================================
-async function testChunked(){
-    clearLog();
-    log("=== BYPASS: Executar em chunks ===");
-    log("Executar 200 ops totais em blocos de 90 com pausa\n");
-    
-    const CHUNK_SIZE = 45; // 90 ops (push+replace)
-    const CHUNKS = 5;
-    
-    try {
-        for(let chunk = 0; chunk < CHUNKS; chunk++){
-            log(`\n[CHUNK ${chunk+1}/${CHUNKS}] Executando ${CHUNK_SIZE} iteracoes...`);
-            resetCounter();
+        try {
+            const dbName = "fuzz_" + randomString(20);
+            const request = indexedDB.open(dbName, randomInt(1, 100));
             
-            for(let i = 0; i < CHUNK_SIZE; i++){
-                history.pushState({}, "", `#c${chunk}_${i}`);
-                history.replaceState({}, "", `#c${chunk}_${i}_r`);
-                trackOp('push+replace');
-                await sleep(1);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                const storeName = randomString(20);
+                
+                try {
+                    const store = db.createObjectStore(storeName, {keyPath: randomString(10)});
+                    store.createIndex(randomString(10), randomString(10));
+                } catch (e) {
+                    exceptionCount++;
+                }
+            };
+            
+            request.onsuccess = (e) => {
+                const db = e.target.result;
+                
+                try {
+                    const tx = db.transaction([Object.keys(db.objectStoreNames)[0] || "default"], "readwrite");
+                    const store = tx.objectStore(Object.keys(db.objectStoreNames)[0] || "default");
+                    
+                    store.put(randomObject());
+                    store.get(randomInt());
+                    store.delete(randomInt());
+                } catch (e) {
+                    exceptionCount++;
+                }
+                
+                db.close();
+            };
+            
+            if (i % 50 === 0) {
+                log(`IndexedDB fuzzing: ${i}/${iterations}`);
+                updateCounters();
             }
             
-            log(`[OK] Chunk ${chunk+1}: ${opCount} ops`);
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH IndexedDB ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
+        }
+        
+        await sleep(delay);
+    }
+    
+    updateStatus("Concluido");
+    log(`IndexedDB fuzzing completo: ${crashCount} crashes`, "success");
+}
+
+// ============================================
+// FUZZER 5: WEB WORKERS
+// ============================================
+async function fuzzWebWorkers() {
+    running = true;
+    updateStatus("Fuzzing Web Workers");
+    log("Iniciando fuzzing de Web Workers...", "info");
+    
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
+    
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
+        
+        try {
+            const workerCode = `
+                onmessage = function(e) {
+                    ${randomString(100)}
+                    postMessage(${randomInt()});
+                }
+            `;
             
-            if(chunk < CHUNKS - 1){
-                log(`[PAUSA] Aguardando 11s antes do proximo chunk...`);
-                await sleep(11000);
+            const blob = new Blob([workerCode], {type: 'application/javascript'});
+            const workerURL = URL.createObjectURL(blob);
+            const worker = new Worker(workerURL);
+            
+            worker.postMessage(randomObject());
+            
+            setTimeout(() => worker.terminate(), 100);
+            
+            if (i % 50 === 0) {
+                log(`Web Worker fuzzing: ${i}/${iterations}`);
+                updateCounters();
             }
+            
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH Worker ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
         }
         
-        log(`\n\n[SUCESSO] ${CHUNKS} chunks completados!`);
-        log(`Total estimado: ${CHUNK_SIZE * CHUNKS * 2} operacoes`);
-        log(`>>> Bypass por chunking FUNCIONA <<<`);
-        
-    } catch(e){
-        log(`\n[ERRO] ${e}`);
+        await sleep(delay);
     }
+    
+    updateStatus("Concluido");
+    log(`Web Worker fuzzing completo: ${crashCount} crashes`, "success");
 }
 
 // ============================================
-// TESTE: Mix de operacoes
+// FUZZER 6: PROMISES/ASYNC
 // ============================================
-async function testMixed(){
-    clearLog();
-    log("=== TESTE: Misturar push/replace/back ===");
-    log("Verificar se history.back() conta para o limite\n");
+async function fuzzPromises() {
+    running = true;
+    updateStatus("Fuzzing Promises");
+    log("Iniciando fuzzing de Promises...", "info");
     
-    resetCounter();
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
     
-    try {
-        for(let i = 0; i < 40; i++){
-            history.pushState({}, "", "#mix" + i);
-            trackOp('push');
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
+        
+        try {
+            const mutations = [
+                () => {
+                    new Promise((resolve, reject) => {
+                        setTimeout(() => resolve(randomObject()), randomInt(0, 10));
+                    }).then(() => {
+                        throw new Error(randomString());
+                    });
+                },
+                () => {
+                    Promise.race([
+                        new Promise(r => setTimeout(r, randomInt(0, 100))),
+                        new Promise((r, rej) => rej(randomObject()))
+                    ]);
+                },
+                () => {
+                    Promise.all(new Array(randomInt(1, 100)).fill(0).map(() => 
+                        new Promise(r => r(randomInt()))
+                    ));
+                },
+            ];
             
-            history.replaceState({}, "", "#mix" + i + "_r");
-            trackOp('replace');
+            const mutation = mutations[randomInt(0, mutations.length - 1)];
+            mutation();
             
-            if(i % 5 === 0){
-                setTimeout(() => history.back(), 0);
-                log(`[${opCount}] ITER ${i} + history.back()`);
-            } else if(i % 10 === 0){
-                log(`[${opCount}] ITER ${i}`);
+            if (i % 100 === 0) {
+                log(`Promise fuzzing: ${i}/${iterations}`);
+                updateCounters();
             }
             
-            await sleep(1);
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH Promise ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
         }
         
-        log(`\n[OK] 40 iteracoes com back(): ${opCount} ops`);
+        await sleep(delay);
+    }
+    
+    updateStatus("Concluido");
+    log(`Promise fuzzing completo: ${crashCount} crashes`, "success");
+}
+
+// ============================================
+// FUZZER 7: JIT COMPILER
+// ============================================
+async function fuzzJIT() {
+    running = true;
+    updateStatus("Fuzzing JIT");
+    log("Iniciando fuzzing de JIT Compiler...", "info");
+    
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
+    
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
         
-    } catch(e){
-        log(`\n[ERRO] Ops ${opCount}: ${e}`);
-    }
-}
-
-// ============================================
-// ANALISE
-// ============================================
-function analyzeBypass(){
-    clearLog();
-    log("=== ANALISE DE BYPASS DO RATE LIMIT ===\n");
-    
-    log("DESCOBERTA:");
-    log("- WebKit limita a 100 operacoes em janela de 10s");
-    log("- pushState E replaceState contam para o limite");
-    log("- SecurityError e lancado na operacao #101\n");
-    
-    log("METODOS DE BYPASS:\n");
-    
-    log("1. CHUNKING (MAIS VIAVEL)");
-    log("   - Executar 90-95 ops");
-    log("   - Pausar 11+ segundos");
-    log("   - Repetir");
-    log("   - Permite operacoes ilimitadas!\n");
-    
-    log("2. SLOW RATE");
-    log("   - Delay >= 100ms entre operacoes");
-    log("   - 100ms * 100 = 10s (dentro da janela)");
-    log("   - Mais lento mas evita erro\n");
-    
-    log("3. APENAS pushState");
-    log("   - Evitar replaceState");
-    log("   - Dobra o numero de operacoes possiveis");
-    log("   - Mas reduz funcionalidade\n");
-    
-    log("IMPLICACOES DE SEGURANCA:");
-    log("- Rate limit PODE ser bypassado");
-    log("- Permite ataques de exaustao de memoria");
-    log("- Possivel DoS do navegador");
-    log("- Heap spray ilimitado via chunking\n");
-    
-    log("EXPLORACAO:");
-    log("1. Usar chunking para criar 1000+ entradas");
-    log("2. Fragmentar heap de forma controlada");
-    log("3. Se existir bug de overflow, explorar apos bypass");
-}
-
-async function testEdgeCases(){
-    clearLog();
-    log("=== EDGE CASES DO CONTADOR ===\n");
-    
-    log("[TESTE 1] Contador zera ao recarregar pagina?");
-    log("  -> SIM (estado do navegador e resetado)\n");
-    
-    log("[TESTE 2] history.back/forward contam?");
-    log("  -> Testando...\n");
-    
-    resetCounter();
-    try {
-        for(let i = 0; i < 120; i++){
-            history.pushState({}, "", "#edge" + i);
-            if(i % 3 === 0) setTimeout(() => history.back(), 0);
-            trackOp('push');
-            await sleep(1);
+        try {
+            // Forçar JIT compilation
+            const hotFunc = new Function(`
+                let x = ${randomInt()};
+                for (let i = 0; i < 100; i++) {
+                    x += ${randomInt()};
+                    x *= ${randomInt()};
+                    x = x | ${randomInt()};
+                }
+                return x;
+            `);
+            
+            for (let j = 0; j < 1000; j++) {
+                hotFunc();
+            }
+            
+            if (i % 10 === 0) {
+                log(`JIT fuzzing: ${i}/${iterations}`);
+                updateCounters();
+            }
+            
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH JIT ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
         }
-        log(`  -> back/forward NAO contam (${opCount} ops sem erro)\n`);
-    } catch(e){
-        log(`  -> back/forward CONTAM (erro em ${opCount} ops)\n`);
+        
+        await sleep(delay);
     }
     
-    log("[TESTE 3] replaceState sem pushState previo?");
-    try {
-        history.replaceState({}, "", "#direct_replace");
-        log("  -> replaceState direto: FUNCIONA\n");
-    } catch(e){
-        log(`  -> replaceState direto: ERRO (${e})\n`);
-    }
+    updateStatus("Concluido");
+    log(`JIT fuzzing completo: ${crashCount} crashes`, "success");
 }
 
 // ============================================
-// INICIALIZACAO
+// FUZZER 8: DOM MANIPULATION
 // ============================================
-log("=== PS4 WebKit Rate Limit Analysis ===");
-log("Limite: ~100 ops em 10 segundos");
-log("pushState + replaceState = 2 ops por iteracao");
-log("49 iters = 98 ops (OK) | 50 iters = 100 ops (LIMITE)\n");
-log("Pronto. Escolha um teste.");
+async function fuzzDOM() {
+    running = true;
+    updateStatus("Fuzzing DOM");
+    log("Iniciando fuzzing de DOM...", "info");
+    
+    const iterations = parseInt(document.getElementById("iterations").value);
+    const delay = parseInt(document.getElementById("delay").value);
+    
+    for (let i = 0; i < iterations && running; i++) {
+        iterCount++;
+        
+        try {
+            const mutations = [
+                () => {
+                    const el = document.createElement(randomString(10));
+                    el.innerHTML = randomString(1000);
+                    document.body.appendChild(el);
+                },
+                () => {
+                    const el = document.createElement('div');
+                    el.setAttribute(randomString(20), randomString(100));
+                },
+                () => {
+                    const range = document.createRange();
+                    range.setStart(document.body, randomInt(0, 10));
+                    range.setEnd(document.body, randomInt(0, 10));
+                },
+                () => {
+                    document.body.style.cssText = randomString(500);
+                },
+            ];
+            
+            const mutation = mutations[randomInt(0, mutations.length - 1)];
+            mutation();
+            
+            if (i % 100 === 0) {
+                log(`DOM fuzzing: ${i}/${iterations}`);
+                updateCounters();
+            }
+            
+        } catch (e) {
+            exceptionCount++;
+            crashCount++;
+            log(`CRASH DOM ${i}: ${e.name} - ${e.message}`, "crash");
+            updateCounters();
+        }
+        
+        await sleep(delay);
+    }
+    
+    updateStatus("Concluido");
+    log(`DOM fuzzing completo: ${crashCount} crashes`, "success");
+}
+
+// ============================================
+// FUZZER: ALL
+// ============================================
+async function fuzzAll() {
+    log("=== MODO AGRESSIVO: FUZZ ALL ===", "info");
+    log("AVISO: Pode travar o navegador!", "crash");
+    
+    if (!confirm("Modo agressivo pode travar o PS4!\nContinuar?")) {
+        return;
+    }
+    
+    running = true;
+    const fuzzers = [
+        fuzzHistory, fuzzTypedArrays, fuzzCanvas,
+        fuzzIndexedDB, fuzzWebWorkers, fuzzPromises,
+        fuzzJIT, fuzzDOM
+    ];
+    
+    for (const fuzzer of fuzzers) {
+        if (!running) break;
+        await fuzzer();
+        await sleep(2000);
+    }
+    
+    log("=== FUZZ ALL COMPLETO ===", "success");
+}
+
+// ============================================
+// EXPORT
+// ============================================
+function exportCrashes() {
+    if (crashLog.length === 0) {
+        alert("Nenhum crash para exportar");
+        return;
+    }
+    
+    const json = JSON.stringify(crashLog, null, 2);
+    const blob = new Blob([json], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ps4_webkit_crashes_' + Date.now() + '.json';
+    a.click();
+    
+    log(`Exportados ${crashLog.length} crashes`, "success");
+}
+
+// ============================================
+// INIT
+// ============================================
+log("PS4 WebKit Fuzzer v1.0 carregado");
+log("Selecione um fuzzer para iniciar");
+updateStatus("Pronto");
 </script>
 
 </body>
