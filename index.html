@@ -1,583 +1,812 @@
-
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PS4 12.00 - Testes WebKit CVE Completo</title>
+    <title>PS4 WebKit Memory Corruption Fuzzer (Revisado)</title>
 </head>
 <body>
-    <h1>PS4 Firmware 12.00 - WebKit CVE Tests (Completo)</h1>
-    <p>Testes para verificar 12 vulnerabilidades CVE no navegador PS4</p>
-    <p><strong>Data:</strong> Janeiro 2026</p>
+    <h1>PS4 WebKit Memory Corruption Fuzzer v2.0</h1>
+    <p><strong>Objetivo:</strong> Detectar crashes reais do processo (CE-34878-0 / fechamento) com sequências reproduzíveis</p>
     <p><strong>Firmware Alvo:</strong> PS4 12.00</p>
-    <p><strong>WebKit PS4:</strong> ~537.73 (aprox. 2013-2014)</p>
     
     <hr>
     
+    <h2>Status do Teste</h2>
+    <div id="status">Aguardando início...</div>
+    <div id="current-test"></div>
+    
+    <hr>
+    
+    <h2>Controles</h2>
+    <button onclick="startFuzzing()">INICIAR FUZZING</button>
+    <button onclick="stopFuzzing()">PARAR</button>
+    <button onclick="clearLogs()">LIMPAR LOGS</button>
+    <button onclick="showResults()">VER RESULTADOS</button>
+    <button onclick="clearAllData()">LIMPAR TUDO (localStorage)</button>
+    
+    <hr>
+    
+    <h2>Log de Execução (Tempo Real)</h2>
+    <div id="log"></div>
+    
+    <hr>
+    
+    <h2>Resultados Detectados</h2>
     <div id="results"></div>
-    
-    <hr>
-    
-    <h2>Testes Disponíveis (12 CVEs)</h2>
-    
-    <h3>Grupo 1: CVEs 2024 - Alta Prioridade</h3>
-    
-    <button onclick="testCVE_2024_23222()">CVE-2024-23222 - Type Confusion (ACE - EXPLORADO)</button>
-    <div id="test-23222"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_27833()">CVE-2024-27833 - Integer Overflow (ACE)</button>
-    <div id="test-27833"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_27851()">CVE-2024-27851 - Bounds Check Failure (ACE)</button>
-    <div id="test-27851"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_40779()">CVE-2024-40779 - OOB Read (Crash)</button>
-    <div id="test-40779"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_40780()">CVE-2024-40780 - OOB Access (Crash)</button>
-    <div id="test-40780"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_40789()">CVE-2024-40789 - OOB Access (Crash)</button>
-    <div id="test-40789"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_23263()">CVE-2024-23263 - CSP Bypass (Logic)</button>
-    <div id="test-23263"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2024_23284()">CVE-2024-23284 - CSP State Issue (Logic)</button>
-    <div id="test-23284"></div>
-    <br><br>
-    
-    <h3>Grupo 2: CVEs 2025 - Críticos Recentes</h3>
-    
-    <button onclick="testCVE_2025_24201()">CVE-2025-24201 - OOB Write (EXPLORADO)</button>
-    <div id="test-24201"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2025_24223()">CVE-2025-24223 - Memory Corruption</button>
-    <div id="test-24223"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2025_31204()">CVE-2025-31204 - Memory Corruption (CVSS 8.8)</button>
-    <div id="test-31204"></div>
-    <br><br>
-    
-    <button onclick="testCVE_2025_31206()">CVE-2025-31206 - Type Confusion</button>
-    <div id="test-31206"></div>
-    <br><br>
-    
-    <hr>
-    
-    <button onclick="testAllCVEs()"><strong>EXECUTAR TODOS OS 12 TESTES</strong></button>
-    
-    <hr>
-    
-    <h2>Informações do Sistema</h2>
-    <div id="system-info"></div>
 
     <script>
-        // Função para adicionar resultado
-        function addResult(message, isError) {
-            var resultsDiv = document.getElementById('results');
+        // ============================================
+        // SISTEMA DE PERSISTÊNCIA ROBUSTO
+        // ============================================
+        
+        var STORAGE_KEY = 'ps4_fuzzer_state_v2';
+        var RESULTS_KEY = 'ps4_fuzzer_results_v2';
+        var running = false;
+        var currentTestIndex = 0;
+        var sessionId = Date.now();
+        
+        // Salvar estado (apenas a cada 5 iterações ou início de fase)
+        function saveState(testName, iteration, phase, data) {
+            var state = {
+                running: true,
+                test: testName,
+                iteration: iteration,
+                phase: phase || 'running',
+                timestamp: new Date().toISOString(),
+                sessionId: sessionId,
+                data: data || {}
+            };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+            console.log('[STATE] ' + testName + ' iter=' + iteration + ' phase=' + phase);
+        }
+        
+        // Marcar saída limpa (clean exit)
+        function markCleanExit(reason) {
+            var state = loadState();
+            if (state) {
+                state.running = false;
+                state.exitReason = reason;
+                state.exitTimestamp = new Date().toISOString();
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                console.log('[CLEAN EXIT] reason=' + reason);
+            }
+        }
+        
+        // Carregar último estado
+        function loadState() {
+            try {
+                var saved = localStorage.getItem(STORAGE_KEY);
+                return saved ? JSON.parse(saved) : null;
+            } catch(e) {
+                return null;
+            }
+        }
+        
+        // Limpar estado após teste bem-sucedido
+        function clearState() {
+            localStorage.removeItem(STORAGE_KEY);
+            console.log('[STATE CLEARED]');
+        }
+        
+        // Salvar resultado (crash, telemetria, etc.)
+        function saveResult(type, testName, category, message, details) {
+            var results = [];
+            try {
+                var saved = localStorage.getItem(RESULTS_KEY);
+                results = saved ? JSON.parse(saved) : [];
+            } catch(e) {}
+            
+            results.push({
+                type: type, // 'CRASH', 'TELEMETRY', 'INVARIANT', 'EVENT'
+                test: testName,
+                category: category, // 'DOM', 'History', 'TypedArray', etc.
+                message: message,
+                timestamp: new Date().toISOString(),
+                details: details || {}
+            });
+            
+            localStorage.setItem(RESULTS_KEY, JSON.stringify(results));
+            console.log('[' + type + '] ' + testName + ' - ' + message);
+        }
+        
+        // ============================================
+        // DETECÇÃO DE CRASH REAL (SEM FALSOS POSITIVOS)
+        // ============================================
+        
+        function detectRealCrash() {
+            var lastState = loadState();
+            
+            if (!lastState) {
+                return null; // Nenhum estado anterior
+            }
+            
+            // Se tem marca de clean exit, não foi crash
+            if (!lastState.running || lastState.exitReason) {
+                console.log('[NO CRASH] Last exit was clean: ' + lastState.exitReason);
+                clearState(); // Limpar estado antigo
+                return null;
+            }
+            
+            // Se running=true e sem exitReason = possível crash
+            var timeDiff = Date.now() - new Date(lastState.timestamp).getTime();
+            
+            // Se passou muito tempo (>1h), pode ser reload manual
+            if (timeDiff > 3600000) {
+                console.log('[UNCERTAIN] State too old (' + Math.floor(timeDiff/60000) + 'min), ignoring');
+                clearState();
+                return null;
+            }
+            
+            // CRASH REAL DETECTADO
+            return {
+                test: lastState.test,
+                iteration: lastState.iteration,
+                phase: lastState.phase,
+                timestamp: lastState.timestamp,
+                data: lastState.data
+            };
+        }
+        
+        // ============================================
+        // LOGGER
+        // ============================================
+        
+        function log(msg, isError) {
+            var logDiv = document.getElementById('log');
+            var time = new Date().toLocaleTimeString();
             var p = document.createElement('p');
-            p.textContent = message;
-            p.style.color = isError ? 'red' : 'green';
-            resultsDiv.appendChild(p);
-        }
-
-        // Função para limpar resultados
-        function clearResults() {
-            document.getElementById('results').innerHTML = '';
-        }
-
-        // Capturar informações do sistema
-        function displaySystemInfo() {
-            var info = document.getElementById('system-info');
-            info.innerHTML = '<p><strong>User Agent:</strong> ' + navigator.userAgent + '</p>';
-            info.innerHTML += '<p><strong>Platform:</strong> ' + navigator.platform + '</p>';
-            info.innerHTML += '<p><strong>Language:</strong> ' + navigator.language + '</p>';
-            info.innerHTML += '<p><strong>Cookies Enabled:</strong> ' + navigator.cookieEnabled + '</p>';
-            info.innerHTML += '<p><strong>Online:</strong> ' + navigator.onLine + '</p>';
-        }
-
-        // CVE-2024-23222 - Type Confusion Test (EXPLORADO)
-        function testCVE_2024_23222() {
-            var target = document.getElementById('test-23222');
-            target.innerHTML = '<p>Testando CVE-2024-23222 (Type Confusion - EXPLORADO)...</p>';
+            p.textContent = '[' + time + '] ' + msg;
+            p.style.color = isError ? 'red' : 'black';
+            logDiv.appendChild(p);
             
-            try {
-                var arr = new Array();
-                arr[0] = {};
-                
-                for (var i = 0; i < 100000; i++) {
-                    arr[i % 100] = i;
-                }
-                
-                var obj = {};
-                obj.toString = function() {
-                    arr.length = 0;
-                    return "test";
-                };
-                
-                var result = arr.concat(obj);
-                
-                target.innerHTML += '<p style="color: green;">Teste concluído sem crash</p>';
-                addResult('CVE-2024-23222: Sistema não crashou', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-23222: Exceção - ' + e.message, true);
+            while (logDiv.children.length > 50) {
+                logDiv.removeChild(logDiv.firstChild);
             }
+            
+            console.log('[' + time + '] ' + msg);
         }
-
-        // CVE-2024-27833 - Integer Overflow Test
-        function testCVE_2024_27833() {
-            var target = document.getElementById('test-27833');
-            target.innerHTML = '<p>Testando CVE-2024-27833 (Integer Overflow)...</p>';
+        
+        function updateStatus(msg) {
+            document.getElementById('status').textContent = msg;
+        }
+        
+        function updateCurrentTest(testName) {
+            document.getElementById('current-test').innerHTML = '<strong>Teste Atual:</strong> ' + testName;
+        }
+        
+        // ============================================
+        // TESTES REVISADOS (FOCO EM CRASH REAL)
+        // ============================================
+        
+        // TESTE 1: DOM UAF Patterns (com reentrância)
+        function test_DOM_UAF() {
+            var testName = 'DOM_UAF';
+            updateCurrentTest(testName);
+            log('Iniciando ' + testName);
             
             try {
-                var maxInt = 0x7FFFFFFF;
-                var largeArray = new Array(1000000);
-                var calc1 = maxInt * 2;
-                var calc2 = maxInt + 1000000;
+                saveState(testName, 0, 'init', {});
                 
-                target.innerHTML += '<p>Calc overflow 1: ' + calc1 + '</p>';
-                target.innerHTML += '<p>Calc overflow 2: ' + calc2 + '</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2024-27833: Teste concluído sem crash', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-27833: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2024-27851 - Bounds Check Test
-        function testCVE_2024_27851() {
-            var target = document.getElementById('test-27851');
-            target.innerHTML = '<p>Testando CVE-2024-27851 (Bounds Check)...</p>';
-            
-            try {
-                var arr = new Array(100);
-                
-                for (var i = 0; i < 1000; i++) {
-                    arr[i] = i * 2;
-                }
-                
-                var val1 = arr[500];
-                var val2 = arr[1000];
-                var val3 = arr[-1];
-                
-                target.innerHTML += '<p>Array length: ' + arr.length + '</p>';
-                target.innerHTML += '<p>OOB reads executados</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2024-27851: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-27851: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2024-40779 - Out-of-Bounds Read Test
-        function testCVE_2024_40779() {
-            var target = document.getElementById('test-40779');
-            target.innerHTML = '<p>Testando CVE-2024-40779 (OOB Read)...</p>';
-            
-            try {
-                var buffer = new ArrayBuffer(1024);
-                var view = new DataView(buffer);
-                
-                for (var i = 0; i < 256; i++) {
-                    view.setUint32(i * 4, i);
-                }
-                
-                try {
-                    var oobRead = view.getUint32(1020);
-                    target.innerHTML += '<p>OOB read executado</p>';
-                } catch (e2) {
-                    target.innerHTML += '<p>Exceção OOB: ' + e2.message + '</p>';
-                }
-                
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2024-40779: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-40779: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2024-40780 - Out-of-Bounds Access Test
-        function testCVE_2024_40780() {
-            var target = document.getElementById('test-40780');
-            target.innerHTML = '<p>Testando CVE-2024-40780 (OOB Access)...</p>';
-            
-            try {
-                var arr = new Float32Array(256);
-                
-                for (var i = 0; i < 256; i++) {
-                    arr[i] = i * 1.5;
-                }
-                
-                var oobVal1 = arr[300];
-                var oobVal2 = arr[-10];
-                
-                target.innerHTML += '<p>OOB access executado</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2024-40780: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-40780: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2024-40789 - Out-of-Bounds Access Test
-        function testCVE_2024_40789() {
-            var target = document.getElementById('test-40789');
-            target.innerHTML = '<p>Testando CVE-2024-40789 (OOB Access)...</p>';
-            
-            try {
-                var arr = new Int32Array(128);
-                
-                for (var i = 0; i < 128; i++) {
-                    arr[i] = i * -1;
-                }
-                
-                var oobAccess = arr[200];
-                
-                target.innerHTML += '<p>OOB access negativo executado</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2024-40789: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-40789: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2024-23263 - CSP Bypass Logic Test
-        function testCVE_2024_23263() {
-            var target = document.getElementById('test-23263');
-            target.innerHTML = '<p>Testando CVE-2024-23263 (CSP Bypass)...</p>';
-            
-            try {
-                var meta = document.createElement('meta');
-                meta.httpEquiv = 'Content-Security-Policy';
-                meta.content = "default-src 'self'";
-                
-                var testScript = document.createElement('script');
-                testScript.textContent = 'var cspTest = true;';
-                
-                target.innerHTML += '<p>CSP meta tag criado</p>';
-                target.innerHTML += '<p style="color: green;">Teste lógico CSP concluído</p>';
-                addResult('CVE-2024-23263: Teste CSP concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-23263: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2024-23284 - CSP State Issue Test
-        function testCVE_2024_23284() {
-            var target = document.getElementById('test-23284');
-            target.innerHTML = '<p>Testando CVE-2024-23284 (CSP State)...</p>';
-            
-            try {
-                var iframe = document.createElement('iframe');
-                iframe.src = 'about:blank';
-                
-                var stateTest = {
-                    cspEnabled: true,
-                    violations: []
-                };
-                
-                target.innerHTML += '<p>Estado CSP testado</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2024-23284: Teste estado CSP concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2024-23284: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2025-24201 - Out-of-Bounds Write Test (EXPLORADO)
-        function testCVE_2025_24201() {
-            var target = document.getElementById('test-24201');
-            target.innerHTML = '<p>Testando CVE-2025-24201 (OOB Write - EXPLORADO)...</p>';
-            
-            try {
-                var arr = new Uint32Array(256);
-                
-                for (var i = 0; i < 256; i++) {
-                    arr[i] = i * 0xDEADBEEF;
-                }
-                
-                try {
-                    arr[300] = 0xBADF00D;
-                    arr[500] = 0xCAFEBABE;
-                    target.innerHTML += '<p>OOB writes executados</p>';
-                } catch (e2) {
-                    target.innerHTML += '<p>Exceção OOB write: ' + e2.message + '</p>';
-                }
-                
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2025-24201: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2025-24201: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2025-24223 - Memory Corruption Test
-        function testCVE_2025_24223() {
-            var target = document.getElementById('test-24223');
-            target.innerHTML = '<p>Testando CVE-2025-24223 (Memory Corruption)...</p>';
-            
-            try {
-                var objArray = [];
-                
-                for (var i = 0; i < 1000; i++) {
-                    objArray.push({
-                        data: new Array(100),
-                        ref: null
+                for (var i = 0; i < 30; i++) {
+                    if (i % 5 === 0) {
+                        saveState(testName, i, 'iteration', {i: i});
+                    }
+                    
+                    // Criar estrutura DOM com atributos
+                    var div = document.createElement('div');
+                    var attr1 = document.createAttribute('data-test');
+                    var attr2 = document.createAttribute('id');
+                    
+                    attr1.value = 'value_' + i;
+                    attr2.value = 'id_' + i;
+                    
+                    div.setAttributeNode(attr1);
+                    div.setAttributeNode(attr2);
+                    document.body.appendChild(div);
+                    
+                    // Criar event listener que pode causar reentrância
+                    div.addEventListener('DOMAttrModified', function(e) {
+                        try {
+                            e.target.removeAttribute('data-test');
+                        } catch(ex) {}
                     });
-                }
-                
-                for (var i = 0; i < 1000; i++) {
-                    objArray[i].ref = objArray[(i + 1) % 1000];
-                }
-                
-                objArray = null;
-                
-                target.innerHTML += '<p>Teste de corrupção de memória executado</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2025-24223: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2025-24223: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2025-31204 - Memory Corruption Test (CVSS 8.8)
-        function testCVE_2025_31204() {
-            var target = document.getElementById('test-31204');
-            target.innerHTML = '<p>Testando CVE-2025-31204 (Memory Corruption - CVSS 8.8)...</p>';
-            
-            try {
-                var buffer1 = new ArrayBuffer(1024);
-                var buffer2 = new ArrayBuffer(2048);
-                
-                var view1 = new DataView(buffer1);
-                var view2 = new DataView(buffer2);
-                
-                for (var i = 0; i < 256; i++) {
-                    view1.setUint32(i * 4, 0xDEADBEEF);
-                    view2.setUint32(i * 8, 0xCAFEBABE);
-                }
-                
-                var mixed = new Uint8Array(buffer1.byteLength + buffer2.byteLength);
-                
-                target.innerHTML += '<p>Buffers misturados criados</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2025-31204: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2025-31204: Exceção - ' + e.message, true);
-            }
-        }
-
-        // CVE-2025-31206 - Type Confusion Test
-        function testCVE_2025_31206() {
-            var target = document.getElementById('test-31206');
-            target.innerHTML = '<p>Testando CVE-2025-31206 (Type Confusion)...</p>';
-            
-            try {
-                var mixedArray = [];
-                
-                for (var i = 0; i < 100; i++) {
-                    if (i % 2 === 0) {
-                        mixedArray.push(i);
-                    } else {
-                        mixedArray.push({value: i});
+                    
+                    // Remover do DOM mas manter referência
+                    var attrRef = div.attributes[0];
+                    document.body.removeChild(div);
+                    
+                    // Tentar acessar (telemetria, não "crash detectado")
+                    try {
+                        var v = attrRef.value;
+                        var n = attrRef.name;
+                    } catch(e) {
+                        saveResult('TELEMETRY', testName, 'DOM', 
+                            e.name + ': ' + e.message, {iteration: i});
                     }
                 }
                 
-                var sum = 0;
-                for (var i = 0; i < mixedArray.length; i++) {
-                    sum += mixedArray[i];
-                }
-                
-                target.innerHTML += '<p>Type confusion test executado</p>';
-                target.innerHTML += '<p>Soma: ' + sum + '</p>';
-                target.innerHTML += '<p style="color: green;">Teste concluído</p>';
-                addResult('CVE-2025-31206: Teste concluído', false);
-            } catch (e) {
-                target.innerHTML += '<p style="color: orange;">Exceção: ' + e.message + '</p>';
-                addResult('CVE-2025-31206: Exceção - ' + e.message, true);
+                markCleanExit('test_completed');
+                clearState();
+                log(testName + ' concluído: SEM CRASH');
+            } catch(e) {
+                saveResult('TELEMETRY', testName, 'DOM', 
+                    'Exception: ' + e.name + ' - ' + e.message, {});
+                markCleanExit('exception');
             }
         }
-
-        // Executar todos os testes
-        function testAllCVEs() {
-            clearResults();
-            addResult('=== INICIANDO BATERIA COMPLETA DE 12 TESTES CVE ===', false);
-            addResult('Data: ' + new Date().toString(), false);
-            addResult('', false);
+        
+        // TESTE 2: History Event-Driven (com popstate real)
+        function test_History_Events() {
+            var testName = 'History_Events';
+            updateCurrentTest(testName);
+            log('Iniciando ' + testName + ' (event-driven)');
             
-            setTimeout(function() { testCVE_2024_23222(); }, 500);
-            setTimeout(function() { testCVE_2024_27833(); }, 1000);
-            setTimeout(function() { testCVE_2024_27851(); }, 1500);
-            setTimeout(function() { testCVE_2024_40779(); }, 2000);
-            setTimeout(function() { testCVE_2024_40780(); }, 2500);
-            setTimeout(function() { testCVE_2024_40789(); }, 3000);
-            setTimeout(function() { testCVE_2024_23263(); }, 3500);
-            setTimeout(function() { testCVE_2024_23284(); }, 4000);
-            setTimeout(function() { testCVE_2025_24201(); }, 4500);
-            setTimeout(function() { testCVE_2025_24223(); }, 5000);
-            setTimeout(function() { testCVE_2025_31204(); }, 5500);
-            setTimeout(function() { testCVE_2025_31206(); }, 6000);
+            var popstateCount = 0;
+            var pushCount = 0;
+            
+            // Instalar handler de popstate
+            var popstateHandler = function(e) {
+                popstateCount++;
+                console.log('[POPSTATE EVENT] count=' + popstateCount + ' state=' + 
+                    (e.state ? JSON.stringify(e.state) : 'null'));
+                saveResult('EVENT', testName, 'History', 'popstate fired', {
+                    count: popstateCount,
+                    state: e.state
+                });
+            };
+            
+            window.addEventListener('popstate', popstateHandler);
+            
+            try {
+                saveState(testName, 0, 'init', {});
+                
+                // Push múltiplos estados
+                for (var i = 0; i < 20; i++) {
+                    if (i % 5 === 0) {
+                        saveState(testName, i, 'pushing', {i: i, pushCount: pushCount});
+                    }
+                    
+                    var stateObj = {
+                        id: i,
+                        data: new Array(50),
+                        timestamp: Date.now()
+                    };
+                    
+                    // Preencher array
+                    for (var j = 0; j < 50; j++) {
+                        stateObj.data[j] = (i * 1000) + j;
+                    }
+                    
+                    history.pushState(stateObj, '', '#state' + i);
+                    pushCount++;
+                    
+                    // Validar que foi salvo
+                    var retrieved = history.state;
+                    if (!retrieved || retrieved.id !== i) {
+                        saveResult('INVARIANT', testName, 'History', 
+                            'State mismatch after push', {
+                            expected: i,
+                            got: retrieved ? retrieved.id : 'null'
+                        });
+                    }
+                }
+                
+                saveState(testName, pushCount, 'going_back', {pushCount: pushCount});
+                
+                // Voltar e esperar eventos
+                log('Navegando back para disparar popstate...');
+                for (var i = 0; i < 5; i++) {
+                    history.back();
+                }
+                
+                // Aguardar eventos assíncronos (importante!)
+                setTimeout(function() {
+                    window.removeEventListener('popstate', popstateHandler);
+                    
+                    log('popstate disparado ' + popstateCount + ' vezes');
+                    saveResult('TELEMETRY', testName, 'History', 
+                        'Test completed', {
+                        pushCount: pushCount,
+                        popstateCount: popstateCount
+                    });
+                    
+                    markCleanExit('test_completed');
+                    clearState();
+                    log(testName + ' concluído: SEM CRASH (popstate=' + popstateCount + ')');
+                    
+                    // Próximo teste
+                    setTimeout(continueToNextTest, 500);
+                }, 1000);
+                
+                return; // Sair sem chamar continueToNextTest aqui
+                
+            } catch(e) {
+                window.removeEventListener('popstate', popstateHandler);
+                saveResult('TELEMETRY', testName, 'History', 
+                    'Exception: ' + e.name + ' - ' + e.message, {});
+                markCleanExit('exception');
+            }
+        }
+        
+        // TESTE 3: TypedArray Sanity (como canário, não detector)
+        function test_TypedArray_Sanity() {
+            var testName = 'TypedArray_Sanity';
+            updateCurrentTest(testName);
+            log('Iniciando ' + testName + ' (canário de invariantes)');
+            
+            try {
+                saveState(testName, 0, 'init', {});
+                
+                for (var i = 0; i < 30; i++) {
+                    if (i % 5 === 0) {
+                        saveState(testName, i, 'iteration', {i: i});
+                    }
+                    
+                    var size = 256 + (i * 64);
+                    var buffer = new ArrayBuffer(size);
+                    var view1 = new Uint32Array(buffer);
+                    var view2 = new Float64Array(buffer);
+                    
+                    // Preencher
+                    for (var j = 0; j < view1.length; j++) {
+                        view1[j] = j * 0xDEADBEEF;
+                    }
+                    
+                    // Validar invariantes básicos
+                    if (buffer.byteLength !== size) {
+                        saveResult('INVARIANT', testName, 'TypedArray', 
+                            'Buffer size mismatch', {
+                            expected: size,
+                            got: buffer.byteLength,
+                            iteration: i
+                        });
+                    }
+                    
+                    if ((view1.length * 4) !== buffer.byteLength) {
+                        saveResult('INVARIANT', testName, 'TypedArray', 
+                            'View1 length inconsistent', {
+                            view1Length: view1.length,
+                            bufferLength: buffer.byteLength,
+                            iteration: i
+                        });
+                    }
+                    
+                    if ((view2.length * 8) !== buffer.byteLength) {
+                        saveResult('INVARIANT', testName, 'TypedArray', 
+                            'View2 length inconsistent', {
+                            view2Length: view2.length,
+                            bufferLength: buffer.byteLength,
+                            iteration: i
+                        });
+                    }
+                    
+                    // Tentativa de criar view com offset inválido (guard-rail esperado)
+                    try {
+                        var badView = new Uint32Array(buffer, 1);
+                        // Se não lançou exceção, isso é estranho
+                        saveResult('TELEMETRY', testName, 'TypedArray', 
+                            'Misaligned view allowed', {iteration: i});
+                    } catch(e) {
+                        // Esperado - guard-rail funcionou
+                    }
+                }
+                
+                markCleanExit('test_completed');
+                clearState();
+                log(testName + ' concluído: SEM CRASH');
+            } catch(e) {
+                saveResult('TELEMETRY', testName, 'TypedArray', 
+                    'Exception: ' + e.name + ' - ' + e.message, {});
+                markCleanExit('exception');
+            }
+        }
+        
+        // TESTE 4: Canvas + ImageData (pressão de memória controlada)
+        function test_Canvas_ImageData() {
+            var testName = 'Canvas_ImageData';
+            updateCurrentTest(testName);
+            log('Iniciando ' + testName);
+            
+            try {
+                saveState(testName, 0, 'init', {});
+                
+                var canvas = document.createElement('canvas');
+                canvas.width = 512;
+                canvas.height = 512;
+                var ctx = canvas.getContext('2d');
+                
+                for (var i = 0; i < 25; i++) {
+                    if (i % 5 === 0) {
+                        saveState(testName, i, 'iteration', {i: i});
+                    }
+                    
+                    // Obter imageData grande
+                    var imageData = ctx.getImageData(0, 0, 512, 512);
+                    var data = imageData.data;
+                    var originalLength = data.length;
+                    
+                    // Manipular pixels
+                    for (var j = 0; j < 10000; j++) {
+                        data[j] = (i * j) & 0xFF;
+                    }
+                    
+                    // Colocar de volta
+                    ctx.putImageData(imageData, 0, 0);
+                    
+                    // Verificar que não houve corrupção no length
+                    var verify = ctx.getImageData(0, 0, 512, 512);
+                    if (verify.data.length !== originalLength) {
+                        saveResult('INVARIANT', testName, 'Canvas', 
+                            'ImageData length changed', {
+                            original: originalLength,
+                            after: verify.data.length,
+                            iteration: i
+                        });
+                    }
+                    
+                    // Verificar alguns pixels
+                    var mismatch = false;
+                    for (var j = 0; j < 100; j++) {
+                        if (verify.data[j] !== data[j]) {
+                            mismatch = true;
+                            break;
+                        }
+                    }
+                    
+                    if (mismatch) {
+                        saveResult('INVARIANT', testName, 'Canvas', 
+                            'Pixel data mismatch after putImageData', {iteration: i});
+                    }
+                }
+                
+                markCleanExit('test_completed');
+                clearState();
+                log(testName + ' concluído: SEM CRASH');
+            } catch(e) {
+                saveResult('TELEMETRY', testName, 'Canvas', 
+                    'Exception: ' + e.name + ' - ' + e.message, {});
+                markCleanExit('exception');
+            }
+        }
+        
+        // TESTE 5: Determinismo (checksum múltiplo)
+        function test_Determinism() {
+            var testName = 'Determinism';
+            updateCurrentTest(testName);
+            log('Iniciando ' + testName + ' (3 execuções idênticas)');
+            
+            try {
+                saveState(testName, 0, 'init', {});
+                
+                var results = [];
+                
+                for (var run = 0; run < 3; run++) {
+                    saveState(testName, run, 'run', {run: run});
+                    
+                    var buffer = new ArrayBuffer(512);
+                    var view = new Uint32Array(buffer);
+                    
+                    // Sequência determinística
+                    for (var i = 0; i < 128; i++) {
+                        view[i] = (i * 0xCAFEBABE) | 0;
+                    }
+                    
+                    // Calcular checksum simples
+                    var sum = 0;
+                    for (var i = 0; i < 128; i++) {
+                        sum = (sum + view[i]) | 0; // Manter em 32-bit
+                    }
+                    
+                    results.push(sum);
+                    log('Run ' + run + ': checksum=' + sum);
+                }
+                
+                // Comparar
+                if (results[0] !== results[1] || results[1] !== results[2]) {
+                    saveResult('INVARIANT', testName, 'Determinism', 
+                        'Non-deterministic behavior detected', {
+                        run1: results[0],
+                        run2: results[1],
+                        run3: results[2]
+                    });
+                    log('DIVERGÊNCIA DETECTADA!', true);
+                } else {
+                    log('Comportamento determinístico: OK');
+                }
+                
+                markCleanExit('test_completed');
+                clearState();
+                log(testName + ' concluído: SEM CRASH');
+            } catch(e) {
+                saveResult('TELEMETRY', testName, 'Determinism', 
+                    'Exception: ' + e.name + ' - ' + e.message, {});
+                markCleanExit('exception');
+            }
+        }
+        
+        // ============================================
+        // ORQUESTRADOR
+        // ============================================
+        
+        var tests = [
+            {name: 'DOM UAF', func: test_DOM_UAF},
+            {name: 'History Events', func: test_History_Events, async: true},
+            {name: 'TypedArray Sanity', func: test_TypedArray_Sanity},
+            {name: 'Canvas ImageData', func: test_Canvas_ImageData},
+            {name: 'Determinism', func: test_Determinism}
+        ];
+        
+        function continueToNextTest() {
+            currentTestIndex++;
+            runNextTest();
+        }
+        
+        function runNextTest() {
+            if (!running || currentTestIndex >= tests.length) {
+                running = false;
+                updateStatus('Fuzzing concluído');
+                log('=== FUZZING COMPLETO ===');
+                showResults();
+                return;
+            }
+            
+            var test = tests[currentTestIndex];
+            log('');
+            log('=== TESTE ' + (currentTestIndex + 1) + '/' + tests.length + ': ' + test.name + ' ===');
             
             setTimeout(function() {
-                addResult('', false);
-                addResult('=== TODOS OS 12 TESTES CONCLUÍDOS ===', false);
-                addResult('Se o navegador crashou durante os testes, uma vulnerabilidade pode estar presente', false);
-            }, 6500);
+                test.func();
+                
+                // Se não é async, continuar imediatamente
+                if (!test.async) {
+                    setTimeout(continueToNextTest, 1000);
+                }
+                // Se é async, o próprio teste chama continueToNextTest()
+            }, 500);
         }
-
-        // Mostrar informações do sistema ao carregar
+        
+        function startFuzzing() {
+            if (running) {
+                log('Fuzzing já está rodando!');
+                return;
+            }
+            
+            running = true;
+            currentTestIndex = 0;
+            
+            log('=== INICIANDO FUZZING ===');
+            log('Data/Hora: ' + new Date().toString());
+            log('UserAgent: ' + navigator.userAgent);
+            log('Total de testes: ' + tests.length);
+            log('');
+            
+            updateStatus('Fuzzing em execução...');
+            runNextTest();
+        }
+        
+        function stopFuzzing() {
+            running = false;
+            markCleanExit('user_stop');
+            updateStatus('Fuzzing parado pelo usuário');
+            log('Fuzzing interrompido');
+        }
+        
+        function clearLogs() {
+            document.getElementById('log').innerHTML = '';
+            log('Logs limpos');
+        }
+        
+        function clearAllData() {
+            localStorage.removeItem(STORAGE_KEY);
+            localStorage.removeItem(RESULTS_KEY);
+            log('Todos os dados removidos do localStorage');
+            showResults();
+        }
+        
+        function showResults() {
+            var resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '';
+            
+            try {
+                var saved = localStorage.getItem(RESULTS_KEY);
+                var results = saved ? JSON.parse(saved) : [];
+                
+                if (results.length === 0) {
+                    resultsDiv.innerHTML = '<p>Nenhum resultado ainda</p>';
+                    return;
+                }
+                
+                // Agrupar por tipo
+                var crashes = results.filter(function(r) { return r.type === 'CRASH'; });
+                var invariants = results.filter(function(r) { return r.type === 'INVARIANT'; });
+                var telemetry = results.filter(function(r) { return r.type === 'TELEMETRY'; });
+                var events = results.filter(function(r) { return r.type === 'EVENT'; });
+                
+                resultsDiv.innerHTML = '<h3>Resumo</h3>' +
+                    '<p>CRASHES: ' + crashes.length + '</p>' +
+                    '<p>INVARIANTES QUEBRADOS: ' + invariants.length + '</p>' +
+                    '<p>TELEMETRIA: ' + telemetry.length + '</p>' +
+                    '<p>EVENTOS: ' + events.length + '</p>';
+                
+                // Mostrar crashes
+                if (crashes.length > 0) {
+                    resultsDiv.innerHTML += '<h3>CRASHES DETECTADOS</h3>';
+                    for (var i = 0; i < crashes.length; i++) {
+                        var c = crashes[i];
+                        resultsDiv.innerHTML += '<hr>' +
+                            '<p><strong>Teste:</strong> ' + c.test + '</p>' +
+                            '<p><strong>Categoria:</strong> ' + c.category + '</p>' +
+                            '<p><strong>Mensagem:</strong> ' + c.message + '</p>' +
+                            '<p><strong>Timestamp:</strong> ' + c.timestamp + '</p>' +
+                            '<p><strong>Detalhes:</strong> ' + JSON.stringify(c.details) + '</p>';
+                    }
+                }
+                
+                // Mostrar invariantes
+                if (invariants.length > 0) {
+                    resultsDiv.innerHTML += '<h3>INVARIANTES QUEBRADOS</h3>';
+                    for (var i = 0; i < invariants.length; i++) {
+                        var inv = invariants[i];
+                        resultsDiv.innerHTML += '<hr>' +
+                            '<p><strong>Teste:</strong> ' + inv.test + '</p>' +
+                            '<p><strong>Categoria:</strong> ' + inv.category + '</p>' +
+                            '<p><strong>Mensagem:</strong> ' + inv.message + '</p>' +
+                            '<p><strong>Detalhes:</strong> ' + JSON.stringify(inv.details) + '</p>';
+                    }
+                }
+                
+            } catch(e) {
+                resultsDiv.innerHTML = '<p>Erro ao carregar resultados: ' + e.message + '</p>';
+            }
+        }
+        
+        // ============================================
+        // INICIALIZAÇÃO E DETECÇÃO DE CRASH
+        // ============================================
+        
         window.onload = function() {
-            displaySystemInfo();
-            addResult('Página carregada. Sistema detectado.', false);
-            addResult('AVISO: Estes são testes básicos e NÃO são exploits funcionais.', false);
-            addResult('Se o navegador crashar, uma vulnerabilidade pode estar presente.', false);
-            addResult('Total de CVEs a testar: 12', false);
+            log('Fuzzer carregado');
+            log('UserAgent: ' + navigator.userAgent);
+            
+            // Detectar crash real (sem falsos positivos)
+            var crash = detectRealCrash();
+            if (crash) {
+                log('=== CRASH REAL DETECTADO ===', true);
+                log('Teste: ' + crash.test, true);
+                log('Iteração: ' + crash.iteration, true);
+                log('Fase: ' + crash.phase, true);
+                log('Timestamp: ' + crash.timestamp, true);
+                log('PROCESSO DO NAVEGADOR CRASHOU!', true);
+                
+                saveResult('CRASH', crash.test, 'BrowserCrash', 
+                    'Processo crashou durante teste', crash.data);
+                
+                clearState(); // Limpar para próxima execução
+            }
+            
+            showResults();
+            updateStatus('Pronto para iniciar');
         };
+        
+        // Marcar clean exit em eventos de saída normal
+        window.addEventListener('beforeunload', function() {
+            if (running) {
+                markCleanExit('page_unload');
+            }
+        });
+        
+        window.addEventListener('pagehide', function() {
+            if (running) {
+                markCleanExit('page_hide');
+            }
+        });
+        
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden && running) {
+                markCleanExit('visibility_change');
+            }
+        });
     </script>
 
     <hr>
     
-    <h2>Detalhes dos 12 CVEs Testados</h2>
+    <h2>Metodologia Revisada (v2.0)</h2>
     
-    <h3>GRUPO 1: CVEs 2024 (8 vulnerabilidades)</h3>
-    
-    <h4>1. CVE-2024-23222 - Type Confusion (EXPLORADO ATIVAMENTE)</h4>
+    <h3>Como Detectamos Crash REAL (sem falsos positivos):</h3>
     <ul>
-        <li><strong>Classe:</strong> Type confusion no JavaScriptCore/WebKit</li>
-        <li><strong>Impacto:</strong> Arbitrary Code Execution</li>
-        <li><strong>Status:</strong> Explorado ativamente ("may have been exploited")</li>
-        <li><strong>Corrigido em:</strong> iOS 17.3, Safari 17.3</li>
-        <li><strong>Prioridade:</strong> CRÍTICA - Type confusion é altamente transferível entre forks WebKit</li>
+        <li><strong>Clean Exit Marker:</strong> Toda saída normal marca exitReason (user_stop, page_unload, test_completed)</li>
+        <li><strong>Crash = Estado Sujo:</strong> Se running=true E sem exitReason = crash real</li>
+        <li><strong>Eventos de saída:</strong> beforeunload, pagehide, visibilitychange marcam clean exit</li>
+        <li><strong>Timeout de 1h:</strong> Estados muito antigos são descartados (não são crashes)</li>
     </ul>
     
-    <h4>2. CVE-2024-27833 - Integer Overflow</h4>
+    <h3>Categorias de Resultados:</h3>
     <ul>
-        <li><strong>Classe:</strong> Integer overflow</li>
-        <li><strong>Impacto:</strong> Arbitrary Code Execution</li>
-        <li><strong>Corrigido em:</strong> Safari 17.5</li>
-        <li><strong>Referência:</strong> Apple Safari 17.5 (WebKit)</li>
+        <li><strong>CRASH:</strong> Processo do navegador morreu (CE-34878-0 ou fechamento)</li>
+        <li><strong>INVARIANT:</strong> Propriedade do objeto em estado impossível (forte evidência de corrupção)</li>
+        <li><strong>TELEMETRY:</strong> Exceções JS, guard-rails atingidos (não são crashes)</li>
+        <li><strong>EVENT:</strong> Eventos disparados (popstate, etc.) para validar execução</li>
     </ul>
     
-    <h4>3. CVE-2024-27851 - Bounds Checks Failure</h4>
+    <h3>Testes e Objetivos:</h3>
+    <ol>
+        <li><strong>DOM UAF:</strong> Use-after-free com reentrância em eventos (sanidade)</li>
+        <li><strong>History Events:</strong> Event-driven com popstate real e validação assíncrona</li>
+        <li><strong>TypedArray Sanity:</strong> Canário de invariantes (não detector)</li>
+        <li><strong>Canvas ImageData:</strong> Pressão de memória controlada com validação</li>
+        <li><strong>Determinism:</strong> Detecta não-determinismo (UB forte)</li>
+    </ol>
+    
+    <h3>Mudanças Principais:</h3>
     <ul>
-        <li><strong>Classe:</strong> Falha de bounds checks</li>
-        <li><strong>Impacto:</strong> Arbitrary Code Execution</li>
-        <li><strong>Corrigido em:</strong> Safari 17.5</li>
-        <li><strong>Referência:</strong> Apple Safari 17.5 (WebKit)</li>
+        <li>✅ Clean exit marker (sem falsos positivos de reload/voltar)</li>
+        <li>✅ Persistência a cada 5 iterações (não toda iteração)</li>
+        <li>✅ History com popstate event-driven real</li>
+        <li>✅ Exceções JS = telemetria (não "crash detectado")</li>
+        <li>✅ Testes como sanidade/canários (realismo sobre poder de detecção)</li>
+        <li>✅ Timeout de 1h para estados antigos</li>
     </ul>
     
-    <h4>4. CVE-2024-40779 - Out-of-Bounds Read</h4>
+    <h3>Entregável para Análise:</h3>
+    <p>Para cada execução, você terá:</p>
     <ul>
-        <li><strong>Classe:</strong> OOB read/access</li>
-        <li><strong>Impacto:</strong> Crash inesperado / Potencial corrupção</li>
-        <li><strong>Descrição:</strong> Apple descreve como crash inesperado/process crash</li>
-        <li><strong>Corrigido em:</strong> Safari 17.6</li>
-        <li><strong>Prioridade:</strong> ALTA - OOB é extremamente comum em cadeias WebKit</li>
+        <li><strong>Resultado:</strong> CRASH / INVARIANT / TELEMETRY / EVENT</li>
+        <li><strong>Superfície:</strong> DOM / History / TypedArray / Canvas / Determinism</li>
+        <li><strong>Se crash:</strong> Teste exato, iteração, fase, timestamp</li>
+        <li><strong>Se invariante:</strong> Detalhes do estado impossível</li>
+        <li><strong>Console.log:</strong> Todos os eventos importantes (sobrevive a crash)</li>
     </ul>
     
-    <h4>5. CVE-2024-40780 - Out-of-Bounds Access</h4>
-    <ul>
-        <li><strong>Classe:</strong> OOB access</li>
-        <li><strong>Impacto:</strong> Crash/Corrupção de memória</li>
-        <li><strong>Corrigido em:</strong> Safari 17.6</li>
-    </ul>
+    <h3>Interpretação dos Resultados:</h3>
+    <table border="1">
+        <tr>
+            <th>Resultado</th>
+            <th>Significado</th>
+            <th>Prioridade</th>
+        </tr>
+        <tr>
+            <td>CRASH</td>
+            <td>Processo morreu - crash real detectado</td>
+            <td>CRÍTICA</td>
+        </tr>
+        <tr>
+            <td>INVARIANT (Non-determinism)</td>
+            <td>UB/memory corruption muito provável</td>
+            <td>ALTA</td>
+        </tr>
+        <tr>
+            <td>INVARIANT (Length mismatch)</td>
+            <td>Estado inconsistente - corrupção possível</td>
+            <td>ALTA</td>
+        </tr>
+        <tr>
+            <td>TELEMETRY</td>
+            <td>Guard-rail ou exceção JS - não é crash</td>
+            <td>BAIXA</td>
+        </tr>
+        <tr>
+            <td>EVENT</td>
+            <td>Validação de execução - teste funcionou</td>
+            <td>INFO</td>
+        </tr>
+    </table>
     
-    <h4>6. CVE-2024-40789 - Out-of-Bounds Access</h4>
-    <ul>
-        <li><strong>Classe:</strong> OOB access</li>
-        <li><strong>Impacto:</strong> Crash/Corrupção de memória</li>
-        <li><strong>Corrigido em:</strong> Safari 17.6</li>
-    </ul>
+    <h3>Como Usar no PS4:</h3>
+    <ol>
+        <li>Abra esta página no navegador do PS4</li>
+        <li>Clique em "INICIAR FUZZING"</li>
+        <li>Aguarde (~1-2 minutos para todos os testes)</li>
+        <li><strong>Se o navegador crashar (CE-34878-0):</strong> Reabra a página - o crash será detectado automaticamente</li>
+        <li>Clique em "VER RESULTADOS" para análise</li>
+        <li>Verifique console do navegador (se disponível) para logs detalhados</li>
+    </ol>
     
-    <h4>7. CVE-2024-23263 - CSP Enforcement Bypass</h4>
-    <ul>
-        <li><strong>Classe:</strong> Falha lógica/estado relacionada a enforcement de CSP</li>
-        <li><strong>Impacto:</strong> Bypass de segurança web (menos RCE, mais segurança do browser)</li>
-        <li><strong>Corrigido em:</strong> Safari 17.4</li>
-        <li><strong>Referência:</strong> Apple Safari 17.4 (WebKit)</li>
-    </ul>
-    
-    <h4>8. CVE-2024-23284 - CSP State Issue</h4>
-    <ul>
-        <li><strong>Classe:</strong> Falha lógica/estado relacionada a CSP</li>
-        <li><strong>Impacto:</strong> Bypass de Content Security Policy</li>
-        <li><strong>Corrigido em:</strong> Safari 17.4</li>
-        <li><strong>Referência:</strong> Apple Safari 17.4 (WebKit)</li>
-    </ul>
-    
-    <h3>GRUPO 2: CVEs 2025 (4 vulnerabilidades - MAIS RECENTES)</h3>
-    
-    <h4>9. CVE-2025-24201 - Out-of-Bounds Write (EXPLORADO)</h4>
-    <ul>
-        <li><strong>Classe:</strong> OOB write</li>
-        <li><strong>Impacto:</strong> Arbitrary Code Execution</li>
-        <li><strong>Status:</strong> Explorado com técnica altamente sofisticada</li>
-        <li><strong>Descrição:</strong> Apple cita exploração e descreve como "supplementary fix" ligado a ataque bloqueado em iOS 17.2</li>
-        <li><strong>Corrigido em:</strong> iOS 18.3.2 / iPadOS 18.3.2</li>
-        <li><strong>Prioridade:</strong> CRÍTICA - Menção de exploração confirmada</li>
-    </ul>
-    
-    <h4>10. CVE-2025-24223 - Memory Corruption</h4>
-    <ul>
-        <li><strong>Classe:</strong> Memory corruption</li>
-        <li><strong>Impacto:</strong> Corrupção de memória ao processar conteúdo web malicioso</li>
-        <li><strong>Descrição:</strong> Resolvido com melhor gerenciamento de memória</li>
-        <li><strong>Corrigido em:</strong> Safari 18.5, WebKitGTK 2.48.2</li>
-        <li><strong>Crédito:</strong> rheza e pesquisador anônimo</li>
-    </ul>
-    
-    <h4>11. CVE-2025-31204 - Memory Corruption (CVSS 8.8 HIGH)</h4>
-    <ul>
-        <li><strong>Classe:</strong> Memory corruption</li>
-        <li><strong>Impacto:</strong> Corrupção de memória ao processar conteúdo web malicioso</li>
-        <li><strong>CVSS Score:</strong> 8.8 (HIGH)</li>
-        <li><strong>CVSS Vector:</strong> CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H</li>
-        <li><strong>Descrição:</strong> Resolvido com melhor gerenciamento de memória (WebKit Bugzilla 291506)</li>
-        <li><strong>Corrigido em:</strong> iOS 18.5, Safari 18.5, WebKitGTK 2.48.2</li>
-        <li><strong>Crédito:</strong> Nan Wang (@eternalsakura13)</li>
-    </ul>
-    
-    <h4>12. CVE-2025-31206 - Type Confusion</h4>
-    <ul>
-        <li><strong>Classe:</strong> Type confusion</li>
-        <li><strong>Impacto:</strong> Memory handling issues</li>
-        <li><strong>Descrição:</strong> Resolvido com melhor gerenciamento de memória</li>
-        <li><strong>Corrigido em:</strong> Safari 18.5, WebKitGTK 2.48.2</li>
-        <li><strong>Referência:</strong> WebKit Bugzilla 290992</li>
-    </ul>
-    
-    <hr>
-    
-    <h2>Análise de Impacto no PS4 12.00</h2>
-    
-    <h3>Compatibilidade com WebKit PS4</h3>
-    <ul>
-        <li><strong>WebKit PS4:</strong> Baseado em WebKit 537.73 (aprox. 2013-2014)</li>
-        <li><strong>CVEs testados:</strong> De versões WebKit 2024-2025 (muito mais recentes)</li>
-        <li><strong>Gap temporal:</strong> ~10-12 anos de diferença</li>
-    </ul>
-    
-    <h3>Probabilidade de Impacto</h3>
-    <ul>
+    <footer>
+        <hr>
+        <p><small>PS4 WebKit Memory Corruption Fuzzer v2.0 (Revisado)</small></p>
+        <p><small>Foco em detecção de crash real sem falsos positivos</small></p>
+        <p><small>Clean exit markers + Event-driven + Sanidade realista</small></p>
+    </footer>
+</body>
+</html>
