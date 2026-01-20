@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>PS4 WebKit Crash Vectors – Variant Suite (A/B/C)</title>
+</head>
+<body>
+  <h1>PS4 WebKit Crash Vectors – Variant Suite (A/B/C)</h1>
+  <p>
+    Segunda rodada de testes com variações dos mesmos vetores (Fullscreen+blur+DOM, History state, Media teardown,
+    DOM/layout storms, Canvas 2D, Font stress, Workers).
+  </p>
+  <p>
+    Regras: execute 1 teste por vez. Exige clique real (user gesture). Use STOP para abortar/limpar.
+  </p>
+
+  <hr>
+
+  <div>
+    <button id="btnClear">Limpar Log</button>
+    <button id="btnStop">STOP (abortar e limpar)</button>
+  </div>
+
+  <pre id="log" style="white-space:pre-wrap;border:1px solid #999;padding:10px;min-height:240px;"></pre>
+
+  <hr>
+
+  <h2>1) Fullscreen + blur + DOM mutation (variações)</h2>
+  <button id="fsA">FS-A: Fullscreen + blur => DOM churn (remove/append + deep nest)</button>
+  <button id="fsB">FS-B: Fullscreen + blur => style/class thrash (recalc storms)</button>
+  <button id="fsC">FS-C: Fullscreen + blur => iframe swap + mutation</button>
+
+  <h2>2) History.pushState + objetos complexos (variações)</h2>
+  <button id="hsA">HS-A: Many pushState (alias refs + typed arrays + strings)</button>
+  <button id="hsB">HS-B: push/replace + rapid hash changes + popstate DOM churn</button>
+  <button id="hsC">HS-C: stress history length + back/forward cadence</button>
+
+  <h2>3) Media teardown (video/audio/TextTrack) (variações)</h2>
+  <button id="mdA">MD-A: create/remove video+audio (invalid src) + load()</button>
+  <button id="mdB">MD-B: TextTrack cue churn + detach during events</button>
+  <button id="mdC">MD-C: many media elements + attribute flips + fast teardown</button>
+
+  <h2>4) DOM deep recursion / layout storms (variações)</h2>
+  <button id="dlA">DL-A: deep nesting + parser insert + rAF layout reads</button>
+  <button id="dlB">DL-B: table layout churn (tables are historically sensitive)</button>
+  <button id="dlC">DL-C: scroll container + massive mutations + forced reflow</button>
+
+  <h2>5) Canvas 2D resize/destruction loops (variações)</h2>
+  <button id="cvA">CV-A: resize 1..4096 + draw ops + destroy</button>
+  <button id="cvB">CV-B: putImageData/getImageData churn + resize</button>
+  <button id="cvC">CV-C: many canvases + pattern/gradient churn</button>
+
+  <h2>6) Font loading stress (variações)</h2>
+  <button id="fnA">FN-A: @font-face invalid + flip font-family across many nodes</button>
+  <button id="fnB">FN-B: FontFace load attempts (if supported) + relayout</button>
+  <button id="fnC">FN-C: style tag churn (insert/remove @font-face repeatedly)</button>
+
+  <h2>7) Workers (com cuidado) (variações)</h2>
+  <button id="wkA">WK-A: worker create/terminate cadence (LOW)</button>
+  <button id="wkB">WK-B: bursty spawn + message flood (MED)</button>
+  <button id="wkC">WK-C: mixed cadence (LOW) + GC pressure coupling</button>
+
+<script>
+(function () {
+  "use strict";
+
+  const logEl = document.getElementById("log");
+  let ABORT = false;
+
+  function p2(n){ return n<10 ? "0"+n : ""+n; }
+  function ts(){
+    const d = new Date();
+    return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+  }
+  function log(msg){
+    logEl.textContent += `[${ts()}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function clearLog(){ logEl.textContent=""; }
+
+  function resetAbort(){ ABORT = false; }
+  function requireTrustedClick(e){
+    if (!e || !e.isTrusted) { log("Blocked: requires real user gesture (trusted click)."); return false; }
+    return true;
+  }
+
+  function mkContainer(title){
+    const c = document.createElement("div");
+    c.setAttribute("data-test-container","1");
+    c.style.border="1px dashed #666";
+    c.style.margin="10px 0";
+    c.style.padding="8px";
+    const h=document.createElement("div");
+    h.textContent=title;
+    h.style.fontWeight="bold";
+    c.appendChild(h);
+    document.body.appendChild(c);
+    return c;
+  }
+
+  function allocGarbage(rounds, size){
+    const junk=[];
+    for(let i=0;i<rounds;i++){
+      if(ABORT) return null;
+      const a=new Uint8Array(size);
+      a[0]=0x41; a[size-1]=0x42;
+      junk.push(a);
+    }
+    return junk;
+  }
+
+  function stopAll(){
+    ABORT = true;
+    log("STOP requested. Cleaning up...");
+    try {
+      if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+      if (document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (e) {}
+
+    const nodes=document.querySelectorAll("[data-test-container='1']");
+    for(const n of nodes){ try{ n.remove(); }catch(e){} }
+
+    window.onblur=null;
+    document.onvisibilitychange=null;
+    window.onpopstate=null;
+
+    if (window.__WORKERS && window.__WORKERS.length){
+      for (const w of window.__WORKERS){ try{ w.terminate(); }catch(e){} }
+      window.__WORKERS.length=0;
+      log("Workers terminated.");
+    }
+    if (window.__WORKER_BLOB_URL){
+      try{ URL.revokeObjectURL(window.__WORKER_BLOB_URL); }catch(e){}
+      window.__WORKER_BLOB_URL=null;
+    }
+
+    log("Cleanup complete.");
+  }
+
+  document.getElementById("btnClear").addEventListener("click", clearLog);
+  document.getElementById("btnStop").addEventListener("click", stopAll);
+
+  /* ============================================================
+     1) Fullscreen + blur + DOM mutation — Variants
+     ============================================================ */
+  function enterFullscreen(){
+    try{
+      const el=document.documentElement;
+      if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else if (el.requestFullscreen) el.requestFullscreen();
+      else log("Fullscreen API not available.");
+    }catch(ex){
+      log("Fullscreen request exception: " + ex);
+    }
+  }
+
+  function fsCommonSetup(tag){
+    log(`FS-${tag}: setting onblur + visibilitychange handlers. Trigger blur via OPTIONS/PS/overlay.`);
+    let fired=0;
+    function once(label, fn){
+      return function(){
+        if(ABORT) return;
+        fired++;
+        log(`FS-${tag}: fired via ${label} (count=${fired}).`);
+        try{ fn(label); }catch(ex){ log(`FS-${tag}: exception: ${ex}`); }
+      };
+    }
+    return { once, get fired(){ return fired; } };
+  }
+
+  function fsA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("FS-A: Fullscreen + blur => DOM churn + deep nesting");
+    enterFullscreen();
+
+    const setup=fsCommonSetup("A");
+    window.onblur = setup.once("onblur", () => {
+      // Remove/append + deep nesting + layout reads
+      for(let i=0;i<300;i++){
+        if(ABORT) return;
+        const n=document.createElement("div");
+        n.textContent="X".repeat(80);
+        c.appendChild(n);
+      }
+      let cur=c;
+      for(let d=0; d<1200; d++){
+        if(ABORT) return;
+        const n=document.createElement("div");
+        if(d%100===0) n.textContent="D"+d;
+        if(d%7===0) n.style.display="inline-block";
+        if(d%11===0){ n.style.position="relative"; n.style.left="1px"; }
+        cur.appendChild(n);
+        cur=n;
+      }
+      void c.offsetWidth; void c.offsetHeight;
+      allocGarbage(250, 4096);
+    });
+
+    document.onvisibilitychange = setup.once("visibilitychange", () => {
+      // Second pass: detach/attach subtree
+      const sub=document.createElement("div");
+      for(let i=0;i<500;i++){
+        if(ABORT) return;
+        const n=document.createElement("span");
+        n.textContent="S"+i;
+        sub.appendChild(n);
+      }
+      c.appendChild(sub);
+      sub.remove();
+      c.appendChild(sub);
+      void c.offsetHeight;
+      allocGarbage(120, 8192);
+    });
+  }
+
+  function fsB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("FS-B: Fullscreen + blur => style/class thrash (recalc storms)");
+    enterFullscreen();
+
+    const setup=fsCommonSetup("B");
+
+    // Build many nodes up front
+    const nodes=[];
+    for(let i=0;i<2500;i++){
+      const d=document.createElement("div");
+      d.textContent="N"+i+" "+"Y".repeat(40);
+      d.className="a";
+      c.appendChild(d);
+      nodes.push(d);
+    }
+
+    const style=document.createElement("style");
+    style.textContent=`
+      .a { padding:1px; margin:1px; }
+      .b { padding:2px; margin:2px; border:1px solid #ccc; }
+      .c { padding:0px; margin:0px; letter-spacing:0.5px; }
+    `;
+    document.head.appendChild(style);
+
+    function thrash(){
+      // flip classes + inline styles + forced reflow
+      for(let pass=0; pass<20; pass++){
+        if(ABORT) return;
+        const cls = (pass%3===0) ? "b" : (pass%3===1) ? "c" : "a";
+        for(let i=0;i<nodes.length;i+=3){
+          nodes[i].className=cls;
+          if((i+pass)%17===0) nodes[i].style.width = ((pass%2)? "97%":"98%");
+        }
+        void c.offsetHeight;
+      }
+      allocGarbage(160, 4096);
+    }
+
+    window.onblur = setup.once("onblur", thrash);
+    document.onvisibilitychange = setup.once("visibilitychange", thrash);
+  }
+
+  function fsC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("FS-C: Fullscreen + blur => iframe swap + mutation");
+    enterFullscreen();
+
+    const setup=fsCommonSetup("C");
+
+    // Pre-create iframe (same-origin about:blank)
+    const ifr=document.createElement("iframe");
+    ifr.width="300"; ifr.height="200";
+    c.appendChild(ifr);
+
+    function iframeChurn(){
+      if(ABORT) return;
+      let doc=null;
+      try { doc = ifr.contentWindow && ifr.contentWindow.document; } catch(e) {}
+      if(doc){
+        try{
+          doc.open();
+          doc.write("<!doctype html><html><body><div id='r'></div></body></html>");
+          doc.close();
+          const r=doc.getElementById("r");
+          // Populate deep structure inside iframe
+          let cur=r;
+          for(let i=0;i<1500;i++){
+            if(ABORT) return;
+            const n=doc.createElement("div");
+            if(i%200===0) n.textContent="IF"+i;
+            cur.appendChild(n);
+            cur=n;
+          }
+        }catch(ex){}
+      }
+      // Swap iframe srcdoc/doc by replacing element
+      try { ifr.remove(); } catch(e){}
+      const ifr2=document.createElement("iframe");
+      ifr2.width="300"; ifr2.height="200";
+      c.appendChild(ifr2);
+      void c.offsetHeight;
+      allocGarbage(120, 8192);
+    }
+
+    window.onblur = setup.once("onblur", iframeChurn);
+    document.onvisibilitychange = setup.once("visibilitychange", iframeChurn);
+  }
+
+  document.getElementById("fsA").addEventListener("click", fsA);
+  document.getElementById("fsB").addEventListener("click", fsB);
+  document.getElementById("fsC").addEventListener("click", fsC);
+
+  /* ============================================================
+     2) History.pushState + objetos complexos — Variants
+     ============================================================ */
+  function buildState(seed, sizeMul){
+    const shared={ marker:"shared-"+seed, pad:"P".repeat(1024*sizeMul) };
+    const st={
+      seed, t:Date.now(),
+      big:"A".repeat(3000*sizeMul) + seed + "B".repeat(3000*sizeMul),
+      shared1:shared,
+      shared2:shared,
+      arr:[],
+      dict:{}
+    };
+    for(let i=0;i<120*sizeMul;i++){
+      st.arr.push({ i, s:"S".repeat(96)+i, ref:shared });
+      st.dict["k"+i]={ i, v:"V".repeat(64) };
+    }
+    st.buf=new ArrayBuffer(2048*sizeMul);
+    st.u8=new Uint8Array(st.buf);
+    st.u8[0]=0x12; st.u8[1]=0x34;
+    return st;
+  }
+
+  function hsA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    mkContainer("HS-A: Many pushState (complex objects)");
+    log("HS-A: starting...");
+    let i=0, max=90;
+    (function step(){
+      if(ABORT) return;
+      i++;
+      try{
+        const st=buildState("A-"+i, 1);
+        history.pushState(st, "", "#A"+i);
+        const rs=history.state;
+        log(`HS-A: push OK i=${i} seed=${rs && rs.seed}`);
+        if(i%15===0) allocGarbage(80, 4096);
+      }catch(ex){
+        log("HS-A: exception: " + ex);
+        return;
+      }
+      if(i<max) setTimeout(step, 0);
+      else log("HS-A: completed.");
+    })();
+  }
+
+  function hsB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    mkContainer("HS-B: push/replace + rapid hash changes + popstate DOM churn");
+    log("HS-B: wiring popstate...");
+
+    window.onpopstate=function(ev){
+      if(ABORT) return;
+      const st=ev ? ev.state : null;
+      log("HS-B: popstate state.seed=" + (st && st.seed));
+      // Coupled DOM churn on pop
+      const c=mkContainer("HS-B: pop DOM churn");
+      for(let i=0;i<350;i++){
+        if(ABORT) return;
+        const d=document.createElement("div");
+        d.textContent="POP " + i + " " + "X".repeat(40);
+        c.appendChild(d);
+      }
+      void c.offsetHeight;
+    };
+
+    let i=0, max=110;
+    (function step(){
+      if(ABORT) return;
+      i++;
+      try{
+        const st=buildState("B-"+i, (i%7===0)?2:1);
+        if(i%2===0) history.replaceState(st,"","#R"+i);
+        else history.pushState(st,"","#P"+i);
+
+        // hash-only changes can take a different path
+        if(i%5===0) location.hash = "#H" + i;
+
+        if(i%9===0){ log("HS-B: history.back()"); history.back(); }
+        else if(i%13===0){ log("HS-B: history.forward()"); history.forward(); }
+
+        if(i%20===0) allocGarbage(100, 8192);
+
+        log("HS-B: step i=" + i);
+      }catch(ex){
+        log("HS-B: exception: " + ex);
+        return;
+      }
+      if(i<max) setTimeout(step, 0);
+      else log("HS-B: completed.");
+    })();
+  }
+
+  function hsC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    mkContainer("HS-C: history length stress + back/forward cadence");
+    log("HS-C: starting...");
+
+    let i=0, max=140;
+    (function step(){
+      if(ABORT) return;
+      i++;
+      try{
+        const st=buildState("C-"+i, 1);
+        history.pushState(st,"","#C"+i);
+
+        // cadence: build up then back/forward in short bursts
+        if(i===60 || i===90 || i===120){
+          log("HS-C: burst back/forward sequence");
+          try{ history.back(); }catch(e){}
+          try{ history.back(); }catch(e){}
+          try{ history.forward(); }catch(e){}
+        }
+
+        if(i%25===0) allocGarbage(120, 4096);
+        if(i%10===0) log("HS-C: i=" + i);
+      }catch(ex){
+        log("HS-C: exception: " + ex);
+        return;
+      }
+      if(i<max) setTimeout(step, 0);
+      else log("HS-C: completed.");
+    })();
+  }
+
+  document.getElementById("hsA").addEventListener("click", hsA);
+  document.getElementById("hsB").addEventListener("click", hsB);
+  document.getElementById("hsC").addEventListener("click", hsC);
+
+  /* ============================================================
+     3) Media teardown — Variants
+     ============================================================ */
+  const invalidVideoSrcs = ["data:video/mp4;base64,", "data:video/webm;base64,", "blob:null/invalid"];
+  const invalidAudioSrcs = ["data:audio/mp3;base64,", "data:audio/wav;base64,"];
+
+  function mdA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("MD-A: create/remove video+audio + load()");
+    log("MD-A: starting...");
+    let iter=0, max=180;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const v=document.createElement("video");
+        v.muted=true; v.preload="auto";
+        v.src=invalidVideoSrcs[iter % invalidVideoSrcs.length];
+        c.appendChild(v);
+        try{ v.load(); }catch(e){}
+
+        const a=document.createElement("audio");
+        a.preload="auto";
+        a.src=invalidAudioSrcs[iter % invalidAudioSrcs.length];
+        c.appendChild(a);
+        try{ a.load(); }catch(e){}
+
+        // teardown quick
+        v.remove(); a.remove();
+        try{ v.src=""; v.load(); }catch(e){}
+        try{ a.src=""; a.load(); }catch(e){}
+
+        if(iter%20===0) log("MD-A: iter=" + iter);
+        if(iter%30===0) allocGarbage(60, 8192);
+      }catch(ex){
+        log("MD-A: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 0);
+      else log("MD-A: completed.");
+    })();
+  }
+
+  function mdB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("MD-B: TextTrack cue churn + detach during events");
+    log("MD-B: starting...");
+
+    let iter=0, max=120;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const v=document.createElement("video");
+        v.muted=true; v.preload="metadata";
+        v.src=invalidVideoSrcs[iter % invalidVideoSrcs.length];
+
+        // attach event hooks; teardown inside hooks
+        v.onerror = function(){ try{ v.remove(); }catch(e){} };
+        v.onloadedmetadata = function(){ try{ v.remove(); }catch(e){} };
+
+        // text track churn
+        try{
+          const tt = v.addTextTrack ? v.addTextTrack("subtitles","x","en") : null;
+          if(tt && tt.addCue){
+            for(let i=0;i<80;i++){
+              if(ABORT) return;
+              let cue=null;
+              if(typeof VTTCue !== "undefined") cue=new VTTCue(i, i+0.1, "Q"+iter+"-"+i);
+              else if(typeof TextTrackCue !== "undefined") cue=new TextTrackCue(i, i+0.1, "Q"+iter+"-"+i);
+              if(cue) tt.addCue(cue);
+            }
+            // remove cues quickly if possible
+            if(tt.cues && tt.removeCue){
+              const cues = tt.cues;
+              // iterate backwards (some engines expect live list)
+              for(let j=cues.length-1;j>=0;j--){
+                if(ABORT) return;
+                try{ tt.removeCue(cues[j]); }catch(e){}
+              }
+            }
+          }
+        }catch(ex){}
+
+        c.appendChild(v);
+        try{ v.load(); }catch(e){}
+        // immediate detach (teardown race)
+        v.remove();
+        try{ v.src=""; v.load(); }catch(e){}
+
+        if(iter%15===0) log("MD-B: iter=" + iter);
+        if(iter%25===0) allocGarbage(80, 4096);
+      }catch(ex){
+        log("MD-B: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 0);
+      else log("MD-B: completed.");
+    })();
+  }
+
+  function mdC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("MD-C: many media elements + attribute flips + fast teardown");
+    log("MD-C: starting...");
+
+    let iter=0, max=60; // each iter creates multiple elements
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const batch=[];
+        for(let k=0;k<8;k++){
+          const v=document.createElement("video");
+          v.muted=true;
+          v.preload=(k%2===0)?"auto":"metadata";
+          v.loop=(k%3===0);
+          v.controls=false;
+          v.src=invalidVideoSrcs[(iter+k) % invalidVideoSrcs.length];
+          c.appendChild(v);
+          batch.push(v);
+
+          const a=document.createElement("audio");
+          a.preload=(k%2===0)?"auto":"metadata";
+          a.src=invalidAudioSrcs[(iter+k) % invalidAudioSrcs.length];
+          c.appendChild(a);
+          batch.push(a);
+        }
+
+        // flip attributes quickly then teardown
+        for(const m of batch){
+          if(ABORT) return;
+          try{ m.autoplay = true; }catch(e){}
+          try{ m.muted = true; }catch(e){}
+          try{ m.preload = "none"; }catch(e){}
+          try{ m.load(); }catch(e){}
+        }
+        for(const m of batch){
+          if(ABORT) return;
+          try{ m.remove(); }catch(e){}
+          try{ m.src=""; m.load(); }catch(e){}
+        }
+
+        if(iter%10===0) log("MD-C: iter=" + iter);
+        allocGarbage(60, 8192);
+      }catch(ex){
+        log("MD-C: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 10);
+      else log("MD-C: completed.");
+    })();
+  }
+
+  document.getElementById("mdA").addEventListener("click", mdA);
+  document.getElementById("mdB").addEventListener("click", mdB);
+  document.getElementById("mdC").addEventListener("click", mdC);
+
+  /* ============================================================
+     4) DOM deep recursion / layout storms — Variants
+     ============================================================ */
+  function dlA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("DL-A: deep nesting + parser insert + rAF layout reads");
+    log("DL-A: building deep tree...");
+    let cur=c;
+    for(let i=0;i<8000;i++){
+      if(ABORT) return;
+      const n=document.createElement("div");
+      if(i%500===0) n.textContent="NODE-"+i;
+      if(i%7===0) n.style.padding="1px";
+      if(i%11===0) n.style.border="1px solid #ccc";
+      cur.appendChild(n);
+      cur=n;
+    }
+
+    // Parser path insert
+    try{
+      const depth=9000;
+      let s="";
+      for(let i=0;i<depth;i++){ if(ABORT) return; s+="<div>"; }
+      s+="<div>PAYLOAD</div>";
+      for(let i=0;i<depth;i++){ if(ABORT) return; s+="</div>"; }
+      const p=document.createElement("div");
+      p.innerHTML=s;
+      c.appendChild(p);
+      log("DL-A: parser insert done depth=" + depth);
+    }catch(ex){
+      log("DL-A: parser exception: " + ex);
+    }
+
+    // rAF storm
+    let frame=0, maxFrames=1400;
+    function raf(){
+      if(ABORT) return;
+      frame++;
+      try{
+        c.style.width = (frame%2) ? "97%" : "98%";
+        c.style.fontSize = (frame%3) ? "15px":"16px";
+        void c.offsetWidth; void c.offsetHeight;
+        if(frame%60===0) log("DL-A: frame=" + frame);
+        if(frame%120===0) allocGarbage(80, 4096);
+      }catch(ex){
+        log("DL-A: raf exception: " + ex);
+        return;
+      }
+      if(frame<maxFrames) requestAnimationFrame(raf);
+      else log("DL-A: completed.");
+    }
+    requestAnimationFrame(raf);
+  }
+
+  function dlB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("DL-B: table layout churn");
+    log("DL-B: building big table...");
+    const table=document.createElement("table");
+    table.style.borderCollapse="collapse";
+    c.appendChild(table);
+
+    const rows=120, cols=24;
+    for(let r=0;r<rows;r++){
+      if(ABORT) return;
+      const tr=document.createElement("tr");
+      for(let k=0;k<cols;k++){
+        const td=document.createElement("td");
+        td.textContent = "R"+r+"C"+k;
+        td.style.border="1px solid #ccc";
+        td.style.padding="1px";
+        tr.appendChild(td);
+      }
+      table.appendChild(tr);
+    }
+
+    log("DL-B: starting mutation loop...");
+    let iter=0, max=600;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        // mutate cell contents/widths to cause table relayout
+        const tr = table.rows[iter % table.rows.length];
+        if(tr && tr.cells && tr.cells.length){
+          const td = tr.cells[iter % tr.cells.length];
+          td.textContent = "M"+iter+" " + "X".repeat((iter%20)+5);
+          td.style.width = (iter%2) ? "10px":"auto";
+        }
+        void table.offsetHeight;
+        if(iter%50===0) log("DL-B: iter=" + iter);
+        if(iter%75===0) allocGarbage(60, 4096);
+      }catch(ex){
+        log("DL-B: exception: " + ex);
+        return;
+      }
+      if(iter<max) requestAnimationFrame(step);
+      else log("DL-B: completed.");
+    })();
+  }
+
+  function dlC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("DL-C: scroll container + massive mutations + forced reflow");
+    const sc=document.createElement("div");
+    sc.style.height="240px";
+    sc.style.overflow="scroll";
+    sc.style.border="1px solid #ccc";
+    c.appendChild(sc);
+
+    // prefill many children
+    const nodes=[];
+    for(let i=0;i<4000;i++){
+      if(ABORT) return;
+      const d=document.createElement("div");
+      d.textContent="ITEM "+i+" "+"Z".repeat(50);
+      sc.appendChild(d);
+      nodes.push(d);
+    }
+
+    let iter=0, max=900;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        // mutate in batches + scroll jumps
+        for(let k=0;k<120;k++){
+          const idx=(iter*17 + k*13) % nodes.length;
+          nodes[idx].textContent = "UPD " + iter + " / " + idx + " " + "Q".repeat((iter%30)+10);
+          if((idx+iter)%19===0) nodes[idx].style.display = (nodes[idx].style.display==="none") ? "block":"none";
+        }
+        sc.scrollTop = (iter*97) % sc.scrollHeight;
+        void sc.offsetHeight;
+        if(iter%60===0) log("DL-C: iter=" + iter);
+        if(iter%90===0) allocGarbage(80, 8192);
+      }catch(ex){
+        log("DL-C: exception: " + ex);
+        return;
+      }
+      if(iter<max) requestAnimationFrame(step);
+      else log("DL-C: completed.");
+    })();
+  }
+
+  document.getElementById("dlA").addEventListener("click", dlA);
+  document.getElementById("dlB").addEventListener("click", dlB);
+  document.getElementById("dlC").addEventListener("click", dlC);
+
+  /* ============================================================
+     5) Canvas 2D — Variants
+     ============================================================ */
+  function cvA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("CV-A: resize 1..4096 + draw ops + destroy");
+    log("CV-A: starting...");
+    let iter=0, max=900;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const canvas=document.createElement("canvas");
+        const s=(iter%5===0)?4096:(iter%4===0)?2048:(iter%3===0)?1024:(iter%2===0)?256:1;
+        canvas.width=s; canvas.height=s;
+        c.appendChild(canvas);
+        const ctx=canvas.getContext("2d");
+        if(ctx){
+          ctx.clearRect(0,0,s,s);
+          ctx.fillRect(0,0,Math.min(64,s),Math.min(64,s));
+          // moderate gradient
+          try{
+            const g=ctx.createRadialGradient(0,0,1, Math.min(256,s),Math.min(256,s), Math.min(512,s));
+            for(let i=0;i<160;i++) g.addColorStop(i/160, "rgb("+(i%255)+",0,0)");
+            ctx.fillStyle=g;
+            ctx.fillRect(0,0,Math.min(512,s),Math.min(512,s));
+          }catch(ex){}
+        }
+        canvas.remove();
+        if(iter%60===0) log("CV-A: iter=" + iter);
+        if(iter%90===0) allocGarbage(60, 8192);
+      }catch(ex){
+        log("CV-A: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 0);
+      else log("CV-A: completed.");
+    })();
+  }
+
+  function cvB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("CV-B: putImageData/getImageData churn + resize");
+    log("CV-B: starting...");
+    let iter=0, max=250;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const canvas=document.createElement("canvas");
+        const s=(iter%3===0)?512:(iter%2===0)?256:128;
+        canvas.width=s; canvas.height=s;
+        c.appendChild(canvas);
+        const ctx=canvas.getContext("2d");
+        if(ctx){
+          // image data churn
+          const img=ctx.createImageData(s,s);
+          // touch some pixels
+          for(let i=0;i<img.data.length;i+=97){
+            img.data[i]=iter&0xff;
+          }
+          ctx.putImageData(img,0,0);
+          try{ ctx.getImageData(0,0,Math.min(64,s),Math.min(64,s)); }catch(ex){}
+          // resize after operations (realloc)
+          canvas.width = (s===512)?256:512;
+          canvas.height = canvas.width;
+        }
+        canvas.remove();
+        if(iter%25===0) log("CV-B: iter=" + iter);
+        if(iter%20===0) allocGarbage(40, 4096);
+      }catch(ex){
+        log("CV-B: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 0);
+      else log("CV-B: completed.");
+    })();
+  }
+
+  function cvC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("CV-C: many canvases + pattern/gradient churn");
+    log("CV-C: starting...");
+    let iter=0, max=120;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const batch=[];
+        for(let k=0;k<12;k++){
+          const canvas=document.createElement("canvas");
+          canvas.width = (k%3===0)?512:256;
+          canvas.height= canvas.width;
+          c.appendChild(canvas);
+          batch.push(canvas);
+
+          const ctx=canvas.getContext("2d");
+          if(ctx){
+            ctx.fillRect(0,0,32,32);
+            // pattern from small canvas
+            const src=document.createElement("canvas");
+            src.width=16; src.height=16;
+            const sctx=src.getContext("2d");
+            if(sctx){ sctx.fillRect(0,0,16,16); }
+            try{
+              const pat=ctx.createPattern(src,"repeat");
+              if(pat){ ctx.fillStyle=pat; ctx.fillRect(0,0,128,128); }
+            }catch(ex){}
+            try{
+              const g=ctx.createLinearGradient(0,0,256,0);
+              for(let i=0;i<120;i++) g.addColorStop(i/120,"rgb(0,"+(i%255)+",0)");
+              ctx.fillStyle=g;
+              ctx.fillRect(0,0,256,64);
+            }catch(ex){}
+          }
+        }
+        // teardown
+        for(const canvas of batch){ try{ canvas.remove(); }catch(e){} }
+
+        if(iter%10===0) log("CV-C: iter=" + iter);
+        allocGarbage(50, 8192);
+      }catch(ex){
+        log("CV-C: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 20);
+      else log("CV-C: completed.");
+    })();
+  }
+
+  document.getElementById("cvA").addEventListener("click", cvA);
+  document.getElementById("cvB").addEventListener("click", cvB);
+  document.getElementById("cvC").addEventListener("click", cvC);
+
+  /* ============================================================
+     6) Font stress — Variants
+     ============================================================ */
+  const badFont = "data:font/woff;base64,d09GRgABAAAAAA"; // truncated
+
+  function fnA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("FN-A: @font-face invalid + flip font-family across many nodes");
+    log("FN-A: starting...");
+
+    const style=document.createElement("style");
+    style.textContent=`
+      @font-face { font-family:"BADFONT_A"; src:url("${badFont}") format("woff"); }
+      .bfA { font-family:"BADFONT_A", sans-serif; }
+    `;
+    document.head.appendChild(style);
+
+    const nodes=[];
+    for(let i=0; i<2500; i++){
+      const d=document.createElement("div");
+      d.textContent = "F"+i+" "+"A".repeat(40);
+      if(i%5===0) d.className="bfA";
+      nodes.push(d);
+      c.appendChild(d);
+    }
+
+    let iter=0, max=160;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        // Flip font-family class on a sliding window to stress font fallback & style recalc
+        const start = (iter*37) % nodes.length;
+        for(let k=0;k<900;k+=3){
+          const idx = (start + k) % nodes.length;
+          const n = nodes[idx];
+          if(!n) continue;
+          n.className = (n.className === "bfA") ? "" : "bfA";
+          if((idx+iter)%17===0) n.style.letterSpacing = ((iter%2)?"0.2px":"0.3px");
+        }
+        void c.offsetHeight;
+        if(iter%20===0) log("FN-A: iter="+iter);
+        if(iter%25===0) allocGarbage(90, 4096);
+      }catch(ex){
+        log("FN-A: exception: " + ex);
+        return;
+      }
+      if(iter<max) requestAnimationFrame(step);
+      else log("FN-A: completed.");
+    })();
+  }
+
+  function fnB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("FN-B: FontFace load attempts (if supported) + relayout");
+    log("FN-B: starting...");
+
+    const supportsFontFace = (typeof FontFace !== "undefined") && document.fonts && document.fonts.add;
+    if(!supportsFontFace){
+      log("FN-B: FontFace API not available here (skipping heavy path). Will do style relayout only.");
+    }
+
+    const nodes=[];
+    for(let i=0;i<1800;i++){
+      const d=document.createElement("div");
+      d.textContent="T"+i+" "+"B".repeat(50);
+      nodes.push(d);
+      c.appendChild(d);
+    }
+
+    let iter=0, max=220;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        if(supportsFontFace){
+          // Create short-lived FontFace objects (invalid/empty source) and add/remove
+          // Even if load fails, parser/work scheduling is exercised.
+          const ff = new FontFace("FF_"+iter, `url(${badFont}) format('woff')`);
+          try{ document.fonts.add(ff); }catch(ex){}
+          try{ ff.load().catch(()=>{}); }catch(ex){}
+          // Attempt cleanup: delete may not exist; we can at least drop refs
+        }
+
+        // Trigger relayout & style recalc
+        for(let k=0;k<300;k++){
+          const idx = (iter*29 + k*7) % nodes.length;
+          const n = nodes[idx];
+          n.style.fontWeight = (iter%2)?"bold":"normal";
+          if((idx+iter)%13===0) n.style.fontSize = ((iter%3)?"15px":"16px");
+        }
+        void c.offsetWidth; void c.offsetHeight;
+        if(iter%25===0) log("FN-B: iter="+iter);
+        if(iter%20===0) allocGarbage(70, 8192);
+      }catch(ex){
+        log("FN-B: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 0);
+      else log("FN-B: completed.");
+    })();
+  }
+
+  function fnC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    const c=mkContainer("FN-C: style tag churn (insert/remove @font-face repeatedly)");
+    log("FN-C: starting...");
+
+    const nodes=[];
+    for(let i=0;i<2000;i++){
+      const d=document.createElement("div");
+      d.textContent="C"+i+" "+"Z".repeat(30);
+      c.appendChild(d);
+      nodes.push(d);
+    }
+
+    let iter=0, max=260;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const st=document.createElement("style");
+        st.textContent = `@font-face{font-family:'TMP_${iter}';src:url('${badFont}') format('woff');}`;
+        document.head.appendChild(st);
+
+        // Apply/flip font-family on a subset
+        const fam = `TMP_${iter}`;
+        for(let k=0;k<600;k+=2){
+          const idx = (iter*31 + k*11) % nodes.length;
+          nodes[idx].style.fontFamily = fam + ", sans-serif";
+        }
+        void c.offsetHeight;
+
+        // Remove style tag quickly (churn parser / font cache)
+        st.remove();
+
+        if(iter%30===0) log("FN-C: iter="+iter);
+        if(iter%25===0) allocGarbage(80, 4096);
+      }catch(ex){
+        log("FN-C: exception: " + ex);
+        return;
+      }
+      if(iter<max) requestAnimationFrame(step);
+      else log("FN-C: completed.");
+    })();
+  }
+
+  document.getElementById("fnA").addEventListener("click", fnA);
+  document.getElementById("fnB").addEventListener("click", fnB);
+  document.getElementById("fnC").addEventListener("click", fnC);
+
+  /* ============================================================
+     7) Workers (com cuidado) â€” Variants
+     ============================================================ */
+  function makeWorkerURL(){
+    const src = `
+      self.onmessage = function(ev){
+        const msg = ev && ev.data;
+        if(msg && msg.cmd==='ping'){
+          // allocate a bit to couple with GC pressure
+          const a = new Uint8Array(msg.sz||1024);
+          a[0]=0x41;
+          self.postMessage({ok:1, n:msg.n||0});
+        } else if(msg && msg.cmd==='spam'){
+          const count = msg.count||100;
+          for(let i=0;i<count;i++){
+            const b = new Uint8Array((i%8+1)*2048);
+            b[0]=i&0xff;
+          }
+          self.postMessage({ok:1, spam:1});
+        }
+      };
+    `;
+    const blob = new Blob([src], {type:"application/javascript"});
+    const url = URL.createObjectURL(blob);
+    window.__WORKER_BLOB_URL = url;
+    return url;
+  }
+
+  function wkA(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    mkContainer("WK-A: worker create/terminate cadence (LOW)");
+    log("WK-A: starting...");
+
+    window.__WORKERS = window.__WORKERS || [];
+    const url = makeWorkerURL();
+
+    let iter=0, max=80;
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        const w = new Worker(url);
+        window.__WORKERS.push(w);
+        w.onmessage = function(){ /* ignore */ };
+        w.postMessage({cmd:'ping', n:iter, sz:2048});
+        // terminate after short delay
+        setTimeout(()=>{ try{ w.terminate(); }catch(e){} }, 10);
+
+        if(iter%10===0) log("WK-A: iter="+iter);
+        if(iter%20===0) allocGarbage(40, 4096);
+      }catch(ex){
+        log("WK-A: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 30);
+      else log("WK-A: completed.");
+    })();
+  }
+
+  function wkB(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    mkContainer("WK-B: bursty spawn + message flood (MED)");
+    log("WK-B: starting...");
+
+    window.__WORKERS = window.__WORKERS || [];
+    const url = makeWorkerURL();
+
+    let burst=0, maxBurst=18;
+    (function step(){
+      if(ABORT) return;
+      burst++;
+      try{
+        const local=[];
+        const n = 6; // keep moderate to avoid console instability
+        for(let i=0;i<n;i++){
+          const w=new Worker(url);
+          local.push(w);
+          window.__WORKERS.push(w);
+          w.postMessage({cmd:'spam', count:140});
+        }
+        // tear down quickly
+        setTimeout(()=>{ for(const w of local){ try{ w.terminate(); }catch(e){} } }, 25);
+
+        if(burst%3===0) log("WK-B: burst="+burst+" workers="+n);
+        allocGarbage(60, 8192);
+      }catch(ex){
+        log("WK-B: exception: " + ex);
+        return;
+      }
+      if(burst<maxBurst) setTimeout(step, 120);
+      else log("WK-B: completed.");
+    })();
+  }
+
+  function wkC(e){
+    if(!requireTrustedClick(e)) return;
+    resetAbort();
+    mkContainer("WK-C: mixed cadence (LOW) + GC pressure coupling");
+    log("WK-C: starting...");
+
+    window.__WORKERS = window.__WORKERS || [];
+    const url = makeWorkerURL();
+
+    let iter=0, max=120;
+    const w = new Worker(url);
+    window.__WORKERS.push(w);
+
+    (function step(){
+      if(ABORT) return;
+      iter++;
+      try{
+        w.postMessage({cmd:'ping', n:iter, sz:(iter%5+1)*4096});
+        // Couple with main-thread allocation + DOM touch
+        allocGarbage(10, (iter%3===0)?16384:8192);
+        if(iter%7===0){
+          const d=document.createElement('div');
+          d.textContent='WK-C '+iter;
+          d.setAttribute('data-test-container','1');
+          document.body.appendChild(d);
+          d.remove();
+        }
+        if(iter%20===0) log("WK-C: iter="+iter);
+      }catch(ex){
+        log("WK-C: exception: " + ex);
+        return;
+      }
+      if(iter<max) setTimeout(step, 40);
+      else {
+        try{ w.terminate(); }catch(e){}
+        log("WK-C: completed.");
+      }
+    })();
+  }
+
+  document.getElementById("wkA").addEventListener("click", wkA);
+  document.getElementById("wkB").addEventListener("click", wkB);
+  document.getElementById("wkC").addEventListener("click", wkC);
+
+})();
+</script>
+</body>
+</html>

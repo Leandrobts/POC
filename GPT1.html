@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>PS4 WebKit Crash Vectors Test Suite (No WebGL / No JIT / No IndexedDB)</title>
+</head>
+<body>
+  <h1>PS4 WebKit Crash Vectors – Test Suite</h1>
+  <p>
+    Objetivo: produzir evidência visual (freeze/crash/fechamento do navegador) com vetores focados em caminhos nativos
+    (layout/DOM, fullscreen+blur, history state, media teardown, canvas 2D, fontes, workers).
+  </p>
+  <p>
+    Importante: execute UM teste por vez. Se travar o console, reinicie e reduza os parâmetros.
+    Este arquivo evita WebGL, JIT e IndexedDB.
+  </p>
+
+  <hr>
+
+  <div>
+    <button id="btnClear">Limpar Log</button>
+    <button id="btnStop">STOP (abortar e limpar)</button>
+  </div>
+
+  <pre id="log" style="white-space:pre-wrap; border:1px solid #999; padding:10px; min-height:220px;"></pre>
+
+  <hr>
+
+  <h2>1) Fullscreen + Blur + DOM Mutation</h2>
+  <p>
+    Como acionar blur no PS4: normalmente ao apertar OPTIONS/PS (ou abrir overlay). O teste entra em fullscreen e,
+    quando ocorrer blur/visibilitychange, executa mutações agressivas no DOM.
+  </p>
+  <button id="tFullscreen">Run: Fullscreen + Blur + DOM Mutation</button>
+
+  <h2>2) History.pushState + Objetos Complexos</h2>
+  <button id="tHistoryA">Run: pushState (complex objects, circular-ish, large strings)</button>
+  <button id="tHistoryB">Run: push/replace + popstate sync (stress)</button>
+
+  <h2>3) Media Teardown (video/audio/TextTrack) – sem rede</h2>
+  <button id="tMedia">Run: Media teardown stress (create/remove/track cues)</button>
+
+  <h2>4) DOM Deep Recursion / Layout Storms</h2>
+  <button id="tDomDeep">Run: Deep DOM + parser path + layout storms</button>
+
+  <h2>5) Canvas 2D Resize / Destruction Loops</h2>
+  <button id="tCanvas">Run: Canvas 2D resize + destroy loops</button>
+
+  <h2>6) Font Loading Stress (FontFace / @font-face) – inválido/truncado</h2>
+  <button id="tFonts">Run: Font loading stress (invalid font data)</button>
+
+  <h2>7) Workers (com cuidado)</h2>
+  <p>
+    Atenção: workers podem causar travamento global dependendo do firmware. Comece com limites baixos e aumente gradualmente.
+  </p>
+  <button id="tWorkersLow">Run: Workers (LOW)</button>
+  <button id="tWorkersMed">Run: Workers (MED)</button>
+
+<script>
+/* ============================================================
+   UTIL / LOG / CONTROL
+   ============================================================ */
+(function () {
+  "use strict";
+
+  const logEl = document.getElementById("log");
+  let ABORT = false;
+
+  function ts() {
+    const d = new Date();
+    const p2 = (n) => (n < 10 ? "0" + n : "" + n);
+    return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+  }
+
+  function log(msg) {
+    logEl.textContent += `[${ts()}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function clearLog() {
+    logEl.textContent = "";
+  }
+
+  function stopAll() {
+    ABORT = true;
+    log("STOP requested: abort flag set. Cleaning up...");
+
+    // Exit fullscreen if possible
+    try {
+      if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+      if (document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (e) {}
+
+    // Remove any test containers
+    const nodes = document.querySelectorAll("[data-test-container='1']");
+    for (let i = 0; i < nodes.length; i++) {
+      try { nodes[i].remove(); } catch (e) {}
+    }
+
+    // Terminate workers if any
+    if (window.__WORKERS && window.__WORKERS.length) {
+      for (const w of window.__WORKERS) {
+        try { w.terminate(); } catch (e) {}
+      }
+      window.__WORKERS.length = 0;
+      log("Workers terminated.");
+    }
+
+    // Revoke worker blob URL if any
+    if (window.__WORKER_BLOB_URL) {
+      try { URL.revokeObjectURL(window.__WORKER_BLOB_URL); } catch (e) {}
+      window.__WORKER_BLOB_URL = null;
+    }
+
+    // Detach global handlers
+    window.onblur = null;
+    document.onvisibilitychange = null;
+    window.onpopstate = null;
+
+    log("Cleanup complete.");
+  }
+
+  function resetAbort() {
+    ABORT = false;
+  }
+
+  function requireTrustedClick(e) {
+    if (!e || !e.isTrusted) {
+      log("Blocked: requires a real user gesture (trusted click).");
+      return false;
+    }
+    return true;
+  }
+
+  function mkContainer(title) {
+    const c = document.createElement("div");
+    c.setAttribute("data-test-container", "1");
+    c.style.border = "1px dashed #666";
+    c.style.padding = "8px";
+    c.style.margin = "10px 0";
+    const h = document.createElement("div");
+    h.textContent = title;
+    h.style.fontWeight = "bold";
+    c.appendChild(h);
+    document.body.appendChild(c);
+    return c;
+  }
+
+  // Helpers to reduce engine optimization / keep pressure
+  function allocGarbage(rounds, size) {
+    const junk = [];
+    for (let i = 0; i < rounds; i++) {
+      if (ABORT) return null;
+      const a = new Uint8Array(size);
+      a[0] = 0x41;
+      a[size - 1] = 0x42;
+      junk.push(a);
+    }
+    return junk;
+  }
+
+  /* ============================================================
+     1) Fullscreen + Blur + DOM Mutation
+     ============================================================ */
+  async function testFullscreenBlurDOM(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    const c = mkContainer("TEST 1: Fullscreen + Blur + DOM Mutation");
+    const info = document.createElement("div");
+    info.textContent = "Entre em fullscreen. Depois provoque BLUR (OPTIONS/PS/overlay).";
+    c.appendChild(info);
+
+    log("TEST 1: setting blur + visibilitychange hooks.");
+    let fired = 0;
+
+    function doMutation(tag) {
+      if (ABORT) return;
+      fired++;
+      log(`TEST 1: mutation fired via ${tag} (count=${fired}).`);
+
+      // Heavy DOM churn: remove/append, deep nesting, style flips
+      try {
+        // Remove many children quickly
+        for (let i = 0; i < 200; i++) {
+          if (ABORT) return;
+          const n = document.createElement("div");
+          n.textContent = "X".repeat(64);
+          c.appendChild(n);
+        }
+
+        // Deep nest
+        let cur = c;
+        for (let d = 0; d < 600; d++) {
+          if (ABORT) return;
+          const n = document.createElement("div");
+          n.textContent = (d % 10 === 0) ? ("D" + d) : "";
+          // flip layout-affecting styles
+          n.style.display = (d % 7 === 0) ? "inline-block" : "block";
+          n.style.position = (d % 11 === 0) ? "relative" : "static";
+          n.style.left = (d % 11 === 0) ? "1px" : "0px";
+          cur.appendChild(n);
+          cur = n;
+        }
+
+        // Trigger layout reads
+        const w = c.offsetWidth;
+        const h = c.offsetHeight;
+        log(`TEST 1: layout read: offsetWidth=${w}, offsetHeight=${h}`);
+
+        // Force some GC pressure
+        allocGarbage(200, 4096);
+
+      } catch (ex) {
+        log("TEST 1: JS exception: " + (ex && ex.message ? ex.message : ex));
+      }
+    }
+
+    window.onblur = function () { doMutation("onblur"); };
+    document.onvisibilitychange = function () { doMutation("visibilitychange"); };
+
+    // Enter fullscreen (webkit first, common on PS4)
+    log("TEST 1: requesting fullscreen...");
+    try {
+      const el = document.documentElement;
+      if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else if (el.requestFullscreen) el.requestFullscreen();
+      else log("TEST 1: fullscreen API not available.");
+    } catch (ex) {
+      log("TEST 1: fullscreen request exception: " + ex);
+    }
+
+    log("TEST 1: waiting for user to trigger blur/overlay...");
+  }
+
+  /* ============================================================
+     2) History.pushState + Objetos Complexos
+     ============================================================ */
+  function buildComplexState(seed) {
+    // Avoid "purely huge JSON" only; include functions/getters placeholders? (Functions not cloneable; we avoid.)
+    const big = "A".repeat(4000) + seed + "B".repeat(4000);
+
+    // Circular references are usually rejected by structured clone; but history state often serializes.
+    // To keep it broadly applicable, we avoid true circular refs and instead use repeated references.
+    const shared = { marker: "shared-" + seed, pad: "C".repeat(2048) };
+
+    const obj = {
+      seed,
+      time: Date.now(),
+      big,
+      shared1: shared,
+      shared2: shared, // aliasing inside the state object
+      arr: [],
+      dict: {}
+    };
+
+    for (let i = 0; i < 150; i++) {
+      obj.arr.push({
+        i,
+        s: "S".repeat(128) + i,
+        nested: { k: "K".repeat(64), ref: shared }
+      });
+      obj.dict["k" + i] = { i, v: "V".repeat(96) };
+    }
+
+    // TypedArrays are often supported in structured clone; include small buffers
+    obj.buf = new ArrayBuffer(4096);
+    obj.u8 = new Uint8Array(obj.buf);
+    obj.u8[0] = 0x12;
+    obj.u8[1] = 0x34;
+
+    return obj;
+  }
+
+  function testHistoryComplex(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    mkContainer("TEST 2A: History.pushState + complex objects");
+    log("TEST 2A: starting pushState loop...");
+
+    let i = 0;
+    const max = 60; // adjust upwards if stable
+    function step() {
+      if (ABORT) return;
+      i++;
+      try {
+        const st = buildComplexState("iter-" + i);
+        history.pushState(st, "", "#s" + i);
+        // Read back state
+        const rs = history.state;
+        log(`TEST 2A: pushState OK i=${i} hash=#s${i} state.seed=${rs && rs.seed}`);
+      } catch (ex) {
+        log("TEST 2A: exception: " + (ex && ex.message ? ex.message : ex));
+        return;
+      }
+      if (i < max) setTimeout(step, 0);
+      else log("TEST 2A: completed.");
+    }
+    step();
+  }
+
+  function testHistoryPopstateSync(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    mkContainer("TEST 2B: push/replace + popstate synchronized mutations");
+    log("TEST 2B: wiring popstate handler + alternating push/replace...");
+
+    let popCount = 0;
+    window.onpopstate = function (ev) {
+      popCount++;
+      const st = ev ? ev.state : null;
+      log(`TEST 2B: popstate fired count=${popCount} state.seed=${st && st.seed}`);
+
+      // On popstate, mutate DOM (couples navigation & layout)
+      try {
+        const c = mkContainer("TEST 2B: popstate DOM churn " + popCount);
+        for (let k = 0; k < 200; k++) {
+          if (ABORT) return;
+          const n = document.createElement("div");
+          n.textContent = "POP " + popCount + " / " + k + " " + "X".repeat(64);
+          c.appendChild(n);
+        }
+        // Layout read
+        void c.offsetHeight;
+      } catch (ex) {
+        log("TEST 2B: popstate mutation exception: " + ex);
+      }
+    };
+
+    let i = 0;
+    const max = 80;
+    function navStep() {
+      if (ABORT) return;
+      i++;
+      try {
+        const st = buildComplexState("nav-" + i);
+        if (i % 2 === 0) history.replaceState(st, "", "#r" + i);
+        else history.pushState(st, "", "#p" + i);
+
+        // Occasionally go back/forward to fire popstate
+        if (i % 6 === 0) {
+          log("TEST 2B: history.back()");
+          history.back();
+        } else if (i % 9 === 0) {
+          log("TEST 2B: history.forward()");
+          history.forward();
+        } else {
+          // no-op
+        }
+
+        log(`TEST 2B: step i=${i} done.`);
+      } catch (ex) {
+        log("TEST 2B: exception: " + (ex && ex.message ? ex.message : ex));
+        return;
+      }
+      if (i < max) setTimeout(navStep, 0);
+      else log("TEST 2B: completed.");
+    }
+    navStep();
+  }
+
+  /* ============================================================
+     3) Media Teardown (video/audio/TextTrack) – sem rede
+     ============================================================ */
+  function testMediaTeardown(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    const c = mkContainer("TEST 3: Media teardown (video/audio/TextTrack)");
+    log("TEST 3: starting...");
+
+    // No network: use invalid/empty sources to stress creation/teardown paths.
+    const invalidVideoSrcs = [
+      "data:video/mp4;base64,",   // empty
+      "data:video/webm;base64,",  // empty
+      "blob:null/invalid"         // invalid
+    ];
+    const invalidAudioSrcs = [
+      "data:audio/mp3;base64,",
+      "data:audio/wav;base64,"
+    ];
+
+    let iter = 0;
+    const max = 120;
+
+    function oneRound() {
+      if (ABORT) return;
+      iter++;
+
+      try {
+        // VIDEO
+        const v = document.createElement("video");
+        v.muted = true;
+        v.loop = false;
+        v.controls = false;
+        v.preload = "auto";
+        v.width = 320;
+        v.height = 180;
+        v.src = invalidVideoSrcs[iter % invalidVideoSrcs.length];
+
+        // TextTrack/Cues stress
+        // Some builds restrict addTextTrack; we guard.
+        try {
+          const tt = v.addTextTrack ? v.addTextTrack("subtitles", "x", "en") : null;
+          if (tt && tt.addCue) {
+            for (let i = 0; i < 30; i++) {
+              if (ABORT) return;
+              // VTTCue exists in many WebKits; fallback to TextTrackCue if needed
+              let cue = null;
+              if (typeof VTTCue !== "undefined") cue = new VTTCue(i, i + 0.5, "CUE-" + iter + "-" + i);
+              else if (typeof TextTrackCue !== "undefined") cue = new TextTrackCue(i, i + 0.5, "CUE-" + iter + "-" + i);
+              if (cue) tt.addCue(cue);
+            }
+          }
+        } catch (ex) {
+          // Keep going; track APIs might be limited
+        }
+
+        c.appendChild(v);
+
+        // AUDIO
+        const a = document.createElement("audio");
+        a.preload = "auto";
+        a.src = invalidAudioSrcs[iter % invalidAudioSrcs.length];
+        c.appendChild(a);
+
+        // Attempt lifecycle calls (often gated by user gesture; we're inside trusted click chain)
+        try { v.load(); } catch (e1) {}
+        try { a.load(); } catch (e2) {}
+
+        // Tear down quickly
+        // Remove during potential pending tasks
+        v.remove();
+        a.remove();
+
+        // Break references
+        // Setting src="" and calling load can trigger teardown paths
+        try { v.src = ""; v.load(); } catch (e3) {}
+        try { a.src = ""; a.load(); } catch (e4) {}
+
+        // Minor GC pressure
+        if (iter % 10 === 0) allocGarbage(120, 4096);
+
+        log("TEST 3: iter=" + iter);
+      } catch (ex) {
+        log("TEST 3: exception: " + (ex && ex.message ? ex.message : ex));
+        return;
+      }
+
+      if (iter < max) setTimeout(oneRound, 0);
+      else log("TEST 3: completed.");
+    }
+
+    oneRound();
+  }
+
+  /* ============================================================
+     4) DOM Deep Recursion / Layout Storms
+     ============================================================ */
+  function testDomDeepLayout(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    const c = mkContainer("TEST 4: DOM deep recursion + layout storms");
+    log("TEST 4: building deep DOM + parser path...");
+
+    // Path A: programmatic nesting
+    let cur = c;
+    for (let i = 0; i < 6000; i++) {
+      if (ABORT) return;
+      const n = document.createElement("div");
+      n.textContent = (i % 200 === 0) ? ("NODE-" + i) : "";
+      // style flips to increase layout work
+      if (i % 3 === 0) n.style.padding = "1px";
+      if (i % 5 === 0) n.style.margin = "1px";
+      if (i % 7 === 0) n.style.border = "1px solid #ccc";
+      cur.appendChild(n);
+      cur = n;
+    }
+
+    // Path B: parser-based deep HTML (can hit different native code)
+    try {
+      const depth = 8000;
+      const html = "<div>" + "X".repeat(16) + "</div>";
+      // Not insane string growth, but repeated insert triggers parser + tree builder
+      let s = "";
+      for (let i = 0; i < depth; i++) {
+        if (ABORT) return;
+        s += "<div>";
+      }
+      s += html;
+      for (let i = 0; i < depth; i++) {
+        if (ABORT) return;
+        s += "</div>";
+      }
+      const p = document.createElement("div");
+      p.innerHTML = s;
+      c.appendChild(p);
+      log("TEST 4: parser deep insert completed (depth=" + depth + ").");
+    } catch (ex) {
+      log("TEST 4: parser deep insert exception: " + ex);
+    }
+
+    // Layout storm loop
+    log("TEST 4: starting layout storm (rAF loop)...");
+    let frame = 0;
+    const maxFrames = 1200;
+
+    function rafLoop() {
+      if (ABORT) return;
+      frame++;
+
+      try {
+        // Style toggles on root container
+        c.style.width = (frame % 2 === 0) ? "97%" : "98%";
+        c.style.fontSize = (frame % 3 === 0) ? "16px" : "15px";
+
+        // Force layout reads
+        void c.offsetHeight;
+        void c.offsetWidth;
+
+        if (frame % 50 === 0) log("TEST 4: frame=" + frame);
+      } catch (ex) {
+        log("TEST 4: exception in rafLoop: " + ex);
+        return;
+      }
+
+      if (frame < maxFrames) requestAnimationFrame(rafLoop);
+      else log("TEST 4: completed.");
+    }
+
+    requestAnimationFrame(rafLoop);
+  }
+
+  /* ============================================================
+     5) Canvas 2D resize/destruction loops
+     ============================================================ */
+  function testCanvas2D(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    const c = mkContainer("TEST 5: Canvas 2D resize + destroy loops");
+    log("TEST 5: starting...");
+
+    let iter = 0;
+    const max = 800;
+
+    function step() {
+      if (ABORT) return;
+      iter++;
+
+      try {
+        const canvas = document.createElement("canvas");
+        // alternate sizes to force reallocations
+        const s = (iter % 4 === 0) ? 4096 : (iter % 3 === 0) ? 2048 : (iter % 2 === 0) ? 1024 : 1;
+        canvas.width = s;
+        canvas.height = s;
+
+        c.appendChild(canvas);
+
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          // Basic operations that stress internal paths
+          ctx.clearRect(0, 0, s, s);
+          ctx.fillRect(0, 0, Math.min(64, s), Math.min(64, s));
+
+          // Gradients (moderate; avoid immediate exceptions)
+          try {
+            const g = ctx.createLinearGradient(0, 0, Math.min(256, s), Math.min(256, s));
+            for (let i = 0; i < 200; i++) {
+              // Many color stops; tune if needed
+              g.addColorStop(i / 200, "rgb(" + (i % 255) + ",0,0)");
+            }
+            ctx.fillStyle = g;
+            ctx.fillRect(0, 0, Math.min(512, s), Math.min(512, s));
+          } catch (ex) {
+            // ignore
+          }
+        }
+
+        // Destroy quickly
+        canvas.remove();
+
+        if (iter % 50 === 0) log("TEST 5: iter=" + iter);
+        if (iter % 80 === 0) allocGarbage(80, 8192);
+      } catch (ex) {
+        log("TEST 5: exception: " + ex);
+        return;
+      }
+
+      if (iter < max) setTimeout(step, 0);
+      else log("TEST 5: completed.");
+    }
+
+    step();
+  }
+
+  /* ============================================================
+     6) Font loading stress (FontFace / @font-face) invalid
+     ============================================================ */
+  async function testFonts(e) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    const c = mkContainer("TEST 6: Font loading stress (invalid/truncated data)");
+    log("TEST 6: starting...");
+
+    // Truncated/invalid base64 payload (intentionally)
+    const badFont = "data:font/woff;base64,d09GRgABAAAAAA"; // tiny/truncated
+    const style = document.createElement("style");
+    style.textContent = `
+      @font-face {
+        font-family: "BADFONT";
+        src: url("${badFont}") format("woff");
+        font-weight: normal;
+        font-style: normal;
+      }
+      .badfont { font-family: "BADFONT", sans-serif; }
+    `;
+    document.head.appendChild(style);
+
+    // FontFace API path (if supported)
+    let hasFontFace = (typeof FontFace !== "undefined");
+    log("TEST 6: FontFace API available? " + (hasFontFace ? "YES" : "NO"));
+
+    // Create lots of nodes and toggle font-family
+    const nodes = [];
+    for (let i = 0; i < 1200; i++) {
+      if (ABORT) return;
+      const d = document.createElement("div");
+      d.textContent = "FONT-NODE " + i + " " + "X".repeat(80);
+      d.className = "badfont";
+      c.appendChild(d);
+      nodes.push(d);
+    }
+
+    // If FontFace exists, try many loads (likely to fail quickly but still hits parser)
+    if (hasFontFace) {
+      try {
+        for (let i = 0; i < 120; i++) {
+          if (ABORT) return;
+          const ff = new FontFace("FF" + i, `url(${badFont})`);
+          // Add & load; many engines will reject, but exercise native validation
+          try { document.fonts.add(ff); } catch (e1) {}
+          try { await ff.load(); } catch (e2) {}
+          if (i % 20 === 0) log("TEST 6: FontFace load attempt i=" + i);
+        }
+      } catch (ex) {
+        log("TEST 6: FontFace loop exception: " + ex);
+      }
+    }
+
+    // Toggle fonts rapidly to cause relayout/paint churn
+    let iter = 0;
+    const max = 800;
+    function flip() {
+      if (ABORT) return;
+      iter++;
+      try {
+        for (let i = 0; i < nodes.length; i += 3) {
+          if (ABORT) return;
+          nodes[i].style.fontFamily = (iter % 2 === 0) ? '"BADFONT", sans-serif' : "sans-serif";
+        }
+        // Force layout
+        void c.offsetHeight;
+        if (iter % 50 === 0) log("TEST 6: flip iter=" + iter);
+        if (iter % 80 === 0) allocGarbage(60, 4096);
+      } catch (ex) {
+        log("TEST 6: flip exception: " + ex);
+        return;
+      }
+      if (iter < max) requestAnimationFrame(flip);
+      else log("TEST 6: completed.");
+    }
+    requestAnimationFrame(flip);
+  }
+
+  /* ============================================================
+     7) Workers (com cuidado)
+     ============================================================ */
+  function makeWorkerURLOnce() {
+    if (window.__WORKER_BLOB_URL) return window.__WORKER_BLOB_URL;
+
+    const code = `
+      self.onmessage = function (e) {
+        // Do some CPU + memory pressure, but bounded.
+        const n = (e && e.data && e.data.n) ? e.data.n : 20000;
+        let s = 0;
+        for (let i = 0; i < n; i++) s += (i ^ 0x5a5a);
+        // Allocate a small chunk
+        const u = new Uint8Array(65536);
+        u[0] = s & 0xff;
+        self.postMessage({ ok: 1, sum: s, b0: u[0] });
+      };
+    `;
+    const blob = new Blob([code], { type: "application/javascript" });
+    window.__WORKER_BLOB_URL = URL.createObjectURL(blob);
+    return window.__WORKER_BLOB_URL;
+  }
+
+  function testWorkers(e, mode) {
+    if (!requireTrustedClick(e)) return;
+    resetAbort();
+
+    mkContainer("TEST 7: Workers (" + mode + ")");
+    log("TEST 7: starting in mode=" + mode);
+
+    // Conservative defaults to avoid kernel panic.
+    // Increase gradually on your device.
+    let maxWorkers = (mode === "LOW") ? 40 : 120;
+    let burst = (mode === "LOW") ? 4 : 8;
+    let workN = (mode === "LOW") ? 15000 : 30000;
+
+    window.__WORKERS = window.__WORKERS || [];
+    const url = makeWorkerURLOnce();
+
+    let created = 0;
+    let completed = 0;
+    let failed = 0;
+
+    function spawnBurst() {
+      if (ABORT) return;
+
+      for (let i = 0; i < burst; i++) {
+        if (ABORT) return;
+        if (created >= maxWorkers) break;
+
+        try {
+          const w = new Worker(url);
+          window.__WORKERS.push(w);
+          created++;
+
+          w.onmessage = function (ev) {
+            completed++;
+            // terminate quickly to stress create/teardown
+            try { w.terminate(); } catch (e1) {}
+            if (completed % 10 === 0) log(`TEST 7: completed=${completed} created=${created} failed=${failed}`);
+          };
+          w.onerror = function () {
+            failed++;
+            try { w.terminate(); } catch (e1) {}
+          };
+
+          w.postMessage({ n: workN });
+
+        } catch (ex) {
+          failed++;
+          log("TEST 7: worker creation exception: " + ex);
+        }
+      }
+
+      if (created < maxWorkers) {
+        // pace creation to reduce global instability
+        setTimeout(spawnBurst, 50);
+      } else {
+        log("TEST 7: reached maxWorkers=" + maxWorkers + " (waiting completions).");
+        // After some time, cleanup
+        setTimeout(() => {
+          if (ABORT) return;
+          log("TEST 7: cleanup pass.");
+          stopAll();
+        }, 2500);
+      }
+    }
+
+    spawnBurst();
+  }
+
+  /* ============================================================
+     WIRE BUTTONS
+     ============================================================ */
+  document.getElementById("btnClear").addEventListener("click", clearLog);
+  document.getElementById("btnStop").addEventListener("click", stopAll);
+
+  document.getElementById("tFullscreen").addEventListener("click", testFullscreenBlurDOM);
+
+  document.getElementById("tHistoryA").addEventListener("click", testHistoryComplex);
+  document.getElementById("tHistoryB").addEventListener("click", testHistoryPopstateSync);
+
+  document.getElementById("tMedia").addEventListener("click", testMediaTeardown);
+
+  document.getElementById("tDomDeep").addEventListener("click", testDomDeepLayout);
+
+  document.getElementById("tCanvas").addEventListener("click", testCanvas2D);
+
+  document.getElementById("tFonts").addEventListener("click", testFonts);
+
+  document.getElementById("tWorkersLow").addEventListener("click", (e) => testWorkers(e, "LOW"));
+  document.getElementById("tWorkersMed").addEventListener("click", (e) => testWorkers(e, "MED"));
+
+  // Minimal environment logging
+  log("Env: userAgent=" + navigator.userAgent);
+  log("Env: WebGL=" + (function(){ try { return !!document.createElement("canvas").getContext("webgl"); } catch(e){ return false; } })());
+  log("Env: FontFace=" + (typeof FontFace !== "undefined"));
+  log("Env: Worker=" + (typeof Worker !== "undefined"));
+  log("Ready.");
+})();
+</script>
+</body>
+</html>
