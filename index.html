@@ -1,373 +1,301 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>PS4 OMEGA Hunter (161-170)</title>
-<style>
-    body { background: #000; color: #ff0000; font-family: 'Consolas', monospace; }
-    button { width: 100%; padding: 12px; margin: 5px 0; background: #330000; color: #ff0000; border: 1px solid #ff0000; cursor: pointer; font-weight: bold; }
-    button:hover { background: #ff0000; color: #fff; }
-    #log { border: 1px solid #ff0000; padding: 10px; margin-top: 20px; height: 350px; overflow-y: scroll; white-space: pre-wrap; font-size: 11px;}
-    .gold { color: gold; font-weight: bold; font-size: 1.2em; animation: blink 1s infinite; }
-    @keyframes blink { 50% { opacity: 0.5; } }
-</style>
-</head>
-<body>
+<!doctype html>
+<meta charset="utf-8">
+<title>PS4 Reflect.construct Sanity Suite</title>
 
-<h1>SUITE v1250000: REFLECT EXPLOIT</h1>
-<hr>
-<div>Foco: Escalar o Bug do Teste 152 (Reflect.construct OOB Read)</div>
-<br>
+<body style="background:#000;color:#0f0;font-family:monospace">
+<h2>PS4 Reflect.construct – Sanity Suite (length snapshot vs leak)</h2>
+<p>Objetivo: diferenciar comportamento spec-like (snapshot de length + Gets) de evidências reais (valor inesperado / type confusion / crash).</p>
 
-<button onclick="run(t161)">161. Reflect OOB Read (Targeting Non-Undefined)</button>
+<button onclick="clearLog()">CLEAR</button>
+<button onclick="S1_baseline()">S1 Baseline (sem shrink)</button>
+<button onclick="S2_shrink_mid()">S2 Shrink no meio (Proxy audit)</button>
+<button onclick="S3_length_reads()">S3 Quantas vezes lê 'length'?</button>
+<button onclick="S4_missing_vs_own()">S4 Missing vs OwnProps (holes / deletes)</button>
+<button onclick="S5_invariants()">S5 Invariants (mesma execução repetida)</button>
+<button onclick="S6_typedarray_detach()">S6 TypedArray Detach Sanity</button>
+<button onclick="S7_cross_realm()">S7 Cross-Realm Sanity (iframe)</button>
 
-<button onclick="run(t162)">162. Stack Spray + Reflect Leak (Control Value)</button>
-
-<button onclick="run(t163)">163. JIT Compiled Reflect.construct (Hot Loop)</button>
-
-<button onclick="run(t164)">164. Proxy 'get' Trap inside Reflect</button>
-
-<button onclick="run(t165)">165. Reflect.construct Cross-Iframe (Realm Confusion)</button>
-
-<button onclick="run(t166)">166. Reflect with 'arguments' Object (Memory Layout)</button>
-
-<button onclick="run(t167)">167. Reflect with Array Holes (Theil Read)</button>
-
-<button onclick="run(t168)">168. Reflect using TypedArray source (Raw Memory)</button>
-
-<button onclick="run(t169)">169. Reflect Argument Destructor Race</button>
-
-<button onclick="run(t170)">170. Massive OOB Read (Index 10000+)</button>
-
-<hr>
-<div id="log">Status: Aguardando...</div>
+<pre id="log" style="border:1px solid #0f0; padding:10px; height:420px; overflow:auto; white-space:pre-wrap;"></pre>
 
 <script>
-    const log = document.getElementById('log');
-    let keeper = []; 
+const L = document.getElementById('log');
+function log(s){ L.textContent += s + "\n"; }
+function gold(s){ L.textContent += "[GOLD] " + s + "\n"; }
+function warn(s){ L.textContent += "[WARN] " + s + "\n"; }
+function clearLog(){ L.textContent = ""; }
 
-    function run(func) {
-        log.innerText += "\n[*] Executando: " + func.name;
-        keeper = []; 
-        setTimeout(func, 100);
+// Util: formata valores sem estourar o log
+function fmt(v){
+  const t = typeof v;
+  if (v === undefined) return "undefined";
+  if (v === null) return "null";
+  if (t === "number") return (Object.is(v, -0) ? "-0" : String(v));
+  if (t === "string") return JSON.stringify(v);
+  if (t === "boolean") return String(v);
+  if (t === "symbol") return v.toString();
+  if (t === "function") return "[Function " + (v.name||"anon") + "]";
+  try {
+    if (Array.isArray(v)) return "[Array len=" + v.length + "]";
+    if (v && v.constructor && v.constructor.name) return "[Object " + v.constructor.name + "]";
+  } catch(e){}
+  return "[Object]";
+}
+
+// Util: roda Reflect.construct e captura ...r
+function reflectRun(argsLike, label){
+  let got = null;
+  function Target(...r){ got = r; }
+  try {
+    Reflect.construct(Target, argsLike);
+    log("[" + label + "] OK. received.length=" + (got ? got.length : "null"));
+  } catch(e){
+    warn("[" + label + "] EXCEPTION: " + e.message);
+  }
+  return got;
+}
+
+/* =========================================================
+   S1: Baseline — sem shrink
+   Prova o "comportamento normal" e serve de controle.
+========================================================= */
+function S1_baseline(){
+  log("=== S1 BASELINE ===");
+  const args = [1,2,3,4];
+  const r = reflectRun(args, "baseline");
+  if (!r) return;
+
+  // Checagens básicas
+  log("Values: " + r.map(fmt).join(", "));
+  if (r.length !== 4) warn("Baseline length inesperado: " + r.length);
+  if (r[3] !== 4) warn("Baseline r[3] inesperado: " + fmt(r[3]));
+  log("S1 done.\n");
+}
+
+/* =========================================================
+   S2: Shrink no meio + Proxy audit
+   Registra (a) quantos índices são acessados e (b) se o engine
+   tenta acessar índices altos após o shrink (esperado).
+   O "sucesso" aqui NÃO é bug — é telemetria.
+========================================================= */
+function S2_shrink_mid(){
+  log("=== S2 SHRINK MID (Proxy audit) ===");
+  const base = new Array(100);
+  for (let i=0;i<100;i++) base[i] = 0x11110000 + i;
+
+  let getCount = 0;
+  let lengthReadCount = 0;
+  const accessed = [];
+  const p = new Proxy(base, {
+    get(target, prop, recv){
+      if (prop === "length") {
+        lengthReadCount++;
+        return Reflect.get(target, prop, recv);
+      }
+      // intercepta índices numéricos
+      const n = (typeof prop === "string" && prop === String(prop|0)) ? (prop|0) : NaN;
+      if (!Number.isNaN(n)) {
+        getCount++;
+        if (accessed.length < 50) accessed.push(n); // cap
+        // gatilho: no índice 10, encolhe para 0
+        if (n === 10) {
+          target.length = 0;
+          log("[*] shrink triggered at index 10 (length->0)");
+        }
+      }
+      return Reflect.get(target, prop, recv);
     }
+  });
 
-    // =================================================================
-    // 161. Reflect OOB Read (Targeting Non-Undefined)
-    // Objetivo: Verificar se lemos apenas 'undefined' ou se conseguimos ler
-    // "lixo" da memória (o que seria um Info Leak real).
-    // =================================================================
-    function t161() {
-        const args = [1, 2, 3, 4];
-        
-        // Getter na última posição válida
-        Object.defineProperty(args, 3, {
-            get: () => {
-                args.length = 0; // Encolhe para 0
-                // Preenche o heap imediatamente para tentar sujar a memória vizinha
-                keeper.push(new Array(100).fill(0x41414141));
-                return 4;
-            }
-        });
-        
-        function Target(...received) {
-            // Esperamos 4 argumentos. O 4º disparou o encolhimento.
-            // O 5º argumento (índice 4) estaria fora dos limites.
-            // Mas o Reflect foi chamado com array de tamanho inicial 4.
-            // Vamos tentar ler o que o Reflect passou para a stack.
-            
-            log.innerText += "\n[+] Recebido: " + received.length;
-            if (received.length > 0) {
-                // Check ultimo argumento
-                const last = received[received.length - 1];
-                log.innerText += " Last: " + last;
-                
-                if (last !== 4 && last !== undefined) {
-                    log.innerHTML += "\n<span class='gold'>[GOLD] OOB LEAK: " + last + "</span>";
-                }
-            }
-        }
-        
-        try {
-            Reflect.construct(Target, args);
-        } catch(e) {
-            log.innerText += "\n[-] Erro: " + e.message;
-        }
+  const r = reflectRun(p, "shrink_mid");
+  log("Telemetry: lengthReadCount=" + lengthReadCount + " getCount=" + getCount);
+  log("First accessed indices (cap 50): " + accessed.join(", "));
+  if (r) {
+    // Aqui r.length pode permanecer 100 (snapshot) — isso é o ponto.
+    log("received.length=" + r.length);
+    // Checa se valores após o shrink viram undefined (esperado)
+    let undefAfter = 0;
+    for (let i=20; i<Math.min(r.length, 100); i++){
+      if (r[i] === undefined) undefAfter++;
     }
+    log("undefined count in range [20..99]: " + undefAfter);
+  }
+  log("S2 done.\n");
+}
 
-    // =================================================================
-    // 162. Stack Spray + Reflect Leak (Control Value)
-    // Objetivo: Preencher a stack com valores conhecidos (0x1337) antes de chamar
-    // o Reflect, para ver se o OOB Read lê nossos valores.
-    // =================================================================
-    function t162() {
-        // Função para sujar a stack
-        function spray_stack(depth) {
-            if (depth == 0) return;
-            const a = 1.1, b = 2.2, c = 3.3, d = 4.4; // Lixo na stack
-            spray_stack(depth - 1);
-        }
-        
-        const args = new Array(100);
-        args.fill(1);
-        
-        Object.defineProperty(args, 50, {
-            get: () => {
-                args.length = 1; // Encolhe
-                return 50;
-            }
-        });
-        
-        function Target(...received) {
-            // Verifica se algum argumento OOB contém nossos números float
-            for(let i=51; i<received.length; i++) {
-                const val = received[i];
-                if (typeof val === 'number' && val !== 1 && val !== 50) {
-                    log.innerHTML += "\n<span class='gold'>[GOLD] STACK CONTROL: " + val + " (Index " + i + ")</span>";
-                    return;
-                }
-            }
-            log.innerText += "\n[+] Apenas undefined lido.";
-        }
+/* =========================================================
+   S3: Quantas vezes lê 'length'?
+   Alguns engines leem 1x, outros podem ler mais (depende de
+   otimizações). Isso NÃO é bug; é fingerprint comportamental.
+========================================================= */
+function S3_length_reads(){
+  log("=== S3 LENGTH READS ===");
+  const base = new Array(1000);
+  base.fill(7);
 
-        spray_stack(100); // Suja a stack
-        try {
-            Reflect.construct(Target, args);
-        } catch(e){}
+  let lengthReads = 0;
+  const p = new Proxy(base, {
+    get(t, k, r){
+      if (k === "length") lengthReads++;
+      // gatilho leve: no índice 5, shrink
+      if (k === "5") t.length = 0;
+      return Reflect.get(t, k, r);
     }
+  });
 
-    // =================================================================
-    // 163. JIT Compiled Reflect.construct (Hot Loop)
-    // Objetivo: O JIT pode remover verificações que o interpretador mantém.
-    // Executamos o exploit dentro de um loop quente.
-    // =================================================================
-    function t163() {
-        const args = [1, 2, 3];
-        let trigger = false;
-        
-        Object.defineProperty(args, 1, {
-            get: () => {
-                if (trigger) args.length = 0;
-                return 2;
-            }
-        });
-        
-        function Target(...r) {
-            if (trigger && r[2] !== undefined) { // r[2] é o OOB
-                 log.innerText += " [!] JIT OOB Val: " + r[2];
-            }
-        }
-        
-        function loop() {
-            Reflect.construct(Target, args);
-        }
-        
-        // Treina JIT
-        for(let i=0; i<10000; i++) loop();
-        
-        // Ativa o exploit
-        trigger = true;
-        try {
-            loop();
-            log.innerText += "\n[+] JIT Loop finalizado.";
-        } catch(e) {
-            log.innerText += "\n[-] JIT Crash: " + e.message;
-        }
+  reflectRun(p, "length_reads");
+  log("lengthReads=" + lengthReads);
+  log("S3 done.\n");
+}
+
+/* =========================================================
+   S4: Missing vs OwnProps (holes/deletes)
+   Distingue:
+   - hole (prop ausente)
+   - prop existente mas valor undefined
+========================================================= */
+function S4_missing_vs_own(){
+  log("=== S4 MISSING vs OWNPROPS ===");
+  const args = new Array(20);
+  args.fill(1);
+  // cria holes
+  delete args[5];
+  delete args[6];
+  // cria ownProp undefined
+  args[7] = undefined;
+
+  const p = new Proxy(args, {
+    get(t,k,r){
+      if (k === "length") return Reflect.get(t,k,r);
+      if (k === "3") { t.length = 0; log("[*] shrink at index 3"); }
+      return Reflect.get(t,k,r);
+    },
+    has(t,k){ return Reflect.has(t,k); },
+    getOwnPropertyDescriptor(t,k){ return Reflect.getOwnPropertyDescriptor(t,k); }
+  });
+
+  const r = reflectRun(p, "missing_vs_own");
+  if (!r) return;
+
+  // reporta slots de interesse
+  function slot(i){
+    const has = (i in args);
+    const v = r[i];
+    return "i=" + i + " (own=" + has + ") => " + fmt(v);
+  }
+  log(slot(5));
+  log(slot(6));
+  log(slot(7));
+
+  // GOLD só se algo realmente anômalo aparecer: não-undefined vindo de slot que virou missing
+  if (!(5 in args) && r[5] !== undefined) gold("Slot 5 missing mas veio " + fmt(r[5]));
+  if (!(6 in args) && r[6] !== undefined) gold("Slot 6 missing mas veio " + fmt(r[6]));
+  log("S4 done.\n");
+}
+
+/* =========================================================
+   S5: Invariants — repetibilidade (N execuções)
+   Se aparecer valor não-determinístico em slots missing,
+   isso é muito mais interessante do que "undefined".
+========================================================= */
+function S5_invariants(){
+  log("=== S5 INVARIANTS (repeatability) ===");
+  const N = 30;
+  const seen = new Map();
+
+  for (let iter=0; iter<N; iter++){
+    const args = new Array(200);
+    args.fill(0x2222);
+
+    Object.defineProperty(args, 10, {
+      get: () => { args.length = 0; return 0x3333; }
+    });
+
+    let r = null;
+    function T(...x){ r = x; }
+    try { Reflect.construct(T, args); } catch(e){ warn("iter "+iter+": " + e.message); continue; }
+
+    // checa alguns índices altos
+    const idxs = [50, 100, 150, 199];
+    for (const i of idxs){
+      const v = r[i];
+      const key = "i" + i;
+      const s = fmt(v) + "|" + (typeof v);
+      if (!seen.has(key)) seen.set(key, new Set());
+      seen.get(key).add(s);
     }
+  }
 
-    // =================================================================
-    // 164. Proxy 'get' Trap inside Reflect
-    // Objetivo: Usar Proxy dá controle total sobre a execução do getter.
-    // =================================================================
-    function t164() {
-        const target_arr = [1, 2, 3];
-        const p = new Proxy(target_arr, {
-            get: function(target, prop) {
-                if (prop === '1') {
-                    target.length = 0;
-                    log.innerText += " [!] Proxy triggered shrink.";
-                }
-                return Reflect.get(target, prop);
-            }
-        });
-        
-        function Target(...r) {
-            log.innerText += "\n[+] Received args: " + r.length;
-            if (r.length > 1 && r[2] === undefined) {
-                 log.innerHTML += "\n<span class='gold'>[GOLD] Proxy-based OOB Success</span>";
-            }
-        }
-        
-        try {
-            Reflect.construct(Target, p);
-        } catch(e){}
+  for (const [k,set] of seen.entries()){
+    log(k + " uniqueValues=" + set.size + " => " + Array.from(set).join(", "));
+    // GOLD: diversidade inesperada (não-determinismo)
+    // Observação: pode ocorrer por diferenças legítimas, mas é um bom gatilho de investigação.
+    if (set.size > 1) gold("Non-determinism detected at " + k);
+  }
+  log("S5 done.\n");
+}
+
+/* =========================================================
+   S6: TypedArray detach sanity
+   Verifica se detach no meio muda resultados de forma
+   consistente. Não é exploit; é fingerprint + estabilidade.
+========================================================= */
+function S6_typedarray_detach(){
+  log("=== S6 TYPEDARRAY DETACH ===");
+  const buf = new ArrayBuffer(64);
+  const u32 = new Uint32Array(buf);
+  for (let i=0;i<u32.length;i++) u32[i] = 0x44440000 + i;
+
+  const p = new Proxy(u32, {
+    get(t,k,r){
+      if (k === "length") return Reflect.get(t,k,r);
+      if (k === "2") {
+        try { postMessage(buf, [buf]); log("[*] detach attempted"); } catch(e){ warn("detach failed: "+e.message); }
+      }
+      return Reflect.get(t,k,r);
     }
+  });
 
-    // =================================================================
-    // 165. Reflect.construct Cross-Iframe (Realm Confusion)
-    // Objetivo: Executar o Reflect em um contexto de iframe.
-    // Se o layout de memória for diferente, o OOB pode pegar objetos de segurança.
-    // =================================================================
-    function t165() {
-        const ifr = document.createElement('iframe');
-        document.body.appendChild(ifr);
-        
-        const win = ifr.contentWindow;
-        const args = new win.Array(10);
-        args.fill(1);
-        
-        Object.defineProperty(args, 5, {
-            get: () => { args.length = 0; return 5; }
-        });
-        
-        function Target(...r) {
-            if (r.length === 10 && r[9] === undefined) {
-                log.innerText += "\n[+] Cross-Realm OOB confirmado.";
-            }
-        }
-        
-        try {
-            win.Reflect.construct(Target, args);
-        } catch(e){}
-        ifr.remove();
-    }
+  const r = reflectRun(p, "typed_detach");
+  if (r) log("Sample: r[0]=" + fmt(r[0]) + " r[3]=" + fmt(r[3]));
+  log("S6 done.\n");
+}
 
-    // =================================================================
-    // 166. Reflect with 'arguments' Object (Memory Layout)
-    // Objetivo: O objeto 'arguments' não é um array comum.
-    // O layout de memória dele na stack é diferente.
-    // =================================================================
-    function t166() {
-        function get_args() { return arguments; }
-        const args = get_args(1, 2, 3, 4, 5);
-        
-        Object.defineProperty(args, 2, {
-            get: () => { 
-                args.length = 0; // Tenta limpar
-                // arguments não tem propriedade .length writable da mesma forma que array em alguns engines
-                // mas podemos tentar deletar índices
-                delete args[3];
-                delete args[4];
-                return 2; 
-            }
-        });
-        
-        function Target(...r) {
-            log.innerText += "\n[+] Args OOB result: " + r[3] + ", " + r[4];
-        }
-        
-        Reflect.construct(Target, args);
-    }
+/* =========================================================
+   S7: Cross-realm sanity (iframe)
+   Verifica apenas consistência do comportamento em realm
+   diferente e registra telemetria simples.
+========================================================= */
+function S7_cross_realm(){
+  log("=== S7 CROSS REALM ===");
+  const ifr = document.createElement("iframe");
+  document.body.appendChild(ifr);
 
-    // =================================================================
-    // 167. Reflect with Array Holes (Theil Read)
-    // Objetivo: Arrays com buracos (holes) podem retornar 'undefined' ou
-    // um valor especial 'Theil' (hole value) se o JIT falhar.
-    // =================================================================
-    function t167() {
-        const args = [1, , , 4]; // Holes
-        
-        Object.defineProperty(args, 0, {
-            get: () => {
-                args.length = 0;
-                return 1;
-            }
-        });
-        
-        function Target(...r) {
-            // Verifica se o buraco (index 1) lê algo diferente de undefined após o shrink
-            log.innerText += "\n[+] Hole read: " + r[1];
-        }
-        
-        Reflect.construct(Target, args);
-    }
+  try {
+    const w = ifr.contentWindow;
+    const args = new w.Array(100);
+    args.fill(9);
 
-    // =================================================================
-    // 168. Reflect using TypedArray source (Raw Memory)
-    // Objetivo: Usar um Uint32Array como fonte de argumentos.
-    // TypedArrays não podem ter getters em índices, mas podemos usar Proxy.
-    // =================================================================
-    function t168() {
-        const buf = new ArrayBuffer(16);
-        const u32 = new Uint32Array(buf); // [0,0,0,0]
-        
-        const p = new Proxy(u32, {
-            get: (t, k) => {
-                if (k == 1) {
-                    // Detach buffer
-                    try { postMessage(buf, [buf]); } catch(e){}
-                }
-                return Reflect.get(t, k);
-            }
-        });
-        
-        function Target(...r) {
-            log.innerText += "\n[+] TypedArray Reflect len: " + r.length;
-            if (r.length > 0 && r[3] === undefined) {
-                 log.innerText += " (Read detached memory as undefined)";
-            }
-        }
-        
-        try { Reflect.construct(Target, p); } catch(e){}
-    }
+    let lengthReads = 0;
+    const p = new w.Proxy(args, {
+      get(t,k,r){
+        if (k === "length") lengthReads++;
+        if (k === "5") t.length = 0;
+        return w.Reflect.get(t,k,r);
+      }
+    });
 
-    // =================================================================
-    // 169. Reflect Argument Destructor Race
-    // Objetivo: Passar objetos que executam código ao serem destruídos (via GC).
-    // Tentar forçar o GC no meio do Reflect.
-    // =================================================================
-    function t169() {
-        const args = [];
-        for(let i=0; i<100; i++) args.push({id: i});
-        
-        Object.defineProperty(args, 50, {
-            get: () => {
-                args.length = 0;
-                // Pressão MASSIVA de GC para tentar coletar os objetos que estavam no array
-                // mas que o Reflect ainda está copiando
-                let tmp = [];
-                for(let k=0; k<5000; k++) tmp.push(new Uint8Array(1024));
-                return 50;
-            }
-        });
-        
-        function Target(...r) {
-            // Verifica se recebemos objetos corrompidos
-            log.innerText += "\n[+] Destructor race check complete.";
-        }
-        
-        Reflect.construct(Target, args);
-    }
+    let got = null;
+    function T(...x){ got = x; }
+    w.Reflect.construct(T, p);
 
-    // =================================================================
-    // 170. Massive OOB Read (Index 10000+)
-    // Objetivo: Tentar ler muito longe. Se não houver bounds check algum,
-    // podemos ler páginas inteiras de memória.
-    // =================================================================
-    function t170() {
-        const args = new Array(10000);
-        args.fill(1);
-        
-        Object.defineProperty(args, 1, {
-            get: () => {
-                args.length = 0;
-                return 1;
-            }
-        });
-        
-        function Target(...r) {
-            // Verifica o último elemento (índice 9999)
-            // Se o loop correu até o fim com array zerado, lemos 10000 slots de lixo
-            if (r.length === 10000) {
-                 log.innerHTML += "\n<span class='gold'>[GOLD] MASSIVE OOB READ CONFIRMED (10k slots)</span>";
-            } else {
-                 log.innerText += "\n[-] Loop parou antes: " + r.length;
-            }
-        }
-        
-        try { Reflect.construct(Target, args); } catch(e){}
-    }
-
+    log("received.length=" + (got ? got.length : "null") + " lengthReads=" + lengthReads);
+    if (got) log("samples: " + [0,1,5,99].map(i=>("r["+i+"]="+fmt(got[i]))).join(" "));
+  } catch(e){
+    warn("cross-realm exception: " + e.message);
+  } finally {
+    ifr.remove();
+  }
+  log("S7 done.\n");
+}
 </script>
 </body>
-</html>
