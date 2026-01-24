@@ -1,347 +1,742 @@
 <!doctype html>
-<meta charset="utf-8">
-<title>PS4 Reflect.construct Sanity Suite</title>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PS4 WebKit – Sanity/Crash Hunting Suite (20 testes)</title>
+  <style>
+    body { background:#000; color:#0f0; font-family:monospace; margin:12px; }
+    h1,h2 { color:#9f9; margin:8px 0; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; }
+    button { background:#111; color:#0f0; border:1px solid #0f0; padding:10px 12px; cursor:pointer; }
+    button:hover { background:#0f0; color:#000; }
+    #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; height:420px; overflow:auto; background:#060606; }
+    .muted { color:#6f6; }
+  </style>
+</head>
+<body>
+  <h1>PS4 WebKit – Sanity/Crash Hunting Suite (20 testes)</h1>
+  <div class="muted">
+    Foco: encontrar novos vetores de crash/CE (sem exploração).<br>
+    Dica: rode 1 por vez; se travar, anote o último "STEP" no log.
+  </div>
 
-<body style="background:#000;color:#0f0;font-family:monospace">
-<h2>PS4 Reflect.construct – Sanity Suite (length snapshot vs leak)</h2>
-<p>Objetivo: diferenciar comportamento spec-like (snapshot de length + Gets) de evidências reais (valor inesperado / type confusion / crash).</p>
+  <div class="row" style="margin:10px 0;">
+    <button onclick="clearLog()">CLEAR</button>
+    <button onclick="resetEnv()">RESET DOM</button>
+    <button onclick="stopLoop()">STOP LOOP</button>
+    <button onclick="loopAll(30)">LOOP ALL x30</button>
+  </div>
 
-<button onclick="clearLog()">CLEAR</button>
-<button onclick="S1_baseline()">S1 Baseline (sem shrink)</button>
-<button onclick="S2_shrink_mid()">S2 Shrink no meio (Proxy audit)</button>
-<button onclick="S3_length_reads()">S3 Quantas vezes lê 'length'?</button>
-<button onclick="S4_missing_vs_own()">S4 Missing vs OwnProps (holes / deletes)</button>
-<button onclick="S5_invariants()">S5 Invariants (mesma execução repetida)</button>
-<button onclick="S6_typedarray_detach()">S6 TypedArray Detach Sanity</button>
-<button onclick="S7_cross_realm()">S7 Cross-Realm Sanity (iframe)</button>
-    <button onclick="S6_typedarray_detach_FIXED()">S6 TypedArray Detach Sanity (FIXED)</button>
+  <h2>Testes (clique para executar)</h2>
+  <div class="row">
+    <button onclick="run(T01)">T01 SVG Path metrics + mutação</button>
+    <button onclick="run(T02)">T02 SVG getBBox/getCTM + teardown</button>
+    <button onclick="run(T03)">T03 SVG filters (blur) + remoção</button>
+    <button onclick="run(T04)">T04 SVG foreignObject + subtree churn</button>
 
+    <button onclick="run(T05)">T05 Range.surroundContents + remoção</button>
+    <button onclick="run(T06)">T06 Range.extractContents + normalize</button>
+    <button onclick="run(T07)">T07 Selection churn + DOM rewrite</button>
+    <button onclick="run(T08)">T08 TreeWalker/NodeIterator + remoção</button>
 
-<pre id="log" style="border:1px solid #0f0; padding:10px; height:420px; overflow:auto; white-space:pre-wrap;"></pre>
+    <button onclick="run(T09)">T09 MutationObserver reentrância + flush</button>
+    <button onclick="run(T10)">T10 ResizeObserver loop (se houver)</button>
+    <button onclick="run(T11)">T11 IntersectionObserver churn (se houver)</button>
+
+    <button onclick="run(T12)">T12 Canvas2D resize + get/putImageData</button>
+    <button onclick="run(T13)">T13 Canvas2D pattern/gradient + teardown</button>
+    <button onclick="run(T14)">T14 Image decode data: + remove/reuse</button>
+    <button onclick="run(T15)">T15 createImageBitmap (se houver)</button>
+
+    <button onclick="run(T16)">T16 WebAudio graph churn (se houver)</button>
+    <button onclick="run(T17)">T17 FontFace load churn (se houver)</button>
+
+    <button onclick="run(T18)">T18 History/hashchange + teardown</button>
+    <button onclick="run(T19)">T19 CSS variables/calc + layout thrash</button>
+    <button onclick="run(T20)">T20 Shadow DOM/slots churn (se houver)</button>
+  </div>
+
+  <pre id="log">Status: pronto.</pre>
 
 <script>
-const L = document.getElementById('log');
-function log(s){ L.textContent += s + "\n"; }
-function gold(s){ L.textContent += "[GOLD] " + s + "\n"; }
-function warn(s){ L.textContent += "[WARN] " + s + "\n"; }
-function clearLog(){ L.textContent = ""; }
+/* =========================
+   Infra / Logger
+========================= */
+const logEl = document.getElementById('log');
+let keeper = [];
+let loopTimer = null;
+let loopStop = false;
+let lastTestName = "";
 
-// Util: formata valores sem estourar o log
-function fmt(v){
-  const t = typeof v;
-  if (v === undefined) return "undefined";
-  if (v === null) return "null";
-  if (t === "number") return (Object.is(v, -0) ? "-0" : String(v));
-  if (t === "string") return JSON.stringify(v);
-  if (t === "boolean") return String(v);
-  if (t === "symbol") return v.toString();
-  if (t === "function") return "[Function " + (v.name||"anon") + "]";
-  try {
-    if (Array.isArray(v)) return "[Array len=" + v.length + "]";
-    if (v && v.constructor && v.constructor.name) return "[Object " + v.constructor.name + "]";
-  } catch(e){}
-  return "[Object]";
+function ts(){
+  const d = new Date();
+  const z = (n)=>String(n).padStart(2,'0');
+  return `${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,'0')}`;
+}
+function log(s){ logEl.textContent += `\n[${ts()}] ${s}`; logEl.scrollTop = logEl.scrollHeight; }
+function warn(s){ log(`WARN: ${s}`); }
+function step(s){ log(`STEP: ${s}`); }
+function ok(s){ log(`OK: ${s}`); }
+
+function clearLog(){ logEl.textContent = "Status: pronto."; }
+function stopLoop(){ loopStop = true; if (loopTimer) { clearTimeout(loopTimer); loopTimer=null; } log("LOOP: stop solicitado."); }
+
+function resetEnv(){
+  stopLoop();
+  keeper = [];
+  // limpa body extra, preserva UI
+  const nodes = Array.from(document.body.querySelectorAll(".sandbox"));
+  for (const n of nodes) n.remove();
+  ok("RESET: sandbox limpo.");
 }
 
-// Util: roda Reflect.construct e captura ...r
-function reflectRun(argsLike, label){
-  let got = null;
-  function Target(...r){ got = r; }
+function run(fn){
+  stopLoop();
+  keeper = [];
+  lastTestName = fn.name;
+  log(`\n=== RUN ${fn.name} ===`);
+  // isola execução e captura exceções
+  setTimeout(() => {
+    try { fn(); }
+    catch(e){ warn(`${fn.name} exception: ${e && e.message ? e.message : e}`); }
+    finally { ok(`${fn.name} finished (se não travou).`); }
+  }, 0);
+}
+
+function loopAll(n){
+  stopLoop();
+  loopStop = false;
+  const tests = [T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20];
+  let i = 0, iter = 0;
+  log(`\n=== LOOP ALL start: ${n} iterações ===`);
+  const tick = () => {
+    if (loopStop) { ok("LOOP ALL stopped."); return; }
+    if (iter >= n) { ok("LOOP ALL concluído."); return; }
+    const fn = tests[i];
+    keeper = [];
+    lastTestName = fn.name;
+    log(`\n--- LOOP iter=${iter+1}/${n} test=${fn.name} ---`);
+    try { fn(); } catch(e){ warn(`${fn.name} exception: ${e && e.message ? e.message : e}`); }
+    i++;
+    if (i >= tests.length) { i=0; iter++; }
+    loopTimer = setTimeout(tick, 60); // pequeno delay para variar timing
+  };
+  loopTimer = setTimeout(tick, 50);
+}
+
+/* =========================
+   Helpers
+========================= */
+function mkSandbox(){
+  const d = document.createElement('div');
+  d.className = "sandbox";
+  d.style.cssText = "position:relative; border:1px dashed #0f0; margin:10px 0; padding:8px;";
+  document.body.appendChild(d);
+  return d;
+}
+
+function forceLayout(el){
+  // pequenas leituras que tendem a forçar flush de layout
+  try { void el.offsetHeight; } catch(e){}
+  try { void el.getBoundingClientRect(); } catch(e){}
+  try { void getComputedStyle(el).width; } catch(e){}
+}
+
+function heapPressure(bytesKB){
+  // pressão moderada, não agressiva a ponto de parecer DoS intencional
+  const n = Math.max(32, Math.min(512, bytesKB|0));
+  const arr = [];
+  for (let i=0;i<n;i++) arr.push(new Uint8Array(1024));
+  keeper.push(arr);
+}
+
+/* =========================================================
+   01–04: SVG
+========================================================= */
+function T01(){
+  const box = mkSandbox();
+  step("Criando SVG path e alternando atributo 'd' enquanto chama getTotalLength()");
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns,'svg');
+  svg.setAttribute('width','320'); svg.setAttribute('height','120');
+  const path = document.createElementNS(ns,'path');
+  path.setAttribute('stroke','#0f0'); path.setAttribute('fill','none'); path.setAttribute('stroke-width','2');
+  svg.appendChild(path); box.appendChild(svg);
+
+  for (let i=0;i<80;i++){
+    const d = `M 5 ${10+(i%80)} C 80 ${10+(i%50)} 160 ${110-(i%90)} 315 ${10+(i%80)}`;
+    path.setAttribute('d', d);
+    // métricas de path costumam tocar código interno SVG
+    try { path.getTotalLength(); } catch(e){ warn("getTotalLength: "+e.message); }
+    if (i % 10 === 0) forceLayout(svg);
+  }
+  ok("SVG path metrics loop concluído.");
+}
+
+function T02(){
+  const box = mkSandbox();
+  step("SVG getBBox/getCTM + remover/reanexar elemento durante leituras");
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns,'svg');
+  svg.setAttribute('width','320'); svg.setAttribute('height','160');
+  const g = document.createElementNS(ns,'g');
+  const r = document.createElementNS(ns,'rect');
+  r.setAttribute('x','10'); r.setAttribute('y','10'); r.setAttribute('width','120'); r.setAttribute('height','80');
+  r.setAttribute('fill','#0a0');
+  g.appendChild(r); svg.appendChild(g); box.appendChild(svg);
+
+  for (let i=0;i<120;i++){
+    r.setAttribute('transform', `translate(${(i%20)},${(i%30)}) rotate(${i%30})`);
+    try { r.getBBox(); } catch(e){ warn("getBBox: "+e.message); }
+    try { r.getCTM && r.getCTM(); } catch(e){ warn("getCTM: "+e.message); }
+    if (i === 40){ step("Teardown parcial: remove rect"); r.remove(); }
+    if (i === 60){ step("Reanexando rect"); g.appendChild(r); }
+    if (i % 15 === 0) forceLayout(svg);
+  }
+  ok("SVG bbox/ctm churn concluído.");
+}
+
+function T03(){
+  const box = mkSandbox();
+  step("SVG filter (GaussianBlur) alternando + remoção do nó");
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns,'svg');
+  svg.setAttribute('width','320'); svg.setAttribute('height','160');
+
+  const defs = document.createElementNS(ns,'defs');
+  const filter = document.createElementNS(ns,'filter');
+  filter.setAttribute('id','f1');
+  const blur = document.createElementNS(ns,'feGaussianBlur');
+  blur.setAttribute('stdDeviation','2');
+  filter.appendChild(blur);
+  defs.appendChild(filter);
+  svg.appendChild(defs);
+
+  const rect = document.createElementNS(ns,'rect');
+  rect.setAttribute('x','10'); rect.setAttribute('y','10'); rect.setAttribute('width','280'); rect.setAttribute('height','120');
+  rect.setAttribute('fill','#090');
+  rect.setAttribute('filter','url(#f1)');
+  svg.appendChild(rect);
+  box.appendChild(svg);
+
+  for (let i=0;i<140;i++){
+    blur.setAttribute('stdDeviation', String((i%10)+0.2));
+    rect.setAttribute('opacity', String((i%10)/10));
+    if (i === 60){ step("Removendo rect durante filter churn"); rect.remove(); }
+    if (i === 80){ step("Reanexando rect"); svg.appendChild(rect); }
+    if (i % 10 === 0) forceLayout(svg);
+  }
+  ok("SVG filter churn concluído.");
+}
+
+function T04(){
+  const box = mkSandbox();
+  step("SVG foreignObject com subtree HTML churn (cria/remove) + medições");
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns,'svg');
+  svg.setAttribute('width','360'); svg.setAttribute('height','160');
+  const fo = document.createElementNS(ns,'foreignObject');
+  fo.setAttribute('x','10'); fo.setAttribute('y','10'); fo.setAttribute('width','340'); fo.setAttribute('height','140');
+  const div = document.createElement('div');
+  div.style.cssText = "font-size:14px; color:#0f0; border:1px solid #0f0;";
+  div.textContent = "foreignObject";
+  fo.appendChild(div);
+  svg.appendChild(fo);
+  box.appendChild(svg);
+
+  for (let i=0;i<80;i++){
+    // churn subtree
+    const span = document.createElement('span');
+    span.textContent = " #" + i + " ";
+    div.appendChild(span);
+    if (i % 5 === 0) div.innerHTML = "reset " + i; // rewrite
+    if (i % 7 === 0) forceLayout(svg);
+    if (i === 40){ step("Remove foreignObject"); fo.remove(); }
+    if (i === 55){ step("Re-add foreignObject"); svg.appendChild(fo); }
+  }
+  ok("SVG foreignObject churn concluído.");
+}
+
+/* =========================================================
+   05–08: Range/Selection/Traversal
+========================================================= */
+function T05(){
+  const box = mkSandbox();
+  step("Range.surroundContents + remover nós alvo durante operação");
+  const host = document.createElement('div');
+  host.innerHTML = "<p>AAA <b>BBB</b> CCC <i>DDD</i> EEE</p>";
+  box.appendChild(host);
+
+  const p = host.querySelector('p');
+  const b = host.querySelector('b');
+  const iel = host.querySelector('i');
+
+  const r = document.createRange();
+  r.setStart(p.firstChild, 0);
+  r.setEnd(iel.firstChild, 2);
+
+  const wrap = document.createElement('span');
+  wrap.style.cssText = "border:1px solid #0f0;";
+
   try {
-    Reflect.construct(Target, argsLike);
-    log("[" + label + "] OK. received.length=" + (got ? got.length : "null"));
+    // teardown em timing microtask
+    Promise.resolve().then(() => { step("Microtask: removendo <b>"); b.remove(); });
+    r.surroundContents(wrap);
+    ok("surroundContents OK");
   } catch(e){
-    warn("[" + label + "] EXCEPTION: " + e.message);
+    warn("surroundContents exception: " + e.message);
   }
-  return got;
+  forceLayout(host);
 }
 
-/* =========================================================
-   S1: Baseline — sem shrink
-   Prova o "comportamento normal" e serve de controle.
-========================================================= */
-function S1_baseline(){
-  log("=== S1 BASELINE ===");
-  const args = [1,2,3,4];
-  const r = reflectRun(args, "baseline");
-  if (!r) return;
+function T06(){
+  const box = mkSandbox();
+  step("Range.extractContents + normalize + rewrite");
+  const host = document.createElement('div');
+  host.innerHTML = "<div id='x'>Hello <span>World</span> <em>!!</em> <u>test</u></div>";
+  box.appendChild(host);
+  const x = host.querySelector('#x');
 
-  // Checagens básicas
-  log("Values: " + r.map(fmt).join(", "));
-  if (r.length !== 4) warn("Baseline length inesperado: " + r.length);
-  if (r[3] !== 4) warn("Baseline r[3] inesperado: " + fmt(r[3]));
-  log("S1 done.\n");
-}
+  const r = document.createRange();
+  r.setStart(x.firstChild, 2);
+  r.setEnd(x.querySelector('u').firstChild, 2);
 
-/* =========================================================
-   S2: Shrink no meio + Proxy audit
-   Registra (a) quantos índices são acessados e (b) se o engine
-   tenta acessar índices altos após o shrink (esperado).
-   O "sucesso" aqui NÃO é bug — é telemetria.
-========================================================= */
-function S2_shrink_mid(){
-  log("=== S2 SHRINK MID (Proxy audit) ===");
-  const base = new Array(100);
-  for (let i=0;i<100;i++) base[i] = 0x11110000 + i;
-
-  let getCount = 0;
-  let lengthReadCount = 0;
-  const accessed = [];
-  const p = new Proxy(base, {
-    get(target, prop, recv){
-      if (prop === "length") {
-        lengthReadCount++;
-        return Reflect.get(target, prop, recv);
-      }
-      // intercepta índices numéricos
-      const n = (typeof prop === "string" && prop === String(prop|0)) ? (prop|0) : NaN;
-      if (!Number.isNaN(n)) {
-        getCount++;
-        if (accessed.length < 50) accessed.push(n); // cap
-        // gatilho: no índice 10, encolhe para 0
-        if (n === 10) {
-          target.length = 0;
-          log("[*] shrink triggered at index 10 (length->0)");
-        }
-      }
-      return Reflect.get(target, prop, recv);
+  for (let k=0;k<30;k++){
+    try {
+      const frag = r.extractContents();
+      keeper.push(frag);
+      x.normalize();
+      if (k % 3 === 0) x.innerHTML += "<span>.</span>";
+      if (k % 5 === 0) x.innerHTML = "<span>reset</span>" + k;
+    } catch(e){
+      warn("extract/normalize exception: " + e.message);
+      break;
     }
+    forceLayout(x);
+  }
+  ok("Range extract loop concluído (ou interrompido por exceção).");
+}
+
+function T07(){
+  const box = mkSandbox();
+  step("Selection churn + DOM rewrite (sem execCommand)");
+  const host = document.createElement('div');
+  host.contentEditable = "true";
+  host.style.cssText = "border:1px solid #0f0; padding:6px; min-height:60px;";
+  host.textContent = "Editable text for selection churn. " + "X".repeat(200);
+  box.appendChild(host);
+
+  const sel = window.getSelection ? window.getSelection() : null;
+  if (!sel){ warn("Selection API ausente."); return; }
+
+  for (let i=0;i<60;i++){
+    try{
+      const r = document.createRange();
+      const tn = host.firstChild;
+      const a = Math.min(10+i, tn.length-1);
+      const b = Math.min(a+5, tn.length);
+      r.setStart(tn, a);
+      r.setEnd(tn, b);
+      sel.removeAllRanges();
+      sel.addRange(r);
+
+      if (i % 8 === 0) host.innerHTML = "rewrite " + i + " " + "Y".repeat(120);
+      if (i % 10 === 0) host.removeAttribute("contenteditable"), host.contentEditable="true";
+      forceLayout(host);
+    } catch(e){
+      warn("Selection churn exception: " + e.message);
+      break;
+    }
+  }
+  ok("Selection churn concluído.");
+}
+
+function T08(){
+  const box = mkSandbox();
+  step("TreeWalker/NodeIterator + remoção enquanto itera");
+  const host = document.createElement('div');
+  host.innerHTML = "<ul>" + Array.from({length:80}, (_,i)=>`<li><span>A${i}</span><b>B${i}</b></li>`).join("") + "</ul>";
+  box.appendChild(host);
+
+  const tw = document.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, null, false);
+  let count = 0;
+  let node;
+  while ((node = tw.nextNode())) {
+    count++;
+    if (count % 17 === 0) {
+      // remove um ancestral para bagunçar a iteração
+      const li = node.closest && node.closest('li');
+      if (li) li.remove();
+    }
+    if (count > 300) break;
+  }
+  ok("TreeWalker iter count=" + count);
+  forceLayout(host);
+}
+
+/* =========================================================
+   09–11: Observers
+========================================================= */
+function T09(){
+  const box = mkSandbox();
+  step("MutationObserver reentrante + flush de layout dentro do callback");
+  const host = document.createElement('div');
+  host.style.cssText = "border:1px solid #0f0; padding:6px;";
+  box.appendChild(host);
+
+  let fired = 0;
+  const mo = new MutationObserver((mutList) => {
+    fired++;
+    // reentrância: desconecta/reconecta + teardown parcial
+    if (fired === 1) step("MO fired#1: disconnect + rebuild");
+    if (fired % 2 === 0) mo.disconnect();
+    if (fired === 3) host.innerHTML = ""; // teardown
+    if (fired === 4) host.innerHTML = "<span>rebuilt</span>";
+    forceLayout(host);
+    if (fired % 2 === 0) mo.observe(host, {childList:true, subtree:true, attributes:true});
   });
 
-  const r = reflectRun(p, "shrink_mid");
-  log("Telemetry: lengthReadCount=" + lengthReadCount + " getCount=" + getCount);
-  log("First accessed indices (cap 50): " + accessed.join(", "));
-  if (r) {
-    // Aqui r.length pode permanecer 100 (snapshot) — isso é o ponto.
-    log("received.length=" + r.length);
-    // Checa se valores após o shrink viram undefined (esperado)
-    let undefAfter = 0;
-    for (let i=20; i<Math.min(r.length, 100); i++){
-      if (r[i] === undefined) undefAfter++;
-    }
-    log("undefined count in range [20..99]: " + undefAfter);
+  mo.observe(host, {childList:true, subtree:true, attributes:true});
+  for (let i=0;i<50;i++){
+    const s = document.createElement('span');
+    s.textContent = "x"+i;
+    host.appendChild(s);
+    if (i % 5 === 0) host.setAttribute('data-x', String(i));
   }
-  log("S2 done.\n");
+  mo.disconnect();
+  ok("MutationObserver churn concluído. fired=" + fired);
 }
 
-/* =========================================================
-   S3: Quantas vezes lê 'length'?
-   Alguns engines leem 1x, outros podem ler mais (depende de
-   otimizações). Isso NÃO é bug; é fingerprint comportamental.
-========================================================= */
-function S3_length_reads(){
-  log("=== S3 LENGTH READS ===");
-  const base = new Array(1000);
-  base.fill(7);
+function T10(){
+  const box = mkSandbox();
+  step("ResizeObserver loop (se suportado) com teardown no callback");
+  if (typeof ResizeObserver === "undefined") { warn("ResizeObserver não suportado."); return; }
+  const host = document.createElement('div');
+  host.style.cssText = "width:80px; height:40px; border:1px solid #0f0;";
+  box.appendChild(host);
 
-  let lengthReads = 0;
-  const p = new Proxy(base, {
-    get(t, k, r){
-      if (k === "length") lengthReads++;
-      // gatilho leve: no índice 5, shrink
-      if (k === "5") t.length = 0;
-      return Reflect.get(t, k, r);
-    }
+  let n = 0;
+  const ro = new ResizeObserver(() => {
+    n++;
+    if (n === 1) step("RO fired#1");
+    if (n === 4) { step("RO: removing host"); host.remove(); }
+    if (n === 6) { step("RO: re-adding host"); box.appendChild(host); }
   });
+  ro.observe(host);
 
-  reflectRun(p, "length_reads");
-  log("lengthReads=" + lengthReads);
-  log("S3 done.\n");
-}
-
-/* =========================================================
-   S4: Missing vs OwnProps (holes/deletes)
-   Distingue:
-   - hole (prop ausente)
-   - prop existente mas valor undefined
-========================================================= */
-function S4_missing_vs_own(){
-  log("=== S4 MISSING vs OWNPROPS ===");
-  const args = new Array(20);
-  args.fill(1);
-  // cria holes
-  delete args[5];
-  delete args[6];
-  // cria ownProp undefined
-  args[7] = undefined;
-
-  const p = new Proxy(args, {
-    get(t,k,r){
-      if (k === "length") return Reflect.get(t,k,r);
-      if (k === "3") { t.length = 0; log("[*] shrink at index 3"); }
-      return Reflect.get(t,k,r);
-    },
-    has(t,k){ return Reflect.has(t,k); },
-    getOwnPropertyDescriptor(t,k){ return Reflect.getOwnPropertyDescriptor(t,k); }
-  });
-
-  const r = reflectRun(p, "missing_vs_own");
-  if (!r) return;
-
-  // reporta slots de interesse
-  function slot(i){
-    const has = (i in args);
-    const v = r[i];
-    return "i=" + i + " (own=" + has + ") => " + fmt(v);
+  for (let i=0;i<40;i++){
+    host.style.width = (80 + (i%30)) + "px";
+    host.style.height = (40 + (i%20)) + "px";
+    forceLayout(host);
   }
-  log(slot(5));
-  log(slot(6));
-  log(slot(7));
+  ro.disconnect();
+  ok("ResizeObserver churn concluído. fired=" + n);
+}
 
-  // GOLD só se algo realmente anômalo aparecer: não-undefined vindo de slot que virou missing
-  if (!(5 in args) && r[5] !== undefined) gold("Slot 5 missing mas veio " + fmt(r[5]));
-  if (!(6 in args) && r[6] !== undefined) gold("Slot 6 missing mas veio " + fmt(r[6]));
-  log("S4 done.\n");
+function T11(){
+  const box = mkSandbox();
+  step("IntersectionObserver churn (se suportado) + removals");
+  if (typeof IntersectionObserver === "undefined") { warn("IntersectionObserver não suportado."); return; }
+  const scroller = document.createElement('div');
+  scroller.style.cssText = "width:320px;height:120px;overflow:auto;border:1px solid #0f0;";
+  const inner = document.createElement('div');
+  inner.style.height = "800px";
+  scroller.appendChild(inner);
+  box.appendChild(scroller);
+
+  const target = document.createElement('div');
+  target.style.cssText = "margin-top:300px;height:40px;border:1px solid #0f0;";
+  inner.appendChild(target);
+
+  let hits = 0;
+  const io = new IntersectionObserver((ents) => {
+    hits += ents.length;
+    if (hits === 1) step("IO first callback");
+    if (hits === 3) { step("IO: remove target"); target.remove(); }
+    if (hits === 5) { step("IO: re-add target"); inner.appendChild(target); }
+  }, { root: scroller });
+
+  io.observe(target);
+
+  for (let i=0;i<50;i++){
+    scroller.scrollTop = (i*20) % 700;
+    forceLayout(scroller);
+  }
+  io.disconnect();
+  ok("IntersectionObserver churn concluído. hits=" + hits);
 }
 
 /* =========================================================
-   S5: Invariants — repetibilidade (N execuções)
-   Se aparecer valor não-determinístico em slots missing,
-   isso é muito mais interessante do que "undefined".
+   12–15: Canvas/Image
 ========================================================= */
-function S5_invariants(){
-  log("=== S5 INVARIANTS (repeatability) ===");
-  const N = 30;
-  const seen = new Map();
+function T12(){
+  const box = mkSandbox();
+  step("Canvas2D resize + getImageData/putImageData alternando tamanhos");
+  const c = document.createElement('canvas');
+  c.width = 32; c.height = 32;
+  c.style.border = "1px solid #0f0";
+  box.appendChild(c);
+  const ctx = c.getContext('2d');
 
-  for (let iter=0; iter<N; iter++){
-    const args = new Array(200);
-    args.fill(0x2222);
-
-    Object.defineProperty(args, 10, {
-      get: () => { args.length = 0; return 0x3333; }
-    });
-
-    let r = null;
-    function T(...x){ r = x; }
-    try { Reflect.construct(T, args); } catch(e){ warn("iter "+iter+": " + e.message); continue; }
-
-    // checa alguns índices altos
-    const idxs = [50, 100, 150, 199];
-    for (const i of idxs){
-      const v = r[i];
-      const key = "i" + i;
-      const s = fmt(v) + "|" + (typeof v);
-      if (!seen.has(key)) seen.set(key, new Set());
-      seen.get(key).add(s);
+  for (let i=0;i<40;i++){
+    const w = (i%2===0) ? 64 : 256;
+    const h = (i%3===0) ? 64 : 128;
+    c.width = w; c.height = h;
+    ctx.fillRect(0,0,w,h);
+    try {
+      const img = ctx.getImageData(0,0,Math.min(32,w),Math.min(32,h));
+      ctx.putImageData(img, 0, 0);
+    } catch(e){
+      warn("get/putImageData exception: " + e.message);
+      break;
     }
+    forceLayout(c);
   }
+  ok("Canvas2D resize/get/put concluído.");
+}
 
-  for (const [k,set] of seen.entries()){
-    log(k + " uniqueValues=" + set.size + " => " + Array.from(set).join(", "));
-    // GOLD: diversidade inesperada (não-determinismo)
-    // Observação: pode ocorrer por diferenças legítimas, mas é um bom gatilho de investigação.
-    if (set.size > 1) gold("Non-determinism detected at " + k);
+function T13(){
+  const box = mkSandbox();
+  step("Canvas2D pattern/gradient + teardown/recreate context");
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 128;
+  c.style.border = "1px solid #0f0";
+  box.appendChild(c);
+
+  for (let i=0;i<30;i++){
+    const ctx = c.getContext('2d');
+    try {
+      const g = ctx.createLinearGradient(0,0,c.width,c.height);
+      g.addColorStop(0,"#0f0"); g.addColorStop(1,"#000");
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,c.width,c.height);
+
+      const pcan = document.createElement('canvas');
+      pcan.width = 8; pcan.height = 8;
+      const pctx = pcan.getContext('2d');
+      pctx.fillRect(0,0,8,8);
+      const pat = ctx.createPattern(pcan, "repeat");
+      ctx.fillStyle = pat;
+      ctx.fillRect(0,0,c.width,c.height);
+
+      if (i % 10 === 0) { step("Teardown canvas element"); c.remove(); box.appendChild(c); }
+    } catch(e){
+      warn("Canvas pattern/gradient exception: " + e.message);
+      break;
+    }
+    forceLayout(c);
   }
-  log("S5 done.\n");
+  ok("Canvas2D pattern/gradient churn concluído.");
+}
+
+function T14(){
+  const box = mkSandbox();
+  step("Image decode data: + remove/reuse rapidamente");
+  // PNG 1x1 verde (data URI)
+  const dataPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII=";
+  const img = document.createElement('img');
+  img.style.border = "1px solid #0f0";
+  box.appendChild(img);
+
+  let loads = 0, errors = 0;
+  img.onload = () => { loads++; };
+  img.onerror = () => { errors++; };
+
+  for (let i=0;i<120;i++){
+    img.src = dataPng + "#v=" + i; // força recarregar (varia URL)
+    if (i % 10 === 0) { img.remove(); box.appendChild(img); }
+    if (i % 15 === 0) heapPressure(96);
+  }
+  ok(`Image churn disparado. loads=${loads} errors=${errors} (pode continuar após fim do loop).`);
+}
+
+function T15(){
+  const box = mkSandbox();
+  step("createImageBitmap (se suportado) + cancel/teardown leve");
+  if (typeof createImageBitmap === "undefined") { warn("createImageBitmap não suportado."); return; }
+
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  box.appendChild(c);
+  const ctx = c.getContext('2d');
+  ctx.fillRect(0,0,64,64);
+
+  let done = 0;
+  const jobs = [];
+  for (let i=0;i<20;i++){
+    const p = createImageBitmap(c).then(bm => {
+      done++;
+      // teardown
+      if (i % 5 === 0) c.width = 64 + (i%3);
+      keeper.push(bm);
+    }).catch(e => warn("createImageBitmap err: " + e.message));
+    jobs.push(p);
+  }
+  Promise.allSettled(jobs).then(()=> ok("createImageBitmap settled. done=" + done));
 }
 
 /* =========================================================
-   S6: TypedArray detach sanity
-   Verifica se detach no meio muda resultados de forma
-   consistente. Não é exploit; é fingerprint + estabilidade.
+   16–17: WebAudio / Font loading
 ========================================================= */
-function S6_typedarray_detach(){
-  log("=== S6 TYPEDARRAY DETACH ===");
-  const buf = new ArrayBuffer(64);
-  const u32 = new Uint32Array(buf);
-  for (let i=0;i<u32.length;i++) u32[i] = 0x44440000 + i;
+function T16(){
+  const box = mkSandbox();
+  step("WebAudio graph churn (se suportado) – cria/fecha e conecta/desconecta");
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { warn("WebAudio (AudioContext) não suportado."); return; }
 
-  const p = new Proxy(u32, {
-    get(t,k,r){
-      if (k === "length") return Reflect.get(t,k,r);
-      if (k === "2") {
-        try { postMessage(buf, [buf]); log("[*] detach attempted"); } catch(e){ warn("detach failed: "+e.message); }
+  let created = 0, closed = 0;
+  const label = document.createElement('div');
+  label.textContent = "WebAudio running...";
+  box.appendChild(label);
+
+  (async () => {
+    for (let i=0;i<8;i++){
+      let ac;
+      try {
+        ac = new AC();
+        created++;
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.connect(gain); gain.connect(ac.destination);
+        gain.gain.value = (i%2) ? 0.0 : 0.001; // quase mudo
+        osc.start();
+        osc.stop(ac.currentTime + 0.02);
+
+        if (ac.suspend) await ac.suspend().catch(()=>{});
+        if (ac.resume) await ac.resume().catch(()=>{});
+      } catch(e){
+        warn("AudioContext create/use err: " + e.message);
+      } finally {
+        if (ac && ac.close) { try { await ac.close(); closed++; } catch(e){} }
       }
-      return Reflect.get(t,k,r);
     }
-  });
+    ok(`WebAudio churn done. created=${created} closed=${closed}`);
+  })();
+}
 
-  const r = reflectRun(p, "typed_detach");
-  if (r) log("Sample: r[0]=" + fmt(r[0]) + " r[3]=" + fmt(r[3]));
-  log("S6 done.\n");
+function T17(){
+  const box = mkSandbox();
+  step("FontFace load churn (se suportado) + swap rápido");
+  if (typeof FontFace === "undefined" || !document.fonts) { warn("FontFace/document.fonts não suportado."); return; }
+
+  const label = document.createElement('div');
+  label.textContent = "FontFace churn...";
+  label.style.fontSize = "18px";
+  box.appendChild(label);
+
+  // fonte mínima (Woff2 data muito curta pode falhar; objetivo é churn/erro controlado)
+  // Usamos uma fonte inválida propositalmente? Melhor não. Vamos usar uma família fictícia e alternar CSS, sem carregar binário.
+  // Ainda assim exercita document.fonts (check/status) e style churn.
+  let checks = 0;
+  (async () => {
+    for (let i=0;i<60;i++){
+      label.style.fontFamily = (i%2) ? "serif" : "monospace";
+      try {
+        // check e status podem tocar pipeline de fonts
+        document.fonts.check("12px " + label.style.fontFamily);
+        checks++;
+      } catch(e){
+        warn("fonts.check err: " + e.message);
+        break;
+      }
+      if (i % 10 === 0) forceLayout(label);
+    }
+    ok("Font churn done. checks=" + checks);
+  })();
 }
 
 /* =========================================================
-   S7: Cross-realm sanity (iframe)
-   Verifica apenas consistência do comportamento em realm
-   diferente e registra telemetria simples.
+   18–20: History/hashchange, CSS vars/layout, Shadow DOM
 ========================================================= */
-function S7_cross_realm(){
-  log("=== S7 CROSS REALM ===");
-  const ifr = document.createElement("iframe");
-  document.body.appendChild(ifr);
+function T18(){
+  const box = mkSandbox();
+  step("hashchange + teardown no handler + DOM churn");
+  const host = document.createElement('div');
+  host.textContent = "hashchange host";
+  host.style.cssText = "border:1px solid #0f0; padding:6px;";
+  box.appendChild(host);
 
-  try {
-    const w = ifr.contentWindow;
-    const args = new w.Array(100);
-    args.fill(9);
+  let hits = 0;
+  const onHash = () => {
+    hits++;
+    if (hits === 1) step("hashchange fired#1");
+    // teardown/rebuild
+    if (hits % 2 === 0) host.innerHTML = "";
+    else host.innerHTML = "<span>rebuilt " + hits + "</span>";
+    forceLayout(host);
+  };
 
-    let lengthReads = 0;
-    const p = new w.Proxy(args, {
-      get(t,k,r){
-        if (k === "length") lengthReads++;
-        if (k === "5") t.length = 0;
-        return w.Reflect.get(t,k,r);
-      }
-    });
-
-    let got = null;
-    function T(...x){ got = x; }
-    w.Reflect.construct(T, p);
-
-    log("received.length=" + (got ? got.length : "null") + " lengthReads=" + lengthReads);
-    if (got) log("samples: " + [0,1,5,99].map(i=>("r["+i+"]="+fmt(got[i]))).join(" "));
-  } catch(e){
-    warn("cross-realm exception: " + e.message);
-  } finally {
-    ifr.remove();
+  window.addEventListener('hashchange', onHash);
+  for (let i=0;i<40;i++){
+    location.hash = "t" + i;
+    if (i % 8 === 0) { host.remove(); box.appendChild(host); }
   }
-  log("S7 done.\n");
+  window.removeEventListener('hashchange', onHash);
+  ok("hashchange churn concluído. hits=" + hits);
 }
-    function S6_typedarray_detach_FIXED(){
-  log("=== S6 TYPEDARRAY DETACH (FIXED) ===");
-  const buf = new ArrayBuffer(64);
-  const u32 = new Uint32Array(buf);
-  for (let i=0;i<u32.length;i++) u32[i] = 0x44440000 + i;
 
-  let lengthReads = 0;
-  let idxReads = 0;
+function T19(){
+  const box = mkSandbox();
+  step("CSS variables + calc() + layout thrash + computedStyle");
+  const host = document.createElement('div');
+  host.style.cssText = "border:1px solid #0f0; padding:6px; --a:10px; --b:2;";
+  host.innerHTML = "<div id='inner'>inner</div>";
+  const inner = host.querySelector('#inner');
+  inner.style.cssText = "width: calc(var(--a) * var(--b)); height: calc(var(--a) * 3); background:#030;";
+  box.appendChild(host);
 
-  const p = new Proxy(u32, {
-    get(t,k){
-      if (k === "length") { lengthReads++; return t.length; }
-
-      // dispara detach quando o engine tenta pegar o índice 2
-      if (k === "2") {
-        try { postMessage(buf, [buf]); log("[*] detach attempted"); } 
-        catch(e){ warn("detach failed: " + e.message); }
-      }
-
-      // para índices numéricos, acessa direto no TypedArray (evita Reflect.get/receiver)
-      if (typeof k === "string" && k === String(k|0)) {
-        idxReads++;
-        return t[k|0];
-      }
-
-      // fallback: propriedades comuns
-      return t[k];
-    }
-  });
-
-  let got=null;
-  function T(...r){ got=r; }
-
-  try {
-    Reflect.construct(T, p);
-    log("[typed_detach_fixed] OK. received.length=" + (got ? got.length : "null"));
-    log("Telemetry: lengthReads=" + lengthReads + " idxReads=" + idxReads);
-    if (got) log("Sample: r[0]=" + fmt(got[0]) + " r[2]=" + fmt(got[2]) + " r[3]=" + fmt(got[3]));
-  } catch(e){
-    warn("[typed_detach_fixed] EXCEPTION: " + e.message);
+  for (let i=0;i<120;i++){
+    host.style.setProperty('--a', (10 + (i%50)) + "px");
+    host.style.setProperty('--b', String(1 + (i%5)));
+    inner.style.marginLeft = "calc(var(--a) / 2)";
+    // alterna propriedades que forçam recálculo/layout
+    if (i % 10 === 0) inner.style.display = (inner.style.display === "none") ? "block" : "none";
+    try { void getComputedStyle(inner).width; } catch(e){ warn("computedStyle err: "+e.message); break; }
+    forceLayout(inner);
   }
-
-  log("S6 fixed done.\n");
+  ok("CSS vars/layout thrash concluído.");
 }
+
+function T20(){
+  const box = mkSandbox();
+  step("Shadow DOM/slots churn (se suportado) + reparenting");
+  if (!HTMLElement.prototype.attachShadow) { warn("Shadow DOM não suportado."); return; }
+
+  const host = document.createElement('div');
+  host.style.cssText = "border:1px solid #0f0; padding:6px;";
+  host.textContent = "host";
+  box.appendChild(host);
+
+  const shadow = host.attachShadow({mode:"open"});
+  shadow.innerHTML = `
+    <style> :host { display:block; } .c { border:1px solid #0f0; padding:4px; } </style>
+    <div class="c"><slot name="s"></slot></div>
+  `;
+
+  const slotted = document.createElement('span');
+  slotted.slot = "s";
+  slotted.textContent = "slotted content";
+  host.appendChild(slotted);
+
+  for (let i=0;i<80;i++){
+    slotted.textContent = "slot#" + i + " " + "Z".repeat(i%40);
+    if (i % 10 === 0) { step("shadow rewrite " + i); shadow.innerHTML = shadow.innerHTML; }
+    if (i % 16 === 0) { host.remove(); box.appendChild(host); }
+    forceLayout(host);
+  }
+  ok("Shadow DOM churn concluído.");
+}
+
+/* =========================
+   Inicialização
+========================= */
+window.addEventListener('error', (e) => {
+  warn("window.onerror: " + (e && e.message ? e.message : "error"));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  warn("unhandledrejection: " + (e && e.reason && e.reason.message ? e.reason.message : e.reason));
+});
 </script>
 </body>
+</html>
