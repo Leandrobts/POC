@@ -3,76 +3,122 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>PS4 WebKit – Advanced Crash-Hunting Fuzzer (Seeded)</title>
+  <title>PS4 WebKit – Advanced Crash-Hunting Fuzzer V2 (HUD + Replay)</title>
   <style>
-    body { background:#000; color:#0f0; font-family:monospace; margin:12px; }
-    h1,h2 { color:#9f9; margin:8px 0; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
-    button,input { background:#111; color:#0f0; border:1px solid #0f0; padding:10px 12px; }
+    body { background:#000; color:#0f0; font-family:monospace; margin:10px; }
+    .grid { display:grid; grid-template-columns: 360px 1fr; gap:10px; }
+    .card { border:1px solid #0f0; padding:10px; background:#050505; }
+    h1,h2 { margin:6px 0; color:#9f9; }
+    button,input,select { background:#111; color:#0f0; border:1px solid #0f0; padding:8px 10px; }
     button { cursor:pointer; }
     button:hover { background:#0f0; color:#000; }
-    #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; height:460px; overflow:auto; background:#060606; font-size:12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+    #hud { white-space:pre-wrap; font-size:12px; }
+    #ring { white-space:pre-wrap; height:420px; overflow:auto; font-size:12px; border-top:1px dashed #0f0; padding-top:8px; }
+    #snapshot { white-space:pre-wrap; height:260px; overflow:auto; font-size:11px; border:1px solid #0f0; padding:8px; background:#020202; }
     .muted { color:#6f6; }
+    .warn { color:#ff0; }
+    .bad  { color:#f55; }
   </style>
 </head>
 <body>
-<h1>PS4 WebKit – Advanced Crash-Hunting Fuzzer (Seeded)</h1>
-<div class="muted">
-  Objetivo: fuzzing direcionado para encontrar novos vetores de CE/crash (sem exploração).<br>
-  Use um seed fixo para reproduzir. Se travar/CE, anote SEED + ITER + LAST ACTIONS.
-</div>
+  <h1>PS4 WebKit – Advanced Crash-Hunting Fuzzer V2</h1>
+  <div class="muted">HUD fixo + ring buffer + snapshot/replay. Critério de parada: stalls repetíveis.</div>
 
-<div class="row">
-  <label>Seed:
-    <input id="seed" value="13371337" size="10" />
-  </label>
-  <label>Steps/iter:
-    <input id="steps" value="40" size="6" />
-  </label>
-  <label>Checkpoint a cada:
-    <input id="ckpt" value="20" size="6" />
-  </label>
-  <label>Delay(ms):
-    <input id="delay" value="0" size="6" />
-  </label>
-</div>
+  <div class="grid">
+    <div class="card">
+      <h2>Controles</h2>
 
-<div class="row">
-  <button onclick="resetEnv()">RESET</button>
-  <button onclick="runOnce()">RUN ONCE</button>
-  <button onclick="runN(200)">RUN 200 iters</button>
-  <button onclick="runUntilStop()">RUN UNTIL STOP</button>
-  <button onclick="stop()">STOP</button>
-  <button onclick="clearLog()">CLEAR LOG</button>
-</div>
+      <div class="row">
+        <label>Seed <input id="seed" value="13371337" size="10"></label>
+        <label>Iters <input id="iters" value="500" size="7"></label>
+      </div>
 
-<pre id="log">Status: pronto.</pre>
+      <div class="row">
+        <label>Steps/iter <input id="steps" value="35" size="6"></label>
+        <label>Delay(ms) <input id="delay" value="0" size="6"></label>
+      </div>
+
+      <div class="row">
+        <label>Stall(ms) <input id="stall" value="1200" size="6"></label>
+        <label>Stop on stalls <input id="stopOn" value="3" size="4"></label>
+      </div>
+
+      <div class="row">
+        <label>Campaign
+          <select id="campaign">
+            <option value="all">ALL (mix)</option>
+            <option value="dom">DOM/layout</option>
+            <option value="range">Range/Selection</option>
+            <option value="svg">SVG</option>
+            <option value="cssom">CSSOM/Keyframes</option>
+            <option value="iframe">iframe/doc.write</option>
+            <option value="canvas">Canvas2D</option>
+            <option value="img">Image/BlobURL</option>
+            <option value="events">Events/timers</option>
+            <option value="scheduler">Scheduler/Races</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row">
+        <button onclick="resetEnv()">RESET</button>
+        <button onclick="runOnce()">RUN ONCE</button>
+        <button onclick="runN()">RUN N</button>
+        <button onclick="runUntilStop()">RUN UNTIL STOP</button>
+        <button onclick="stop()">STOP</button>
+      </div>
+
+      <div class="row">
+        <button onclick="takeSnapshot()">SNAPSHOT</button>
+        <button onclick="clearRing()">CLEAR RING</button>
+        <button onclick="clearSnapshot()">CLEAR SNAP</button>
+      </div>
+
+      <div id="hud"></div>
+    </div>
+
+    <div class="card">
+      <h2>Ring Buffer (últimas linhas)</h2>
+      <div id="ring"></div>
+      <h2>Snapshot / Replay Script</h2>
+      <div id="snapshot">Status: pronto.</div>
+    </div>
+  </div>
 
 <script>
-/* =========================================================
-   Logger / State
-========================================================= */
-const logEl = document.getElementById('log');
+/* =========================
+   Ring buffer logger
+========================= */
+const ringEl = document.getElementById('ring');
+const hudEl  = document.getElementById('hud');
+const snapEl = document.getElementById('snapshot');
+
+const RING_MAX = 220;
+let ring = [];
+
+function pushRing(line){
+  ring.push(line);
+  if (ring.length > RING_MAX) ring.shift();
+  ringEl.textContent = ring.join("\n");
+  ringEl.scrollTop = ringEl.scrollHeight;
+}
+function clearRing(){ ring = []; ringEl.textContent = ""; }
+function clearSnapshot(){ snapEl.textContent = "Status: pronto."; }
+
+function nowMs(){ return Date.now(); }
+function z2(n){ return String(n).padStart(2,'0'); }
 function ts(){
   const d = new Date();
-  const z = (n)=>String(n).padStart(2,'0');
-  return `${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,'0')}`;
+  return `${z2(d.getHours())}:${z2(d.getMinutes())}:${z2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,'0')}`;
 }
-function log(s){ logEl.textContent += `\n[${ts()}] ${s}`; logEl.scrollTop = logEl.scrollHeight; }
-function warn(s){ log(`WARN: ${s}`); }
-function ok(s){ log(`OK: ${s}`); }
+function log(msg){ pushRing(`[${ts()}] ${msg}`); }
+function warn(msg){ pushRing(`[${ts()}] WARN: ${msg}`); }
+function bad(msg){ pushRing(`[${ts()}] BAD: ${msg}`); }
 
-let keeper = [];
-let running = false;
-let iter = 0;
-let lastActions = [];
-let lastHeartbeat = Date.now();
-let watchdogTimer = null;
-let loopTimer = null;
-
-/* =========================================================
-   Deterministic PRNG (xorshift32)
-========================================================= */
+/* =========================
+   PRNG
+========================= */
 function XorShift32(seed){
   let x = (seed >>> 0) || 0x12345678;
   return {
@@ -82,66 +128,113 @@ function XorShift32(seed){
       x ^= (x << 5) >>> 0;
       return x >>> 0;
     },
-    nextFloat(){
-      // [0,1)
-      return (this.nextU32() / 0x100000000);
-    },
-    pick(n){
-      return (this.nextU32() % n) >>> 0;
-    }
+    pick(n){ return (this.nextU32() % n) >>> 0; }
   };
 }
 
-/* =========================================================
-   Watchdog: detecta freeze parcial (quando possível)
-========================================================= */
+/* =========================
+   Global State
+========================= */
+let running = false;
+let iter = 0;
+let stepIdx = 0;
+let currentSeed = 0;
+let rng = null;
+
+let lastActions = [];
+let lastPrograms = [];
+let keeper = [];
+
+let stallCount = 0;
+let lastTick = nowMs();
+let watchdog = null;
+let loopTimer = null;
+
+function cfg(){
+  return {
+    seed: (parseInt(document.getElementById('seed').value,10) || 1337) >>> 0,
+    iters: Math.max(1, parseInt(document.getElementById('iters').value,10) || 500),
+    steps: Math.max(5, Math.min(160, parseInt(document.getElementById('steps').value,10) || 35)),
+    delay: Math.max(0, Math.min(200, parseInt(document.getElementById('delay').value,10) || 0)),
+    stall: Math.max(300, Math.min(8000, parseInt(document.getElementById('stall').value,10) || 1200)),
+    stopOn: Math.max(1, Math.min(20, parseInt(document.getElementById('stopOn').value,10) || 3)),
+    campaign: document.getElementById('campaign').value
+  };
+}
+
+function hud(extra){
+  const c = cfg();
+  hudEl.innerHTML =
+`<div class="muted">seed=${currentSeed} iter=${iter} step=${stepIdx} campaign=${c.campaign}</div>
+<div>stallCount=${stallCount} stallThreshold=${c.stall}ms stopOn=${c.stopOn}</div>
+<div class="muted">last: ${lastActions.slice(-8).join(" | ")}</div>
+${extra ? `<div class="warn">${extra}</div>` : ""}`;
+}
+
+function record(action){
+  lastActions.push(action);
+  if (lastActions.length > 48) lastActions.shift();
+}
+
+function takeSnapshot(){
+  const c = cfg();
+  const snap =
+`=== SNAPSHOT ===
+seed=${currentSeed}
+iter=${iter}
+steps/iter=${c.steps}
+campaign=${c.campaign}
+stallCount=${stallCount}
+lastActions:
+${lastActions.map(a=>" - "+a).join("\n")}
+
+REPLAY IDEA:
+- Fixar seed acima
+- Rodar somente estas ações na ordem (sem fuzz)
+===============
+`;
+  snapEl.textContent = snap;
+  log("SNAPSHOT gerado.");
+}
+
+/* =========================
+   Watchdog (stall)
+========================= */
 function startWatchdog(){
   stopWatchdog();
-  lastHeartbeat = Date.now();
-  watchdogTimer = setInterval(() => {
-    const now = Date.now();
-    const dt = now - lastHeartbeat;
-    // Se o main thread ficar preso, esse timer também para.
-    // Mas quando ele volta (micro-freezes), registramos.
-    if (dt > 1500) {
-      warn(`WATCHDOG: stall detectado dt=${dt}ms (possível freeze parcial). SEED=${currentSeed} ITER=${iter}`);
-      dumpLast();
+  lastTick = nowMs();
+  watchdog = setInterval(() => {
+    const c = cfg();
+    const now = nowMs();
+    const dt = now - lastTick;
+    lastTick = now;
+
+    if (dt > c.stall) {
+      stallCount++;
+      bad(`STALL dt=${dt}ms (count=${stallCount}) seed=${currentSeed} iter=${iter} step=${stepIdx}`);
+      takeSnapshot();
+      hud(`STALL detectado dt=${dt}ms`);
+
+      if (stallCount >= c.stopOn) {
+        bad("STOP ON STALL: limite atingido.");
+        stop();
+      }
     }
-    lastHeartbeat = now;
   }, 250);
 }
 function stopWatchdog(){
-  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer=null; }
-}
-function heartbeat(){
-  lastHeartbeat = Date.now();
+  if (watchdog){ clearInterval(watchdog); watchdog=null; }
 }
 
-/* =========================================================
-   UI helpers
-========================================================= */
-function clearLog(){ logEl.textContent = "Status: pronto."; }
-function stop(){
-  running = false;
-  if (loopTimer) { clearTimeout(loopTimer); loopTimer=null; }
-  stopWatchdog();
-  ok("STOP solicitado.");
-}
+/* =========================
+   Environment helpers
+========================= */
 function mkSandbox(){
   const d = document.createElement('div');
   d.className = "sandbox";
-  d.style.cssText = "position:relative; border:1px dashed #0f0; margin:10px 0; padding:8px;";
+  d.style.cssText = "border:1px dashed #0f0; margin:8px 0; padding:6px;";
   document.body.appendChild(d);
   return d;
-}
-function resetEnv(){
-  stop();
-  keeper = [];
-  lastActions = [];
-  iter = 0;
-  const nodes = Array.from(document.body.querySelectorAll(".sandbox"));
-  for (const n of nodes) n.remove();
-  ok("RESET: sandbox limpo.");
 }
 function forceLayout(el){
   try { void el.offsetHeight; } catch(e){}
@@ -149,721 +242,649 @@ function forceLayout(el){
   try { void getComputedStyle(el).width; } catch(e){}
 }
 function heapPressure(kb){
-  const n = Math.max(32, Math.min(900, kb|0));
+  const n = Math.max(16, Math.min(260, kb|0));
   const arr = [];
   for (let i=0;i<n;i++) arr.push(new Uint8Array(1024));
   keeper.push(arr);
 }
-
-/* =========================================================
-   Fuzzer core
-========================================================= */
-let currentSeed = 0;
-let rng = null;
-
-function recordAction(name, meta){
-  const s = meta ? `${name}(${meta})` : name;
-  lastActions.push(s);
-  if (lastActions.length > 30) lastActions.shift();
+function resetEnv(){
+  stop();
+  keeper = [];
+  lastActions = [];
+  lastPrograms = [];
+  iter = 0; stepIdx = 0; stallCount = 0;
+  document.querySelectorAll(".sandbox").forEach(n => n.remove());
+  log("RESET OK.");
+  hud();
 }
 
-function dumpLast(){
-  log("---- LAST PROGRAM ----");
-  log(`SEED=${currentSeed} ITER=${iter}`);
-  log(`ACTIONS: ${lastActions.join(" | ")}`);
-  log("----------------------");
+function stop(){
+  running = false;
+  if (loopTimer){ clearTimeout(loopTimer); loopTimer=null; }
+  stopWatchdog();
+  log("STOP.");
+  hud();
 }
 
-function readCfg(){
-  const seed = parseInt(document.getElementById('seed').value, 10) || 1337;
-  const steps = Math.max(5, Math.min(200, parseInt(document.getElementById('steps').value, 10) || 40));
-  const ckpt = Math.max(5, Math.min(500, parseInt(document.getElementById('ckpt').value, 10) || 20));
-  const delay = Math.max(0, Math.min(200, parseInt(document.getElementById('delay').value, 10) || 0));
-  return { seed, steps, ckpt, delay };
+/* =========================
+   Runner
+========================= */
+function initRun(){
+  const c = cfg();
+  currentSeed = c.seed;
+  rng = XorShift32(currentSeed);
+  iter = 0; stepIdx = 0; stallCount = 0;
+  lastActions = [];
+  keeper = [];
+  startWatchdog();
+  hud();
+  log(`RUN init seed=${currentSeed} campaign=${c.campaign} steps=${c.steps}`);
 }
 
 function runOnce(){
   stop();
-  const cfg = readCfg();
-  currentSeed = cfg.seed >>> 0;
-  rng = XorShift32(currentSeed);
-  iter = 0;
-  lastActions = [];
-  startWatchdog();
-  log(`\n=== RUN ONCE seed=${currentSeed} steps=${cfg.steps} ===`);
+  initRun();
+  const c = cfg();
   try {
-    runIteration(cfg.steps, cfg.ckpt);
-    ok("RUN ONCE finished.");
+    runIteration(c.steps, c.campaign);
+    log("RUN ONCE done.");
   } catch(e){
-    warn("RUN ONCE exception: " + (e && e.message ? e.message : e));
-    dumpLast();
+    warn("exception: " + (e && e.message ? e.message : e));
+    takeSnapshot();
   }
   stopWatchdog();
 }
 
-function runN(n){
+function runN(){
   stop();
-  const cfg = readCfg();
-  currentSeed = cfg.seed >>> 0;
-  rng = XorShift32(currentSeed);
-  iter = 0;
-  lastActions = [];
-  startWatchdog();
+  initRun();
+  const c = cfg();
   running = true;
 
-  log(`\n=== RUN N start seed=${currentSeed} iters=${n} steps/iter=${cfg.steps} ===`);
   const tick = () => {
     if (!running) return;
+
     try {
-      runIteration(cfg.steps, cfg.ckpt);
+      runIteration(c.steps, c.campaign);
     } catch(e){
-      warn("Exception: " + (e && e.message ? e.message : e));
-      dumpLast();
-      running = false;
-      stopWatchdog();
+      warn("exception: " + (e && e.message ? e.message : e));
+      takeSnapshot();
+      stop();
       return;
     }
+
     iter++;
-    if (iter >= n) {
-      ok("RUN N concluído.");
-      running = false;
-      stopWatchdog();
+    hud();
+
+    if (iter >= c.iters){
+      log("RUN N concluído.");
+      stop();
       return;
     }
-    loopTimer = setTimeout(tick, cfg.delay);
+    loopTimer = setTimeout(tick, c.delay);
   };
-  loopTimer = setTimeout(tick, cfg.delay);
+  loopTimer = setTimeout(tick, c.delay);
 }
 
 function runUntilStop(){
   stop();
-  const cfg = readCfg();
-  currentSeed = cfg.seed >>> 0;
-  rng = XorShift32(currentSeed);
-  iter = 0;
-  lastActions = [];
-  startWatchdog();
+  initRun();
+  const c = cfg();
   running = true;
 
-  log(`\n=== RUN UNTIL STOP start seed=${currentSeed} steps/iter=${cfg.steps} ===`);
   const tick = () => {
     if (!running) return;
+
     try {
-      runIteration(cfg.steps, cfg.ckpt);
+      runIteration(c.steps, c.campaign);
     } catch(e){
-      warn("Exception: " + (e && e.message ? e.message : e));
-      dumpLast();
-      running = false;
-      stopWatchdog();
+      warn("exception: " + (e && e.message ? e.message : e));
+      takeSnapshot();
+      stop();
       return;
     }
+
     iter++;
-    loopTimer = setTimeout(tick, cfg.delay);
+    hud();
+    loopTimer = setTimeout(tick, c.delay);
   };
-  loopTimer = setTimeout(tick, cfg.delay);
+  loopTimer = setTimeout(tick, c.delay);
 }
 
-/* =========================================================
-   The “program”: choose a domain and mutate
-========================================================= */
-function runIteration(steps, ckptEvery){
-  // checkpoint curto para foto/registro manual
-  if (iter % ckptEvery === 0) {
-    log(`CKPT: iter=${iter} seed=${currentSeed} next=${rng.nextU32().toString(16)}`);
-  }
-  heartbeat();
-
-  // cria sandbox por iteração para isolar
+/* =========================
+   Action Families + Scheduler/Races
+========================= */
+function runIteration(steps, campaign){
   const box = mkSandbox();
-  const ctx = makeContext(box);
+  const ctx = makeCtx(box);
 
-  for (let s=0;s<steps;s++){
-    heartbeat();
-    // escolhe família
-    const family = rng.pick(8); // 0..7
-    switch(family){
-      case 0: actDOM(ctx); break;
-      case 1: actRange(ctx); break;
-      case 2: actSVG(ctx); break;
-      case 3: actCSSOM(ctx); break;
-      case 4: actIframe(ctx); break;
-      case 5: actCanvas(ctx); break;
-      case 6: actImage(ctx); break;
-      case 7: actEvents(ctx); break;
-    }
-    if (s % 7 === 0) heapPressure(40 + (rng.pick(80)));
+  lastPrograms.push([]);
+  if (lastPrograms.length > 6) lastPrograms.shift();
+
+  for (stepIdx=0; stepIdx<steps; stepIdx++){
+    const fam = pickFamily(campaign);
+    const action = doFamily(fam, ctx);
+    record(`${fam}:${action}`);
+    lastPrograms[lastPrograms.length-1].push(`${fam}:${action}`);
+
+    if (stepIdx % 9 === 0) heapPressure(40 + rng.pick(60));
+    if (stepIdx % 7 === 0) forceLayout(ctx.host);
   }
 
-  // teardown variado
-  if (rng.pick(3) === 0) { recordAction("teardown_box"); box.remove(); }
-  else { forceLayout(box); }
+  if (rng.pick(3) === 0) { box.remove(); record("teardown:removeBox"); }
+  else { forceLayout(box); record("teardown:layout"); }
 
-  // mantém poucos sandboxes para não virar só exaustão
   const sand = document.querySelectorAll(".sandbox");
-  if (sand.length > 6) {
-    sand[0].remove();
-    recordAction("gc_sandbox_trim");
-  }
+  if (sand.length > 5) { sand[0].remove(); record("trim:sandbox"); }
 }
 
-/* =========================================================
-   Context per iteration
-========================================================= */
-function makeContext(box){
-  const ctx = { box, dom:null, svg:null, styleEl:null, sheet:null, canvas:null, cctx:null, img:null, ifr:null };
-  // host DOM
+function pickFamily(campaign){
+  const map = {
+    all: ["dom","range","svg","cssom","iframe","canvas","img","events","scheduler"],
+    dom: ["dom"],
+    range: ["range"],
+    svg: ["svg"],
+    cssom: ["cssom"],
+    iframe: ["iframe"],
+    canvas: ["canvas"],
+    img: ["img"],
+    events: ["events"],
+    scheduler: ["scheduler"]
+  };
+  const a = map[campaign] || map.all;
+  return a[rng.pick(a.length)];
+}
+
+function makeCtx(box){
   const host = document.createElement('div');
   host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px; min-height:40px;";
-  host.innerHTML = "<b>host</b> <i>fuzz</i> " + "A".repeat(80);
+  host.innerHTML = "<b>host</b> " + "A".repeat(120);
   box.appendChild(host);
-  ctx.dom = host;
 
-  // stylesheet
   const st = document.createElement('style');
   st.textContent = "/* fuzz */";
   box.appendChild(st);
-  ctx.styleEl = st;
-  ctx.sheet = st.sheet || null;
 
-  // canvas
   const c = document.createElement('canvas');
-  c.width = 128; c.height = 64;
-  c.style.cssText = "border:1px solid #0f0; margin-top:6px;";
+  c.width=160; c.height=80;
+  c.style.cssText="border:1px solid #0f0; margin-top:6px;";
   box.appendChild(c);
-  ctx.canvas = c;
-  try { ctx.cctx = c.getContext('2d'); } catch(e){ ctx.cctx = null; }
 
-  // img
   const img = document.createElement('img');
-  img.style.cssText = "border:1px solid #0f0; width:24px; height:24px; margin-left:6px;";
+  img.style.cssText="border:1px solid #0f0; width:24px; height:24px; margin-left:6px;";
   box.appendChild(img);
-  ctx.img = img;
 
-  return ctx;
+  return {
+    box,
+    host,
+    styleEl: st,
+    sheet: st.sheet || null,
+    canvas: c,
+    cctx: (()=>{ try{return c.getContext('2d');}catch(e){return null;} })(),
+    img,
+    ifr: null,
+    svg: null,
+    svgPath: null
+  };
 }
 
-/* =========================================================
-   Action families (sanity/crash hunting)
-========================================================= */
+function doFamily(fam, ctx){
+  switch(fam){
+    case "dom": return actDOM(ctx);
+    case "range": return actRange(ctx);
+    case "svg": return actSVG(ctx);
+    case "cssom": return actCSSOM(ctx);
+    case "iframe": return actIframe(ctx);
+    case "canvas": return actCanvas(ctx);
+    case "img": return actImage(ctx);
+    case "events": return actEvents(ctx);
+    case "scheduler": return actScheduler(ctx);
+    default: return "noop";
+  }
+}
+
+/* ---------- DOM/layout ---------- */
 function actDOM(ctx){
-  const h = ctx.dom;
+  const h = ctx.host;
   const op = rng.pick(7);
-  switch(op){
-    case 0: { // innerHTML rewrite
-      recordAction("DOM.innerHTML", String(op));
-      h.innerHTML = "<span>" + "X".repeat(20 + rng.pick(120)) + "</span>";
-      break;
-    }
-    case 1: { // append/remove nodes
-      recordAction("DOM.appendRemove", String(op));
-      const n = document.createElement(rng.pick(2) ? "span" : "div");
-      n.textContent = "n" + rng.pick(9999);
-      h.appendChild(n);
-      if (h.childNodes.length > 20) h.removeChild(h.firstChild);
-      break;
-    }
-    case 2: { // attribute churn + computed style
-      recordAction("DOM.attr+style", String(op));
-      h.setAttribute("data-x", String(rng.pick(100000)));
-      h.style.marginLeft = (rng.pick(20)) + "px";
-      try { void getComputedStyle(h).width; } catch(e){}
-      break;
-    }
-    case 3: { // reparent host
-      recordAction("DOM.reparent", String(op));
-      const b = ctx.box;
-      h.remove();
-      b.appendChild(h);
-      break;
-    }
-    case 4: { // text node normalize
-      recordAction("DOM.normalize", String(op));
-      h.appendChild(document.createTextNode("T" + "y".repeat(rng.pick(80))));
-      h.normalize();
-      break;
-    }
-    case 5: { // create DocumentFragment insert
-      recordAction("DOM.fragment", String(op));
-      const frag = document.createDocumentFragment();
-      for (let i=0;i<5;i++){
-        const s = document.createElement('span');
-        s.textContent = "@"+rng.pick(999);
-        frag.appendChild(s);
-      }
-      h.prepend(frag);
-      break;
-    }
-    case 6: { // scrollIntoView stress if possible
-      recordAction("DOM.scrollIntoView", String(op));
-      const s = document.createElement('div');
-      s.style.height = "400px";
-      h.appendChild(s);
-      try { s.scrollIntoView(); } catch(e){}
-      s.remove();
-      break;
-    }
-  }
-  forceLayout(h);
+  if (op===0){ h.innerHTML = "<span>"+("X".repeat(20+rng.pick(160)))+"</span>"; return "innerHTML"; }
+  if (op===1){ const n=document.createElement(rng.pick(2)?"span":"div"); n.textContent="n"+rng.pick(9999); h.appendChild(n); if(h.childNodes.length>25) h.removeChild(h.firstChild); return "appendRemove"; }
+  if (op===2){ h.setAttribute("data-x", String(rng.pick(100000))); h.style.marginLeft=(rng.pick(25))+"px"; try{void getComputedStyle(h).width;}catch(e){} return "attr+style"; }
+  if (op===3){ h.classList.toggle("a"); h.classList.toggle("b"); return "classList"; }
+  if (op===4){ h.appendChild(document.createTextNode("T"+"y".repeat(rng.pick(120)))); h.normalize(); return "normalize"; }
+  if (op===5){ const frag=document.createDocumentFragment(); for(let i=0;i<6;i++){ const s=document.createElement('span'); s.textContent="@"+rng.pick(999); frag.appendChild(s);} h.prepend(frag); return "fragment"; }
+  if (op===6){ const s=document.createElement('div'); s.style.height="420px"; h.appendChild(s); try{s.scrollIntoView();}catch(e){} s.remove(); return "scrollIntoView"; }
+  return "noop";
 }
 
+/* ---------- Range/Selection ---------- */
 function actRange(ctx){
-  const h = ctx.dom;
-  if (!h.firstChild) return;
+  const h = ctx.host;
   const op = rng.pick(6);
-  switch(op){
-    case 0: {
-      recordAction("Range.deleteContents", String(op));
-      try{
-        const r = document.createRange();
-        const tn = h.firstChild.nodeType === 3 ? h.firstChild : (h.firstChild.firstChild || h.firstChild);
-        if (!tn || !tn.length) break;
-        const a = Math.min(rng.pick(Math.max(1, tn.length)), tn.length-1);
-        const b = Math.min(a + rng.pick(10), tn.length);
-        r.setStart(tn, a);
-        r.setEnd(tn, b);
-        r.deleteContents();
-      } catch(e){}
-      break;
+  try{
+    if (!h.firstChild) return "noChild";
+    if (op===0){ 
+      const r=document.createRange(); 
+      const tn=(h.firstChild.nodeType===3)?h.firstChild:(h.firstChild.firstChild||h.firstChild); 
+      if(!tn || tn.nodeType !== 3 || !tn.length) return "noText"; 
+      const a=Math.min(rng.pick(Math.max(1, tn.length)), Math.max(0, tn.length-1)); 
+      const b=Math.min(a+rng.pick(12), tn.length); 
+      r.setStart(tn,a); 
+      r.setEnd(tn,b); 
+      r.deleteContents(); 
+      return "deleteContents"; 
     }
-    case 1: {
-      recordAction("Range.extract+append", String(op));
-      try{
-        const r = document.createRange();
-        const tn = h.firstChild.nodeType === 3 ? h.firstChild : (h.firstChild.firstChild || h.firstChild);
-        if (!tn || !tn.length) break;
-        r.setStart(tn, 0);
-        r.setEnd(tn, Math.min(5 + rng.pick(20), tn.length));
-        const frag = r.extractContents();
-        keeper.push(frag);
-        h.appendChild(frag);
-      } catch(e){}
-      break;
+    if (op===1){ 
+      const r=document.createRange(); 
+      const el=h.querySelector("span,div,b,i")||h; 
+      const tn=el.firstChild&&el.firstChild.nodeType===3?el.firstChild:null; 
+      if(!tn||!tn.length) return "noText"; 
+      r.setStart(tn,0); 
+      r.setEnd(tn,Math.min(20,tn.length)); 
+      const frag=r.extractContents(); 
+      keeper.push(frag); 
+      h.appendChild(frag); 
+      return "extractAppend"; 
     }
-    case 2: {
-      recordAction("Range.getClientRects", String(op));
-      try{
-        const r = document.createRange();
-        const el = h.querySelector("span,div,b,i") || h;
-        const tn = el.firstChild && el.firstChild.nodeType === 3 ? el.firstChild : null;
-        if (!tn || !tn.length) break;
-        r.setStart(tn, 0);
-        r.setEnd(tn, Math.min(10, tn.length));
-        r.getClientRects && r.getClientRects();
-      } catch(e){}
-      break;
+    if (op===2){ 
+      const r=document.createRange(); 
+      const el=h.querySelector("span,div,b,i")||h; 
+      const tn=el.firstChild&&el.firstChild.nodeType===3?el.firstChild:null; 
+      if(!tn||!tn.length) return "noText"; 
+      r.setStart(tn,0); 
+      r.setEnd(tn,Math.min(10,tn.length)); 
+      r.getClientRects&&r.getClientRects(); 
+      return "getClientRects"; 
     }
-    case 3: {
-      recordAction("Selection.churn", String(op));
-      const sel = window.getSelection && window.getSelection();
-      if (!sel) break;
-      try{
-        const r = document.createRange();
-        const el = h.querySelector("span,div,b,i") || h;
-        const tn = el.firstChild && el.firstChild.nodeType === 3 ? el.firstChild : null;
-        if (!tn || !tn.length) break;
-        const a = Math.min(rng.pick(tn.length), tn.length-1);
-        r.setStart(tn, a);
-        r.setEnd(tn, Math.min(a+1+rng.pick(10), tn.length));
-        sel.removeAllRanges();
-        sel.addRange(r);
-      } catch(e){}
-      break;
+    if (op===3){ 
+      const sel=window.getSelection&&window.getSelection(); 
+      if(!sel) return "noSelection"; 
+      const r=document.createRange(); 
+      const el=h.querySelector("span,div,b,i")||h; 
+      const tn=el.firstChild&&el.firstChild.nodeType===3?el.firstChild:null; 
+      if(!tn||!tn.length) return "noText"; 
+      const a=Math.min(rng.pick(Math.max(1, tn.length)), Math.max(0, tn.length-1)); 
+      r.setStart(tn,a); 
+      r.setEnd(tn,Math.min(a+1+rng.pick(10), tn.length)); 
+      sel.removeAllRanges(); 
+      sel.addRange(r); 
+      return "selectionSet"; 
     }
-    case 4: {
-      recordAction("Range.surround", String(op));
-      try{
-        const r = document.createRange();
-        const el = h.querySelector("b,i,span") || h;
-        if (!el.firstChild || el.firstChild.nodeType !== 3) break;
-        const tn = el.firstChild;
-        if (tn.length < 2) break;
-        r.setStart(tn, 0);
-        r.setEnd(tn, Math.min(2+rng.pick(8), tn.length));
-        const wrap = document.createElement('span');
-        wrap.textContent = "";
-        r.surroundContents(wrap);
-      } catch(e){}
-      break;
+    if (op===4){ 
+      const tw=document.createTreeWalker(h, NodeFilter.SHOW_ELEMENT, null, false); 
+      let n,c=0; 
+      while((n=tw.nextNode())&&c++<25){ 
+        if(c%9===0 && n.parentNode) n.parentNode.removeChild(n);
+      } 
+      return "treeWalkerRemove"; 
     }
-    case 5: {
-      recordAction("TreeWalker.removeWhileIter", String(op));
-      try{
-        const tw = document.createTreeWalker(h, NodeFilter.SHOW_ELEMENT, null, false);
-        let n, c=0;
-        while((n = tw.nextNode()) && c++ < 30){
-          if (c % 9 === 0 && n.parentNode) n.parentNode.removeChild(n);
-        }
-      } catch(e){}
-      break;
+    if (op===5){ 
+      h.innerHTML = "<b>rewrite</b> "+ "R".repeat(200+rng.pick(200));
+      return "rewrite";
     }
-  }
-  forceLayout(h);
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
+/* ---------- SVG ---------- */
+function ensureSVG(ctx){
+  if (ctx.svg) return;
+  const ns="http://www.w3.org/2000/svg";
+  const svg=document.createElementNS(ns,'svg');
+  svg.setAttribute('width','340'); svg.setAttribute('height','120');
+  svg.style.border="1px solid #0f0";
+  const path=document.createElementNS(ns,'path');
+  path.setAttribute('stroke','lime'); path.setAttribute('fill','none'); path.setAttribute('stroke-width','2');
+  path.setAttribute('d','M10 10 C 100 10 200 110 330 110');
+  svg.appendChild(path);
+  ctx.box.appendChild(svg);
+  ctx.svg=svg; ctx.svgPath=path;
+}
 function actSVG(ctx){
-  const op = rng.pick(6);
-  const ns = "http://www.w3.org/2000/svg";
-  // lazy init svg
-  if (!ctx.svg){
-    const svg = document.createElementNS(ns,'svg');
-    svg.setAttribute('width','340'); svg.setAttribute('height','120');
-    svg.style.border = "1px solid #0f0";
-    ctx.box.appendChild(svg);
-    ctx.svg = svg;
-
-    const path = document.createElementNS(ns,'path');
-    path.setAttribute('stroke','lime'); path.setAttribute('fill','none'); path.setAttribute('stroke-width','2');
-    path.setAttribute('d','M10 10 C 100 10 200 110 330 110');
-    svg.appendChild(path);
-    ctx.svgPath = path;
-  }
-  const svg = ctx.svg;
-  const p = ctx.svgPath;
-
-  switch(op){
-    case 0:
-      recordAction("SVG.path.d+len", String(op));
-      p.setAttribute('d', `M10 ${10+rng.pick(90)} C 100 ${10+rng.pick(90)} 200 ${10+rng.pick(90)} 330 ${10+rng.pick(90)}`);
-      try { p.getTotalLength && p.getTotalLength(); } catch(e){}
-      break;
-    case 1:
-      recordAction("SVG.getBBox/remove", String(op));
-      try { p.getBBox && p.getBBox(); } catch(e){}
-      if (rng.pick(4) === 0) p.remove();
-      if (!p.isConnected) svg.appendChild(p);
-      break;
-    case 2:
-      recordAction("SVG.filter.blur", String(op));
-      // quick filter injection
-      try{
-        let defs = svg.querySelector('defs');
-        if (!defs){ defs = document.createElementNS(ns,'defs'); svg.insertBefore(defs, svg.firstChild); }
-        let f = defs.querySelector('#f');
-        if (!f){
-          f = document.createElementNS(ns,'filter'); f.setAttribute('id','f');
-          const blur = document.createElementNS(ns,'feGaussianBlur'); blur.setAttribute('stdDeviation','2');
-          f.appendChild(blur);
-          defs.appendChild(f);
-        } else {
-          const blur = f.firstChild;
-          blur && blur.setAttribute('stdDeviation', String((rng.pick(10)+1)/2));
-        }
-        p.setAttribute('filter','url(#f)');
-      } catch(e){}
-      break;
-    case 3:
-      recordAction("SVG.foreignObject", String(op));
-      try{
-        let fo = svg.querySelector('foreignObject');
-        if (!fo){
-          fo = document.createElementNS(ns,'foreignObject');
-          fo.setAttribute('x','10'); fo.setAttribute('y','10'); fo.setAttribute('width','320'); fo.setAttribute('height','80');
-          const d = document.createElement('div');
-          d.textContent = "FO " + "Z".repeat(50);
-          fo.appendChild(d);
-          svg.appendChild(fo);
-        } else {
-          const d = fo.firstChild;
-          if (d) d.textContent = "FO#" + rng.pick(9999) + " " + "Y".repeat(rng.pick(120));
-          if (rng.pick(5) === 0) fo.remove();
-        }
-      } catch(e){}
-      break;
-    case 4:
-      recordAction("SVG.serialize", String(op));
-      if (typeof XMLSerializer !== "undefined") {
-        try { new XMLSerializer().serializeToString(svg); } catch(e){}
+  ensureSVG(ctx);
+  const svg=ctx.svg, p=ctx.svgPath;
+  const op=rng.pick(6);
+  try{
+    if (op===0){ p.setAttribute('d',`M10 ${10+rng.pick(90)} C 100 ${10+rng.pick(90)} 200 ${10+rng.pick(90)} 330 ${10+rng.pick(90)}`); p.getTotalLength&&p.getTotalLength(); return "pathD+len"; }
+    if (op===1){ p.getBBox&&p.getBBox(); if(rng.pick(4)===0)p.remove(); if(!p.isConnected)svg.appendChild(p); return "bbox+remove"; }
+    if (op===2){ 
+      let defs=svg.querySelector('defs'); 
+      if(!defs){
+        defs=document.createElementNS(svg.namespaceURI,'defs'); 
+        svg.insertBefore(defs, svg.firstChild);
+      } 
+      let f=defs.querySelector('#f'); 
+      if(!f){ 
+        f=document.createElementNS(svg.namespaceURI,'filter'); 
+        f.setAttribute('id','f'); 
+        const blur=document.createElementNS(svg.namespaceURI,'feGaussianBlur'); 
+        blur.setAttribute('stdDeviation','2'); 
+        f.appendChild(blur); 
+        defs.appendChild(f);
+      } else { 
+        const blur=f.firstChild; 
+        blur&&blur.setAttribute('stdDeviation', String((rng.pick(12)+1)/2)); 
+      } 
+      p.setAttribute('filter','url(#f)'); 
+      return "filterBlur"; 
+    }
+    if (op===3){ 
+      if(typeof XMLSerializer!=="undefined"){ 
+        new XMLSerializer().serializeToString(svg); 
+      } 
+      return "serialize"; 
+    }
+    if (op===4){ 
+      let t=svg.querySelector('text'); 
+      if(!t){ 
+        t=document.createElementNS(svg.namespaceURI,'text'); 
+        t.setAttribute('x','10'); 
+        t.setAttribute('y','60'); 
+        svg.appendChild(t);
+      } 
+      t.textContent="t#"+rng.pick(9999)+" "+ "B".repeat(rng.pick(220)); 
+      t.getComputedTextLength&&t.getComputedTextLength(); 
+      return "textMetrics"; 
+    }
+    if (op===5){ 
+      let fo=svg.querySelector('foreignObject');
+      if(!fo){ 
+        fo=document.createElementNS(svg.namespaceURI,'foreignObject'); 
+        fo.setAttribute('x','10');
+        fo.setAttribute('y','10');
+        fo.setAttribute('width','320');
+        fo.setAttribute('height','80'); 
+        const d=document.createElement('div'); 
+        d.textContent="FO "+ "Z".repeat(90); 
+        fo.appendChild(d); 
+        svg.appendChild(fo); 
       }
-      break;
-    case 5:
-      recordAction("SVG.text.metrics", String(op));
-      try{
-        let t = svg.querySelector('text');
-        if (!t){
-          t = document.createElementNS(ns,'text');
-          t.setAttribute('x','10'); t.setAttribute('y','60');
-          t.textContent = "text " + "A".repeat(80);
-          svg.appendChild(t);
-        } else {
-          t.textContent = "t#" + rng.pick(9999) + " " + "B".repeat(rng.pick(200));
-        }
-        t.getComputedTextLength && t.getComputedTextLength();
-      } catch(e){}
-      break;
-  }
-  forceLayout(svg);
+      else { 
+        const d=fo.firstChild; 
+        if(d) d.textContent="FO#"+rng.pick(9999)+" "+ "Y".repeat(rng.pick(180)); 
+        if(rng.pick(5)===0) fo.remove(); 
+      }
+      return "foreignObject";
+    }
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
+/* ---------- CSSOM ---------- */
 function actCSSOM(ctx){
-  const sheet = ctx.sheet;
-  const h = ctx.dom;
-  const op = rng.pick(6);
-
-  switch(op){
-    case 0:
-      recordAction("CSSOM.insertRule", String(op));
-      if (sheet && sheet.insertRule){
-        try{
-          const cls = "f" + rng.pick(80);
-          const rule = `.${cls}{margin-left:${rng.pick(40)}px;padding:${rng.pick(8)}px;}`;
-          sheet.insertRule(rule, Math.min(sheet.cssRules.length, 0));
-          if (sheet.cssRules.length > 120) sheet.deleteRule(0);
-          h.className = cls;
-        } catch(e){}
-      }
-      break;
-    case 1:
-      recordAction("CSS.keyframes", String(op));
-      if (sheet && sheet.insertRule){
-        try{
-          const name = "k" + rng.pick(2000);
-          sheet.insertRule(`@keyframes ${name}{0%{transform:translateX(0)}100%{transform:translateX(${rng.pick(30)}px)}}`, sheet.cssRules.length);
-          h.style.animation = `${name} 0.06s linear infinite`;
-          if (sheet.cssRules.length > 60) sheet.deleteRule(0);
-        } catch(e){}
-      }
-      break;
-    case 2:
-      recordAction("CSS.vars.calc", String(op));
-      h.style.setProperty('--a', (10 + rng.pick(60)) + "px");
-      h.style.setProperty('--b', String(1 + rng.pick(6)));
-      h.style.width = "calc(var(--a) * var(--b))";
-      try { void getComputedStyle(h).width; } catch(e){}
-      break;
-    case 3:
-      recordAction("CSS.displayFlip", String(op));
-      h.style.display = (h.style.display === "none") ? "block" : "none";
-      h.style.position = (rng.pick(2) ? "relative" : "static");
-      break;
-    case 4:
-      recordAction("CSS.reparentStyleEl", String(op));
-      if (ctx.styleEl){
-        ctx.styleEl.remove();
-        ctx.box.appendChild(ctx.styleEl);
-      }
-      break;
-    case 5:
-      recordAction("CSS.classListToggle", String(op));
-      h.classList.toggle("aa");
-      h.classList.toggle("bb");
-      break;
-  }
-  forceLayout(h);
+  const sheet=ctx.sheet, h=ctx.host;
+  const op=rng.pick(6);
+  try{
+    if (op===0 && sheet && sheet.insertRule){ 
+      const cls="f"+rng.pick(80); 
+      const idx = sheet.cssRules.length;
+      sheet.insertRule(`.${cls}{margin-left:${rng.pick(40)}px;padding:${rng.pick(9)}px;}`, idx); 
+      if(sheet.cssRules.length>120) sheet.deleteRule(0); 
+      h.className=cls; 
+      return "insertRule"; 
+    }
+    if (op===1 && sheet && sheet.insertRule){ 
+      const name="k"+rng.pick(2000); 
+      sheet.insertRule(`@keyframes ${name}{0%{transform:translateX(0)}100%{transform:translateX(${rng.pick(30)}px)}}`, sheet.cssRules.length); 
+      h.style.animation=`${name} 0.06s linear infinite`; 
+      if(sheet.cssRules.length>60) sheet.deleteRule(0); 
+      return "keyframes"; 
+    }
+    if (op===2){ 
+      h.style.setProperty('--a',(10+rng.pick(60))+"px"); 
+      h.style.setProperty('--b', String(1+rng.pick(6))); 
+      h.style.width="calc(var(--a) * var(--b))"; 
+      void getComputedStyle(h).width; 
+      return "cssVarsCalc"; 
+    }
+    if (op===3){ 
+      h.style.display=(h.style.display==="none")?"block":"none"; 
+      h.style.position=(rng.pick(2)?"relative":"static"); 
+      return "displayFlip"; 
+    }
+    if (op===4){ 
+      ctx.styleEl.remove(); 
+      ctx.box.appendChild(ctx.styleEl); 
+      return "reparentStyle"; 
+    }
+    if (op===5){ 
+      h.classList.toggle("aa"); 
+      h.classList.toggle("bb"); 
+      return "toggleClasses"; 
+    }
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
+/* ---------- iframe/doc.write ---------- */
 function actIframe(ctx){
-  const op = rng.pick(5);
-  const box = ctx.box;
-
-  if (!ctx.ifr){
-    const ifr = document.createElement('iframe');
-    ifr.style.cssText = "width:340px;height:80px;border:1px solid #0f0;margin-top:6px;";
-    box.appendChild(ifr);
-    ctx.ifr = ifr;
-  }
-  const ifr = ctx.ifr;
-
-  switch(op){
-    case 0:
-      recordAction("IFR.srcdoc", String(op));
-      try{
-        const i = rng.pick(9999);
-        ifr.srcdoc = `<!doctype html><meta charset=utf-8><body>f${i}<script>document.body.innerHTML='x${i}';<\/script></body>`;
-      } catch(e){}
-      break;
-    case 1:
-      recordAction("IFR.write", String(op));
-      try{
-        const w = ifr.contentWindow;
-        const d = w && w.document;
-        if (d){
-          d.open(); d.write("<!doctype html><body><div>W"+rng.pick(9999)+"</div></body>"); d.close();
-        }
-      } catch(e){}
-      break;
-    case 2:
-      recordAction("IFR.removeReadd", String(op));
-      ifr.remove();
-      box.appendChild(ifr);
-      break;
-    case 3:
-      recordAction("IFR.postMessage", String(op));
-      try{
-        const w = ifr.contentWindow;
-        w && w.postMessage && w.postMessage({n:rng.pick(999)}, "*");
-      } catch(e){}
-      break;
-    case 4:
-      recordAction("IFR.sizeChurn", String(op));
-      ifr.style.height = (60 + rng.pick(100)) + "px";
-      ifr.style.width = (260 + rng.pick(120)) + "px";
-      break;
-  }
-  forceLayout(ifr);
+  const op=rng.pick(5);
+  try{
+    if(!ctx.ifr){
+      const ifr=document.createElement('iframe');
+      ifr.style.cssText="width:340px;height:80px;border:1px solid #0f0;margin-top:6px;";
+      ctx.box.appendChild(ifr);
+      ctx.ifr=ifr;
+    }
+    const ifr=ctx.ifr;
+    if (op===0){ 
+      ifr.srcdoc=`<!doctype html><meta charset=utf-8><body>f${rng.pick(9999)}<script>document.body.innerHTML='x';<\/script></body>`; 
+      return "srcdoc"; 
+    }
+    if (op===1){ 
+      const w=ifr.contentWindow; 
+      const d=w&&w.document; 
+      if(d){ 
+        d.open(); 
+        d.write("<!doctype html><body><div>W"+rng.pick(9999)+"</div></body>"); 
+        d.close(); 
+      } 
+      return "docWrite"; 
+    }
+    if (op===2){ 
+      ifr.remove(); 
+      ctx.box.appendChild(ifr); 
+      return "removeReadd"; 
+    }
+    if (op===3){ 
+      const w=ifr.contentWindow; 
+      w&&w.postMessage&&w.postMessage({n:rng.pick(999)}, "*"); 
+      return "postMessage"; 
+    }
+    if (op===4){ 
+      ifr.style.height=(60+rng.pick(110))+"px"; 
+      ifr.style.width=(260+rng.pick(130))+"px"; 
+      return "sizeChurn"; 
+    }
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
+/* ---------- Canvas2D ---------- */
 function actCanvas(ctx){
-  const c = ctx.canvas;
-  const g = ctx.cctx;
-  if (!c || !g) return;
-  const op = rng.pick(6);
-
-  switch(op){
-    case 0:
-      recordAction("CANVAS.resize", String(op));
-      c.width = 32 + rng.pick(480);
-      c.height = 32 + rng.pick(240);
-      break;
-    case 1:
-      recordAction("CANVAS.getPut", String(op));
-      try{
-        g.fillRect(0,0,c.width,c.height);
-        const w = Math.min(64, c.width), h = Math.min(64, c.height);
-        const id = g.getImageData(0,0,w,h);
-        g.putImageData(id, 0, 0);
-      } catch(e){}
-      break;
-    case 2:
-      recordAction("CANVAS.pattern", String(op));
-      try{
-        const pc = document.createElement('canvas');
-        pc.width=8; pc.height=8;
-        const pg = pc.getContext('2d');
-        pg.fillRect(0,0,8,8);
-        const pat = g.createPattern(pc, "repeat");
-        g.fillStyle = pat;
-        g.fillRect(0,0,c.width,c.height);
-      } catch(e){}
-      break;
-    case 3:
-      recordAction("CANVAS.toDataURL", String(op));
-      try { c.toDataURL("image/png"); } catch(e){}
-      break;
-    case 4:
-      recordAction("CANVAS.teardown", String(op));
-      c.remove();
-      ctx.box.appendChild(c);
-      break;
-    case 5:
-      recordAction("CANVAS.text", String(op));
-      try{
-        g.font = (10+rng.pick(30)) + "px monospace";
-        g.fillText("T"+rng.pick(9999), 2, 14+rng.pick(40));
-      } catch(e){}
-      break;
-  }
-  forceLayout(c);
+  const c=ctx.canvas, g=ctx.cctx;
+  if(!c||!g) return "noCtx";
+  const op=rng.pick(6);
+  try{
+    if (op===0){ c.width=32+rng.pick(520); c.height=32+rng.pick(260); return "resize"; }
+    if (op===1){ 
+      g.fillRect(0,0,c.width,c.height); 
+      const w=Math.min(64,c.width), h=Math.min(64,c.height); 
+      const id=g.getImageData(0,0,w,h); 
+      g.putImageData(id,0,0); 
+      return "getPut"; 
+    }
+    if (op===2){ 
+      const pc=document.createElement('canvas'); 
+      pc.width=8;
+      pc.height=8; 
+      const pg=pc.getContext('2d'); 
+      pg.fillRect(0,0,8,8); 
+      const pat=g.createPattern(pc,"repeat"); 
+      g.fillStyle=pat; 
+      g.fillRect(0,0,c.width,c.height); 
+      return "pattern"; 
+    }
+    if (op===3){ c.toDataURL("image/png"); return "toDataURL"; }
+    if (op===4){ c.remove(); ctx.box.appendChild(c); return "teardown"; }
+    if (op===5){ 
+      g.font=(10+rng.pick(30))+"px monospace"; 
+      g.fillText("T"+rng.pick(9999), 2, 14+rng.pick(40)); 
+      return "text"; 
+    }
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
+/* ---------- Image/BlobURL ---------- */
 function actImage(ctx){
-  const img = ctx.img;
-  const op = rng.pick(6);
-
-  // tiny png base64
-  const dataPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII=";
-  switch(op){
-    case 0:
-      recordAction("IMG.dataURL", String(op));
-      img.src = dataPng + "#v=" + rng.pick(100000);
-      break;
-    case 1:
-      recordAction("IMG.removeReadd", String(op));
-      img.remove();
-      ctx.box.appendChild(img);
-      break;
-    case 2:
-      recordAction("IMG.blobURL", String(op));
-      if (typeof Blob !== "undefined" && typeof URL !== "undefined"){
-        try{
-          const bytes = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII="), c=>c.charCodeAt(0));
-          const blob = new Blob([bytes], {type:"image/png"});
-          const url = URL.createObjectURL(blob);
-          img.src = url;
-          if (rng.pick(2)===0) URL.revokeObjectURL(url); // revoke cedo
-        } catch(e){}
+  const img=ctx.img;
+  const op=rng.pick(6);
+  const dataPng="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII=";
+  try{
+    if (op===0){ img.src=dataPng+"#"+rng.pick(999999); return "dataURL"; }
+    if (op===1){ img.remove(); ctx.box.appendChild(img); return "removeReadd"; }
+    if (op===2){
+      if (typeof Blob!=="undefined" && typeof URL!=="undefined"){
+        const bytes=Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII="), c=>c.charCodeAt(0));
+        const blob=new Blob([bytes],{type:"image/png"});
+        const url=URL.createObjectURL(blob);
+        img.src=url;
+        if(rng.pick(2)===0) URL.revokeObjectURL(url);
       }
-      break;
-    case 3:
-      recordAction("IMG.decodeAttempt", String(op));
-      // decode() pode não existir; tentar sem depender
-      try { img.decode && img.decode().catch(()=>{}); } catch(e){}
-      break;
-    case 4:
-      recordAction("IMG.sizeChurn", String(op));
-      img.style.width = (8 + rng.pick(80)) + "px";
-      img.style.height = (8 + rng.pick(80)) + "px";
-      break;
-    case 5:
-      recordAction("IMG.styleChurn", String(op));
-      img.style.transform = "rotate(" + (rng.pick(360)) + "deg)";
-      img.style.opacity = String((rng.pick(10)+1)/10);
-      break;
-  }
-  forceLayout(img);
+      return "blobURL";
+    }
+    if (op===3){ 
+      img.style.transform="rotate("+rng.pick(360)+"deg)"; 
+      img.style.opacity=String((rng.pick(10)+1)/10); 
+      return "styleChurn"; 
+    }
+    if (op===4){ 
+      img.style.width=(8+rng.pick(90))+"px"; 
+      img.style.height=(8+rng.pick(90))+"px"; 
+      return "sizeChurn"; 
+    }
+    if (op===5){ 
+      try{ img.decode&&img.decode().catch(()=>{});}catch(e){} 
+      return "decodeAttempt"; 
+    }
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
+/* ---------- Events/timers ---------- */
 function actEvents(ctx){
-  const h = ctx.dom;
-  const op = rng.pick(6);
-
-  switch(op){
-    case 0:
-      recordAction("EVT.dispatchCustom", String(op));
-      try{
-        const ev = new CustomEvent("omega", {bubbles:true});
-        h.dispatchEvent(ev);
-      } catch(e){}
-      break;
-    case 1:
-      recordAction("EVT.addRemove", String(op));
-      try{
-        const fn = ()=>{};
-        h.addEventListener("click", fn);
-        if (rng.pick(2)===0) h.removeEventListener("click", fn);
-        h.dispatchEvent(new MouseEvent("click"));
-      } catch(e){}
-      break;
-    case 2:
-      recordAction("EVT.MutationObserver", String(op));
-      try{
-        const mo = new MutationObserver(()=>{ h.classList.toggle("m"); });
-        mo.observe(h, {attributes:true, childList:true, subtree:true});
-        h.setAttribute("data-m", String(rng.pick(9999)));
-        mo.disconnect();
-      } catch(e){}
-      break;
-    case 3:
-      recordAction("EVT.hashchange", String(op));
-      try { location.hash = "f" + rng.pick(99999); } catch(e){}
-      break;
-    case 4:
-      recordAction("EVT.rAF", String(op));
-      if (window.requestAnimationFrame){
-        try{
-          requestAnimationFrame(()=>{ h.textContent = "raf"+rng.pick(9999); forceLayout(h); });
-        } catch(e){}
-      }
-      break;
-    case 5:
-      recordAction("EVT.timerTeardown", String(op));
-      setTimeout(() => {
-        try { h.remove(); } catch(e){}
-      }, 0);
-      break;
-  }
-  forceLayout(h);
+  const h=ctx.host;
+  const op=rng.pick(6);
+  try{
+    if (op===0){ 
+      h.dispatchEvent(new CustomEvent("omega",{bubbles:true})); 
+      return "dispatchCustom"; 
+    }
+    if (op===1){ 
+      const fn=()=>{}; 
+      h.addEventListener("click",fn); 
+      if(rng.pick(2)===0) h.removeEventListener("click",fn); 
+      h.dispatchEvent(new MouseEvent("click")); 
+      return "clickAddRemove"; 
+    }
+    if (op===2){ 
+      const mo=new MutationObserver(()=>{ h.classList.toggle("m"); }); 
+      mo.observe(h,{attributes:true,childList:true,subtree:true}); 
+      h.setAttribute("data-m", String(rng.pick(9999))); 
+      mo.disconnect(); 
+      return "mutationObs"; 
+    }
+    if (op===3){ location.hash="f"+rng.pick(99999); return "hash"; }
+    if (op===4){ 
+      if(window.requestAnimationFrame){ 
+        requestAnimationFrame(()=>{ 
+          h.textContent="raf"+rng.pick(9999); 
+          forceLayout(h); 
+        }); 
+      } 
+      return "rAF"; 
+    }
+    if (op===5){ 
+      setTimeout(()=>{ try{h.remove();}catch(e){} }, 0); 
+      return "timerTeardown"; 
+    }
+  }catch(e){ return "err"; }
+  return "noop";
 }
 
-/* =========================================================
-   Global error hooks
-========================================================= */
+/* ---------- Scheduler/Races ---------- */
+function actScheduler(ctx){
+  const h=ctx.host;
+  const op=rng.pick(6);
+
+  if (op===0){
+    Promise.resolve().then(()=>{ 
+      try{ 
+        h.innerHTML="<i>micro</i>"+ "M".repeat(80+rng.pick(120)); 
+        forceLayout(h);
+      }catch(e){} 
+    });
+    return "microtaskRewrite";
+  }
+  if (op===1){
+    setTimeout(()=>{ 
+      try{ 
+        h.classList.toggle("t"); 
+        forceLayout(h);
+      }catch(e){} 
+    }, 0);
+    return "timeoutToggle";
+  }
+  if (op===2){
+    if (window.requestAnimationFrame){
+      requestAnimationFrame(()=>{ 
+        try{ h.remove(); }catch(e){} 
+      });
+    }
+    return "rAFRemove";
+  }
+  if (op===3){
+    forceLayout(h);
+    h.style.marginLeft = (rng.pick(30))+"px";
+    return "layoutThenMutate";
+  }
+  if (op===4){
+    Promise.resolve().then(()=>{ 
+      try{ 
+        const p=h.parentNode; 
+        if(p){ 
+          h.remove(); 
+          p.appendChild(h);
+        } 
+      }catch(e){} 
+    });
+    return "microtaskReparent";
+  }
+  if (op===5){
+    setTimeout(()=>{ 
+      Promise.resolve().then(()=>{ 
+        try{ 
+          h.textContent="chain"+rng.pick(9999); 
+          forceLayout(h);
+        }catch(e){} 
+      }); 
+    }, 0);
+    return "timeoutMicroLayout";
+  }
+  return "noop";
+}
+
+/* =========================
+   Error hooks
+========================= */
 window.addEventListener('error', (e) => {
   warn("window.onerror: " + (e && e.message ? e.message : "error"));
-  dumpLast();
+  takeSnapshot();
 });
 window.addEventListener('unhandledrejection', (e) => {
   warn("unhandledrejection: " + (e && e.reason && e.reason.message ? e.reason.message : e.reason));
-  dumpLast();
+  takeSnapshot();
 });
 </script>
 </body>
