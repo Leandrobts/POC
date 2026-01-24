@@ -3,72 +3,56 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>PS4 WebKit – Sanity/Crash Hunting Suite (20 testes – V3)</title>
+  <title>PS4 WebKit – Advanced Crash-Hunting Fuzzer (Seeded)</title>
   <style>
     body { background:#000; color:#0f0; font-family:monospace; margin:12px; }
     h1,h2 { color:#9f9; margin:8px 0; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; }
-    button { background:#111; color:#0f0; border:1px solid #0f0; padding:10px 12px; cursor:pointer; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
+    button,input { background:#111; color:#0f0; border:1px solid #0f0; padding:10px 12px; }
+    button { cursor:pointer; }
     button:hover { background:#0f0; color:#000; }
-    #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; height:440px; overflow:auto; background:#060606; }
+    #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; height:460px; overflow:auto; background:#060606; font-size:12px; }
     .muted { color:#6f6; }
   </style>
 </head>
 <body>
-  <h1>PS4 WebKit – Sanity/Crash Hunting Suite (20 testes – V3)</h1>
-  <div class="muted">
-    Foco: novos vetores de CE/crash (sanidade/crash hunting). Sem exploração.<br>
-    Recomendo: RESET entre testes. Para timing/race, use LOOP ALL x80.
-  </div>
+<h1>PS4 WebKit – Advanced Crash-Hunting Fuzzer (Seeded)</h1>
+<div class="muted">
+  Objetivo: fuzzing direcionado para encontrar novos vetores de CE/crash (sem exploração).<br>
+  Use um seed fixo para reproduzir. Se travar/CE, anote SEED + ITER + LAST ACTIONS.
+</div>
 
-  <div class="row" style="margin:10px 0;">
-    <button onclick="clearLog()">CLEAR</button>
-    <button onclick="resetEnv()">RESET DOM</button>
-    <button onclick="stopLoop()">STOP LOOP</button>
-    <button onclick="loopAll(80)">LOOP ALL x80</button>
-  </div>
+<div class="row">
+  <label>Seed:
+    <input id="seed" value="13371337" size="10" />
+  </label>
+  <label>Steps/iter:
+    <input id="steps" value="40" size="6" />
+  </label>
+  <label>Checkpoint a cada:
+    <input id="ckpt" value="20" size="6" />
+  </label>
+  <label>Delay(ms):
+    <input id="delay" value="0" size="6" />
+  </label>
+</div>
 
-  <h2>Testes (T41–T60)</h2>
-  <div class="row">
-    <button onclick="run(T41)">T41 CSSOM insertRule/deleteRule churn</button>
-    <button onclick="run(T42)">T42 Keyframes/animation rule churn</button>
-    <button onclick="run(T43)">T43 getComputedStyle flood + class churn</button>
-    <button onclick="run(T44)">T44 DOMTokenList (classList) reentrante</button>
+<div class="row">
+  <button onclick="resetEnv()">RESET</button>
+  <button onclick="runOnce()">RUN ONCE</button>
+  <button onclick="runN(200)">RUN 200 iters</button>
+  <button onclick="runUntilStop()">RUN UNTIL STOP</button>
+  <button onclick="stop()">STOP</button>
+  <button onclick="clearLog()">CLEAR LOG</button>
+</div>
 
-    <button onclick="run(T45)">T45 XPath evaluate + DOM teardown</button>
-    <button onclick="run(T46)">T46 XML Document import/adopt churn</button>
-    <button onclick="run(T47)">T47 XSLTProcessor transform (se houver)</button>
-
-    <button onclick="run(T48)">T48 Focus/blur storm em inputs + rewrite</button>
-    <button onclick="run(T49)">T49 Textarea selectionRange churn</button>
-    <button onclick="run(T50)">T50 Form clone/reset + validity (se houver)</button>
-
-    <button onclick="run(T51)">T51 EventTarget add/remove listeners massivo</button>
-    <button onclick="run(T52)">T52 dispatchEvent com subtree removido</button>
-    <button onclick="run(T53)">T53 requestAnimationFrame churn + teardown</button>
-
-    <button onclick="run(T54)">T54 localStorage churn (se houver)</button>
-    <button onclick="run(T55)">T55 URL/URLSearchParams churn</button>
-    <button onclick="run(T56)">T56 FileReader Blob churn (se houver)</button>
-
-    <button onclick="run(T57)">T57 MessagePort chain relay (se houver)</button>
-    <button onclick="run(T58)">T58 Worker nested postMessage (se houver)</button>
-
-    <button onclick="run(T59)">T59 DOMSubtreeModified event (se houver)</button>
-    <button onclick="run(T60)">T60 DocumentFragment/Range deleteContents churn</button>
-  </div>
-
-  <pre id="log">Status: pronto.</pre>
+<pre id="log">Status: pronto.</pre>
 
 <script>
-/* =========================
-   Infra / Logger
-========================= */
+/* =========================================================
+   Logger / State
+========================================================= */
 const logEl = document.getElementById('log');
-let keeper = [];
-let loopTimer = null;
-let loopStop = false;
-
 function ts(){
   const d = new Date();
   const z = (n)=>String(n).padStart(2,'0');
@@ -76,54 +60,73 @@ function ts(){
 }
 function log(s){ logEl.textContent += `\n[${ts()}] ${s}`; logEl.scrollTop = logEl.scrollHeight; }
 function warn(s){ log(`WARN: ${s}`); }
-function step(s){ log(`STEP: ${s}`); }
 function ok(s){ log(`OK: ${s}`); }
 
-function clearLog(){ logEl.textContent = "Status: pronto."; }
-function stopLoop(){ loopStop = true; if (loopTimer) { clearTimeout(loopTimer); loopTimer=null; } log("LOOP: stop solicitado."); }
+let keeper = [];
+let running = false;
+let iter = 0;
+let lastActions = [];
+let lastHeartbeat = Date.now();
+let watchdogTimer = null;
+let loopTimer = null;
 
-function resetEnv(){
-  stopLoop();
-  keeper = [];
-  const nodes = Array.from(document.body.querySelectorAll(".sandbox"));
-  for (const n of nodes) n.remove();
-  ok("RESET: sandbox limpo.");
-}
-
-function run(fn){
-  stopLoop();
-  keeper = [];
-  log(`\n=== RUN ${fn.name} ===`);
-  setTimeout(() => {
-    try { fn(); }
-    catch(e){ warn(`${fn.name} exception: ${e && e.message ? e.message : e}`); }
-    finally { ok(`${fn.name} finished (se não travou).`); }
-  }, 0);
-}
-
-function loopAll(n){
-  stopLoop();
-  loopStop = false;
-  const tests = [T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60];
-  let i = 0, iter = 0;
-  log(`\n=== LOOP ALL start: ${n} iterações ===`);
-  const tick = () => {
-    if (loopStop) { ok("LOOP ALL stopped."); return; }
-    if (iter >= n) { ok("LOOP ALL concluído."); return; }
-    const fn = tests[i];
-    keeper = [];
-    log(`\n--- LOOP iter=${iter+1}/${n} test=${fn.name} ---`);
-    try { fn(); } catch(e){ warn(`${fn.name} exception: ${e && e.message ? e.message : e}`); }
-    i++;
-    if (i >= tests.length) { i=0; iter++; }
-    loopTimer = setTimeout(tick, 70);
+/* =========================================================
+   Deterministic PRNG (xorshift32)
+========================================================= */
+function XorShift32(seed){
+  let x = (seed >>> 0) || 0x12345678;
+  return {
+    nextU32(){
+      x ^= (x << 13) >>> 0;
+      x ^= (x >>> 17) >>> 0;
+      x ^= (x << 5) >>> 0;
+      return x >>> 0;
+    },
+    nextFloat(){
+      // [0,1)
+      return (this.nextU32() / 0x100000000);
+    },
+    pick(n){
+      return (this.nextU32() % n) >>> 0;
+    }
   };
-  loopTimer = setTimeout(tick, 80);
 }
 
-/* =========================
-   Helpers
-========================= */
+/* =========================================================
+   Watchdog: detecta freeze parcial (quando possível)
+========================================================= */
+function startWatchdog(){
+  stopWatchdog();
+  lastHeartbeat = Date.now();
+  watchdogTimer = setInterval(() => {
+    const now = Date.now();
+    const dt = now - lastHeartbeat;
+    // Se o main thread ficar preso, esse timer também para.
+    // Mas quando ele volta (micro-freezes), registramos.
+    if (dt > 1500) {
+      warn(`WATCHDOG: stall detectado dt=${dt}ms (possível freeze parcial). SEED=${currentSeed} ITER=${iter}`);
+      dumpLast();
+    }
+    lastHeartbeat = now;
+  }, 250);
+}
+function stopWatchdog(){
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer=null; }
+}
+function heartbeat(){
+  lastHeartbeat = Date.now();
+}
+
+/* =========================================================
+   UI helpers
+========================================================= */
+function clearLog(){ logEl.textContent = "Status: pronto."; }
+function stop(){
+  running = false;
+  if (loopTimer) { clearTimeout(loopTimer); loopTimer=null; }
+  stopWatchdog();
+  ok("STOP solicitado.");
+}
 function mkSandbox(){
   const d = document.createElement('div');
   d.className = "sandbox";
@@ -131,605 +134,737 @@ function mkSandbox(){
   document.body.appendChild(d);
   return d;
 }
+function resetEnv(){
+  stop();
+  keeper = [];
+  lastActions = [];
+  iter = 0;
+  const nodes = Array.from(document.body.querySelectorAll(".sandbox"));
+  for (const n of nodes) n.remove();
+  ok("RESET: sandbox limpo.");
+}
 function forceLayout(el){
   try { void el.offsetHeight; } catch(e){}
   try { void el.getBoundingClientRect(); } catch(e){}
   try { void getComputedStyle(el).width; } catch(e){}
 }
 function heapPressure(kb){
-  const n = Math.max(24, Math.min(700, kb|0));
+  const n = Math.max(32, Math.min(900, kb|0));
   const arr = [];
   for (let i=0;i<n;i++) arr.push(new Uint8Array(1024));
   keeper.push(arr);
 }
 
 /* =========================================================
-   T41–T44: CSSOM / style system edge cases
+   Fuzzer core
 ========================================================= */
-function T41(){
-  const box = mkSandbox();
-  step("CSSOM: cria stylesheet, insertRule/deleteRule intensivo + forceLayout");
-  const st = document.createElement('style');
-  st.textContent = "/* init */";
-  box.appendChild(st);
+let currentSeed = 0;
+let rng = null;
 
-  const sheet = st.sheet;
-  if (!sheet || !sheet.insertRule) { warn("CSSStyleSheet insertRule não suportado."); return; }
-
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  for (let i=0;i<200;i++){
-    const cls = "c" + (i%50);
-    host.className = cls;
-    try {
-      const rule = `.${cls} { margin-left:${(i%30)}px; padding:${(i%7)}px; }`;
-      sheet.insertRule(rule, Math.min(sheet.cssRules.length, 0));
-      if (sheet.cssRules.length > 120) sheet.deleteRule(0);
-    } catch(e){
-      warn("CSSOM rule err: " + e.message);
-      break;
-    }
-    if (i % 15 === 0) forceLayout(host);
-  }
-  ok("CSSOM churn concluído.");
+function recordAction(name, meta){
+  const s = meta ? `${name}(${meta})` : name;
+  lastActions.push(s);
+  if (lastActions.length > 30) lastActions.shift();
 }
 
-function T42(){
-  const box = mkSandbox();
-  step("Keyframes/animation rule churn (inserir/remover @keyframes e alternar animação)");
-  const st = document.createElement('style');
-  box.appendChild(st);
-  const sheet = st.sheet;
-  if (!sheet || !sheet.insertRule) { warn("CSSOM insertRule não suportado."); return; }
-
-  const el = document.createElement('div');
-  el.textContent = "anim";
-  el.style.cssText = "border:1px solid #0f0; width:120px; height:30px; line-height:30px;";
-  box.appendChild(el);
-
-  for (let i=0;i<80;i++){
-    const name = "k" + i;
-    try {
-      sheet.insertRule(`@keyframes ${name}{0%{transform:translateX(0)}100%{transform:translateX(${(i%30)}px)}}`, sheet.cssRules.length);
-      el.style.animation = `${name} 0.05s linear infinite`;
-      if (sheet.cssRules.length > 40) sheet.deleteRule(0);
-    } catch(e){
-      warn("keyframes err: " + e.message);
-      break;
-    }
-    if (i % 8 === 0) { el.remove(); box.appendChild(el); }
-    forceLayout(el);
-  }
-  ok("Keyframes churn concluído.");
+function dumpLast(){
+  log("---- LAST PROGRAM ----");
+  log(`SEED=${currentSeed} ITER=${iter}`);
+  log(`ACTIONS: ${lastActions.join(" | ")}`);
+  log("----------------------");
 }
 
-function T43(){
-  const box = mkSandbox();
-  step("ComputedStyle flood + alternância de classes + rewrite periódico");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  const st = document.createElement('style');
-  st.textContent = Array.from({length:40}, (_,i)=>`.k${i}{margin-left:${i}px; padding:${i%5}px;}`).join("\n");
-  box.appendChild(st);
-
-  for (let i=0;i<500;i++){
-    host.className = "k" + (i%40);
-    try { void getComputedStyle(host).marginLeft; } catch(e){ warn("getComputedStyle err: "+e.message); break; }
-    if (i % 50 === 0) host.innerHTML = "<span>rewrite " + i + "</span>" + "X".repeat(200);
-    if (i % 35 === 0) forceLayout(host);
-  }
-  ok("ComputedStyle flood concluído.");
+function readCfg(){
+  const seed = parseInt(document.getElementById('seed').value, 10) || 1337;
+  const steps = Math.max(5, Math.min(200, parseInt(document.getElementById('steps').value, 10) || 40));
+  const ckpt = Math.max(5, Math.min(500, parseInt(document.getElementById('ckpt').value, 10) || 20));
+  const delay = Math.max(0, Math.min(200, parseInt(document.getElementById('delay').value, 10) || 0));
+  return { seed, steps, ckpt, delay };
 }
 
-function T44(){
-  const box = mkSandbox();
-  step("classList reentrante: toggle dentro de handler disparado por MutationObserver");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  host.textContent = "tokenlist";
-  box.appendChild(host);
-
-  let fired = 0;
-  const mo = new MutationObserver(() => {
-    fired++;
-    // reentrância: mexe em classList durante observação de atributo
-    host.classList.toggle("a");
-    host.classList.toggle("b");
-    if (fired % 5 === 0) host.textContent = "fired#" + fired;
-    forceLayout(host);
-  });
-  mo.observe(host, {attributes:true});
-
-  for (let i=0;i<120;i++){
-    host.className = (i%2) ? "x" : "y";
-    if (i % 20 === 0) heapPressure(60);
-  }
-  mo.disconnect();
-  ok("DOMTokenList reentrante concluído. fired=" + fired);
-}
-
-/* =========================================================
-   T45–T47: XPath / XML docs / XSLT
-========================================================= */
-function T45(){
-  const box = mkSandbox();
-  step("XPath evaluate + DOM teardown enquanto itera resultados");
-  if (!document.evaluate) { warn("XPath (document.evaluate) não suportado."); return; }
-
-  const host = document.createElement('div');
-  host.innerHTML = "<ul>" + Array.from({length:120}, (_,i)=>`<li><span class='x'>A${i}</span><b>B${i}</b></li>`).join("") + "</ul>";
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  for (let i=0;i<40;i++){
-    try {
-      const snap = document.evaluate("//span[@class='x']", host, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      for (let k=0;k<snap.snapshotLength;k+=7){
-        const n = snap.snapshotItem(k);
-        if (n) n.textContent = "X" + i + ":" + k;
-        if (k === 21 && i % 5 === 0) { step("teardown host.innerHTML"); host.innerHTML = "<div>reset</div>"; }
-      }
-    } catch(e){
-      warn("XPath err: " + e.message);
-      break;
-    }
-    forceLayout(host);
-  }
-  ok("XPath churn concluído.");
-}
-
-function T46(){
-  const box = mkSandbox();
-  step("XML docs: createDocument + importNode/adoptNode + replaceChildren");
-  if (!document.implementation || !document.implementation.createDocument) { warn("createDocument não suportado."); return; }
-
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  for (let i=0;i<80;i++){
-    try {
-      const xd = document.implementation.createDocument("", "root", null);
-      const r = xd.documentElement;
-      const child = xd.createElement("item");
-      child.setAttribute("n", String(i));
-      child.textContent = "Z".repeat(i%60);
-      r.appendChild(child);
-
-      const imported = document.importNode(r, true);
-      if (i % 2 === 0) host.replaceChildren(imported);
-      else host.appendChild(imported);
-
-      if (i % 10 === 0) host.textContent = "reset " + i;
-    } catch(e){
-      warn("XML import/adopt err: " + e.message);
-      break;
-    }
-    if (i % 8 === 0) forceLayout(host);
-  }
-  ok("XML import/adopt churn concluído.");
-}
-
-function T47(){
-  const box = mkSandbox();
-  step("XSLTProcessor transformToFragment (se suportado) + teardown alvo");
-  if (typeof XSLTProcessor === "undefined" || !document.implementation || !document.implementation.createDocument) {
-    warn("XSLTProcessor não suportado.");
-    return;
-  }
-
+function runOnce(){
+  stop();
+  const cfg = readCfg();
+  currentSeed = cfg.seed >>> 0;
+  rng = XorShift32(currentSeed);
+  iter = 0;
+  lastActions = [];
+  startWatchdog();
+  log(`\n=== RUN ONCE seed=${currentSeed} steps=${cfg.steps} ===`);
   try {
-    const xml = document.implementation.createDocument("", "root", null);
-    for (let i=0;i<40;i++){
-      const it = xml.createElement("item");
-      it.textContent = "I" + i;
-      xml.documentElement.appendChild(it);
-    }
-
-    const xslText =
-      `<?xml version="1.0"?>
-       <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
-         <xsl:template match="/">
-           <div>
-             <xsl:for-each select="root/item">
-               <span><xsl:value-of select="."/></span>
-             </xsl:for-each>
-           </div>
-         </xsl:template>
-       </xsl:stylesheet>`;
-
-    const xslDoc = new DOMParser().parseFromString(xslText, "application/xml");
-    const proc = new XSLTProcessor();
-    proc.importStylesheet(xslDoc);
-
-    const host = document.createElement('div');
-    host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-    box.appendChild(host);
-
-    for (let i=0;i<80;i++){
-      const frag = proc.transformToFragment(xml, document);
-      host.replaceChildren(frag);
-      if (i === 30) { step("remove host"); host.remove(); box.appendChild(host); }
-      if (i % 10 === 0) forceLayout(host);
-    }
-    ok("XSLT churn concluído.");
+    runIteration(cfg.steps, cfg.ckpt);
+    ok("RUN ONCE finished.");
   } catch(e){
-    warn("XSLT err: " + e.message);
+    warn("RUN ONCE exception: " + (e && e.message ? e.message : e));
+    dumpLast();
   }
+  stopWatchdog();
 }
 
-/* =========================================================
-   T48–T50: Forms / selection / validity
-========================================================= */
-function T48(){
-  const box = mkSandbox();
-  step("Focus/blur storm em inputs + rewrite do container");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
+function runN(n){
+  stop();
+  const cfg = readCfg();
+  currentSeed = cfg.seed >>> 0;
+  rng = XorShift32(currentSeed);
+  iter = 0;
+  lastActions = [];
+  startWatchdog();
+  running = true;
 
-  const inputs = [];
-  for (let i=0;i<20;i++){
-    const inp = document.createElement('input');
-    inp.value = "v" + i;
-    inp.style.cssText = "display:block; margin:2px 0; width:320px;";
-    host.appendChild(inp);
-    inputs.push(inp);
-  }
-
-  for (let i=0;i<200;i++){
-    const t = inputs[i % inputs.length];
-    try { t.focus(); } catch(e){}
-    try { t.blur(); } catch(e){}
-    if (i % 40 === 0) { step("rewrite host"); host.innerHTML = ""; inputs.forEach(x=>host.appendChild(x)); }
-    if (i % 30 === 0) forceLayout(host);
-  }
-  ok("Focus/blur storm concluído.");
-}
-
-function T49(){
-  const box = mkSandbox();
-  step("Textarea selectionRange churn + value rewrite + remove/readd");
-  const ta = document.createElement('textarea');
-  ta.style.cssText = "width:340px;height:120px;border:1px solid #0f0;background:#000;color:#0f0;";
-  ta.value = "A".repeat(2000);
-  box.appendChild(ta);
-
-  for (let i=0;i<200;i++){
+  log(`\n=== RUN N start seed=${currentSeed} iters=${n} steps/iter=${cfg.steps} ===`);
+  const tick = () => {
+    if (!running) return;
     try {
-      const a = (i*7) % 1900;
-      const b = a + (i%80);
-      ta.setSelectionRange(a, b);
-      if (i % 25 === 0) ta.value = "B".repeat(2200) + " #" + i;
-      if (i % 40 === 0) { step("remove/readd textarea"); ta.remove(); box.appendChild(ta); }
+      runIteration(cfg.steps, cfg.ckpt);
     } catch(e){
-      warn("selectionRange err: " + e.message);
-      break;
+      warn("Exception: " + (e && e.message ? e.message : e));
+      dumpLast();
+      running = false;
+      stopWatchdog();
+      return;
     }
-    if (i % 15 === 0) forceLayout(ta);
-  }
-  ok("Textarea selection churn concluído.");
-}
-
-function T50(){
-  const box = mkSandbox();
-  step("Form clone/reset + constraint validation (se houver) + replaceChildren");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  const form = document.createElement('form');
-  form.innerHTML =
-    `<input required value="x">
-     <input type="email" value="a@b">
-     <input pattern="\\d+" value="123">
-     <button type="reset">reset</button>`;
-  host.appendChild(form);
-
-  for (let i=0;i<120;i++){
-    try {
-      if (form.checkValidity) form.checkValidity();
-      if (i % 5 === 0 && form.reset) form.reset();
-      if (i % 7 === 0) {
-        const clone = form.cloneNode(true);
-        host.replaceChildren(clone);
-      }
-    } catch(e){
-      warn("form validity/reset err: " + e.message);
-      break;
+    iter++;
+    if (iter >= n) {
+      ok("RUN N concluído.");
+      running = false;
+      stopWatchdog();
+      return;
     }
-    if (i % 10 === 0) forceLayout(host);
-  }
-  ok("Form churn concluído.");
-}
-
-/* =========================================================
-   T51–T53: Events / rAF / dispatch
-========================================================= */
-function T51(){
-  const box = mkSandbox();
-  step("add/remove listeners massivo em muitos nós + dispatch");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  const nodes = [];
-  for (let i=0;i<120;i++){
-    const d = document.createElement('div');
-    d.textContent = "n"+i;
-    host.appendChild(d);
-    nodes.push(d);
-  }
-
-  let hits = 0;
-  const handler = () => { hits++; };
-
-  for (let i=0;i<200;i++){
-    const n = nodes[i % nodes.length];
-    n.addEventListener("click", handler);
-    if (i % 2 === 0) n.removeEventListener("click", handler);
-    try { n.dispatchEvent(new MouseEvent("click")); } catch(e){}
-    if (i % 40 === 0) heapPressure(70);
-  }
-  ok("Event listeners churn concluído. hits=" + hits);
-}
-
-function T52(){
-  const box = mkSandbox();
-  step("dispatchEvent em subtree removido (custom event) + reattach");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  const child = document.createElement('div');
-  child.textContent = "child";
-  host.appendChild(child);
-  box.appendChild(host);
-
-  let got = 0;
-  child.addEventListener("omega", () => { got++; });
-
-  for (let i=0;i<120;i++){
-    if (i === 40) { step("remove host"); host.remove(); }
-    if (i === 60) { step("reattach host"); box.appendChild(host); }
-    try { child.dispatchEvent(new CustomEvent("omega", {bubbles:true})); } catch(e){ warn("dispatch err: "+e.message); }
-    if (i % 10 === 0) forceLayout(child);
-  }
-  ok("dispatchEvent churn concluído. got=" + got);
-}
-
-function T53(){
-  const box = mkSandbox();
-  step("requestAnimationFrame churn: cria/remove muitos nós por frame (curto)");
-  if (!window.requestAnimationFrame) { warn("rAF não suportado."); return; }
-
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  let frames = 0;
-  function frame(){
-    frames++;
-    // churn por frame
-    for (let i=0;i<30;i++){
-      const d = document.createElement('div');
-      d.textContent = "f"+frames+"-"+i;
-      host.appendChild(d);
-    }
-    while (host.childNodes.length > 80) host.removeChild(host.firstChild);
-
-    if (frames === 20) { step("teardown host"); host.remove(); box.appendChild(host); }
-    forceLayout(host);
-
-    if (frames < 120) requestAnimationFrame(frame);
-    else ok("rAF churn concluído. frames=" + frames);
-  }
-  requestAnimationFrame(frame);
-}
-
-/* =========================================================
-   T54–T56: Storage / URL / FileReader
-========================================================= */
-function T54(){
-  const box = mkSandbox();
-  step("localStorage churn (se suportado) + JSON + removeItem/clear");
-  if (!window.localStorage) { warn("localStorage não suportado."); return; }
-
-  let okOps = 0;
-  try {
-    for (let i=0;i<400;i++){
-      localStorage.setItem("k"+(i%80), JSON.stringify({i, s:"X".repeat(i%120)}));
-      if (i % 3 === 0) localStorage.removeItem("k"+((i*7)%80));
-      if (i % 97 === 0) localStorage.clear();
-      okOps++;
-      if (i % 50 === 0) heapPressure(60);
-    }
-    ok("localStorage churn concluído. ops=" + okOps);
-  } catch(e){
-    warn("localStorage err: " + e.message + " (ops=" + okOps + ")");
-  }
-}
-
-function T55(){
-  const box = mkSandbox();
-  step("URL/URLSearchParams churn + encode/decode + new URL()");
-  if (typeof URL === "undefined") { warn("URL API não suportada."); return; }
-
-  for (let i=0;i<800;i++){
-    try{
-      const u = new URL("https://example.invalid/path?x=1");
-      u.searchParams.set("a", "A".repeat(i%200));
-      u.searchParams.set("b", String(i));
-      const s = u.toString();
-      // parse de volta
-      const u2 = new URL(s);
-      void u2.searchParams.get("a");
-    } catch(e){
-      warn("URL churn err: " + e.message);
-      break;
-    }
-  }
-  ok("URL/URLSearchParams churn concluído.");
-}
-
-function T56(){
-  const box = mkSandbox();
-  step("FileReader Blob churn (se suportado): readAsText/readAsArrayBuffer alternando");
-  if (typeof FileReader === "undefined" || typeof Blob === "undefined") { warn("FileReader/Blob não suportado."); return; }
-
-  let done = 0, err = 0;
-  for (let i=0;i<60;i++){
-    try{
-      const fr = new FileReader();
-      const blob = new Blob(["Z".repeat(20000 + (i%10)*1000)], {type:"text/plain"});
-      fr.onerror = () => { err++; };
-      fr.onload = () => { done++; };
-
-      if (i % 2 === 0 && fr.readAsArrayBuffer) fr.readAsArrayBuffer(blob);
-      else fr.readAsText(blob);
-      keeper.push(fr);
-    } catch(e){
-      warn("FileReader err: " + e.message);
-      break;
-    }
-    if (i % 10 === 0) heapPressure(80);
-  }
-  ok("FileReader churn disparado. done=" + done + " err=" + err + " (assíncrono)");
-}
-
-/* =========================================================
-   T57–T58: MessagePorts / Workers (variação)
-========================================================= */
-function T57(){
-  const box = mkSandbox();
-  step("MessagePort chain relay (se suportado): porta1->porta2->porta3");
-  if (typeof MessageChannel === "undefined") { warn("MessageChannel não suportado."); return; }
-
-  const ch1 = new MessageChannel();
-  const ch2 = new MessageChannel();
-  const ch3 = new MessageChannel();
-  keeper.push(ch1, ch2, ch3);
-
-  let hops = 0;
-  ch1.port1.onmessage = (e) => { hops++; try { ch2.port2.postMessage(e.data); } catch(_){} };
-  ch2.port1.onmessage = (e) => { hops++; try { ch3.port2.postMessage(e.data); } catch(_){} };
-  ch3.port1.onmessage = (e) => { hops++; };
-
-  for (let i=0;i<200;i++){
-    try { ch1.port2.postMessage({i, s:"M".repeat(i%60)}); } catch(e){ warn("postMessage err: "+e.message); break; }
-    if (i % 50 === 0) { try { ch2.port1.close(); ch2.port2.close(); } catch(_){} } // fecha no meio
-  }
-  ok("MessagePort chain relay concluído. hops=" + hops);
-}
-
-function T58(){
-  const box = mkSandbox();
-  step("Worker nested postMessage (se suportado): worker ecoa e cria payload variado");
-  if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL === "undefined") { warn("Worker/Blob/URL não suportado."); return; }
-
-  const code = `
-    self.onmessage = (e) => {
-      const n = e.data.n|0;
-      // payload moderado
-      const arr = [];
-      for (let i=0;i<50;i++) arr.push("X".repeat((n+i)%40));
-      postMessage({n, arrlen:arr.length});
-    };
-  `;
-  const url = URL.createObjectURL(new Blob([code], {type:"application/javascript"}));
-  let got = 0;
-
-  try{
-    const w = new Worker(url);
-    w.onmessage = () => { got++; };
-    for (let i=0;i<120;i++){
-      w.postMessage({n:i});
-      if (i === 60) { step("terminate worker mid-stream"); w.terminate(); }
-    }
-    keeper.push(w);
-  } catch(e){
-    warn("Worker err: " + e.message);
-  } finally {
-    try { URL.revokeObjectURL(url); } catch(_){}
-  }
-  ok("Worker nested postMessage disparado. got=" + got + " (assíncrono)");
-}
-
-/* =========================================================
-   T59: Mutation Events legacy
-========================================================= */
-function T59(){
-  const box = mkSandbox();
-  step("DOMSubtreeModified (se suportado) + mutações + teardown no handler");
-  const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  box.appendChild(host);
-
-  let fired = 0;
-  const handler = () => {
-    fired++;
-    if (fired === 1) step("DOMSubtreeModified fired#1");
-    if (fired === 20) { step("handler teardown host"); host.innerHTML = ""; }
-    forceLayout(host);
+    loopTimer = setTimeout(tick, cfg.delay);
   };
+  loopTimer = setTimeout(tick, cfg.delay);
+}
 
-  try { host.addEventListener("DOMSubtreeModified", handler); } catch(e){ warn("addEventListener DOMSubtreeModified falhou: "+e.message); return; }
+function runUntilStop(){
+  stop();
+  const cfg = readCfg();
+  currentSeed = cfg.seed >>> 0;
+  rng = XorShift32(currentSeed);
+  iter = 0;
+  lastActions = [];
+  startWatchdog();
+  running = true;
 
-  for (let i=0;i<80;i++){
-    const s = document.createElement('span');
-    s.textContent = "s" + i;
-    host.appendChild(s);
-    if (i % 10 === 0) host.textContent = "reset " + i;
-  }
-  host.removeEventListener("DOMSubtreeModified", handler);
-  ok("DOMSubtreeModified churn concluído. fired=" + fired);
+  log(`\n=== RUN UNTIL STOP start seed=${currentSeed} steps/iter=${cfg.steps} ===`);
+  const tick = () => {
+    if (!running) return;
+    try {
+      runIteration(cfg.steps, cfg.ckpt);
+    } catch(e){
+      warn("Exception: " + (e && e.message ? e.message : e));
+      dumpLast();
+      running = false;
+      stopWatchdog();
+      return;
+    }
+    iter++;
+    loopTimer = setTimeout(tick, cfg.delay);
+  };
+  loopTimer = setTimeout(tick, cfg.delay);
 }
 
 /* =========================================================
-   T60: DocumentFragment + Range deleteContents churn
+   The “program”: choose a domain and mutate
 ========================================================= */
-function T60(){
+function runIteration(steps, ckptEvery){
+  // checkpoint curto para foto/registro manual
+  if (iter % ckptEvery === 0) {
+    log(`CKPT: iter=${iter} seed=${currentSeed} next=${rng.nextU32().toString(16)}`);
+  }
+  heartbeat();
+
+  // cria sandbox por iteração para isolar
   const box = mkSandbox();
-  step("DocumentFragment + Range.deleteContents + append/prepend + normalize");
+  const ctx = makeContext(box);
+
+  for (let s=0;s<steps;s++){
+    heartbeat();
+    // escolhe família
+    const family = rng.pick(8); // 0..7
+    switch(family){
+      case 0: actDOM(ctx); break;
+      case 1: actRange(ctx); break;
+      case 2: actSVG(ctx); break;
+      case 3: actCSSOM(ctx); break;
+      case 4: actIframe(ctx); break;
+      case 5: actCanvas(ctx); break;
+      case 6: actImage(ctx); break;
+      case 7: actEvents(ctx); break;
+    }
+    if (s % 7 === 0) heapPressure(40 + (rng.pick(80)));
+  }
+
+  // teardown variado
+  if (rng.pick(3) === 0) { recordAction("teardown_box"); box.remove(); }
+  else { forceLayout(box); }
+
+  // mantém poucos sandboxes para não virar só exaustão
+  const sand = document.querySelectorAll(".sandbox");
+  if (sand.length > 6) {
+    sand[0].remove();
+    recordAction("gc_sandbox_trim");
+  }
+}
+
+/* =========================================================
+   Context per iteration
+========================================================= */
+function makeContext(box){
+  const ctx = { box, dom:null, svg:null, styleEl:null, sheet:null, canvas:null, cctx:null, img:null, ifr:null };
+  // host DOM
   const host = document.createElement('div');
-  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px;";
-  host.innerHTML = "<p>" + "Q".repeat(800) + "</p><p>" + "W".repeat(800) + "</p>";
+  host.style.cssText = "border:1px solid #0f0; padding:6px; width:340px; min-height:40px;";
+  host.innerHTML = "<b>host</b> <i>fuzz</i> " + "A".repeat(80);
   box.appendChild(host);
+  ctx.dom = host;
 
-  for (let i=0;i<60;i++){
-    try{
-      const p1 = host.firstElementChild;
-      const p2 = host.lastElementChild;
-      const r = document.createRange();
-      r.setStart(p1.firstChild, Math.min(10+(i%50), p1.firstChild.length-1));
-      r.setEnd(p2.firstChild, Math.min(20+(i%60), p2.firstChild.length-1));
-      r.deleteContents();
+  // stylesheet
+  const st = document.createElement('style');
+  st.textContent = "/* fuzz */";
+  box.appendChild(st);
+  ctx.styleEl = st;
+  ctx.sheet = st.sheet || null;
 
+  // canvas
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 64;
+  c.style.cssText = "border:1px solid #0f0; margin-top:6px;";
+  box.appendChild(c);
+  ctx.canvas = c;
+  try { ctx.cctx = c.getContext('2d'); } catch(e){ ctx.cctx = null; }
+
+  // img
+  const img = document.createElement('img');
+  img.style.cssText = "border:1px solid #0f0; width:24px; height:24px; margin-left:6px;";
+  box.appendChild(img);
+  ctx.img = img;
+
+  return ctx;
+}
+
+/* =========================================================
+   Action families (sanity/crash hunting)
+========================================================= */
+function actDOM(ctx){
+  const h = ctx.dom;
+  const op = rng.pick(7);
+  switch(op){
+    case 0: { // innerHTML rewrite
+      recordAction("DOM.innerHTML", String(op));
+      h.innerHTML = "<span>" + "X".repeat(20 + rng.pick(120)) + "</span>";
+      break;
+    }
+    case 1: { // append/remove nodes
+      recordAction("DOM.appendRemove", String(op));
+      const n = document.createElement(rng.pick(2) ? "span" : "div");
+      n.textContent = "n" + rng.pick(9999);
+      h.appendChild(n);
+      if (h.childNodes.length > 20) h.removeChild(h.firstChild);
+      break;
+    }
+    case 2: { // attribute churn + computed style
+      recordAction("DOM.attr+style", String(op));
+      h.setAttribute("data-x", String(rng.pick(100000)));
+      h.style.marginLeft = (rng.pick(20)) + "px";
+      try { void getComputedStyle(h).width; } catch(e){}
+      break;
+    }
+    case 3: { // reparent host
+      recordAction("DOM.reparent", String(op));
+      const b = ctx.box;
+      h.remove();
+      b.appendChild(h);
+      break;
+    }
+    case 4: { // text node normalize
+      recordAction("DOM.normalize", String(op));
+      h.appendChild(document.createTextNode("T" + "y".repeat(rng.pick(80))));
+      h.normalize();
+      break;
+    }
+    case 5: { // create DocumentFragment insert
+      recordAction("DOM.fragment", String(op));
       const frag = document.createDocumentFragment();
-      for (let k=0;k<10;k++){
+      for (let i=0;i<5;i++){
         const s = document.createElement('span');
-        s.textContent = "@" + i + ":" + k;
+        s.textContent = "@"+rng.pick(999);
         frag.appendChild(s);
       }
-      host.prepend(frag);
-      if (i % 10 === 0) host.normalize();
-      if (i === 30) { step("rewrite host"); host.innerHTML = "<p>reset</p>" + "<p>" + "E".repeat(600) + "</p>"; }
-    } catch(e){
-      warn("Range/fragment err: " + e.message);
+      h.prepend(frag);
       break;
     }
-    if (i % 6 === 0) forceLayout(host);
+    case 6: { // scrollIntoView stress if possible
+      recordAction("DOM.scrollIntoView", String(op));
+      const s = document.createElement('div');
+      s.style.height = "400px";
+      h.appendChild(s);
+      try { s.scrollIntoView(); } catch(e){}
+      s.remove();
+      break;
+    }
   }
-  ok("Fragment/Range deleteContents churn concluído.");
+  forceLayout(h);
 }
 
-/* =========================
-   Global traps
-========================= */
-window.addEventListener('error', (e) => warn("window.onerror: " + (e && e.message ? e.message : "error")));
-window.addEventListener('unhandledrejection', (e) => warn("unhandledrejection: " + (e && e.reason && e.reason.message ? e.reason.message : e.reason)));
+function actRange(ctx){
+  const h = ctx.dom;
+  if (!h.firstChild) return;
+  const op = rng.pick(6);
+  switch(op){
+    case 0: {
+      recordAction("Range.deleteContents", String(op));
+      try{
+        const r = document.createRange();
+        const tn = h.firstChild.nodeType === 3 ? h.firstChild : (h.firstChild.firstChild || h.firstChild);
+        if (!tn || !tn.length) break;
+        const a = Math.min(rng.pick(Math.max(1, tn.length)), tn.length-1);
+        const b = Math.min(a + rng.pick(10), tn.length);
+        r.setStart(tn, a);
+        r.setEnd(tn, b);
+        r.deleteContents();
+      } catch(e){}
+      break;
+    }
+    case 1: {
+      recordAction("Range.extract+append", String(op));
+      try{
+        const r = document.createRange();
+        const tn = h.firstChild.nodeType === 3 ? h.firstChild : (h.firstChild.firstChild || h.firstChild);
+        if (!tn || !tn.length) break;
+        r.setStart(tn, 0);
+        r.setEnd(tn, Math.min(5 + rng.pick(20), tn.length));
+        const frag = r.extractContents();
+        keeper.push(frag);
+        h.appendChild(frag);
+      } catch(e){}
+      break;
+    }
+    case 2: {
+      recordAction("Range.getClientRects", String(op));
+      try{
+        const r = document.createRange();
+        const el = h.querySelector("span,div,b,i") || h;
+        const tn = el.firstChild && el.firstChild.nodeType === 3 ? el.firstChild : null;
+        if (!tn || !tn.length) break;
+        r.setStart(tn, 0);
+        r.setEnd(tn, Math.min(10, tn.length));
+        r.getClientRects && r.getClientRects();
+      } catch(e){}
+      break;
+    }
+    case 3: {
+      recordAction("Selection.churn", String(op));
+      const sel = window.getSelection && window.getSelection();
+      if (!sel) break;
+      try{
+        const r = document.createRange();
+        const el = h.querySelector("span,div,b,i") || h;
+        const tn = el.firstChild && el.firstChild.nodeType === 3 ? el.firstChild : null;
+        if (!tn || !tn.length) break;
+        const a = Math.min(rng.pick(tn.length), tn.length-1);
+        r.setStart(tn, a);
+        r.setEnd(tn, Math.min(a+1+rng.pick(10), tn.length));
+        sel.removeAllRanges();
+        sel.addRange(r);
+      } catch(e){}
+      break;
+    }
+    case 4: {
+      recordAction("Range.surround", String(op));
+      try{
+        const r = document.createRange();
+        const el = h.querySelector("b,i,span") || h;
+        if (!el.firstChild || el.firstChild.nodeType !== 3) break;
+        const tn = el.firstChild;
+        if (tn.length < 2) break;
+        r.setStart(tn, 0);
+        r.setEnd(tn, Math.min(2+rng.pick(8), tn.length));
+        const wrap = document.createElement('span');
+        wrap.textContent = "";
+        r.surroundContents(wrap);
+      } catch(e){}
+      break;
+    }
+    case 5: {
+      recordAction("TreeWalker.removeWhileIter", String(op));
+      try{
+        const tw = document.createTreeWalker(h, NodeFilter.SHOW_ELEMENT, null, false);
+        let n, c=0;
+        while((n = tw.nextNode()) && c++ < 30){
+          if (c % 9 === 0 && n.parentNode) n.parentNode.removeChild(n);
+        }
+      } catch(e){}
+      break;
+    }
+  }
+  forceLayout(h);
+}
+
+function actSVG(ctx){
+  const op = rng.pick(6);
+  const ns = "http://www.w3.org/2000/svg";
+  // lazy init svg
+  if (!ctx.svg){
+    const svg = document.createElementNS(ns,'svg');
+    svg.setAttribute('width','340'); svg.setAttribute('height','120');
+    svg.style.border = "1px solid #0f0";
+    ctx.box.appendChild(svg);
+    ctx.svg = svg;
+
+    const path = document.createElementNS(ns,'path');
+    path.setAttribute('stroke','lime'); path.setAttribute('fill','none'); path.setAttribute('stroke-width','2');
+    path.setAttribute('d','M10 10 C 100 10 200 110 330 110');
+    svg.appendChild(path);
+    ctx.svgPath = path;
+  }
+  const svg = ctx.svg;
+  const p = ctx.svgPath;
+
+  switch(op){
+    case 0:
+      recordAction("SVG.path.d+len", String(op));
+      p.setAttribute('d', `M10 ${10+rng.pick(90)} C 100 ${10+rng.pick(90)} 200 ${10+rng.pick(90)} 330 ${10+rng.pick(90)}`);
+      try { p.getTotalLength && p.getTotalLength(); } catch(e){}
+      break;
+    case 1:
+      recordAction("SVG.getBBox/remove", String(op));
+      try { p.getBBox && p.getBBox(); } catch(e){}
+      if (rng.pick(4) === 0) p.remove();
+      if (!p.isConnected) svg.appendChild(p);
+      break;
+    case 2:
+      recordAction("SVG.filter.blur", String(op));
+      // quick filter injection
+      try{
+        let defs = svg.querySelector('defs');
+        if (!defs){ defs = document.createElementNS(ns,'defs'); svg.insertBefore(defs, svg.firstChild); }
+        let f = defs.querySelector('#f');
+        if (!f){
+          f = document.createElementNS(ns,'filter'); f.setAttribute('id','f');
+          const blur = document.createElementNS(ns,'feGaussianBlur'); blur.setAttribute('stdDeviation','2');
+          f.appendChild(blur);
+          defs.appendChild(f);
+        } else {
+          const blur = f.firstChild;
+          blur && blur.setAttribute('stdDeviation', String((rng.pick(10)+1)/2));
+        }
+        p.setAttribute('filter','url(#f)');
+      } catch(e){}
+      break;
+    case 3:
+      recordAction("SVG.foreignObject", String(op));
+      try{
+        let fo = svg.querySelector('foreignObject');
+        if (!fo){
+          fo = document.createElementNS(ns,'foreignObject');
+          fo.setAttribute('x','10'); fo.setAttribute('y','10'); fo.setAttribute('width','320'); fo.setAttribute('height','80');
+          const d = document.createElement('div');
+          d.textContent = "FO " + "Z".repeat(50);
+          fo.appendChild(d);
+          svg.appendChild(fo);
+        } else {
+          const d = fo.firstChild;
+          if (d) d.textContent = "FO#" + rng.pick(9999) + " " + "Y".repeat(rng.pick(120));
+          if (rng.pick(5) === 0) fo.remove();
+        }
+      } catch(e){}
+      break;
+    case 4:
+      recordAction("SVG.serialize", String(op));
+      if (typeof XMLSerializer !== "undefined") {
+        try { new XMLSerializer().serializeToString(svg); } catch(e){}
+      }
+      break;
+    case 5:
+      recordAction("SVG.text.metrics", String(op));
+      try{
+        let t = svg.querySelector('text');
+        if (!t){
+          t = document.createElementNS(ns,'text');
+          t.setAttribute('x','10'); t.setAttribute('y','60');
+          t.textContent = "text " + "A".repeat(80);
+          svg.appendChild(t);
+        } else {
+          t.textContent = "t#" + rng.pick(9999) + " " + "B".repeat(rng.pick(200));
+        }
+        t.getComputedTextLength && t.getComputedTextLength();
+      } catch(e){}
+      break;
+  }
+  forceLayout(svg);
+}
+
+function actCSSOM(ctx){
+  const sheet = ctx.sheet;
+  const h = ctx.dom;
+  const op = rng.pick(6);
+
+  switch(op){
+    case 0:
+      recordAction("CSSOM.insertRule", String(op));
+      if (sheet && sheet.insertRule){
+        try{
+          const cls = "f" + rng.pick(80);
+          const rule = `.${cls}{margin-left:${rng.pick(40)}px;padding:${rng.pick(8)}px;}`;
+          sheet.insertRule(rule, Math.min(sheet.cssRules.length, 0));
+          if (sheet.cssRules.length > 120) sheet.deleteRule(0);
+          h.className = cls;
+        } catch(e){}
+      }
+      break;
+    case 1:
+      recordAction("CSS.keyframes", String(op));
+      if (sheet && sheet.insertRule){
+        try{
+          const name = "k" + rng.pick(2000);
+          sheet.insertRule(`@keyframes ${name}{0%{transform:translateX(0)}100%{transform:translateX(${rng.pick(30)}px)}}`, sheet.cssRules.length);
+          h.style.animation = `${name} 0.06s linear infinite`;
+          if (sheet.cssRules.length > 60) sheet.deleteRule(0);
+        } catch(e){}
+      }
+      break;
+    case 2:
+      recordAction("CSS.vars.calc", String(op));
+      h.style.setProperty('--a', (10 + rng.pick(60)) + "px");
+      h.style.setProperty('--b', String(1 + rng.pick(6)));
+      h.style.width = "calc(var(--a) * var(--b))";
+      try { void getComputedStyle(h).width; } catch(e){}
+      break;
+    case 3:
+      recordAction("CSS.displayFlip", String(op));
+      h.style.display = (h.style.display === "none") ? "block" : "none";
+      h.style.position = (rng.pick(2) ? "relative" : "static");
+      break;
+    case 4:
+      recordAction("CSS.reparentStyleEl", String(op));
+      if (ctx.styleEl){
+        ctx.styleEl.remove();
+        ctx.box.appendChild(ctx.styleEl);
+      }
+      break;
+    case 5:
+      recordAction("CSS.classListToggle", String(op));
+      h.classList.toggle("aa");
+      h.classList.toggle("bb");
+      break;
+  }
+  forceLayout(h);
+}
+
+function actIframe(ctx){
+  const op = rng.pick(5);
+  const box = ctx.box;
+
+  if (!ctx.ifr){
+    const ifr = document.createElement('iframe');
+    ifr.style.cssText = "width:340px;height:80px;border:1px solid #0f0;margin-top:6px;";
+    box.appendChild(ifr);
+    ctx.ifr = ifr;
+  }
+  const ifr = ctx.ifr;
+
+  switch(op){
+    case 0:
+      recordAction("IFR.srcdoc", String(op));
+      try{
+        const i = rng.pick(9999);
+        ifr.srcdoc = `<!doctype html><meta charset=utf-8><body>f${i}<script>document.body.innerHTML='x${i}';<\/script></body>`;
+      } catch(e){}
+      break;
+    case 1:
+      recordAction("IFR.write", String(op));
+      try{
+        const w = ifr.contentWindow;
+        const d = w && w.document;
+        if (d){
+          d.open(); d.write("<!doctype html><body><div>W"+rng.pick(9999)+"</div></body>"); d.close();
+        }
+      } catch(e){}
+      break;
+    case 2:
+      recordAction("IFR.removeReadd", String(op));
+      ifr.remove();
+      box.appendChild(ifr);
+      break;
+    case 3:
+      recordAction("IFR.postMessage", String(op));
+      try{
+        const w = ifr.contentWindow;
+        w && w.postMessage && w.postMessage({n:rng.pick(999)}, "*");
+      } catch(e){}
+      break;
+    case 4:
+      recordAction("IFR.sizeChurn", String(op));
+      ifr.style.height = (60 + rng.pick(100)) + "px";
+      ifr.style.width = (260 + rng.pick(120)) + "px";
+      break;
+  }
+  forceLayout(ifr);
+}
+
+function actCanvas(ctx){
+  const c = ctx.canvas;
+  const g = ctx.cctx;
+  if (!c || !g) return;
+  const op = rng.pick(6);
+
+  switch(op){
+    case 0:
+      recordAction("CANVAS.resize", String(op));
+      c.width = 32 + rng.pick(480);
+      c.height = 32 + rng.pick(240);
+      break;
+    case 1:
+      recordAction("CANVAS.getPut", String(op));
+      try{
+        g.fillRect(0,0,c.width,c.height);
+        const w = Math.min(64, c.width), h = Math.min(64, c.height);
+        const id = g.getImageData(0,0,w,h);
+        g.putImageData(id, 0, 0);
+      } catch(e){}
+      break;
+    case 2:
+      recordAction("CANVAS.pattern", String(op));
+      try{
+        const pc = document.createElement('canvas');
+        pc.width=8; pc.height=8;
+        const pg = pc.getContext('2d');
+        pg.fillRect(0,0,8,8);
+        const pat = g.createPattern(pc, "repeat");
+        g.fillStyle = pat;
+        g.fillRect(0,0,c.width,c.height);
+      } catch(e){}
+      break;
+    case 3:
+      recordAction("CANVAS.toDataURL", String(op));
+      try { c.toDataURL("image/png"); } catch(e){}
+      break;
+    case 4:
+      recordAction("CANVAS.teardown", String(op));
+      c.remove();
+      ctx.box.appendChild(c);
+      break;
+    case 5:
+      recordAction("CANVAS.text", String(op));
+      try{
+        g.font = (10+rng.pick(30)) + "px monospace";
+        g.fillText("T"+rng.pick(9999), 2, 14+rng.pick(40));
+      } catch(e){}
+      break;
+  }
+  forceLayout(c);
+}
+
+function actImage(ctx){
+  const img = ctx.img;
+  const op = rng.pick(6);
+
+  // tiny png base64
+  const dataPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII=";
+  switch(op){
+    case 0:
+      recordAction("IMG.dataURL", String(op));
+      img.src = dataPng + "#v=" + rng.pick(100000);
+      break;
+    case 1:
+      recordAction("IMG.removeReadd", String(op));
+      img.remove();
+      ctx.box.appendChild(img);
+      break;
+    case 2:
+      recordAction("IMG.blobURL", String(op));
+      if (typeof Blob !== "undefined" && typeof URL !== "undefined"){
+        try{
+          const bytes = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+J8b0AAAAASUVORK5CYII="), c=>c.charCodeAt(0));
+          const blob = new Blob([bytes], {type:"image/png"});
+          const url = URL.createObjectURL(blob);
+          img.src = url;
+          if (rng.pick(2)===0) URL.revokeObjectURL(url); // revoke cedo
+        } catch(e){}
+      }
+      break;
+    case 3:
+      recordAction("IMG.decodeAttempt", String(op));
+      // decode() pode não existir; tentar sem depender
+      try { img.decode && img.decode().catch(()=>{}); } catch(e){}
+      break;
+    case 4:
+      recordAction("IMG.sizeChurn", String(op));
+      img.style.width = (8 + rng.pick(80)) + "px";
+      img.style.height = (8 + rng.pick(80)) + "px";
+      break;
+    case 5:
+      recordAction("IMG.styleChurn", String(op));
+      img.style.transform = "rotate(" + (rng.pick(360)) + "deg)";
+      img.style.opacity = String((rng.pick(10)+1)/10);
+      break;
+  }
+  forceLayout(img);
+}
+
+function actEvents(ctx){
+  const h = ctx.dom;
+  const op = rng.pick(6);
+
+  switch(op){
+    case 0:
+      recordAction("EVT.dispatchCustom", String(op));
+      try{
+        const ev = new CustomEvent("omega", {bubbles:true});
+        h.dispatchEvent(ev);
+      } catch(e){}
+      break;
+    case 1:
+      recordAction("EVT.addRemove", String(op));
+      try{
+        const fn = ()=>{};
+        h.addEventListener("click", fn);
+        if (rng.pick(2)===0) h.removeEventListener("click", fn);
+        h.dispatchEvent(new MouseEvent("click"));
+      } catch(e){}
+      break;
+    case 2:
+      recordAction("EVT.MutationObserver", String(op));
+      try{
+        const mo = new MutationObserver(()=>{ h.classList.toggle("m"); });
+        mo.observe(h, {attributes:true, childList:true, subtree:true});
+        h.setAttribute("data-m", String(rng.pick(9999)));
+        mo.disconnect();
+      } catch(e){}
+      break;
+    case 3:
+      recordAction("EVT.hashchange", String(op));
+      try { location.hash = "f" + rng.pick(99999); } catch(e){}
+      break;
+    case 4:
+      recordAction("EVT.rAF", String(op));
+      if (window.requestAnimationFrame){
+        try{
+          requestAnimationFrame(()=>{ h.textContent = "raf"+rng.pick(9999); forceLayout(h); });
+        } catch(e){}
+      }
+      break;
+    case 5:
+      recordAction("EVT.timerTeardown", String(op));
+      setTimeout(() => {
+        try { h.remove(); } catch(e){}
+      }, 0);
+      break;
+  }
+  forceLayout(h);
+}
+
+/* =========================================================
+   Global error hooks
+========================================================= */
+window.addEventListener('error', (e) => {
+  warn("window.onerror: " + (e && e.message ? e.message : "error"));
+  dumpLast();
+});
+window.addEventListener('unhandledrejection', (e) => {
+  warn("unhandledrejection: " + (e && e.reason && e.reason.message ? e.reason.message : e.reason));
+  dumpLast();
+});
 </script>
 </body>
 </html>
