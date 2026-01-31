@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PS4 WebKit - NAV Forensics Harness (Signals Only)</title>
+<style>
+  body{font-family:monospace;background:#000;color:#0f0;margin:0;padding:14px}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+  button{font-family:monospace;font-size:14px;padding:10px 12px;background:#0a0;color:#000;border:0;cursor:pointer}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  input{font-family:monospace;font-size:14px;padding:8px;background:#111;color:#0f0;border:1px solid #0a0;width:90px}
+  .box{border:1px solid #0a0;padding:10px;margin-top:10px;white-space:pre-wrap;word-break:break-word}
+  .warn{color:#ff0}
+  .bad{color:#f55}
+  .ok{color:#0f0}
+</style>
+</head>
+<body>
+<h2>PS4 WebKit - NAV Forensics Harness (Signals Only)</h2>
+<div class="row">
+  <button id="btnClear" onclick="clearLog()">Limpar</button>
+  <button id="btnNav1" onclick="runNav1()">Rodar NAV1 (state)</button>
+  <button id="btnNav2" onclick="runNav2()">Rodar NAV2 (cross-entry)</button>
+  <button id="btnStop" onclick="stopAll()">Parar</button>
+</div>
+
+<div class="row">
+  <span>Mode</span>
+  <select id="mode">
+    <option value="SAFE">SAFE</option>
+    <option value="AGGR">AGGR</option>
+  </select>
+  <span>seed</span>
+  <input id="seed" type="number" value="1337" min="1" step="1">
+  <span>ops</span>
+  <input id="ops" type="number" value="12" min="4" step="1">
+  <span>timeout(ms)</span>
+  <input id="timeoutMs" type="number" value="700" min="100" step="50">
+</div>
+
+<div class="box" id="log"></div>
+
+<script>
+/*
+  Objetivo: transformar "sinais fortes" em evidência de integridade/consistência
+  SEM apertar timing agressivo nem tentar crash. Tudo bounded.
+  O foco é:
+   - STATE_NULL_OR_UNEXPECTED: event.state null ou token inesperado
+   - POP_TIMEOUT: popstate não chega dentro de uma janela razoável
+   - CROSS_CONTAM: token de NAV2 em verificação NAV1 ou vice-versa (quando isolado)
+   - ENV_BLOCKED: origin/null ou políticas bloqueando replaceState/pushState
+
+  Estratégia:
+   1) Não confiar em history.length ou "índices esperados".
+   2) Criar entradas com tokens únicos (runId + i).
+   3) Validar por token, não por posição.
+   4) Rodar NAV1 e NAV2 separadamente (um por vez), e opcionalmente limpar por reload manual.
+*/
+
+const LOG = document.getElementById('log');
+let STOP = false;
+
+function nowMs(){ return (performance && performance.now) ? performance.now() : Date.now(); }
+
+function log(s, cls){
+  const line = document.createElement('div');
+  line.textContent = s;
+  if(cls) line.className = cls;
+  LOG.appendChild(line);
+  LOG.scrollTop = LOG.scrollHeight;
+}
+function hr(){ log("------------------------------------------------------------"); }
+
+function clearLog(){ LOG.textContent=""; }
+
+function stopAll(){
+  STOP = true;
+  log("[CTRL] STOP set = true", "warn");
+}
+
+function envInfo(){
+  const u = (typeof navigator !== "undefined" && navigator.userAgent) ? navigator.userAgent : "n/a";
+  let origin = "n/a";
+  try { origin = location.origin; } catch(e){ origin = "err"; }
+  log("[INFO] UA=" + u);
+  log("[INFO] url=" + safe(location.href));
+  log("[INFO] origin=" + safe(origin));
+}
+
+function safe(x){
+  try { return String(x); } catch(e){ return "<unprintable>"; }
+}
+
+function caps(){
+  const mode = document.getElementById('mode').value;
+  const opsIn = parseInt(document.getElementById('ops').value, 10) || 12;
+  // bounded: SAFE menor, AGGR maior (mas sem exagero)
+  const ops = (mode === "SAFE") ? Math.min(opsIn, 14) : Math.min(opsIn, 25);
+  const timeoutMs = Math.min(Math.max(parseInt(document.getElementById('timeoutMs').value,10)||700, 150), 2500);
+  const seed = parseInt(document.getElementById('seed').value,10) || 1337;
+  return {mode, ops, timeoutMs, seed};
+}
+
+function mkToken(kind, runId, i){
+  return kind + ":" + runId + ":" + i;
+}
+
+function parseToken(state){
+  // aceitamos string token direta ou objeto {t:token, kind:..}
+  if(state == null) return {ok:false, reason:"STATE_NULL", token:null, kind:null};
+  if(typeof state === "string"){
+    const parts = state.split(":");
+    return {ok: parts.length>=3, reason: parts.length>=3 ? "OK" : "STATE_STR_BAD", token: state, kind: parts[0]||null};
+  }
+  if(typeof state === "object"){
+    const t = state.t || state.token || null;
+    if(typeof t === "string"){
+      const parts = t.split(":");
+      return {ok: parts.length>=3, reason: parts.length>=3 ? "OK" : "STATE_OBJ_TOKEN_BAD", token:t, kind: parts[0]||null};
+    }
+    return {ok:false, reason:"STATE_OBJ_NO_TOKEN", token:null, kind: state.kind||null};
+  }
+  return {ok:false, reason:"STATE_TYPE_"+(typeof state), token:null, kind:null};
+}
+
+function tryPush(urlHash, stateObj){
+  try{
+    history.pushState(stateObj, "", urlHash);
+    return {ok:true};
+  }catch(e){
+    return {ok:false, err:safe(e)};
+  }
+}
+function tryReplace(urlHash, stateObj){
+  try{
+    history.replaceState(stateObj, "", urlHash);
+    return {ok:true};
+  }catch(e){
+    return {ok:false, err:safe(e)};
+  }
+}
+
+function waitPopOnce(expectedDelta, timeoutMs){
+  // espera um popstate ou timeout; delta é informativo apenas
+  return new Promise(resolve=>{
+    let done = false;
+    const t0 = nowMs();
+    function finish(res){
+      if(done) return;
+      done = true;
+      window.removeEventListener("popstate", onPop, true);
+      resolve(Object.assign({dt: (nowMs()-t0)}, res));
+    }
+    function onPop(ev){
+      finish({ok:true, ev});
+    }
+    window.addEventListener("popstate", onPop, true);
+    setTimeout(()=>finish({ok:false, reason:"POP_TIMEOUT", expectedDelta}), timeoutMs);
+  });
+}
+
+function disableBtns(dis){
+  document.getElementById('btnNav1').disabled = dis;
+  document.getElementById('btnNav2').disabled = dis;
+}
+
+async function runNav1(){
+  STOP = false;
+  disableBtns(true);
+  clearLog();
+  envInfo();
+  const C = caps();
+  log("[RUN] NAV1 | mode="+C.mode+" ops="+C.ops+" timeoutMs="+C.timeoutMs+" seed="+C.seed);
+  hr();
+
+  // RunID evita confusão entre execuções na mesma sessão
+  const runId = "r" + C.seed + "_" + Math.floor(nowMs()).toString(16);
+
+  // RC counters (alert-only)
+  const RC = {
+    ENV_BLOCKED: 0,
+    REPLACE_FAIL: 0,
+    PUSH_FAIL: 0,
+    POP_TIMEOUT: 0,
+    STATE_NULL: 0,
+    STATE_UNEXPECTED_KIND: 0,
+    TOKEN_MISMATCH: 0,
+    CROSS_CONTAM: 0,
+    OK: 0
+  };
+
+  // Baseline entry: garantir que current entry tem token NAV1:runId:-1
+  const baseHash = "#nav1_base_" + runId;
+  const baseState = {t: mkToken("NAV1", runId, -1), kind:"NAV1", base:true};
+  const rep = tryReplace(baseHash, baseState);
+  if(!rep.ok){
+    RC.REPLACE_FAIL++;
+    // origin 'null' / policy - comum em content:// (Android). É ambiente, não bug.
+    RC.ENV_BLOCKED++;
+    log("[ALERT][RC=ENV_BLOCKED] replaceState falhou: "+rep.err, "warn");
+    log("[HINT] Se você estiver em content:// (origin=null), History pode bloquear mutation. Use file:// ou http/https no PS4.", "warn");
+    disableBtns(false);
+    return;
+  }
+
+  // Criar N entradas com token determinístico
+  const expected = [];
+  for(let i=0;i<C.ops;i++){
+    if(STOP) break;
+    const tok = mkToken("NAV1", runId, i);
+    expected.push(tok);
+    const h = "#nav1_" + runId + "_" + i;
+    const st = {t: tok, kind:"NAV1", i};
+    const r = tryPush(h, st);
+    if(!r.ok){
+      RC.PUSH_FAIL++;
+      log("[ALERT][RC=PUSH_FAIL] pushState falhou i="+i+" err="+r.err, "warn");
+      break;
+    }
+  }
+
+  // Navegar para trás e validar tokens recebidos
+  // IMPORTANTE: não usar history.length / idx. Validar por token recebido vs conjunto esperado.
+  const seen = {};
+  for(let step=0; step<expected.length; step++){
+    if(STOP) break;
+    // move 1 passo pra trás
+    try { history.go(-1); } catch(e){ /* ignore */ }
+
+    const res = await waitPopOnce(-1, C.timeoutMs);
+    if(!res.ok){
+      RC.POP_TIMEOUT++;
+      log("[ALERT][RC=POP_TIMEOUT] step="+step+" dt="+res.dt.toFixed(1)+"ms", "warn");
+      continue;
+    }
+
+    const st = res.ev ? res.ev.state : null;
+    const p = parseToken(st);
+
+    if(!p.ok){
+      if(p.reason === "STATE_NULL") RC.STATE_NULL++;
+      else RC.TOKEN_MISMATCH++;
+      log("[ALERT][RC="+p.reason+"] popstate.state inválido: "+safe(st), "warn");
+      continue;
+    }
+
+    // kind esperado NAV1
+    if(p.kind !== "NAV1"){
+      RC.STATE_UNEXPECTED_KIND++;
+      log("[ALERT][RC=STATE_UNEXPECTED_KIND] gotKind="+safe(p.kind)+" token="+p.token, "warn");
+    }
+
+    // cross-contam: token NAV2 aparecendo aqui
+    if(p.token.indexOf("NAV2:") === 0){
+      RC.CROSS_CONTAM++;
+      log("[ALERT][RC=CROSS_CONTAM] token NAV2 visto durante NAV1: "+p.token, "bad");
+    }
+
+    // token pertence ao conjunto esperado?
+    if(expected.indexOf(p.token) === -1 && p.token !== baseState.t){
+      RC.TOKEN_MISMATCH++;
+      log("[ALERT][RC=TOKEN_MISMATCH] token inesperado: "+p.token, "bad");
+    } else {
+      RC.OK++;
+      seen[p.token] = (seen[p.token]||0)+1;
+    }
+  }
+
+  hr();
+  // Sumário focado em alertas (pouco verboso)
+  const alerts = RC.ENV_BLOCKED+RC.PUSH_FAIL+RC.REPLACE_FAIL+RC.POP_TIMEOUT+RC.STATE_NULL+RC.STATE_UNEXPECTED_KIND+RC.TOKEN_MISMATCH+RC.CROSS_CONTAM;
+  log("[SUM] NAV1 alerts="+alerts+" okEvents="+RC.OK);
+  if(alerts===0){
+    log("[PASS] NAV1 :: Nenhum sinal forte observado (nesta execução).", "ok");
+  }else{
+    log("[FAIL] NAV1 :: Alertas observados (ver RC acima).", "bad");
+  }
+  log("[RC] "+JSON.stringify(RC));
+  disableBtns(false);
+}
+
+async function runNav2(){
+  STOP = false;
+  disableBtns(true);
+  clearLog();
+  envInfo();
+  const C = caps();
+  log("[RUN] NAV2 | mode="+C.mode+" ops="+C.ops+" timeoutMs="+C.timeoutMs+" seed="+C.seed);
+  hr();
+
+  const runId = "r" + C.seed + "_" + Math.floor(nowMs()).toString(16);
+
+  const RC = {
+    ENV_BLOCKED: 0,
+    REPLACE_FAIL: 0,
+    PUSH_FAIL: 0,
+    POP_TIMEOUT: 0,
+    TOKEN_MISMATCH: 0,
+    CROSS_CONTAM: 0,
+    OK: 0
+  };
+
+  // Criar duas "famílias" de entries intercaladas: A e B.
+  // Depois navegar e verificar se o token recebido muda de família conforme esperado.
+  // Isso detecta contaminação entre entradas (state de uma família aparecendo na outra).
+  const baseHash = "#nav2_base_" + runId;
+  const baseState = {t: mkToken("NAV2", runId, -1), kind:"NAV2", base:true};
+  const rep = tryReplace(baseHash, baseState);
+  if(!rep.ok){
+    RC.REPLACE_FAIL++;
+    RC.ENV_BLOCKED++;
+    log("[ALERT][RC=ENV_BLOCKED] replaceState falhou: "+rep.err, "warn");
+    disableBtns(false);
+    return;
+  }
+
+  const A = [], B = [];
+  const total = C.ops; // bounded
+  for(let i=0;i<total;i++){
+    if(STOP) break;
+    const fam = (i%2===0) ? "A" : "B";
+    const tok = "NAV2:"+runId+":"+fam+":"+i;
+    const h = "#nav2_" + runId + "_" + fam + "_" + i;
+    const st = {t: tok, kind:"NAV2", fam, i};
+    const r = tryPush(h, st);
+    if(!r.ok){
+      RC.PUSH_FAIL++;
+      log("[ALERT][RC=PUSH_FAIL] pushState falhou i="+i+" err="+r.err, "warn");
+      break;
+    }
+    (fam==="A" ? A : B).push(tok);
+  }
+
+  // Caminhar para trás e checar alternância A/B (padrão esperado)
+  // Não é "índice": é sequência observada vs sequência construída.
+  let expectedFam = null;
+  for(let step=0; step<total; step++){
+    if(STOP) break;
+
+    try { history.go(-1); } catch(e){ /* ignore */ }
+    const res = await waitPopOnce(-1, C.timeoutMs);
+    if(!res.ok){
+      RC.POP_TIMEOUT++;
+      log("[ALERT][RC=POP_TIMEOUT] step="+step+" dt="+res.dt.toFixed(1)+"ms", "warn");
+      continue;
+    }
+
+    const st = res.ev ? res.ev.state : null;
+    const p = parseToken(st);
+    if(!p.ok){
+      RC.TOKEN_MISMATCH++;
+      log("[ALERT][RC="+p.reason+"] popstate.state inválido: "+safe(st), "warn");
+      continue;
+    }
+
+    // token NAV1 aparecendo aqui é cross-contam
+    if(p.token.indexOf("NAV1:") === 0){
+      RC.CROSS_CONTAM++;
+      log("[ALERT][RC=CROSS_CONTAM] token NAV1 visto durante NAV2: "+p.token, "bad");
+    }
+
+    // extrair fam pelo token NAV2:runId:A:idx
+    const parts = p.token.split(":");
+    let fam = null;
+    if(parts.length>=4) fam = parts[2];
+
+    if(fam !== "A" && fam !== "B" && p.token !== baseState.t){
+      RC.TOKEN_MISMATCH++;
+      log("[ALERT][RC=TOKEN_MISMATCH] token formato inesperado: "+p.token, "bad");
+      continue;
+    }
+
+    if(expectedFam === null){
+      expectedFam = fam; // inicializa com o primeiro visto
+    } else if(fam === expectedFam){
+      // não alternou: possível atraso/duplicação/contaminação (mas também pode ser repetição de popstate)
+      RC.TOKEN_MISMATCH++;
+      log("[ALERT][RC=FAM_NOT_ALTERNATING] fam repetida="+fam+" token="+p.token, "warn");
+    } else {
+      expectedFam = fam;
+    }
+
+    RC.OK++;
+  }
+
+  hr();
+  const alerts = RC.ENV_BLOCKED+RC.PUSH_FAIL+RC.REPLACE_FAIL+RC.POP_TIMEOUT+RC.TOKEN_MISMATCH+RC.CROSS_CONTAM;
+  log("[SUM] NAV2 alerts="+alerts+" okEvents="+RC.OK);
+  if(alerts===0){
+    log("[PASS] NAV2 :: Nenhum sinal forte observado (nesta execução).", "ok");
+  }else{
+    log("[FAIL] NAV2 :: Alertas observados (ver RC acima).", "bad");
+  }
+  log("[RC] "+JSON.stringify(RC));
+  disableBtns(false);
+}
+</script>
+
+<hr style="border-color:#0a0">
+<div class="box">
+Notas rápidas:
+- Se NAV1 reportar STATE_NULL onde você acabou de gravar token, isso é anomalia de integridade de state.
+- Se NAV1/NAV2 reportarem CROSS_CONTAM em execução isolada (rodando só um teste após reload), isso é sinal forte.
+- POP_TIMEOUT só conta se for reprodutível e com evidência de que a navegação aconteceu; aqui ele é "alerta", não "prova".
+- Evite rodar NAV1 e NAV2 em sequência sem reload quando estiver coletando evidência: o histórico acumula.
+</div>
+</body>
+</html>
