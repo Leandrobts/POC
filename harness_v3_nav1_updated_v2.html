@@ -1,0 +1,853 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>PS4 WebKit Harness v3 (Vuln-Focused / Non-DoS)</title>
+</head>
+<body>
+<h2>PS4 WebKit Harness v3 � Focado em Vulnerabilidades (sem explora��o / sem DoS)</h2>
+
+<div>
+  <button onclick="ui.runOnce()">Run ALL once</button>
+  <button onclick="ui.runLoop()">Loop N</button>
+  <button onclick="ui.stop()">STOP</button>
+  <button onclick="ui.clear()">Clear</button>
+</div>
+
+<div style="margin-top:10px;">
+  <label>Mode:
+    <select id="mode">
+      <option value="SAFE">SAFE</option>
+      <option value="AGGR">AGGR (bounded)</option>
+    </select>
+  </label>
+  <label style="margin-left:10px;">Loop N:
+    <input id="loopN" type="number" value="50" min="1" max="500" step="10">
+  </label>
+  <label style="margin-left:10px;">Delay ms:
+    <input id="delayMs" type="number" value="20" min="0" max="200" step="5">
+  </label>
+  <label style="margin-left:10px;">Seed:
+    <input id="seed" type="number" value="1337" min="1" step="1">
+  </label>
+</div>
+
+<hr/>
+
+<div>
+  <b>Sele��o de testes</b><br/>
+  <label><input type="checkbox" class="t" value="NAV1" checked> NAV1 (history state clone/alias)</label><br/>
+  <label><input type="checkbox" class="t" value="DOMU1" checked> DOMU1 (removed-node access + layout flush)</label><br/>
+  <label><input type="checkbox" class="t" value="DOME1" checked> DOME1 (transition/animation events + invariants)</label><br/>
+  <label><input type="checkbox" class="t" value="CSS2"  checked> CSS2 (recalc/layout flush consistency)</label><br/>
+  <label><input type="checkbox" class="t" value="IFR1"  checked> IFR1 (iframe same-origin churn)</label><br/>
+  <label><input type="checkbox" class="t" value="FS1"> FS1 (fullscreen + blur/focus se suportado)</label><br/>
+  <label><input type="checkbox" class="t" value="MED1"> MED1 (media pipeline teardown - fonte v�lida m�nima)</label><br/>
+  <label><input type="checkbox" class="t" value="JS3"  checked> JS3 (Proxy reentrancy bounded)</label><br/>
+  <label><input type="checkbox" class="t" value="TA1"  checked> TA1 (TypedArray sentinels / consistency)</label><br/>
+</div>
+
+<hr/>
+<pre id="log" style="white-space:pre-wrap;font-family:monospace;"></pre>
+
+<script>
+"use strict";
+
+/* =========================
+   LOG + UTIL
+   ========================= */
+const L = document.getElementById("log");
+function log(s){ L.textContent += s + "\n"; }
+function hr(){ log("------------------------------------------------------------"); }
+
+function now(){ return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now(); }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function raf(){ return new Promise(r=>requestAnimationFrame(r)); }
+
+function readMode(){ return document.getElementById("mode").value; }
+function readLoopN(){ return Math.max(1, Math.min(500, (+document.getElementById("loopN").value||50))); }
+function readDelay(){ return Math.max(0, Math.min(200, (+document.getElementById("delayMs").value||20))); }
+function readSeed(){ return Math.max(1, (+document.getElementById("seed").value||1337)); }
+
+function selectedTests(){
+  const boxes = Array.from(document.querySelectorAll(".t"));
+  return boxes.filter(b=>b.checked).map(b=>b.value);
+}
+
+function mulberry32(a){
+  return function() {
+    let t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function safeCap(mode){
+  // Caps r�gidos (AGGR aumenta mas continua bounded).
+  if(mode === "AGGR"){
+    return {
+      budgetMs: 10,        // budget por frame (n�o-DoS)
+      domNodes: 1200,
+      cssRules: 800,
+      readsPerIter: 250,
+      churnIters: 18,
+      proxyOps: 6000,
+      historyOps: 25,
+      taPages: 64
+    };
+  }
+  return {
+    budgetMs: 6,
+    domNodes: 600,
+    cssRules: 300,
+    readsPerIter: 120,
+    churnIters: 10,
+    proxyOps: 2500,
+    historyOps: 12,
+    taPages: 32
+  };
+}
+
+function fmt(n){ return (Math.round(n*100)/100).toFixed(2); }
+
+const CTRL = {
+  stop:false,
+  fails:0,
+  lastTest:"",
+  lastCP:"",
+  reqStop(){ this.stop = true; log("[CTRL] STOP requested"); }
+};
+
+function fail(tag, msg){
+  CTRL.fails++;
+  log("[FAIL] " + tag + " :: " + msg);
+}
+
+async function eventLoopDriftCheck(label){
+  const t0 = now();
+  await sleep(0);
+  const dt = now() - t0;
+  log(`[HLTH] ${label} eventLoop drift ~${fmt(dt)}ms`);
+}
+
+function assert(cond, tag, msg){
+  if(!cond) fail(tag, msg);
+}
+
+/* =========================
+   TEST: NAV1
+   ========================= */
+async function testNAV1(ctx){
+  const tag = "NAV1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: history state clone/alias validation (no exploitation) | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const cap = ctx.cap;
+
+  // Session token to filter unrelated popstate noise.
+  const token = `NAV1_${Date.now().toString(16)}_${(Math.random()*1e9|0).toString(16)}`;
+  let seq = 0;
+
+  // Track originals so we can detect true reference aliasing (should NEVER happen for structured clone).
+  const originals = Object.create(null);
+
+  // Stats
+  let popSeen = 0;
+  let cloneAtPush = 0;      // popped state matches pre-mutation snapshot
+  let lateCloneLike = 0;    // popped state matches post-mutation snapshot (or other anomaly)
+  let refAlias = 0;         // popped ArrayBuffer aliases original (strong signal)
+  let wrongOrInconclusive = 0;
+  let crossContam = 0;
+  let timeouts = 0;
+  let goErrors = 0;
+
+  // Navigation synchronization (avoid go(-1);go(1) races).
+  let expected = null;     // {magic, seq}
+  let pending = null;      // {resolve, reject, timer}
+
+  function makeState(magic){
+    const buf = new ArrayBuffer(64);
+    const u32 = new Uint32Array(buf);
+    u32[0] = magic >>> 0;
+    u32[1] = 0x9ABCDEF0 >>> 0;
+    return {
+      __nav1: { token, seq: (++seq)>>>0 },
+      magic: magic>>>0,
+      buf,
+      nested: { a: [1,2,3], t: "x" + (magic>>>0) },
+      mark: { id: "S" + (magic>>>0) }
+    };
+  }
+
+  function waitPop(ms){
+    if(pending) { try{ pending.resolve(null); }catch(e){} pending = null; }
+    return new Promise((resolve)=>{
+      const t = setTimeout(()=>{ pending = null; resolve(null); }, ms);
+      pending = { resolve, timer: t };
+    });
+  }
+
+  function finishPending(ev){
+    if(!pending) return;
+    clearTimeout(pending.timer);
+    const r = pending.resolve;
+    pending = null;
+    try{ r(ev); }catch(e){}
+  }
+
+  const onPop = (ev)=>{
+    try{
+      const st = ev.state;
+      if(!st || !st.__nav1 || st.__nav1.token !== token) {
+        // Unrelated entry / browser internal state -> ignore.
+        return;
+      }
+
+      popSeen++;
+
+      // Validate expected navigation target if we are mid-step.
+      if(expected && (st.magic !== expected.magic || st.__nav1.seq !== expected.seq)){
+        crossContam++;
+      }
+
+      // Snapshot comparisons:
+      const rec = originals[st.__nav1.seq];
+      if(rec && rec.snapPre !== undefined && rec.snapPost !== undefined){
+        // Compare popped first word with pre/post snapshots.
+        let popped0 = 0xFFFFFFFF>>>0;
+        try { popped0 = (new Uint32Array(st.buf)[0]>>>0); } catch(e){}
+        if(popped0 === rec.snapPre) cloneAtPush++;
+        else if(popped0 === rec.snapPost) lateCloneLike++;
+        else wrongOrInconclusive++;
+      } else {
+        wrongOrInconclusive++;
+      }
+
+      // Strong alias check: write through popped buffer and see if original changes.
+      if(rec && rec.buf){
+        try{
+          const v = new Uint32Array(st.buf);
+          const before = v[0]>>>0;
+          const probe = (before ^ 0xA5A5A5A5)>>>0;
+          v[0] = probe;
+          // Read original buffer
+          const ov = new Uint32Array(rec.buf);
+          const o0 = ov[0]>>>0;
+          if(o0 === probe){
+            refAlias++;
+          }
+          // Restore popped buffer to avoid cascading effects inside the browser.
+          v[0] = before;
+        }catch(e){}
+      }
+
+      finishPending(ev);
+    }catch(e){
+      wrongOrInconclusive++;
+      finishPending(ev);
+    }
+  };
+
+  window.addEventListener("popstate", onPop);
+
+  // Reset to a stable base URL. (Some envs behave better with hash-only changes.)
+  const base = "?" + (ctx.seed>>>0);
+  history.replaceState({__nav1:{token,seq:0}, magic:0, buf:null}, "", base);
+
+  // Push N entries. We mutate originals AFTER push to detect whether the clone happens at push time.
+  const N = cap.historyOps|0;
+  for(let i=0;i<N && !CTRL.stop;i++){
+    const magic = (0x12340000 + i)>>>0;
+    const st = makeState(magic);
+
+    // pre-mutation snapshot
+    let pre = 0xFFFFFFFF>>>0;
+    try { pre = (new Uint32Array(st.buf)[0]>>>0); } catch(e){}
+
+    // Push entry
+    history.pushState(st, "", base + "&i=" + i);
+
+    // Mutate original AFTER push (should not affect popped clone)
+    let post = pre;
+    try{
+      const v = new Uint32Array(st.buf);
+      v[0] = (v[0] ^ 0xFFFFFFFF)>>>0;
+      post = v[0]>>>0;
+    }catch(e){}
+
+    originals[st.__nav1.seq] = { seq: st.__nav1.seq, magic, buf: st.buf, snapPre: pre, snapPost: post };
+  }
+
+  // Deterministic navigation: step back to first pushed entry and then forward to last.
+  // This avoids the go(-1);go(1) "ping-pong" race that can drop popstate events on some consoles.
+  // We only require popstate that carries our token.
+  const steps = Math.min(N, 25); // hard bound for safety even in AGGR
+  const navTimeout = (ctx.mode === "AGGR") ? 140 : 90;
+
+  // 1) Walk backwards 'steps' times
+  for(let k=0;k<steps && !CTRL.stop;k++){
+    // Target seq is (seq - 1 - k) but seq includes pushes; simplest: compute by reading our table:
+    const targetSeq = (seq - k)>>>0;
+    const rec = originals[targetSeq];
+    if(!rec) break;
+    expected = { magic: rec.magic, seq: rec.seq };
+    try{
+      history.go(-1);
+    }catch(e){
+      goErrors++;
+      break;
+    }
+    const ev = await waitPop(navTimeout);
+    if(!ev){ timeouts++; }
+    await sleep(0);
+  }
+
+  // 2) Walk forwards 'steps' times
+  for(let k=0;k<steps && !CTRL.stop;k++){
+    // target is increasing; approximate by remembering last expected and incrementing
+    // We'll accept any in-order token'd popstate events; crossContam already tracks mismatches.
+    expected = null; // during forward we don't assert exact seq; too many impl variations.
+    try{
+      history.go(1);
+    }catch(e){
+      goErrors++;
+      break;
+    }
+    const ev = await waitPop(navTimeout);
+    if(!ev){ timeouts++; }
+    await sleep(0);
+  }
+
+  expected = null;
+  window.removeEventListener("popstate", onPop);
+  if(pending){ try{ clearTimeout(pending.timer); pending = null; }catch(e){} }
+
+  log(`[OK] popSeen=${popSeen} cloneAtPush=${cloneAtPush} lateCloneLike=${lateCloneLike} refAlias=${refAlias} wrong/inconclusive=${wrongOrInconclusive} crossContam=${crossContam} timeouts=${timeouts} goErrors=${goErrors}`);
+
+  // Fail conditions:
+  // - refAlias is the strongest indicator (should be impossible under structured clone).
+  // - sustained crossContam / wrongOrInconclusive suggests history bookkeeping anomalies.
+  if(refAlias > 0){
+    fail(tag, "Popped history state appears to alias original ArrayBuffer (should be impossible) — strong structured clone violation");
+  }else if(crossContam > 0 && crossContam >= Math.max(2, Math.floor(popSeen/8))){
+    fail(tag, "Popstate returned unexpected entry state too often (possible history bookkeeping anomaly)");
+  }else if(lateCloneLike > 0 && lateCloneLike >= Math.max(2, Math.floor(popSeen/6))){
+    fail(tag, "Popped state frequently reflects post-push mutations (clone timing anomaly)");
+  }
+}
+
+/* =========================
+   TEST: DOMU1
+   ========================= */
+async function testDOMU1(ctx){
+  const tag = "DOMU1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: removed node access + forced layout reads | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const cap = ctx.cap;
+  const root = document.createElement("div");
+  document.body.appendChild(root);
+
+  const n = cap.domNodes;
+  const nodes = [];
+  for(let i=0;i<n;i++){
+    const d = document.createElement("div");
+    d.textContent = "x" + i;
+    d.style.cssText = "display:block; padding:0; margin:0;";
+    root.appendChild(d);
+    nodes.push(d);
+  }
+
+  const victim = nodes[(n/2)|0];
+  const parent = victim.parentNode;
+  parent.removeChild(victim);
+
+  assert(victim.isConnected === false, tag, "victim should be disconnected after remove");
+  assert(parent.isConnected === true, tag, "parent should remain connected");
+
+  let weird = 0;
+  for(let k=0;k<cap.churnIters && !CTRL.stop;k++){
+    const idx = (k*37) % n;
+    const e = nodes[idx];
+    if(e && e.parentNode){
+      e.style.width = (10 + (k%30)) + "px";
+      e.className = (k%2) ? "a" : "b";
+    }
+
+    try{
+      const r = victim.getBoundingClientRect();
+      if(!(isFinite(r.left) && isFinite(r.width))) weird++;
+    }catch(e){ weird++; }
+
+    try{
+      void root.offsetHeight;
+      void document.body.offsetHeight;
+    }catch(e){ weird++; }
+
+    await raf();
+  }
+
+  root.remove();
+
+  log(`[OK] removed-node anomalies=${weird}`);
+  if(weird > Math.max(3, Math.floor(cap.churnIters/2))){
+    fail(tag, "unexpectedly high anomalies when reading removed node");
+  }
+}
+
+/* =========================
+   TEST: DOME1
+   ========================= */
+async function testDOME1(ctx){
+  const tag = "DOME1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: transition/animation events + ordering | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const box = document.createElement("div");
+  box.style.cssText = "width:10px;height:10px;background:#09f; will-change: transform, opacity;";
+  document.body.appendChild(box);
+
+  let te = 0, ae = 0, weird = 0;
+
+  box.addEventListener("transitionend", ()=>{ te++; });
+  box.addEventListener("animationend", ()=>{ ae++; });
+
+  const st = document.createElement("style");
+  st.textContent = `
+  .t1 { transition: transform 30ms linear, opacity 30ms linear; transform: translateX(30px); opacity: 0.5; }
+  .t0 { transition: transform 30ms linear, opacity 30ms linear; transform: translateX(0px); opacity: 1; }
+  @keyframes k { from { transform: translateY(0px); } to { transform: translateY(10px); } }
+  .a1 { animation: k 30ms linear 1; }
+  `;
+  document.head.appendChild(st);
+
+  box.className = "t0";
+  await raf();
+  box.className = "t1";
+  await raf();
+  box.className = "t0 a1";
+
+  for(let i=0;i<8 && !CTRL.stop;i++){
+    try{
+      const cs = getComputedStyle(box);
+      if(!cs || !cs.transform) weird++;
+      void box.getBoundingClientRect();
+    }catch(e){ weird++; }
+    await sleep(10);
+  }
+
+  box.remove();
+  st.remove();
+
+  log(`[OK] transitionend=${te} animationend=${ae} weird=${weird}`);
+  if(weird > 3) fail(tag, "computedStyle/layout read behaved oddly");
+}
+
+/* =========================
+   TEST: CSS2
+   ========================= */
+async function testCSS2(ctx){
+  const tag = "CSS2";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: rule churn + computedStyle flush + consistency | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const cap = ctx.cap;
+  const rng = mulberry32(ctx.seed ^ 0x0C55); // v�lido
+
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+
+  const st = document.createElement("style");
+  document.head.appendChild(st);
+  const sheet = st.sheet;
+
+  const nodes = [];
+  for(let i=0;i<Math.min(cap.domNodes, 500);i++){
+    const d = document.createElement("div");
+    d.className = "c0";
+    d.textContent = "n" + i;
+    host.appendChild(d);
+    nodes.push(d);
+  }
+
+  let ops = 0;
+  let weird = 0;
+
+  const rulesN = cap.cssRules;
+  for(let i=0;i<rulesN && !CTRL.stop;i++){
+    try{
+      const px = (i % 33);
+      sheet.insertRule(`.c${i}{ margin-left:${px}px; padding:${(i%7)}px; }`, sheet.cssRules.length);
+      ops++;
+    }catch(e){
+      break;
+    }
+  }
+
+  const t0 = now();
+  let it = 0;
+  while(!CTRL.stop && it < cap.churnIters){
+    const frameStart = now();
+
+    for(let k=0;k<120 && !CTRL.stop;k++){
+      const idx = (rng()*nodes.length)|0;
+      const node = nodes[idx];
+      const cls = "c" + ((it*97 + k) % Math.max(1, ops));
+      node.className = cls;
+    }
+
+    for(let r=0;r<cap.readsPerIter && !CTRL.stop;r++){
+      const idx = (rng()*nodes.length)|0;
+      try{
+        const cs = getComputedStyle(nodes[idx]);
+        if(!cs || cs.marginLeft === "") weird++;
+      }catch(e){ weird++; }
+    }
+
+    try{ void host.offsetHeight; } catch(e){ weird++; }
+
+    it++;
+    const spent = now() - frameStart;
+    if(spent < cap.budgetMs) await raf();
+  }
+  const dt = now() - t0;
+
+  host.remove();
+  st.remove();
+
+  log(`[OK] css rules inserted=${ops} churnIters=${it} weird=${weird} dt=${fmt(dt)}ms`);
+  if(weird > Math.max(5, cap.churnIters)) fail(tag, "excessive computedStyle/layout anomalies");
+}
+
+/* =========================
+   TEST: IFR1
+   ========================= */
+async function testIFR1(ctx){
+  const tag = "IFR1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: iframe same-origin internal churn | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const cap = ctx.cap;
+  const rng = mulberry32(ctx.seed ^ 0x01F2); // CORRIGIDO (antes era 0x1FR inv�lido)
+
+  const iframe = document.createElement("iframe");
+  iframe.style.width = "1px";
+  iframe.style.height = "1px";
+  document.body.appendChild(iframe);
+
+  iframe.srcdoc = "<!doctype html><meta charset=utf-8><title>x</title><body><div id=r></div></body>";
+  await sleep(50);
+
+  let weird = 0;
+  let ops = 0;
+
+  function getDoc(){
+    try{ return iframe.contentDocument; }catch(e){ return null; }
+  }
+
+  const doc = getDoc();
+  if(!doc){ fail(tag, "iframe contentDocument not accessible"); iframe.remove(); return; }
+
+  const root = doc.getElementById("r");
+  if(!root){ fail(tag, "iframe root missing"); iframe.remove(); return; }
+
+  for(let it=0; it<cap.churnIters && !CTRL.stop; it++){
+    const frag = doc.createDocumentFragment();
+    const n = (ctx.mode === "AGGR") ? 120 : 60;
+    for(let i=0;i<n;i++){
+      const d = doc.createElement("span");
+      d.textContent = "s";
+      frag.appendChild(d);
+    }
+    root.textContent = "";
+    root.appendChild(frag);
+    ops += n;
+
+    try{
+      root.setAttribute("data-x", "" + ((rng()*1e9)|0));
+      void root.offsetHeight;
+    }catch(e){ weird++; }
+
+    try{ void iframe.getBoundingClientRect(); } catch(e){ weird++; }
+
+    await raf();
+  }
+
+  iframe.remove();
+  log(`[OK] iframe ops=${ops} weird=${weird}`);
+  if(weird > 5) fail(tag, "iframe churn produced excessive anomalies");
+}
+
+/* =========================
+   TEST: FS1
+   ========================= */
+async function testFS1(ctx){
+  const tag = "FS1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: fullscreen + blur/focus choreography (se suportado) | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  let blur=0, focus=0, fsErr=0;
+  const onBlur = ()=>blur++;
+  const onFocus = ()=>focus++;
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("focus", onFocus);
+
+  const el = document.documentElement;
+  const req = el.webkitRequestFullscreen || el.requestFullscreen;
+  if(!req){
+    log("[OK] fullscreen API not available");
+    window.removeEventListener("blur", onBlur);
+    window.removeEventListener("focus", onFocus);
+    return;
+  }
+
+  try{
+    req.call(el);
+    await sleep(50);
+  }catch(e){ fsErr++; }
+
+  for(let i=0;i<4 && !CTRL.stop;i++){
+    await raf();
+    await sleep(20);
+  }
+
+  const exit = document.webkitExitFullscreen || document.exitFullscreen;
+  try{ if(exit) exit.call(document); }catch(e){ fsErr++; }
+
+  window.removeEventListener("blur", onBlur);
+  window.removeEventListener("focus", onFocus);
+
+  log(`[OK] blur=${blur} focus=${focus} fsErr=${fsErr}`);
+}
+
+/* =========================
+   TEST: MED1
+   ========================= */
+async function testMED1(ctx){
+  const tag = "MED1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: media pipeline (valid minimal) + teardown | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const wavBase64 =
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+
+  const a = document.createElement("audio");
+  a.preload = "auto";
+  a.src = "data:audio/wav;base64," + wavBase64;
+  document.body.appendChild(a);
+
+  let errs=0, plays=0;
+  function onErr(){ errs++; }
+  a.addEventListener("error", onErr);
+
+  const N = (ctx.mode === "AGGR") ? 10 : 6;
+  for(let i=0;i<N && !CTRL.stop;i++){
+    try{
+      const p = a.play();
+      plays++;
+      if(p && p.catch) await p.catch(()=>{ errs++; });
+    }catch(e){ errs++; }
+    try{ a.pause(); }catch(e){ errs++; }
+    try{ a.load(); }catch(e){ errs++; }
+    await sleep(20);
+  }
+
+  a.removeEventListener("error", onErr);
+  a.remove();
+
+  log(`[OK] playAttempts=${plays} errs=${errs}`);
+}
+
+/* =========================
+   TEST: JS3
+   ========================= */
+async function testJS3(ctx){
+  const tag = "JS3";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: Proxy/Reflect reentrancy (bounded) + invariant checks | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const cap = ctx.cap;
+  const rng = mulberry32(ctx.seed ^ 0x0A53); // CORRIGIDO (antes era 0xJ53 inv�lido)
+
+  let traps=0, reads=0, weird=0;
+
+  const target = { a:1, b:2, c:3 };
+  const P = new Proxy(target, {
+    get(obj, prop){
+      traps++;
+      try{
+        if(prop === "a"){
+          document.body.setAttribute("data-p", "" + ((rng()*1e6)|0));
+        }
+        reads++;
+        return Reflect.get(obj, prop);
+      }catch(e){ weird++; return undefined; }
+    },
+    set(obj, prop, val){
+      traps++;
+      try{
+        return Reflect.set(obj, prop, val);
+      }catch(e){ weird++; return false; }
+    }
+  });
+
+  const t0 = now();
+  for(let i=0;i<cap.proxyOps && !CTRL.stop;i++){
+    try{
+      const k = (i%3===0) ? "a" : (i%3===1 ? "b" : "c");
+      const v = P[k];
+      if(typeof v !== "number") weird++;
+      P[k] = (v|0) + 1;
+    }catch(e){ weird++; }
+
+    if((i % 700) === 0) await raf();
+  }
+  const dt = now()-t0;
+
+  if(typeof target.a !== "number" || typeof target.b !== "number" || typeof target.c !== "number"){
+    fail(tag, "target type invariant violated");
+  }
+
+  log(`[OK] traps=${traps} reads=${reads} weird=${weird} dt=${fmt(dt)}ms`);
+  if(weird > Math.max(5, cap.proxyOps/800)) fail(tag, "excessive proxy anomalies");
+}
+
+/* =========================
+   TEST: TA1
+   ========================= */
+async function testTA1(ctx){
+  const tag = "TA1";
+  CTRL.lastTest = tag;
+  log(`[TEST] ${tag} :: TypedArray sentinels + consistency checks | mode=${ctx.mode} seed=${ctx.seed}`);
+
+  const cap = ctx.cap;
+
+  const pages = [];
+  for(let i=0;i<cap.taPages;i++){
+    const b = new ArrayBuffer(0x1000);
+    const u32 = new Uint32Array(b);
+    u32[0] = 0x12345678;
+    u32[1] = 0x9ABCDEF0;
+    u32[10] = 0xAAAAAAAA;
+    u32[20] = 0xBBBBBBBB;
+    pages.push(u32);
+  }
+
+  let bad=0;
+  for(let it=0; it<12 && !CTRL.stop; it++){
+    for(let p=0;p<pages.length;p+=2){
+      const u = pages[p];
+      u[2] = (u[2] + 1) >>> 0;
+      u[3] = (u[3] ^ 0xDEADBEEF) >>> 0;
+    }
+
+    const tmp = [];
+    for(let k=0;k<80;k++){
+      tmp.push(new Uint8Array(256));
+    }
+
+    for(let p=0;p<pages.length;p+=3){
+      const u = pages[p];
+      if((u[0]>>>0) !== 0x12345678) bad++;
+      if((u[1]>>>0) !== 0x9ABCDEF0) bad++;
+      if((u[10]>>>0) !== 0xAAAAAAAA) bad++;
+      if((u[20]>>>0) !== 0xBBBBBBBB) bad++;
+    }
+
+    await raf();
+  }
+
+  log(`[OK] sentinel mismatches=${bad}`);
+  if(bad !== 0){
+    fail(tag, "TypedArray sentinels changed unexpectedly (strong anomaly)");
+  }
+}
+
+/* =========================
+   RUNNER
+   ========================= */
+const TESTS = {
+  NAV1: testNAV1,
+  DOMU1: testDOMU1,
+  DOME1: testDOME1,
+  CSS2: testCSS2,
+  IFR1: testIFR1,
+  FS1: testFS1,
+  MED1: testMED1,
+  JS3: testJS3,
+  TA1: testTA1
+};
+
+async function runList(list, mode, seedBase){
+  CTRL.fails = 0;
+  CTRL.lastCP = "";
+  const cap = safeCap(mode);
+
+  log(`[READY] Harness v3 carregado. Objetivo: indicadores de vulnerabilidade (sem explora��o / sem DoS).`);
+  log(`[INFO] mode=${mode} caps: budgetMs=${cap.budgetMs} domNodes=${cap.domNodes} cssRules=${cap.cssRules} historyOps=${cap.historyOps}`);
+  hr();
+
+  for(let i=0;i<list.length && !CTRL.stop;i++){
+    const name = list[i];
+    const fn = TESTS[name];
+    if(!fn){ log("[WARN] Unknown test: "+name); continue; }
+
+    CTRL.lastCP = "begin " + name;
+    log("[CP] " + CTRL.lastCP);
+
+    const t0 = now();
+    try{
+      await eventLoopDriftCheck(name + ":pre");
+      await fn({ mode, seed: (seedBase + i)>>>0, cap });
+      await eventLoopDriftCheck(name + ":post");
+    }catch(e){
+      fail(name, "exception: " + (e && e.message ? e.message : String(e)));
+    }
+    const dt = now()-t0;
+
+    CTRL.lastCP = "end " + name;
+    log("[CP] " + CTRL.lastCP + " dt=" + fmt(dt) + "ms");
+    hr();
+  }
+
+  log(`[RUN] Done. fails=${CTRL.fails} lastTest=${CTRL.lastTest} lastCP=${CTRL.lastCP}`);
+}
+
+const ui = {
+  clear(){ L.textContent=""; },
+  stop(){ CTRL.reqStop(); },
+  async runOnce(){
+    CTRL.stop = false;
+    const mode = readMode();
+    const seed = readSeed();
+    const list = selectedTests();
+    log(`[RUN] Once | tests=${list.length} mode=${mode}`);
+    await runList(list, mode, seed);
+  },
+  async runLoop(){
+    CTRL.stop = false;
+    const mode = readMode();
+    const seed0 = readSeed();
+    const list = selectedTests();
+    const N = readLoopN();
+    const delay = readDelay();
+
+    log(`[RUN] Loop | tests=${list.length} mode=${mode} loopN=${N} delayMs=${delay}`);
+    hr();
+
+    for(let it=0; it<N && !CTRL.stop; it++){
+      log(`[ITER] ${it+1}/${N}`);
+      await runList(list, mode, (seed0 + it)>>>0);
+      if(delay) await sleep(delay);
+    }
+    log(`[RUN] Loop done. fails=${CTRL.fails}`);
+  }
+};
+
+log("[READY] Harness v3 carregado. Sugest�o: SAFE -> Run ALL once. Depois SAFE -> selecionar 2-4 testes e Loop N.");
+log("[INFO] Sem window.open. Tudo roda na mesma aba. AGGR � bounded e n�o � DoS.");
+</script>
+</body>
+</html>
