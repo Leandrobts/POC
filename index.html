@@ -2,523 +2,601 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
+<title>PS4 WebKit Research Harness v4.1 (SAFE/AGGR bounded)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PS4 WebKit Harness v4 (Safe Invariants)</title>
 </head>
 <body>
-<h2>PS4 WebKit Harness v4 — Safe Invariants (sem exploração / sem DoS)</h2>
+<h2>PS4 WebKit Research Harness v4.1</h2>
+<p><b>Objetivo:</b> encontrar anomalias/crashes com <u>invariantes</u> e <u>reason codes</u> (sem exploração).</p>
 
 <div>
-  <label>Mode:
-    <select id="modeSel">
-      <option value="SAFE">SAFE</option>
-      <option value="AGGR">AGGR</option>
-    </select>
-  </label>
-  <label style="margin-left:10px;">Seed:
-    <input id="seedSel" type="number" value="1337" min="1" step="1">
-  </label>
-  <label style="margin-left:10px;">Loop N:
-    <input id="loopN" type="number" value="30" min="1" step="1">
-  </label>
-  <label style="margin-left:10px;">Delay ms:
-    <input id="delayMs" type="number" value="30" min="0" step="10">
-  </label>
+  <button onclick="clearLog()">Limpar</button>
+  <button onclick="runOnce('SAFE')">RUN Once SAFE</button>
+  <button onclick="runOnce('AGGR')">RUN Once AGGR</button>
+  <button onclick="startLoop('SAFE')">Loop SAFE</button>
+  <button onclick="startLoop('AGGR')">Loop AGGR</button>
+  <button onclick="stopLoop()">Parar</button>
 </div>
 
 <div style="margin-top:10px;">
-  <button onclick="CTRL.clearLog()">Limpar log</button>
-  <button onclick="UI.runOnceSelected()">RUN Once (selecionados)</button>
-  <button onclick="UI.loopSelected()">Loop N (selecionados)</button>
-  <button onclick="CTRL.stopNow()">STOP</button>
+  <label>Loop N <input id="loopN" type="number" value="50" min="1" step="10"></label>
+  <label style="margin-left:10px;">Delay ms <input id="delayMs" type="number" value="20" min="0" step="10"></label>
 </div>
 
-<hr>
-
-<div>
-  <b>Selecione testes:</b><br>
-  <label><input type="checkbox" class="tchk" value="NAV1" checked> NAV1 — History clone/ack + bookkeeping</label><br>
-  <label><input type="checkbox" class="tchk" value="CLONE1" checked> CLONE1 — Structured clone via MessageChannel (invariantes)</label><br>
-  <label><input type="checkbox" class="tchk" value="DOM1" checked> DOM1 — DOM lifecycle + getters (invariantes)</label><br>
-  <label><input type="checkbox" class="tchk" value="MEDIA1"> MEDIA1 — Media teardown invariants (video/TextTrack)</label><br>
-  <label><input type="checkbox" class="tchk" value="CAN1"> CAN1 — Canvas2D resize/destroy invariants</label><br>
+<div style="margin-top:10px;">
+  <label><input type="checkbox" id="t_nav1" checked> NAV1 (History clone/bookkeeping)</label><br>
+  <label><input type="checkbox" id="t_nav2" checked> NAV2 (History deferred integrity + cross-entry)</label><br>
+  <label><input type="checkbox" id="t_style1" checked> STYLE1 (Fullscreen/blur + DOM mutation invariants)</label><br>
+  <label><input type="checkbox" id="t_layout1" checked> LAYOUT1 (Layout thrash + mutation invariants)</label><br>
+  <label><input type="checkbox" id="t_media1" checked> MEDIA1 (Media teardown invariants)</label><br>
 </div>
 
-<hr>
-
-<pre id="log" style="white-space:pre-wrap;word-break:break-word;"></pre>
+<pre id="log" style="white-space:pre-wrap; border:1px solid #999; padding:10px; margin-top:10px; height:60vh; overflow:auto;"></pre>
 
 <script>
-const CTRL = {
-  stop: false,
-  lastTest: "NONE",
-  fails: 0,
-  clearLog(){
-    document.getElementById("log").textContent = "";
-  },
-  stopNow(){
-    this.stop = true;
-    log("[CTRL] stop=1 (requested)");
-  }
-};
+/* =========================
+   HARNESS CORE
+   ========================= */
+(function(){
+  const logEl = document.getElementById('log');
+  const NOW = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  const UA = (navigator && navigator.userAgent) ? navigator.userAgent : "unknown";
+  const ORIGIN = (location && location.origin) ? location.origin : "unknown";
+  const URL0 = (location && location.href) ? location.href : "unknown";
 
-function nowMs(){ return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now(); }
-function log(s){
-  const el = document.getElementById("log");
-  el.textContent += s + "\n";
-  try { el.scrollTop = el.scrollHeight; } catch(e){}
-}
-function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
+  function log(s){ logEl.textContent += s + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+  window.clearLog = () => { logEl.textContent = ""; };
 
-function rand32(seed){
-  let x = seed >>> 0;
-  x ^= (x << 13) >>> 0;
-  x ^= (x >>> 17) >>> 0;
-  x ^= (x << 5) >>> 0;
-  return x >>> 0;
-}
-
-function makeCaps(mode){
-  if(mode === "AGGR"){
-    return { budgetMs:10, historyOps:25, domNodes:1200, canvasOps:120, mediaOps:30, cloneOps:80, ackTimeoutMs:160, driftWarnMs:30 };
-  }
-  return { budgetMs:6, historyOps:12, domNodes:600, canvasOps:60, mediaOps:15, cloneOps:40, ackTimeoutMs:120, driftWarnMs:20 };
-}
-
-function ctxFromUI(){
-  const mode = document.getElementById("modeSel").value;
-  const seed = (parseInt(document.getElementById("seedSel").value, 10) || 1337) >>> 0;
-  return { mode, seed, cap: makeCaps(mode) };
-}
-
-function RC(code, msg){ return `[RC:${code}] ${msg}`; }
-function pass(tag, msg){ log(`[PASS] ${tag} :: ${msg}`); }
-function fail(tag, msg){ CTRL.fails++; log(`[FAIL] ${tag} :: ${msg}`); }
-
-function snapshot(tag){
-  let href=""; let len=-1;
-  try{ href = location.href; }catch(e){ href="(nohref)"; }
-  try{ len = history.length; }catch(e){ len=-2; }
-  log(`[SNAP] ${tag} href=${href} histLen=${len}`);
-}
-
-async function healthDrift(tag){
-  const t0 = nowMs();
-  await sleep(0);
-  const d = nowMs() - t0;
-  log(`[HLTH] ${tag} eventLoop drift ~${d.toFixed(2)}ms`);
-  return d;
-}
-
-function selectTests(){
-  const boxes = document.querySelectorAll(".tchk");
-  const out = [];
-  for(let i=0;i<boxes.length;i++) if(boxes[i].checked) out.push(boxes[i].value);
-  return out;
-}
-
-const TESTS = {};
-
-/* ========================= NAV1 ========================= */
-TESTS.NAV1 = async function(ctx){
-  const tag = "NAV1";
-  CTRL.lastTest = tag;
-  log(`[TEST] ${tag} :: history state clone/ack + bookkeeping | mode=${ctx.mode} seed=${ctx.seed}`);
-  const cap = ctx.cap;
-
-  let urlMutable = true;
-  let href = "";
-  let origin = "(noorigin)";
-  try{ href = location.href || ""; }catch(e){ href = ""; }
-  try{ origin = location.origin; }catch(e){ origin = "(noorigin)"; }
-  if(origin === "null") urlMutable = false;
-  if(href.indexOf("content://") === 0) urlMutable = false;
-
-  const baseToken = (rand32(ctx.seed) ^ 0xC0DEF00D) >>> 0;
-
-  function makeState(idx, token){
-    const buf = new ArrayBuffer(64);
-    const u32 = new Uint32Array(buf);
-    u32[0] = (0xA11A0000 ^ idx) >>> 0;
-    u32[1] = (0xB22B0000 ^ token) >>> 0;
-    u32[2] = idx >>> 0;
-    u32[3] = token >>> 0;
-    return { v:4, idx:idx>>>0, token:token>>>0, buf:buf, sig:{a:u32[0]>>>0,b:u32[1]>>>0}, nested:{t:"NAV1:"+(token>>>0), a:[1,2,3]} };
+  // Determinístico
+  function xorshift32(seed){
+    let x = (seed|0) || 0x12345678;
+    return function(){
+      x ^= (x << 13); x |= 0;
+      x ^= (x >>> 17);
+      x ^= (x << 5); x |= 0;
+      return (x >>> 0);
+    };
   }
 
-  let expectedIdx = 0;
-  const pushed = [];
-  let envBlocked=0, goErrors=0, timeouts=0, stateAnom=0, contam=0;
-  let popSeen=0, cloneAtPush=0, refAlias=0, inconclusive=0;
-
-  let expect=null, ackResolve=null;
-  function armAck(e){ expect=e; return new Promise(res=>{ ackResolve=res; }); }
-  function disarmAck(){ expect=null; ackResolve=null; }
-
-  function safeReplaceState(st, urlStr){
-    try{
-      if(urlMutable && urlStr) history.replaceState(st,"",urlStr);
-      else history.replaceState(st,"",undefined);
-      return true;
-    }catch(e){
-      envBlocked++;
-      log(`[INFO] ${tag} replaceState blocked: ${e && e.message ? e.message : e}`);
-      return false;
+  function pickTests(){
+    const ids = ["nav1","nav2","style1","layout1","media1"];
+    const out = [];
+    for (let id of ids){
+      const cb = document.getElementById("t_"+id);
+      if (cb && cb.checked) out.push(id.toUpperCase());
     }
-  }
-  function safePushState(st, urlStr){
-    try{
-      if(urlMutable && urlStr) history.pushState(st,"",urlStr);
-      else history.pushState(st,"",undefined);
-      return true;
-    }catch(e){
-      envBlocked++;
-      log(`[INFO] ${tag} pushState blocked: ${e && e.message ? e.message : e}`);
-      return false;
-    }
+    return out;
   }
 
-  const onPop = (ev)=>{
-    popSeen++;
-    const st = ev.state;
-    if(!st || typeof st !== "object"){ stateAnom++; if(ackResolve) ackResolve({ok:false,why:"no_state"}); disarmAck(); return; }
-    const idx = (st.idx>>>0);
-    const token = (st.token>>>0);
-    if(expect){
-      if(idx !== (expect.wantIdx>>>0) || token !== (expect.wantToken>>>0)){
-        let matchedOther=false;
-        for(let i=0;i<pushed.length;i++){
-          if((pushed[i].idx>>>0)===idx && (pushed[i].token>>>0)===token){ matchedOther=true; break; }
-        }
-        if(matchedOther) contam++;
-        stateAnom++;
-        if(ackResolve) ackResolve({ok:false,why:"mismatch",idx,token,wantIdx:expect.wantIdx,wantToken:expect.wantToken});
-        disarmAck();
-        return;
-      }
-    }
-    if(ackResolve) ackResolve({ok:true,idx,token});
-    disarmAck();
+  const CAPS = {
+    SAFE:  { budgetMs: 6,  historyOps: 12, cloneOps: 40, domNodes: 220, layoutOps: 80,  mediaOps: 20 },
+    AGGR:  { budgetMs: 10, historyOps: 25, cloneOps: 90, domNodes: 420, layoutOps: 180, mediaOps: 35 }
   };
 
-  window.addEventListener("popstate", onPop);
-
-  const baseQ = "?seed=" + (ctx.seed>>>0);
-  const initOk = safeReplaceState(makeState(0, baseToken), urlMutable ? (baseQ + "&i=0") : null);
-  if(!initOk){
-    window.removeEventListener("popstate", onPop);
-    fail(tag, RC("ENV_BLOCK","History replaceState blocked (origin/url policy). No conclusão em PS4."));
-    snapshot(tag);
-    return;
-  }
-  pushed.push({idx:0, token:baseToken});
-
-  for(let i=1;i<=cap.historyOps && !CTRL.stop;i++){
-    const token = (rand32(baseToken ^ i) ^ 0x13579BDF) >>> 0;
-    const st = makeState(i, token);
-    const origU32 = new Uint32Array(st.buf);
-    const okPush = safePushState(st, urlMutable ? (baseQ + "&i=" + i) : null);
-    if(!okPush) break;
-    expectedIdx = i;
-    pushed.push({idx:i, token});
-
-    // mutate original AFTER push to test cloneAtPush
-    try{ origU32[0] = (origU32[0] ^ 0xFFFFFFFF) >>> 0; }catch(e){}
-
-    // go(-1)
-    try{
-      const wantIdxBack = (expectedIdx - 1) >>> 0;
-      const wantTokBack = pushed[wantIdxBack].token >>> 0;
-      const pBack = armAck({wantIdx:wantIdxBack, wantToken:wantTokBack, dir:-1});
-      history.go(-1);
-      const rBack = await Promise.race([pBack, sleep(cap.ackTimeoutMs).then(()=>({ok:false,why:"timeout"}))]);
-      if(!rBack || !rBack.ok){ timeouts++; log(`[WARN] ${tag} go(-1) ${RC("EVENT_DROP", (rBack&&rBack.why)?rBack.why:"timeout")}`); }
-      else expectedIdx = wantIdxBack;
-    }catch(e){ goErrors++; break; }
-
-    // go(+1)
-    try{
-      const wantIdxFwd = (expectedIdx + 1) >>> 0;
-      const wantTokFwd = pushed[wantIdxFwd].token >>> 0;
-      const pFwd = armAck({wantIdx:wantIdxFwd, wantToken:wantTokFwd, dir:+1});
-      history.go(1);
-      const rFwd = await Promise.race([pFwd, sleep(cap.ackTimeoutMs).then(()=>({ok:false,why:"timeout"}))]);
-      if(!rFwd || !rFwd.ok){ timeouts++; log(`[WARN] ${tag} go(+1) ${RC("EVENT_DROP", (rFwd&&rFwd.why)?rFwd.why:"timeout")}`); }
-      else expectedIdx = wantIdxFwd;
-    }catch(e){ goErrors++; break; }
-
-    // classify cloneAtPush conservatively
-    try{
-      const cur = history.state;
-      if(cur && cur.buf){
-        const v = new Uint32Array(cur.buf);
-        if((v[0]>>>0) !== (origU32[0]>>>0)) cloneAtPush++;
-        else refAlias++;
-      }else inconclusive++;
-    }catch(e){ inconclusive++; }
-
-    const d = await healthDrift(tag + ":step");
-    if(d > cap.driftWarnMs){ log(`[INFO] ${tag} ${RC("DRIFT","drift alto; yield 1 frame para reduzir ruído")}`); await sleep(16); }
+  function healthTag(tag, when){
+    // drift aproximado: mede atraso de um setTimeout(0)
+    const t0 = NOW();
+    return new Promise(res => {
+      setTimeout(() => {
+        const dt = NOW() - t0;
+        log(`[HLTH] ${tag}:${when} eventLoop drift ~${dt.toFixed(2)}ms`);
+        res(dt);
+      }, 0);
+    });
   }
 
-  window.removeEventListener("popstate", onPop);
-
-  log(`[OK] popSeen=${popSeen} cloneAtPush=${cloneAtPush} refAlias=${refAlias} wrong/inconclusive=${stateAnom+inconclusive} crossContam=${contam} timeouts=${timeouts} goErrors=${goErrors} envBlocked=${envBlocked}`);
-
-  if(envBlocked>0){ fail(tag, RC("ENV_BLOCK","History API bloqueada por policy (mais comum no Android content://).")); snapshot(tag); return; }
-  if(contam>=2){ fail(tag, RC("STATE_ANOMALY","Cross-entry contamination (token/idx de entrada errada).")); snapshot(tag); return; }
-  if(stateAnom>=3){ fail(tag, RC("STATE_ANOMALY","Múltiplas anomalias em ev.state/idx/token (bookkeeping).")); snapshot(tag); return; }
-  if(refAlias>=2 && cloneAtPush===0){ fail(tag, RC("ALIAS","History state parece aliasar buffer original (repetível).")); snapshot(tag); return; }
-
-  pass(tag, "OK (bounded), invariants mantidos.");
-};
-
-/* ========================= CLONE1 ========================= */
-TESTS.CLONE1 = async function(ctx){
-  const tag="CLONE1";
-  CTRL.lastTest=tag;
-  log(`[TEST] ${tag} :: MessageChannel structured clone invariants | mode=${ctx.mode} seed=${ctx.seed}`);
-  const cap = ctx.cap;
-
-  let ok=0,bad=0,throws=0,aliasSus=0,shapeAnom=0;
-
-  function makePayload(i){
-    const buf=new ArrayBuffer(64);
-    const u32=new Uint32Array(buf);
-    const token=(rand32(ctx.seed ^ i) ^ 0xABCD1234)>>>0;
-    u32[0]=(0xC10E0000 ^ i)>>>0;
-    u32[1]=token>>>0;
-    return {v:1,i:i>>>0,token:token>>>0,buf:buf,nested:{s:"C:"+(token>>>0),a:[i,i+1]}};
+  function rc(code, extra){
+    // reason code format: RC:NAME key=val ...
+    let s = `[RC] ${code}`;
+    if (extra) s += " " + extra;
+    log(s);
   }
 
-  const ch=new MessageChannel();
-  const p1=ch.port1, p2=ch.port2;
-  p2.start();
-
-  for(let i=0;i<cap.cloneOps && !CTRL.stop;i++){
-    const payload=makePayload(i);
-    const orig=new Uint32Array(payload.buf);
-    const before0=orig[0]>>>0;
-    let got=null;
-
-    try{
-      const pr=new Promise(res=>{ p2.onmessage=(ev)=>res(ev.data); });
-      p1.postMessage(payload);
-      got = await Promise.race([pr, sleep(cap.ackTimeoutMs).then(()=>null)]);
-    }catch(e){ throws++; continue; }
-
-    if(!got){ bad++; log(`[WARN] ${tag} ${RC("EVENT_DROP","sem retorno no timeout")}`); continue; }
-    if(typeof got!=="object" || !got.buf || typeof got.token!=="number"){ shapeAnom++; continue; }
-
-    try{ orig[0]=(orig[0]^0xFFFFFFFF)>>>0; }catch(e){}
-
-    try{
-      const g=new Uint32Array(got.buf);
-      const g0=g[0]>>>0;
-      if(g0 === (orig[0]>>>0)) aliasSus++;
-      if(g0 === before0) ok++; else bad++;
-    }catch(e){ bad++; }
+  function capYield(mode){
+    // micro-yield para dar chance de popstate/media events rodarem
+    const budget = CAPS[mode].budgetMs;
+    const t0 = NOW();
+    return new Promise(res => {
+      function spin(){
+        if ((NOW() - t0) >= budget) return res();
+        setTimeout(spin, 0);
+      }
+      spin();
+    });
   }
 
-  log(`[OK] ok=${ok} bad=${bad} throws=${throws} aliasSus=${aliasSus} shapeAnom=${shapeAnom}`);
-  if(aliasSus>=2){ fail(tag, RC("ALIAS","Buffer clonado parece refletir mutação do original (inesperado).")); snapshot(tag); return; }
-  if(shapeAnom>=3){ fail(tag, RC("SHAPE","Anomalias repetidas no payload clonado.")); snapshot(tag); return; }
-  pass(tag,"OK (bounded).");
-};
+  // Execução controlada
+  async function runSuite(mode, seed){
+    const caps = CAPS[mode];
+    const tests = pickTests();
+    log(`[READY] Harness v4.1 carregado. Objetivo: indicadores de vulnerabilidade (sem exploração / sem DoS).`);
+    log(`[INFO] UA=${UA}`);
+    log(`[INFO] origin=${ORIGIN} url=${URL0}`);
+    log(`[INFO] mode=${mode} caps: budgetMs=${caps.budgetMs} historyOps=${caps.historyOps} cloneOps=${caps.cloneOps} domNodes<=${caps.domNodes} layoutOps=${caps.layoutOps} mediaOps=${caps.mediaOps}`);
+    log(`[RUN] Once | tests=${tests.length} mode=${mode} seed=${seed}`);
 
-/* ========================= DOM1 ========================= */
-TESTS.DOM1 = async function(ctx){
-  const tag="DOM1";
-  CTRL.lastTest=tag;
-  log(`[TEST] ${tag} :: DOM lifecycle + getters invariants | mode=${ctx.mode} seed=${ctx.seed}`);
-  const cap = ctx.cap;
-
-  let created=0,removed=0,reattached=0,anom=0,throws=0;
-  const host=document.createElement("div");
-  host.id="dom1_host_"+(ctx.seed>>>0);
-  document.body.appendChild(host);
-
-  function makeNode(i){
-    const d=document.createElement("div");
-    d.setAttribute("data-i",""+i);
-    d.textContent="N"+i;
-    return d;
-  }
-
-  const limit = Math.min(cap.domNodes, 300);
-  for(let i=0;i<limit && !CTRL.stop;i++){
-    try{
-      const n=makeNode(i);
-      host.appendChild(n); created++;
-
-      const w=n.offsetWidth, t=n.offsetTop;
-      if(typeof w!=="number" || typeof t!=="number") anom++;
-
-      n.remove(); removed++;
-      await Promise.resolve();
-
-      host.appendChild(n); reattached++;
-      const w2=n.offsetWidth;
-      if(typeof w2!=="number") anom++;
-
-      n.setAttribute("data-x","x"+((rand32(ctx.seed^i))>>>0));
-      n.style.display = (i%7===0) ? "none" : "block";
-      const h2=n.offsetHeight;
-      if(typeof h2!=="number") anom++;
-    }catch(e){ throws++; }
-
-    if((i%50)===0) await sleep(0);
-  }
-
-  try{ host.remove(); }catch(e){}
-  log(`[OK] created=${created} removed=${removed} reattached=${reattached} anom=${anom} throws=${throws}`);
-  if(throws>=3){ fail(tag, RC("EXC","Exceções repetidas durante operações DOM bounded.")); snapshot(tag); return; }
-  pass(tag,"OK (bounded).");
-};
-
-/* ========================= MEDIA1 ========================= */
-TESTS.MEDIA1 = async function(ctx){
-  const tag="MEDIA1";
-  CTRL.lastTest=tag;
-  log(`[TEST] ${tag} :: media teardown invariants (video/TextTrack) | mode=${ctx.mode} seed=${ctx.seed}`);
-  const cap=ctx.cap;
-  let ops=0,skips=0,throws=0;
-
-  for(let i=0;i<cap.mediaOps && !CTRL.stop;i++){
-    const v=document.createElement("video");
-    v.muted=true;
-    try{
-      document.body.appendChild(v);
-      v.src="";
-      if(typeof v.load==="function") v.load();
-      if(typeof v.addTextTrack==="function"){
-        const tt=v.addTextTrack("subtitles","t","en");
-        tt.mode="hidden"; tt.mode="disabled";
-      }else skips++;
-
-      if(v.pause) v.pause();
-      v.removeAttribute("src");
-      if(typeof v.load==="function") v.load();
-      v.remove();
-      ops++;
-    }catch(e){
-      throws++;
-      try{ v.remove(); }catch(_){}
-    }
-    await sleep(0);
-  }
-
-  log(`[OK] ops=${ops} skips=${skips} throws=${throws}`);
-  if(throws>=2){ fail(tag, RC("EXC","Exceções inesperadas em teardown de mídia (bounded).")); snapshot(tag); return; }
-  pass(tag,"OK (bounded).");
-};
-
-/* ========================= CAN1 ========================= */
-TESTS.CAN1 = async function(ctx){
-  const tag="CAN1";
-  CTRL.lastTest=tag;
-  log(`[TEST] ${tag} :: Canvas2D resize/destroy invariants | mode=${ctx.mode} seed=${ctx.seed}`);
-  const cap=ctx.cap;
-  let ops=0,skips=0,throws=0,anom=0;
-
-  for(let i=0;i<cap.canvasOps && !CTRL.stop;i++){
-    const c=document.createElement("canvas");
-    c.width=64; c.height=64;
-    try{
-      document.body.appendChild(c);
-      const g=c.getContext("2d");
-      if(!g){ skips++; c.remove(); continue; }
-      g.fillRect(0,0,1,1);
-      g.clearRect(0,0,64,64);
-      c.width = 32 + (i%32);
-      c.height = 32 + ((i*3)%32);
-      const img=g.getImageData(0,0,1,1);
-      if(!img || !img.data || img.data.length<4) anom++;
-      c.remove();
-      ops++;
-    }catch(e){
-      throws++;
-      try{ c.remove(); }catch(_){}
-    }
-    if((i%30)===0) await sleep(0);
-  }
-
-  log(`[OK] ops=${ops} skips=${skips} throws=${throws} anom=${anom}`);
-  if(throws>=2){ fail(tag, RC("EXC","Exceções inesperadas em ciclo de canvas (bounded).")); snapshot(tag); return; }
-  pass(tag,"OK (bounded).");
-};
-
-/* ========================= Runner/UI ========================= */
-const UI = {
-  async runOnceSelected(){
-    CTRL.stop=false; CTRL.fails=0;
-    const ctx=ctxFromUI();
-    const sel=selectTests();
-
-    log(`[READY] Harness v4 carregado. Sugestão: SAFE -> Run ALL once. Depois SAFE -> selecionar 2-3 e Loop N.`);
-    log(`[INFO] Sem window.open. Tudo roda na mesma aba. SAFE/AGGR são bounded (não é DoS).`);
-    log(`[RUN] Once | tests=${sel.length} mode=${ctx.mode}`);
-    log(`[INFO] mode=${ctx.mode} caps: budgetMs=${ctx.cap.budgetMs} historyOps=${ctx.cap.historyOps} cloneOps=${ctx.cap.cloneOps} domNodes<=${Math.min(ctx.cap.domNodes,300)} canvasOps=${ctx.cap.canvasOps} mediaOps=${ctx.cap.mediaOps}`);
-
-    for(let i=0;i<sel.length && !CTRL.stop;i++){
-      const name=sel[i], fn=TESTS[name];
-      if(!fn){ log(`[SKIP] unknown test ${name}`); continue; }
+    let fails = 0;
+    for (let t of tests){
+      const t0 = NOW();
       log("------------------------------------------------------------");
-      log(`[CP] begin ${name}`);
-      await healthDrift(name + ":pre");
-      const t0=nowMs();
-      try{ await fn(ctx); }
-      catch(e){ fail(name, RC("EXC","Unhandled exception: "+(e&&e.message?e.message:e))); snapshot(name); }
-      const dt=nowMs()-t0;
-      await healthDrift(name + ":post");
-      log(`[CP] end ${name} dt=${dt.toFixed(2)}ms`);
+      log(`[CP] begin ${t}`);
+      await healthTag(t, "pre");
+      try{
+        const ok = await TESTS[t](mode, seed);
+        if (!ok){
+          fails++;
+          log(`[FAIL] ${t} :: invariants violados (ver RC acima)`);
+        }else{
+          log(`[PASS] ${t} :: OK (bounded).`);
+        }
+      }catch(e){
+        fails++;
+        log(`[FAIL] ${t} :: exception: ${e && e.message ? e.message : String(e)}`);
+        rc(`${t}_EXC`, `name=${(e&&e.name)||'unknown'}`);
+      }
+      await healthTag(t, "post");
+      log(`[CP] end ${t} dt=${(NOW()-t0).toFixed(2)}ms`);
     }
-
     log("------------------------------------------------------------");
-    log(`[RUN] Done. fails=${CTRL.fails} lastTest=${CTRL.lastTest}`);
-  },
+    log(`[RUN] Done. fails=${fails} lastTest=${tests[tests.length-1]||"none"}`);
+    return fails;
+  }
 
-  async loopSelected(){
-    CTRL.stop=false; CTRL.fails=0;
-    const base=ctxFromUI();
-    const sel=selectTests();
-    const N=Math.max(1, parseInt(document.getElementById("loopN").value,10)||10);
-    const delay=Math.max(0, parseInt(document.getElementById("delayMs").value,10)||0);
+  let loopTimer = null;
+  let loopStop = false;
+  window.stopLoop = () => { loopStop = true; if (loopTimer) { clearTimeout(loopTimer); loopTimer = null; } log("[RUN] Loop stop requested."); };
 
-    log(`[RUN] Loop | tests=${sel.length} mode=${base.mode} loopN=${N} delayMs=${delay}`);
+  window.runOnce = (mode) => {
+    const seed = 1337;
+    runSuite(mode, seed);
+  };
 
-    for(let k=1;k<=N && !CTRL.stop;k++){
+  window.startLoop = (mode) => {
+    const N = Math.max(1, parseInt(document.getElementById("loopN").value||"50",10));
+    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value||"20",10));
+    loopStop = false;
+    log(`[RUN] Loop | mode=${mode} loopN=${N} delayMs=${delayMs}`);
+    let i = 0;
+    const baseSeed = 1337;
+    const step = async () => {
+      if (loopStop) { log("[RUN] Loop stopped."); return; }
+      i++;
       log("------------------------------------------------------------");
-      log(`[ITER] ${k}/${N}`);
+      log(`[ITER] ${i}/${N}`);
+      const fails = await runSuite(mode, baseSeed + i - 1);
+      if (i >= N) { log(`[RUN] Loop done. fails(last)=${fails}`); return; }
+      loopTimer = setTimeout(step, delayMs);
+    };
+    step();
+  };
 
-      const ctx={ mode:base.mode, seed:(base.seed+(k-1))>>>0, cap:base.cap };
+  /* =========================
+     TESTS
+     ========================= */
 
-      for(let i=0;i<sel.length && !CTRL.stop;i++){
-        const name=sel[i], fn=TESTS[name];
-        if(!fn) continue;
-        log("------------------------------------------------------------");
-        log(`[CP] begin ${name}`);
-        await healthDrift(name + ":pre");
-        const t0=nowMs();
-        try{ await fn(ctx); }
-        catch(e){ fail(name, RC("EXC","Unhandled exception: "+(e&&e.message?e.message:e))); snapshot(name); }
-        const dt=nowMs()-t0;
-        await healthDrift(name + ":post");
-        log(`[CP] end ${name} dt=${dt.toFixed(2)}ms`);
+  function makeState(rng, idx){
+    // Estado cloneável, com sentinelas suficientes para detectar mistura
+    const a = (rng() & 0xFFFF);
+    const b = (rng() & 0xFFFF);
+    const buf = new ArrayBuffer(64);
+    const u32 = new Uint32Array(buf);
+    u32[0] = 0xC0FFEE00 ^ idx;
+    u32[1] = 0x12345678 ^ a;
+    u32[2] = 0x9ABCDEF0 ^ b;
+    // objeto com "shape" estável
+    return {
+      kind: "NAV",
+      idx: idx,
+      tag: "E" + idx + "_" + a.toString(16),
+      nums: [idx, a, b, (a^b)>>>0],
+      meta: { a:a, b:b, t: NOW() },
+      buf: buf
+    };
+  }
+
+  function shallowHashState(st){
+    try{
+      const u32 = new Uint32Array(st.buf);
+      return ((u32[0]^u32[1]^u32[2])>>>0);
+    }catch(_){
+      return 0;
+    }
+  }
+
+  function tryReplaceState(state, url){
+    // Android content:// origin=null pode bloquear. No PS4 file:// geralmente permite.
+    history.replaceState(state, "", url);
+  }
+
+  async function historyGoAndWait(delta, timeoutMs){
+    return new Promise(res => {
+      let done = false;
+      function finish(ok){
+        if (done) return;
+        done = true;
+        window.removeEventListener("popstate", onPop);
+        res(ok);
+      }
+      const to = setTimeout(() => finish(false), timeoutMs);
+      function onPop(_ev){
+        clearTimeout(to);
+        finish(true);
+      }
+      window.addEventListener("popstate", onPop, { once: true });
+      try{
+        history.go(delta);
+      }catch(e){
+        clearTimeout(to);
+        finish(false);
+      }
+    });
+  }
+
+  // NAV1: valida bookkeeping e clone no push (sem tentar aliasing)
+  async function NAV1(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed);
+    const ops = caps.historyOps;
+
+    let popSeen = 0;
+    let cloneAtPush = 0;
+    let wrong = 0;
+    let timeouts = 0;
+    let envBlocked = 0;
+
+    // Cria entradas
+    const baseLen = history.length;
+    rc("NAV1_BASE", `historyLen=${baseLen}`);
+
+    const entries = [];
+    for (let i=0;i<ops;i++){
+      const st = makeState(rng, i);
+      const hash0 = shallowHashState(st);
+      // tenta detectar clone no push: muta após push e vê se pop retorna o valor antigo
+      const url = "#nav1_" + seed + "_" + i;
+      try{
+        history.pushState(st, "", url);
+      }catch(e){
+        rc("NAV1_PUSH_THROW", `i=${i} name=${e.name||'err'}`);
+        return false;
+      }
+      // mutate local object after push
+      try{
+        st.meta.a ^= 0x1111;
+        const u32 = new Uint32Array(st.buf);
+        u32[1] ^= 0x01010101;
+      }catch(_){}
+      entries.push({ idx:i, url:url, hash0:hash0, expect0:(0xC0FFEE00 ^ i)>>>0 });
+      await capYield(mode);
+    }
+
+    // Caminha para trás e valida popstate
+    for (let i=ops-1;i>=0;i--){
+      const ok = await historyGoAndWait(-1, 1200);
+      if (!ok){
+        timeouts++;
+        rc("NAV1_POP_TIMEOUT", `i=${i}`);
+        continue;
+      }
+      popSeen++;
+
+      const st = history.state;
+      if (!st || st.kind !== "NAV"){
+        wrong++;
+        rc("NAV1_STATE_NULL_OR_KIND", `i=${i} gotKind=${st && st.kind}`);
+        continue;
       }
 
-      log("------------------------------------------------------------");
-      log(`[RUN] Done iter=${k}. fails=${CTRL.fails} lastTest=${CTRL.lastTest}`);
-      if(delay) await sleep(delay);
+      // expected id
+      if (st.idx !== i){
+        wrong++;
+        rc("NAV1_IDX_MISMATCH", `expect=${i} got=${st.idx} url=${location.href}`);
+      }
+
+      // buffer sentinel integrity (detecta mistura)
+      try{
+        const u32 = new Uint32Array(st.buf);
+        const s0 = u32[0]>>>0;
+        if (s0 !== ((0xC0FFEE00 ^ st.idx)>>>0)){
+          wrong++;
+          rc("NAV1_BUF_SENTINEL_BAD", `idx=${st.idx} got=0x${s0.toString(16)}`);
+        }
+      }catch(e){
+        wrong++;
+        rc("NAV1_BUF_ACCESS_THROW", `idx=${st.idx} name=${e.name||'err'}`);
+      }
+
+      // clone-at-push signal (se pop retorna valores originais, não os mutados)
+      // heurística: se meta.a == original (sem xor 0x1111) e buf[1] não foi xor 0x01010101
+      // Como não guardamos original, inferimos pela consistência interna: nums[1] deve bater meta.a.
+      if (st && st.meta && st.nums && st.nums.length >= 3){
+        if (((st.nums[1]>>>0) === (st.meta.a>>>0)) && ((st.nums[2]>>>0) === (st.meta.b>>>0))){
+          cloneAtPush++;
+        }
+      }
+
+      await capYield(mode);
     }
 
-    log(`[RUN] Loop done. fails=${CTRL.fails}`);
-  }
-};
+    // tenta voltar ao fim (não falhar se não conseguir)
+    for (let k=0;k<ops;k++){
+      const ok = await historyGoAndWait(+1, 800);
+      if (!ok) break;
+      await capYield(mode);
+    }
 
-(function(){
-  log(`[READY] Harness v4 carregado. Objetivo: indicadores de vulnerabilidade (sem exploração / sem DoS).`);
-  log(`[INFO] Dica: no Android via content:// o History bloqueia URL mutation (origin=null). No PS4 via file:// ou http isso tende a funcionar.`);
+    log(`[OK] popSeen=${popSeen} cloneAtPush=${cloneAtPush} wrong/inconclusive=${wrong} timeouts=${timeouts} envBlocked=${envBlocked}`);
+    return (wrong === 0); // timeouts contam como inconclusivo (não marca falha por si)
+  }
+
+  // NAV2: integridade deferida + cross-entry contamination detector
+  async function NAV2(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed ^ 0xA5A5A5A5);
+    const ops = Math.max(8, Math.min(caps.historyOps, 18));
+
+    let popSeen = 0, wrong = 0, timeouts = 0, cross = 0;
+
+    // cria dois "grupos" com sentinelas bem diferentes para detectar cross contamination
+    const rec = []; // expected per index
+    for (let i=0;i<ops;i++){
+      const st = makeState(rng, i);
+      // grupo A/B alternado
+      const group = (i & 1) ? 0xA0A00000 : 0xB0B00000;
+      try{
+        const u32 = new Uint32Array(st.buf);
+        u32[3] = (group ^ i)>>>0;
+      }catch(_){}
+      const expect = { idx:i, group:group>>>0, url:"#nav2_"+seed+"_"+i };
+      rec.push(expect);
+      history.pushState(st, "", expect.url);
+
+      // after push: aggressively overwrite local references (helps detect stale pointer use, without "spray")
+      // (não é exploração; é só reduzir determinismo)
+      let trash = [];
+      for (let t=0;t<12;t++){
+        trash.push({x:t, y:"T"+t, z:[t,t^1,t^2]});
+      }
+      trash = null;
+
+      await capYield(mode);
+    }
+
+    // bounce pattern: go back 2, forward 1 repeatedly to stress bookkeeping order
+    for (let step=0; step<ops; step++){
+      const delta = (step % 3 === 0) ? -2 : +1;
+      const ok = await historyGoAndWait(delta, 1200);
+      if (!ok){ timeouts++; rc("NAV2_POP_TIMEOUT", `step=${step} delta=${delta}`); continue; }
+      popSeen++;
+
+      const st = history.state;
+      if (!st || st.kind !== "NAV"){ wrong++; rc("NAV2_KIND_BAD", `gotKind=${st && st.kind}`); continue; }
+
+      // expected group from sentinel u32[3]
+      try{
+        const u32 = new Uint32Array(st.buf);
+        const g = (u32[3] ^ st.idx) & 0xFFFF0000;
+        const expectG = (st.idx & 1) ? 0xA0A00000 : 0xB0B00000;
+        if (((g>>>0) !== (expectG>>>0))){
+          cross++;
+          rc("NAV2_CROSS_GROUP", `idx=${st.idx} got=0x${(g>>>0).toString(16)} exp=0x${expectG.toString(16)}`);
+        }
+      }catch(e){
+        wrong++;
+        rc("NAV2_BUF_THROW", `idx=${st.idx} name=${e.name||'err'}`);
+      }
+
+      // URL bookkeeping sanity: hash should match our pattern sometimes; if not, log but not fail
+      if (String(location.hash).indexOf("nav2_") === -1){
+        rc("NAV2_HASH_ANOM", `hash=${location.hash}`);
+      }
+
+      await capYield(mode);
+    }
+
+    log(`[OK] popSeen=${popSeen} wrong/inconclusive=${wrong} crossContam=${cross} timeouts=${timeouts}`);
+    return (wrong === 0 && cross === 0);
+  }
+
+  // STYLE1: fullscreen/blur + DOM mutation + animation lifecycle invariants
+  async function STYLE1(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed ^ 0x13579BDF);
+    const N = Math.min(caps.domNodes, 220);
+
+    let skips = 0, anom = 0, throws = 0;
+
+    // container
+    const host = document.createElement("div");
+    host.id = "style1_host";
+    host.style.cssText = "position:relative; width:320px; height:180px; overflow:hidden; border:1px solid #444;";
+    document.body.appendChild(host);
+
+    // create nodes with animation + filter toggles
+    const nodes = [];
+    for (let i=0;i<N;i++){
+      const d = document.createElement("div");
+      d.textContent = "n"+i;
+      d.style.cssText = "position:absolute; left:"+(i%16)*20+"px; top:"+((i/16)|0)*12+"px; font-size:10px;";
+      // quick style changes
+      d.style.filter = (i%3===0) ? "blur(0.6px)" : "none";
+      host.appendChild(d);
+      nodes.push(d);
+    }
+
+    // attempt fullscreen if available (PS4 may require user gesture; we are in button click path)
+    const fsEl = document.documentElement;
+    try{
+      if (fsEl && fsEl.webkitRequestFullscreen){
+        fsEl.webkitRequestFullscreen();
+      }else if (fsEl && fsEl.requestFullscreen){
+        fsEl.requestFullscreen();
+      }else{
+        skips++;
+        rc("STYLE1_NO_FULLSCREEN", "");
+      }
+    }catch(e){
+      skips++;
+      rc("STYLE1_FULLSCREEN_THROW", `name=${e.name||'err'}`);
+    }
+
+    // mutation/blur toggles + detach/reattach
+    for (let k=0;k<Math.min(18, caps.historyOps);k++){
+      try{
+        const idx = (rng() % nodes.length) | 0;
+        const n = nodes[idx];
+        if (!n || !n.isConnected){ anom++; rc("STYLE1_NODE_NOT_CONNECTED", `k=${k} idx=${idx}`); continue; }
+        // toggle filter + contentVisibility (often tricky in WebKit variants)
+        n.style.filter = (n.style.filter === "none") ? "blur(1px)" : "none";
+        host.style.webkitFilter = (k%2===0) ? "blur(0.8px)" : "none";
+        // detach/reattach slice
+        if (k % 3 === 0){
+          const frag = document.createDocumentFragment();
+          for (let j=0;j<8 && nodes.length;j++){
+            const m = nodes[(idx+j)%nodes.length];
+            if (m && m.parentNode === host) frag.appendChild(m);
+          }
+          host.appendChild(frag);
+        }
+        // force style/layout reads (bounded)
+        void host.offsetHeight;
+        void n.getBoundingClientRect();
+      }catch(e){
+        throws++;
+        rc("STYLE1_MUT_THROW", `k=${k} name=${e.name||'err'}`);
+      }
+      await capYield(mode);
+    }
+
+    // invariants: host must be connected, no node should have NaN geometry
+    try{
+      if (!host.isConnected){ anom++; rc("STYLE1_HOST_DISCONNECTED", ""); }
+      for (let i=0;i<Math.min(40, nodes.length);i++){
+        const r = nodes[i].getBoundingClientRect();
+        if (!(r.width >= 0) || !(r.height >= 0)){ anom++; rc("STYLE1_RECT_NAN", `i=${i} w=${r.width} h=${r.height}`); break; }
+      }
+    }catch(e){
+      throws++;
+      rc("STYLE1_POST_THROW", `name=${e.name||'err'}`);
+    }
+
+    // cleanup
+    try{ host.remove(); }catch(_){}
+
+    log(`[OK] skips=${skips} anom=${anom} throws=${throws}`);
+    return (anom === 0 && throws === 0);
+  }
+
+  // LAYOUT1: layout thrash + mutation; invariants about monotonic counters & stable reads
+  async function LAYOUT1(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed ^ 0xCAFEBABE);
+    const ops = caps.layoutOps;
+
+    let anom = 0, throws = 0;
+
+    const root = document.createElement("div");
+    root.id = "layout1_root";
+    root.style.cssText = "width:320px; border:1px dashed #777; padding:4px;";
+    document.body.appendChild(root);
+
+    // build a nested tree (bounded)
+    const depth = (mode === "AGGR") ? 20 : 14;
+    let cur = root;
+    for (let d=0; d<depth; d++){
+      const box = document.createElement("div");
+      box.textContent = "d"+d;
+      box.style.cssText = "padding:2px; margin:1px; border:1px solid #999;";
+      cur.appendChild(box);
+      cur = box;
+    }
+
+    let lastH = -1;
+    for (let i=0;i<ops;i++){
+      try{
+        // mutate: toggle class-like style and innerHTML for small subtrees
+        if (i % 5 === 0){
+          cur.style.borderWidth = ((i%3)+1) + "px";
+          cur.style.letterSpacing = ((i%4)) + "px";
+        }
+        if (i % 9 === 0){
+          cur.innerHTML = "<span>t"+i+"</span><span>u"+(i^1)+"</span>";
+        }
+        // read forcing layout
+        const h = root.offsetHeight;
+        if (lastH !== -1 && h <= 0){
+          anom++; rc("LAYOUT1_HEIGHT_BAD", `i=${i} h=${h}`); break;
+        }
+        lastH = h;
+        // random sibling insert/remove
+        if (i % 7 === 0){
+          const s = document.createElement("div");
+          s.textContent = "s"+i;
+          root.insertBefore(s, root.firstChild);
+          if (root.childNodes.length > 30) root.removeChild(root.firstChild);
+        }
+      }catch(e){
+        throws++;
+        rc("LAYOUT1_THROW", `i=${i} name=${e.name||'err'}`);
+      }
+      await capYield(mode);
+    }
+
+    try{ root.remove(); }catch(_){}
+
+    log(`[OK] anom=${anom} throws=${throws}`);
+    return (anom === 0 && throws === 0);
+  }
+
+  // MEDIA1: bounded teardown; invariants around event ordering & no stuck state
+  async function MEDIA1(mode, seed){
+    const caps = CAPS[mode];
+    const ops = caps.mediaOps;
+    let throws = 0, skips = 0;
+
+    // Use a tiny silent audio via AudioContext if present; fallback to <video> element teardown without src.
+    const hasAC = (typeof AudioContext !== "undefined") || (typeof webkitAudioContext !== "undefined");
+
+    for (let i=0;i<ops;i++){
+      try{
+        if (hasAC){
+          const AC = AudioContext || webkitAudioContext;
+          const ctx = new AC();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          gain.gain.value = 0.0;
+          osc.connect(gain); gain.connect(ctx.destination);
+          osc.start();
+          // rapid close
+          if (ctx.close) await ctx.close();
+        }else{
+          skips++;
+          const v = document.createElement("video");
+          v.preload = "none";
+          document.body.appendChild(v);
+          v.load();
+          v.src = "";
+          v.remove();
+        }
+      }catch(e){
+        throws++;
+        rc("MEDIA1_THROW", `i=${i} name=${e.name||'err'}`);
+      }
+      await capYield(mode);
+    }
+
+    log(`[OK] ops=${ops} skips=${skips} throws=${throws}`);
+    return (throws === 0);
+  }
+
+  const TESTS = {
+    "NAV1": NAV1,
+    "NAV2": NAV2,
+    "STYLE1": STYLE1,
+    "LAYOUT1": LAYOUT1,
+    "MEDIA1": MEDIA1
+  };
+
 })();
 </script>
 </body>
