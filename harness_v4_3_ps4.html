@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>PS4 WebKit Research Harness v4.3 (UAF-style sequences, bounded)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+<h2>PS4 WebKit Research Harness v4.3</h2>
+<p><b>Objetivo:</b> caçar <u>anomalias/crashes</u> com <u>invariantes</u> + <u>reason codes</u> (sem exploração).</p>
+<p><b>Foco:</b> sequências historicamente associadas a UAF/corrupção: <i>DOM detach/reattach + style recalc em microtask</i>, <i>media teardown + TextTrack cue churn</i>, <i>layout thrash (read/write/remove)</i>. Tudo <b>bounded</b>.</p>
+
+<div>
+  <button onclick="clearLog()">Limpar</button>
+  <button onclick="runOnce('SAFE')">RUN Once SAFE</button>
+  <button onclick="runOnce('AGGR')">RUN Once AGGR</button>
+  <button onclick="startLoop('SAFE')">Loop SAFE</button>
+  <button onclick="startLoop('AGGR')">Loop AGGR</button>
+  <button onclick="stopLoop()">Parar</button>
+</div>
+
+<div style="margin-top:10px;">
+  <label>Loop N <input id="loopN" type="number" value="50" min="1" step="10"></label>
+  <label style="margin-left:10px;">Delay ms <input id="delayMs" type="number" value="20" min="0" step="10"></label>
+</div>
+
+<div style="margin-top:10px;">
+  <label><input type="checkbox" id="t_styleuaf" checked> STYLE_UAF (detach/reattach + style recalc em microtask)</label><br>
+  <label><input type="checkbox" id="t_mediatt" checked> MEDIA_TT (video/TextTrack addCue/removeCue + teardown apertado)</label><br>
+  <label><input type="checkbox" id="t_layoutuaf" checked> LAYOUT_THRASH (layout read/write/remove em loop curto)</label><br>
+</div>
+
+<pre id="log" style="white-space:pre-wrap; border:1px solid #999; padding:10px; margin-top:10px; height:62vh; overflow:auto;"></pre>
+
+<script>
+(function(){
+  const logEl = document.getElementById('log');
+  const NOW = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  const UA = (navigator && navigator.userAgent) ? navigator.userAgent : 'unknown';
+
+  function log(s){ logEl.textContent += s + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+  window.clearLog = () => { logEl.textContent = ''; };
+
+  function xorshift32(seed){
+    let x = (seed|0) || 0x12345678;
+    return function(){
+      x ^= (x << 13); x |= 0;
+      x ^= (x >>> 17);
+      x ^= (x << 5);  x |= 0;
+      return (x >>> 0);
+    };
+  }
+
+  const CAPS = {
+    SAFE: { budgetMs: 6,  styleOps: 60,  layoutOps: 70,  mediaOps: 16,  domNodes: 180, cueOps: 24,  microBursts: 6 },
+    AGGR: { budgetMs: 10, styleOps: 140, layoutOps: 160, mediaOps: 28,  domNodes: 420, cueOps: 70,  microBursts: 12 }
+  };
+
+  function rc(code, extra){
+    let s = `[RC] ${code}`;
+    if (extra) s += ' ' + extra;
+    log(s);
+  }
+
+  async function healthTag(tag, when){
+    const t0 = NOW();
+    return new Promise(res => {
+      setTimeout(() => {
+        const dt = NOW() - t0;
+        log(`[HLTH] ${tag}:${when} eventLoop drift ~${dt.toFixed(2)}ms`);
+        res(dt);
+      }, 0);
+    });
+  }
+
+  function pickTests(){
+    const ids = ['STYLE_UAF','MEDIA_TT','LAYOUT_THRASH'];
+    const map = { STYLE_UAF:'styleuaf', MEDIA_TT:'mediatt', LAYOUT_THRASH:'layoutuaf' };
+    const out = [];
+    for (const id of ids){
+      const cb = document.getElementById('t_' + map[id]);
+      if (cb && cb.checked) out.push(id);
+    }
+    return out;
+  }
+
+  function capYield(mode){
+    const budget = CAPS[mode].budgetMs;
+    const t0 = NOW();
+    return new Promise(res => {
+      function spin(){
+        if ((NOW() - t0) >= budget) return res();
+        setTimeout(spin, 0);
+      }
+      spin();
+    });
+  }
+
+  function safeFlushStyle(el){
+    // Força recálculo sem “spray” nem alocação massiva
+    try{
+      void el.offsetTop;
+      void el.offsetWidth;
+      void getComputedStyle(el).width;
+      return true;
+    }catch(e){
+      return false;
+    }
+  }
+
+  function safeRaf(){
+    return new Promise(res => requestAnimationFrame(() => res(true)));
+  }
+
+  async function runSuite(mode, seed){
+    const caps = CAPS[mode];
+    const tests = pickTests();
+    log(`[READY] Harness v4.3 carregado. Objetivo: indicadores de vulnerabilidade (sem exploração / sem DoS).`);
+    log(`[INFO] UA=${UA}`);
+    log(`[INFO] origin=${location.origin||'unknown'} url=${location.href||'unknown'}`);
+    log(`[INFO] mode=${mode} caps: budgetMs=${caps.budgetMs} styleOps=${caps.styleOps} layoutOps=${caps.layoutOps} mediaOps=${caps.mediaOps} domNodes<=${caps.domNodes} cueOps=${caps.cueOps} microBursts=${caps.microBursts}`);
+    log(`[RUN] Once | tests=${tests.length} mode=${mode} seed=${seed}`);
+
+    let fails = 0;
+    for (const t of tests){
+      const t0 = NOW();
+      log('------------------------------------------------------------');
+      log(`[CP] begin ${t}`);
+      await healthTag(t, 'pre');
+      try{
+        const ok = await TESTS[t](mode, seed);
+        if (!ok){
+          fails++;
+          log(`[FAIL] ${t} :: invariants violados (ver RC acima)`);
+        } else {
+          log(`[PASS] ${t} :: OK (bounded).`);
+        }
+      }catch(e){
+        fails++;
+        log(`[FAIL] ${t} :: exception: ${e && e.message ? e.message : String(e)}`);
+        rc(`${t}_EXC`, `name=${(e&&e.name)||'unknown'}`);
+      }
+      await healthTag(t, 'post');
+      log(`[CP] end ${t} dt=${(NOW()-t0).toFixed(2)}ms`);
+    }
+    log('------------------------------------------------------------');
+    log(`[RUN] Done. fails=${fails} lastTest=${tests[tests.length-1]||'none'}`);
+    return fails;
+  }
+
+  let loopTimer = null;
+  let loopStop = false;
+  window.stopLoop = () => {
+    loopStop = true;
+    if (loopTimer) { clearTimeout(loopTimer); loopTimer = null; }
+    log('[RUN] Loop stop requested.');
+  };
+
+  window.runOnce = (mode) => {
+    runSuite(mode, 1337);
+  };
+
+  window.startLoop = (mode) => {
+    const N = Math.max(1, parseInt(document.getElementById('loopN').value||'50',10));
+    const delayMs = Math.max(0, parseInt(document.getElementById('delayMs').value||'20',10));
+    loopStop = false;
+    log(`[RUN] Loop | mode=${mode} loopN=${N} delayMs=${delayMs}`);
+    let i = 0;
+    const baseSeed = 1337;
+
+    const step = async () => {
+      if (loopStop) { log('[RUN] Loop stopped.'); return; }
+      i++;
+      log('------------------------------------------------------------');
+      log(`[ITER] ${i}/${N}`);
+      const fails = await runSuite(mode, baseSeed + i - 1);
+      if (i >= N) { log(`[RUN] Loop done. fails(last)=${fails}`); return; }
+      loopTimer = setTimeout(step, delayMs);
+    };
+    step();
+  };
+
+  /* =========================
+     TESTS (UAF-style sequences)
+     ========================= */
+
+  // STYLE_UAF: detach/reattach em microtasks com recalc no meio
+  async function STYLE_UAF(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed);
+
+    let ops = 0;
+    let anom = 0;
+    let throws = 0;
+    let skips = 0;
+
+    const host = document.createElement('div');
+    host.id = 'host_style_uaf';
+    host.style.cssText = 'position:relative; left:0; top:0; width:280px; padding:4px; border:1px solid #666;';
+    document.body.appendChild(host);
+
+    // Construção de alvo (evita SVG/complexidades que variam muito)
+    const container = document.createElement('div');
+    container.style.cssText = 'display:block; padding:2px;';
+    host.appendChild(container);
+
+    const child = document.createElement('div');
+    child.textContent = 'UAF-seq';
+    child.style.cssText = 'display:inline-block; padding:2px 6px; margin:2px; border:1px solid #999;';
+    container.appendChild(child);
+
+    // Tentativa de fullscreen/blur (pode exigir gesto). Se falhar, segue sem.
+    let fsTried = false, fsOk = false;
+    try{
+      if (document.documentElement && document.documentElement.requestFullscreen){
+        fsTried = true;
+        // não await: browsers podem rejeitar sem gesture; capturamos via catch
+        document.documentElement.requestFullscreen().then(() => { fsOk = true; }).catch(() => {});
+      }
+    }catch(_){ /* ignore */ }
+
+    for (let b=0; b<caps.microBursts; b++){
+      // mini-jitter: alterna propriedades que acionam style recalc
+      const k = (rng() & 7);
+      const togg = (k & 1) ? 'block' : 'inline-block';
+      const filter = (k & 2) ? 'blur(0.1px)' : 'none';
+      const vis = (k & 4) ? 'hidden' : 'visible';
+
+      try{
+        container.style.display = togg;
+        child.style.filter = filter;
+        child.style.visibility = vis;
+      }catch(e){ throws++; rc('STYLE_UAF_STYLE_SET_THROW', `b=${b}`); }
+
+      // Sequência em microtask: detach -> flush -> reattach -> flush
+      await Promise.resolve().then(() => {
+        try{
+          if (!child.isConnected){
+            rc('STYLE_UAF_CHILD_NOT_CONNECTED_PRE', `b=${b}`);
+            anom++; return;
+          }
+          child.remove();
+          // flush em elemento ainda referenciado
+          const ok1 = safeFlushStyle(container);
+          if (!ok1){ anom++; rc('STYLE_UAF_FLUSH_FAIL_1', `b=${b}`); }
+          container.appendChild(child);
+          const ok2 = safeFlushStyle(child);
+          if (!ok2){ anom++; rc('STYLE_UAF_FLUSH_FAIL_2', `b=${b}`); }
+        }catch(e){
+          throws++; rc('STYLE_UAF_MICROTASK_THROW', `b=${b} name=${e.name||'err'}`);
+        }
+      });
+
+      // Pós-invariantes
+      ops++;
+      if (!child.isConnected){
+        anom++; rc('STYLE_UAF_CHILD_DISCONNECTED_POST', `b=${b}`);
+        // tenta recuperar
+        try{ container.appendChild(child); }catch(_){ }
+      }
+
+      // Jitter curtíssimo (bounded)
+      await capYield(mode);
+    }
+
+    // Cleanup
+    try{ host.remove(); }catch(_){ }
+
+    // Interpretação: anomalias aqui são fortes se forem (a) inconsistentes e (b) acompanhadas de crash/glitch.
+    log(`[OK] ops=${ops} anom=${anom} throws=${throws} fsTried=${fsTried?1:0} fsOk=${fsOk?1:0} skips=${skips}`);
+
+    // FAIL se invariantes quebraram (anom/throws) acima de um limiar baixo
+    if (throws > 0) return false;
+    if (anom > 0) return false;
+    return true;
+  }
+
+  // MEDIA_TT: TextTrack churn + teardown apertado
+  async function MEDIA_TT(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed);
+
+    let ops = 0;
+    let throws = 0;
+    let skips = 0;
+    let anom = 0;
+
+    // PS4 pode não suportar TextTrack / VTTCue completo. Detecta e registra.
+    const hasCue = (typeof VTTCue !== 'undefined') || (typeof TextTrackCue !== 'undefined');
+    if (!hasCue){
+      rc('MEDIA_TT_NO_CUE_API', 'VTTCue/TextTrackCue missing');
+      log(`[OK] ops=0 skips=1 throws=0`);
+      return true; // não é falha: ambiente sem API
+    }
+
+    const host = document.createElement('div');
+    host.id = 'host_media_tt';
+    document.body.appendChild(host);
+
+    const v = document.createElement('video');
+    v.muted = true;
+    v.playsInline = true;
+    v.controls = false;
+    v.preload = 'none';
+    // não carregamos mídia externa (offline). O objetivo é a API lifecycle.
+    host.appendChild(v);
+
+    let track = null;
+    try{
+      track = v.addTextTrack('subtitles', 't', 'en');
+      track.mode = 'hidden';
+    }catch(e){
+      rc('MEDIA_TT_ADDTRACK_THROW', `name=${e.name||'err'}`);
+      throws++; skips++;
+      try{ host.remove(); }catch(_){ }
+      log(`[OK] ops=0 skips=${skips} throws=${throws}`);
+      return (throws===0);
+    }
+
+    const CueCtor = (typeof VTTCue !== 'undefined') ? VTTCue : TextTrackCue;
+
+    for (let i=0;i<caps.cueOps;i++){
+      const a = (rng() & 0xFF) / 255;
+      const t0 = (i % 3) * 0.1;
+      const t1 = t0 + 0.05 + a*0.05;
+      let cue = null;
+      try{
+        cue = new CueCtor(t0, t1, 'x');
+      }catch(e){
+        rc('MEDIA_TT_CUE_CTOR_THROW', `i=${i}`);
+        throws++; break;
+      }
+
+      // Timing apertado: addCue/removeCue em microtask + teardown no meio
+      try{
+        track.addCue(cue);
+      }catch(e){
+        rc('MEDIA_TT_ADD_CUE_THROW', `i=${i} name=${e.name||'err'}`);
+        throws++; break;
+      }
+
+      await Promise.resolve().then(() => {
+        try{
+          track.removeCue(cue);
+        }catch(e){
+          // Alguns engines exigem que cue esteja presente; removemos 1x só.
+        }
+
+        // Teardown apertado (bounded): remove e recoloca o elemento
+        const doTeardown = ((rng() & 7) === 0); // ~1/8
+        if (doTeardown){
+          try{
+            v.remove();
+            // toca propriedades para forçar caminhos internos
+            void v.readyState;
+            void v.networkState;
+            host.appendChild(v);
+          }catch(e){
+            throws++; rc('MEDIA_TT_TEARDOWN_THROW', `i=${i} name=${e.name||'err'}`);
+          }
+        }
+      });
+
+      // Pós-invariantes
+      ops++;
+      if (v.parentNode !== host){
+        anom++; rc('MEDIA_TT_VIDEO_NOT_IN_HOST', `i=${i}`);
+        try{ host.appendChild(v); }catch(_){ }
+      }
+
+      // Yield curto
+      await capYield(mode);
+    }
+
+    // Final: teardown definitivo
+    try{ v.src = ''; }catch(_){ }
+    try{ v.load && v.load(); }catch(_){ }
+    try{ host.remove(); }catch(_){ }
+
+    log(`[OK] ops=${ops} skips=${skips} throws=${throws} anom=${anom}`);
+    if (throws>0) return false;
+    if (anom>0) return false;
+    return true;
+  }
+
+  // LAYOUT_THRASH: read/write/remove em loop curto, com microtask no meio
+  async function LAYOUT_THRASH(mode, seed){
+    const caps = CAPS[mode];
+    const rng = xorshift32(seed);
+
+    let ops = 0;
+    let throws = 0;
+    let anom = 0;
+
+    const host = document.createElement('div');
+    host.id = 'host_layout_thr';
+    host.style.cssText = 'position:relative; width:320px; border:1px solid #666; padding:4px;';
+    document.body.appendChild(host);
+
+    // cria uma grade moderada (bounded)
+    const nodes = [];
+    const n = Math.min(caps.domNodes, 480);
+    for (let i=0;i<n;i++){
+      const d = document.createElement('div');
+      d.textContent = 'n'+i;
+      d.style.cssText = 'display:inline-block; width:10px; height:10px; margin:1px; border:1px solid #999;';
+      host.appendChild(d);
+      nodes.push(d);
+    }
+
+    for (let i=0;i<caps.layoutOps;i++){
+      const idx = (rng() % nodes.length) | 0;
+      const el = nodes[idx];
+      const phase = (rng() & 3);
+
+      try{
+        // read layout
+        const r1 = el.getBoundingClientRect();
+        if (!isFinite(r1.width) || r1.width < 0){
+          anom++; rc('LAYOUT_BAD_RECT', `i=${i} w=${r1.width}`);
+        }
+
+        // write style
+        if (phase===0) el.style.width = (10 + (rng() & 7)) + 'px';
+        if (phase===1) el.style.marginLeft = ((rng() & 3)) + 'px';
+        if (phase===2) el.style.borderWidth = ((rng() & 1)+1) + 'px';
+        if (phase===3) el.style.transform = 'translateZ(0)';
+
+        // microtask: remove e recoloca, e lê layout de novo
+        await Promise.resolve().then(() => {
+          try{
+            el.remove();
+            // lê layout do host (força recalc)
+            void host.offsetHeight;
+            host.appendChild(el);
+            const r2 = el.getBoundingClientRect();
+            if (!isFinite(r2.height) || r2.height < 0){
+              anom++; rc('LAYOUT_BAD_RECT_POST', `i=${i} h=${r2.height}`);
+            }
+          }catch(e){
+            throws++; rc('LAYOUT_MICROTASK_THROW', `i=${i} name=${e.name||'err'}`);
+          }
+        });
+
+      }catch(e){
+        throws++; rc('LAYOUT_LOOP_THROW', `i=${i} name=${e.name||'err'}`);
+      }
+
+      ops++;
+      // bounded yield
+      await capYield(mode);
+    }
+
+    try{ host.remove(); }catch(_){ }
+
+    log(`[OK] ops=${ops} anom=${anom} throws=${throws}`);
+    if (throws>0) return false;
+    if (anom>0) return false;
+    return true;
+  }
+
+  const TESTS = {
+    STYLE_UAF,
+    MEDIA_TT,
+    LAYOUT_THRASH
+  };
+
+})();
+</script>
+</body>
+</html>
