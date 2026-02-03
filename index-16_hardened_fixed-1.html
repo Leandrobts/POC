@@ -1,0 +1,758 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>History API Fuzzer - 50 Edge Cases</title>
+</head>
+<body>
+
+<button id="btnRun" onclick="runAll()">RODAR TODOS OS 50 TESTES</button>
+<button onclick="location.reload()">RESET (reload page)</button>
+
+<pre id="log"></pre>
+
+<script>
+(function(){
+"use strict";
+
+
+let alertCount = 0;
+const $log = document.getElementById("log");
+const $btn = document.getElementById("btnRun");
+let STOP = false;
+
+function log(m) { $log.textContent += m + "\n"; console.log(m); }
+function ALERT(m) { alertCount++; const msg = "[ALERTA] " + m; $log.textContent += msg + "\\n"; console.error(msg); }
+
+function randHex(n){ return ((Math.random()*(1<<24))|0).toString(16).padStart(6,"0").slice(0,n||4); }
+function hrefNoHash(){ return location.href.split("#")[0]; }
+
+// Helper: aguarda com timeout
+function waitPop(ms){
+  return new Promise(function(resolve){
+    let arrived = false;
+    const h = function(ev){
+      if(arrived) return;
+      arrived = true;
+      window.removeEventListener("popstate", h);
+      resolve({ ok:true, state:ev.state });
+    };
+    window.addEventListener("popstate", h);
+    setTimeout(function(){
+      if(!arrived){ arrived=true; window.removeEventListener("popstate", h); resolve({ok:false}); }
+    }, ms);
+  });
+}
+
+// ============================================================
+// BATERIA DE 50 TESTES
+// ============================================================
+
+const TESTES = [
+
+// ===== GRUPO 1: History state manipulation extremo =====
+{
+  id: 1,
+  desc: "replaceState com state null",
+  fn: async function(){
+    history.replaceState(null, "");
+    const st = history.state;
+    if(st !== null) ALERT("T1: state deveria ser null, got " + typeof st);
+  }
+},
+{
+  id: 2,
+  desc: "replaceState com state undefined",
+  fn: async function(){
+    history.replaceState(undefined, "");
+    const st = history.state;
+    if(st !== null && st !== undefined) ALERT("T2: state inesperado: " + st);
+  }
+},
+{
+  id: 3,
+  desc: "replaceState com objeto circular",
+  fn: async function(){
+    const obj = { a: 1 };
+    obj.self = obj;
+    try {
+      history.replaceState(obj, "");
+      ALERT("T3: replaceState com circular nao lancou erro");
+    } catch(e) {
+      // esperado
+    }
+  }
+},
+{
+  id: 4,
+  desc: "replaceState com ArrayBuffer gigante (100MB)",
+  fn: async function(){
+    try {
+      const huge = new ArrayBuffer(100*1024*1024);
+      history.replaceState({ buf: huge }, "");
+      ALERT("T4: 100MB ArrayBuffer em state foi aceito");
+    } catch(e) {
+      // esperado falhar por memoria
+    }
+  }
+},
+{
+  id: 5,
+  desc: "replaceState 1000x sem yield",
+  fn: async function(){
+    const start = Date.now();
+    for(let i=0; i<1000; i++){
+      history.replaceState({ seq: i }, "");
+    }
+    const st = history.state;
+    if(st && st.seq !== 999) ALERT("T5: esperado seq=999, got " + st.seq);
+    if(Date.now() - start > 5000) ALERT("T5: 1000 replaceState levou mais de 5s");
+  }
+},
+{
+  id: 6,
+  desc: "replaceState durante popstate callback",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.pushState({ id: "B" }, "");
+    window.onpopstate = function(ev){
+      history.replaceState({ injected: true, orig: ev.state }, "");
+    };
+    history.back();
+    await waitPop(1000);
+    const st = history.state;
+    if(st && st.injected) ALERT("T6: replaceState durante popstate foi processado");
+  }
+},
+{
+  id: 7,
+  desc: "pushState 500x criando entries massivas",
+  fn: async function(){
+    const before = history.length;
+    for(let i=0; i<500; i++){
+      history.pushState({ id: i }, "");
+    }
+    const after = history.length;
+    if(after - before !== 500) ALERT("T7: esperado delta=500, got " + (after-before));
+  }
+},
+{
+  id: 8,
+  desc: "replaceState com string de 10MB",
+  fn: async function(){
+    try {
+      const big = "X".repeat(10*1024*1024);
+      history.replaceState({ data: big }, "");
+      const st = history.state;
+      if(st && st.data && st.data.length === 10*1024*1024) ALERT("T8: 10MB string em state OK");
+    } catch(e) {
+      // esperado falhar
+    }
+  }
+},
+
+// ===== GRUPO 2: URL manipulation edge cases =====
+{
+  id: 9,
+  desc: "replaceState com URL de 10000 chars",
+  fn: async function(){
+    const longUrl = hrefNoHash() + "?" + "a".repeat(10000);
+    try {
+      history.replaceState(null, "", longUrl);
+      if(location.href.length > 10000) ALERT("T9: URL de 10k chars foi aceita");
+    } catch(e) {}
+  }
+},
+{
+  id: 10,
+  desc: "pushState com URL invalida (sem protocolo)",
+  fn: async function(){
+    try {
+      history.pushState(null, "", "example.com/test");
+      ALERT("T10: URL invalida foi aceita");
+    } catch(e) {
+      // esperado
+    }
+  }
+},
+{
+  id: 11,
+  desc: "replaceState alternando URL 500x",
+  fn: async function(){
+    const url1 = hrefNoHash() + "?a=1";
+    const url2 = hrefNoHash() + "?b=2";
+    for(let i=0; i<500; i++){
+      history.replaceState(null, "", i % 2 === 0 ? url1 : url2);
+    }
+    if(location.href !== url2) ALERT("T11: URL final inesperada");
+  }
+},
+
+// ===== GRUPO 3: Burst + navigation races =====
+{
+  id: 12,
+  desc: "burst 300 + back imediato",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    for(let i=0; i<300; i++) history.replaceState({ seq: i }, "");
+    history.back();
+    const r = await waitPop(2000);
+    if(!r.ok) ALERT("T12: timeout apos burst=300");
+  }
+},
+{
+  id: 13,
+  desc: "burst 500 + forward",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.pushState({ id: "B" }, "");
+    history.back();
+    await waitPop(500);
+    for(let i=0; i<500; i++) history.replaceState({ seq: i }, "");
+    history.forward();
+    const r = await waitPop(2000);
+    if(!r.ok) ALERT("T13: timeout no forward apos burst=500");
+  }
+},
+{
+  id: 14,
+  desc: "burst durante back em andamento",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.pushState({ id: "B" }, "");
+    history.back();
+    // burst DURANTE o back (nao espera pop)
+    for(let i=0; i<200; i++) history.replaceState({ seq: i }, "");
+    const r = await waitPop(2000);
+    if(!r.ok) ALERT("T14: burst durante back causou timeout");
+  }
+},
+{
+  id: 15,
+  desc: "go(-50) em history com 10 entries",
+  fn: async function(){
+    for(let i=0; i<10; i++) history.pushState({ id: i }, "");
+    history.go(-50);
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T15: go(-50) nao entregou popstate");
+  }
+},
+
+// ===== GRUPO 4: State deserialization stress =====
+{
+  id: 16,
+  desc: "state com 1000 nested objects",
+  fn: async function(){
+    let obj = { val: 0 };
+    for(let i=0; i<1000; i++){
+      obj = { nested: obj, val: i };
+    }
+    try {
+      history.replaceState(obj, "");
+      const st = history.state;
+      if(!st || !st.nested) ALERT("T16: nested 1000x corrompeu");
+    } catch(e) {
+      ALERT("T16: exception com nested 1000x: " + e.message);
+    }
+  }
+},
+{
+  id: 17,
+  desc: "state com 10000 keys no objeto",
+  fn: async function(){
+    const obj = {};
+    for(let i=0; i<10000; i++) obj["k"+i] = i;
+    history.replaceState(obj, "");
+    const st = history.state;
+    if(!st || Object.keys(st).length !== 10000) ALERT("T17: 10k keys corrompeu");
+  }
+},
+{
+  id: 18,
+  desc: "state com Map e Set",
+  fn: async function(){
+    const m = new Map(); m.set("a", 1);
+    const s = new Set(); s.add(42);
+    history.replaceState({ map: m, set: s }, "");
+    const st = history.state;
+    // Map/Set nao sao structured-cloneable em WebKit antigo
+    if(st && (st.map instanceof Map || st.set instanceof Set)){
+      ALERT("T18: Map/Set foram clonados (inesperado)");
+    }
+  }
+},
+{
+  id: 19,
+  desc: "state com ImageData",
+  fn: async function(){
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 100;
+    const ctx = canvas.getContext("2d");
+    const imgData = ctx.getImageData(0,0,100,100);
+    try {
+      history.replaceState({ img: imgData }, "");
+      const st = history.state;
+      if(st && st.img) ALERT("T19: ImageData foi clonado");
+    } catch(e) {}
+  }
+},
+{
+  id: 20,
+  desc: "state com Date object",
+  fn: async function(){
+    const d = new Date();
+    history.replaceState({ date: d }, "");
+    const st = history.state;
+    if(st && st.date instanceof Date) ALERT("T20: Date manteve tipo (esperado perder)");
+  }
+},
+
+// ===== GRUPO 5: Timing races =====
+{
+  id: 21,
+  desc: "replaceState + back no mesmo tick",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.replaceState({ id: "B" }, "");
+    history.back();
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T21: replace+back no mesmo tick causou timeout");
+  }
+},
+{
+  id: 22,
+  desc: "back + back sequencial",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.pushState({ id: "B" }, "");
+    history.pushState({ id: "C" }, "");
+    history.back();
+    history.back();
+    let count = 0;
+    const h = function(){ count++; };
+    window.addEventListener("popstate", h);
+    await new Promise(r => setTimeout(r, 1000));
+    window.removeEventListener("popstate", h);
+    if(count !== 2) ALERT("T22: 2 back() gerou " + count + " popstate(s)");
+  }
+},
+{
+  id: 23,
+  desc: "go(0) nao deveria disparar popstate",
+  fn: async function(){
+    let fired = false;
+    const h = function(){ fired = true; };
+    window.addEventListener("popstate", h);
+    history.go(0);
+    await new Promise(r => setTimeout(r, 500));
+    window.removeEventListener("popstate", h);
+    if(fired) ALERT("T23: go(0) disparou popstate (nao deveria)");
+  }
+},
+
+// ===== GRUPO 6: Memory pressure + GC =====
+{
+  id: 24,
+  desc: "burst + force GC via allocations",
+  fn: async function(){
+    for(let i=0; i<200; i++) history.replaceState({ seq: i }, "");
+    let trash = [];
+    for(let i=0; i<5000; i++) trash.push(new ArrayBuffer(8192));
+    trash = null;
+    await new Promise(r => setTimeout(r, 100));
+    const st = history.state;
+    if(!st || st.seq === undefined) ALERT("T24: state corrompeu apos GC");
+  }
+},
+{
+  id: 25,
+  desc: "state com weak reference simulation",
+  fn: async function(){
+    const holder = { data: new Array(1000).fill(1) };
+    history.replaceState({ ref: holder }, "");
+    holder.data = null; // solta referencia
+    let trash = [];
+    for(let i=0; i<3000; i++) trash.push(new ArrayBuffer(8192));
+    trash = null;
+    await new Promise(r => setTimeout(r, 100));
+    const st = history.state;
+    if(st && st.ref && st.ref.data === null) ALERT("T25: ref no state foi alterada externamente");
+  }
+},
+
+// ===== GRUPO 7: Hash manipulation =====
+{
+  id: 26,
+  desc: "replaceState alternando hash 1000x",
+  fn: async function(){
+    for(let i=0; i<1000; i++){
+      history.replaceState(null, "", hrefNoHash() + "#hash" + i);
+    }
+    if(!location.hash.endsWith("999")) ALERT("T26: hash final inesperado");
+  }
+},
+{
+  id: 27,
+  desc: "pushState com hash -> back com hash",
+  fn: async function(){
+    history.pushState(null, "", hrefNoHash() + "#a");
+    history.pushState(null, "", hrefNoHash() + "#b");
+    history.back();
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T27: back com hash timeout");
+    if(!location.hash.endsWith("#a")) ALERT("T27: hash final errado");
+  }
+},
+
+// ===== GRUPO 8: State integrity checks =====
+{
+  id: 28,
+  desc: "verificar se state eh deep-cloned",
+  fn: async function(){
+    const obj = { arr: [1,2,3] };
+    history.replaceState(obj, "");
+    obj.arr.push(4);
+    const st = history.state;
+    if(st && st.arr && st.arr.length === 4) ALERT("T28: state nao foi deep-cloned");
+  }
+},
+{
+  id: 29,
+  desc: "state com typed arrays",
+  fn: async function(){
+    const u8 = new Uint8Array([1,2,3,4]);
+    history.replaceState({ typed: u8 }, "");
+    const st = history.state;
+    if(st && st.typed && !(st.typed instanceof Uint8Array)){
+      ALERT("T29: Uint8Array perdeu tipo");
+    }
+  }
+},
+{
+  id: 30,
+  desc: "state seq consistency apos burst",
+  fn: async function(){
+    for(let i=0; i<200; i++) history.replaceState({ seq: i }, "");
+    const st = history.state;
+    if(st && st.seq !== 199) ALERT("T30: esperado seq=199, got " + st.seq);
+  }
+},
+
+// ===== GRUPO 9: Navigation loop detection =====
+{
+  id: 31,
+  desc: "back em loop (50x)",
+  fn: async function(){
+    for(let i=0; i<50; i++) history.pushState({ id: i }, "");
+    for(let i=0; i<50; i++) history.back();
+    await new Promise(r => setTimeout(r, 2000));
+    // browser nao deveria crashar
+  }
+},
+{
+  id: 32,
+  desc: "forward em loop sem history ahead",
+  fn: async function(){
+    for(let i=0; i<50; i++) history.forward();
+    await new Promise(r => setTimeout(r, 500));
+    // nao deveria crashar
+  }
+},
+
+// ===== GRUPO 10: Cross-origin simulation (same-origin) =====
+{
+  id: 33,
+  desc: "pushState com query param gigante",
+  fn: async function(){
+    const q = "x".repeat(5000);
+    try {
+      history.pushState(null, "", hrefNoHash() + "?" + q);
+      if(location.search.length > 5000) ALERT("T33: query de 5k chars aceita");
+    } catch(e) {}
+  }
+},
+
+// ===== GRUPO 11: Exception handling =====
+{
+  id: 34,
+  desc: "replaceState com getter que lanca erro",
+  fn: async function(){
+    const obj = {};
+    Object.defineProperty(obj, "boom", {
+      get: function(){ throw new Error("BOOM"); }
+    });
+    try {
+      history.replaceState(obj, "");
+      ALERT("T34: getter com erro nao impediu replaceState");
+    } catch(e) {
+      // esperado
+    }
+  }
+},
+{
+  id: 35,
+  desc: "popstate handler que lanca erro",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    window.onpopstate = function(){ throw new Error("CRASH"); };
+    history.back();
+    await new Promise(r => setTimeout(r, 500));
+    // nao deveria crashar browser
+  }
+},
+
+// ===== GRUPO 12: Desync scenarios =====
+{
+  id: 36,
+  desc: "burst + verificar ultimo seq com delay",
+  fn: async function(){
+    for(let i=0; i<300; i++) history.replaceState({ seq: i }, "");
+    await new Promise(r => setTimeout(r, 50));
+    const st = history.state;
+    if(st && st.seq !== 299) ALERT("T36: seq=" + st.seq + " esperado 299");
+  }
+},
+{
+  id: 37,
+  desc: "replaceState 100x + navegar + verificar state",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    for(let i=0; i<100; i++) history.replaceState({ seq: i }, "");
+    history.pushState({ id: "B" }, "");
+    history.back();
+    const r = await waitPop(1000);
+    if(r.ok && r.state){
+      if(r.state.seq === undefined) ALERT("T37: state do back perdeu seq");
+    }
+  }
+},
+
+// ===== GRUPO 13: Payload extremo =====
+{
+  id: 38,
+  desc: "state com array de 100k elementos",
+  fn: async function(){
+    const big = new Array(100000).fill(42);
+    history.replaceState({ arr: big }, "");
+    const st = history.state;
+    if(!st || !st.arr || st.arr.length !== 100000) ALERT("T38: array 100k corrompeu");
+  }
+},
+{
+  id: 39,
+  desc: "state com string Unicode complexa",
+  fn: async function(){
+    const unicode = "💀".repeat(10000);
+    history.replaceState({ emoji: unicode }, "");
+    const st = history.state;
+    if(!st || !st.emoji || st.emoji.length !== 10000) ALERT("T39: unicode corrompeu");
+  }
+},
+
+// ===== GRUPO 14: Boundary conditions =====
+{
+  id: 40,
+  desc: "replaceState exatamente no threshold (15)",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    for(let i=0; i<15; i++) history.replaceState({ seq: i }, "");
+    history.back();
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T40: burst=15 causou timeout (threshold)");
+  }
+},
+{
+  id: 41,
+  desc: "replaceState exatamente no threshold (20)",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    for(let i=0; i<20; i++) history.replaceState({ seq: i }, "");
+    history.back();
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T41: burst=20 causou timeout");
+  }
+},
+
+// ===== GRUPO 15: Multi-navigation =====
+{
+  id: 42,
+  desc: "back + forward + back rapido",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.pushState({ id: "B" }, "");
+    history.pushState({ id: "C" }, "");
+    history.back();
+    await waitPop(200);
+    history.forward();
+    await waitPop(200);
+    history.back();
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T42: navegacao rapida causou timeout");
+  }
+},
+
+// ===== GRUPO 16: Title manipulation =====
+{
+  id: 43,
+  desc: "replaceState com title de 10k chars",
+  fn: async function(){
+    const title = "T".repeat(10000);
+    history.replaceState(null, title);
+    if(document.title.length > 10000) ALERT("T43: title gigante foi aceito");
+  }
+},
+
+// ===== GRUPO 17: Concurrent operations =====
+{
+  id: 44,
+  desc: "replaceState em 2 entries diferentes rapidamente",
+  fn: async function(){
+    history.pushState({ id: "A" }, "");
+    history.pushState({ id: "B" }, "");
+    history.replaceState({ id: "A2" }, "");
+    history.back();
+    await waitPop(200);
+    history.replaceState({ id: "A3" }, "");
+    history.forward();
+    const r = await waitPop(1000);
+    if(!r.ok) ALERT("T44: replace em entries diferentes timeout");
+  }
+},
+
+// ===== GRUPO 18: Edge do burst =====
+{
+  id: 45,
+  desc: "burst=199 (1 a menos que 200)",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    for(let i=0; i<199; i++) history.replaceState({ seq: i }, "");
+    history.back();
+    const r = await waitPop(2000);
+    if(!r.ok) ALERT("T45: burst=199 timeout");
+  }
+},
+{
+  id: 46,
+  desc: "burst=201 (1 a mais que 200)",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    for(let i=0; i<201; i++) history.replaceState({ seq: i }, "");
+    history.back();
+    const r = await waitPop(2000);
+    if(!r.ok) ALERT("T46: burst=201 timeout");
+  }
+},
+
+// ===== GRUPO 19: Regression checks =====
+{
+  id: 47,
+  desc: "CVE-2022-22620 style (replaceState no onblur)",
+  fn: async function(){
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    history.pushState(null, "", location + "#test47");
+    history.pushState(null, "");
+    input.focus();
+    input.onblur = function(){ history.replaceState({ injected: true }, ""); };
+    history.back();
+    const r = await waitPop(1000);
+    document.body.removeChild(input);
+    if(r.ok && r.state && r.state.injected) ALERT("T47: CVE-2022-22620 pattern funcionou");
+  }
+},
+
+// ===== GRUPO 20: Final stress =====
+{
+  id: 48,
+  desc: "burst 1000 + back",
+  fn: async function(){
+    history.pushState({ id: "X" }, "");
+    for(let i=0; i<1000; i++) history.replaceState({ seq: i }, "");
+    history.back();
+    const r = await waitPop(3000);
+    if(!r.ok) ALERT("T48: burst=1000 timeout");
+  }
+},
+{
+  id: 49,
+  desc: "10 burst de 200 em sequencia",
+  fn: async function(){
+    for(let b=0; b<10; b++){
+      history.pushState({ burst: b }, "");
+      for(let i=0; i<200; i++) history.replaceState({ burst: b, seq: i }, "");
+    }
+    const st = history.state;
+    if(!st || st.burst !== 9) ALERT("T49: ultimo burst nao commitou");
+  }
+},
+{
+  id: 50,
+  desc: "Final: burst 500 + GC + back",
+  fn: async function(){
+    history.pushState({ id: "FINAL" }, "");
+    for(let i=0; i<500; i++) history.replaceState({ seq: i }, "");
+    let trash = [];
+    for(let i=0; i<10000; i++) trash.push(new ArrayBuffer(4096));
+    trash = null;
+    await new Promise(r => setTimeout(r, 100));
+    history.back();
+    const r = await waitPop(3000);
+    if(!r.ok) ALERT("T50: burst=500 + GC timeout");
+  }
+}
+
+];
+
+// ============================================================
+// RUNNER
+// ============================================================
+window.runAll = async function(){
+  $btn.disabled = true;
+  STOP = false;
+  $log.textContent = "";
+  log("Iniciando 50 testes...");
+  log("Mostrando apenas ALERTAS (comportamento anormal).");
+  log("Se crashar = POC de bug real.\n");
+
+  alertCount = 0;
+  const start = Date.now();
+
+  for(let i=0; i<TESTES.length; i++){
+    if(STOP) break;
+    const t = TESTES[i];
+    const __prevOnPop = window.onpopstate;
+    window.onpopstate = null;
+    try {
+      await t.fn();
+    } catch(e) {
+      ALERT("T" + t.id + " EXCEPTION: " + e.message);
+    } finally {
+      window.onpopstate = __prevOnPop;
+    }
+
+    if(i % 10 === 9){
+      log("... " + (i+1) + "/50 completos");
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
+
+  const elapsed = ((Date.now() - start)/1000).toFixed(1);
+  log("\n=== FINAL ===");
+  log("50 testes completos em " + elapsed + "s");
+  log("ALERTAS encontrados: " + alertCount);
+  
+  if(alertCount === 0){
+    log("\nNenhum alerta. Comportamento consistente neste browser.");
+  } else {
+    log("\n" + alertCount + " alertas encontrados.");
+    log("Revise os ALERTAS acima para identificar comportamentos anormais.");
+  }
+  
+  $btn.disabled = false;
+};
+
+})();
+</script>
+</body>
+</html>
+
