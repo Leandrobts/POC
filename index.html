@@ -2,461 +2,179 @@
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>PS4 WebKit – History/Clone V2 (Hardened + Throttle)</title>
+  <title>PS4 WebKit – Blob.type Controls V2.1 (4 tests, ALERTA-only)</title>
 </head>
 <body>
-  <h2>PS4 WebKit – V2 Hardened (Throttle) – Log apenas ALERTA</h2>
+  <h2>PS4 WebKit – V2.1 (apenas 4 testes) – Blob.type com caracteres de controle</h2>
+  <p>Log apenas <b>[ALERTA]</b>. Tamanhos moderados. Sem CSS.</p>
 
-  <button onclick="runAll()">Rodar todos</button>
-  <button onclick="runCore()">Rodar CORE (mais valiosos)</button>
   <button onclick="clearLog()">Limpar</button>
+  <button onclick="tBlobFetch()">T6b Blob.type → fetch (Content-Type)</button>
+  <button onclick="tBlobIframe()">T6c Blob.type → iframe load</button>
+  <button onclick="tBlobFileReader()">T6d Blob.type → FileReader DataURL</button>
+  <button onclick="tHeaders()">T6e Headers reject newline?</button>
 
   <hr>
-  <div id="status"></div>
   <pre id="log"></pre>
+  <iframe id="f" width="360" height="120"></iframe>
 
 <script>
-/* =========================================================
-   LOG (ALERTA-only)
-   ========================================================= */
+/* =========================
+   ALERTA-only logger (ES5)
+   ========================= */
 var $log = document.getElementById("log");
-var $status = document.getElementById("status");
-var ALERT_COUNT = 0;
+var ALERTS = 0;
 
-function setStatus(s){
-  try { $status.textContent = s; } catch(e){}
-}
 function clearLog(){
-  try { $log.textContent = ""; } catch(e){}
-  ALERT_COUNT = 0;
-  setStatus("");
-}
-function ALERT(msg){
-  ALERT_COUNT++;
-  try { $log.textContent += "[ALERTA] " + msg + "\n"; } catch(e){}
+  try{ $log.textContent = ""; }catch(e){}
+  ALERTS = 0;
 }
 
-/* =========================================================
-   Small utils (ES5)
-   ========================================================= */
-function now(){ return Date.now ? Date.now() : (new Date()).getTime(); }
-function sleep(ms, cb){ setTimeout(cb, ms); }
-
-function mkCycle(tag){
-  var o = { tag: tag };
-  o.self = o;
-  o.arr = [o, {k:1}, [o]];
-  return o;
-}
-function sigState(st){
-  try{
-    var t = (st && st.tag) ? st.tag : "(no-tag)";
-    var cyc = !!(st && st.self === st);
-    var a0 = (st && st.arr && st.arr[0] === st) ? "arr0=state" : "arr0!=state";
-    return t + "|" + (cyc ? "CYC" : "NO") + "|" + a0;
-  }catch(e){
-    return "sig_error:" + String(e);
-  }
-}
-function churn(level){
-  // bounded heap churn (não DoS)
-  try{
-    var i, n = 80 * level;
-    var junk = [];
-    for(i=0;i<n;i++) junk.push(new Uint8Array(4096));
-  }catch(e){}
+function LOG(m){
+  try{ $log.textContent += m + "\\n"; }catch(e){}
 }
 
-/* =========================================================
-   History op throttle (avoid >100 ops/10s)
-   - window=10s, max=90 ops
-   ========================================================= */
-var HIST_WINDOW_MS = 10000;
-var HIST_MAX_OPS = 90;
-var histOps = [];
+function ALERT(m){
+  ALERTS++;
+  LOG("[ALERTA] " + m);
+}
 
-function histRateWait(cb){
-  var t = now();
-  while(histOps.length && (t - histOps[0]) > HIST_WINDOW_MS) histOps.shift();
+function safeRevoke(url){
+  try{ if(url) URL.revokeObjectURL(url); }catch(e){}
+}
 
-  if(histOps.length < HIST_MAX_OPS){
-    histOps.push(t);
-    cb();
+/* =========================
+   T6b: Blob.type -> fetch header content-type
+   ALERTA if response header contains control chars
+   ========================= */
+function tBlobFetch(){
+  clearLog();
+  LOG("T6b start...");
+  if(!window.Blob || !window.fetch || !window.URL){
+    LOG("fetch/Blob/URL não disponível.");
     return;
   }
-  var wait = HIST_WINDOW_MS - (t - histOps[0]) + 25;
-  if(wait < 25) wait = 25;
-  setTimeout(function(){ histRateWait(cb); }, wait);
-}
 
-function safePushState(stateObj, urlHash, done){
-  histRateWait(function(){
+  var b = new Blob(["hello"], { type: "text/plain\\nbad\\n" });
+  var url = URL.createObjectURL(b);
+
+  fetch(url).then(function(r){
+    var ct = null;
     try{
-      history.pushState(stateObj, "", urlHash);
-      done && done(null);
-    }catch(e){
-      done && done(e);
+      if(r.headers && r.headers.get) ct = r.headers.get("content-type");
+    }catch(e){}
+    LOG("resp content-type: " + ct);
+
+    if(ct && (ct.indexOf("\\n") !== -1 || ct.indexOf("\\r") !== -1)){
+      ALERT("Content-Type header contém controle: " + ct);
     }
+    return r.text();
+  }).then(function(t){
+    LOG("body: " + t);
+    safeRevoke(url);
+  }).catch(function(e){
+    LOG("fetch error: " + e);
+    safeRevoke(url);
   });
 }
 
-function safeReplaceState(stateObj, urlHash, done){
-  histRateWait(function(){
-    try{
-      history.replaceState(stateObj, "", urlHash);
-      done && done(null);
-    }catch(e){
-      done && done(e);
-    }
-  });
-}
-
-/* =========================================================
-   Async runner (series)
-   Each test: function(next){ ...; next(); }
-   ========================================================= */
-function runSeries(list, done){
-  var i = 0;
-  function step(){
-    if(i >= list.length) return done && done();
-    var fn = list[i++];
-    try{
-      fn(function(){ setTimeout(step, 10); });
-    }catch(e){
-      ALERT("Runner EXCEPTION: " + String(e));
-      setTimeout(step, 10);
-    }
-  }
-  step();
-}
-
-/* =========================================================
-   TESTS (bounded, throttle-aware)
-   ========================================================= */
-var tests = [];
-var baseURL = (function(){
-  try { return location.href.split("#")[0]; } catch(e) { return ""; }
-})();
-
-function addTest(id, name, fn){
-  tests.push({ id:id, name:name, run:fn });
-}
-
-/* T1: history.pushState aceita ciclo e preserva */
-addTest(1, "pushState cycle preserved", function(next){
-  safePushState(mkCycle("T1_CYC"), baseURL + "#T1", function(err){
-    if(err){
-      // Se lançar, é divergente do seu achado anterior (ainda interessante)
-      ALERT("T1 pushState lançou: " + String(err));
-      return next();
-    }
-    var st = null;
-    try { st = history.state; } catch(e){}
-    if(!(st && st.self === st)) ALERT("T1 pushState aceitou mas NÃO preservou ciclo em history.state.");
-    next();
-  });
-});
-
-/* T2: replaceState aceita ciclo e preserva */
-addTest(2, "replaceState cycle preserved", function(next){
-  safeReplaceState(mkCycle("T2_CYC"), baseURL + "#T2", function(err){
-    if(err){
-      ALERT("T2 replaceState lançou: " + String(err));
-      return next();
-    }
-    var st = null;
-    try { st = history.state; } catch(e){}
-    if(!(st && st.self === st)) ALERT("T2 replaceState aceitou mas NÃO preservou ciclo em history.state.");
-    next();
-  });
-});
-
-/* T3: MessageChannel preserva ciclo no receptor */
-addTest(3, "MessageChannel cycle preserved", function(next){
-  if(typeof MessageChannel === "undefined") return next();
-  var ch = new MessageChannel();
-  var done = false;
-
-  ch.port1.onmessage = function(e){
-    if(done) return;
-    done = true;
-    try{
-      var d = e.data;
-      if(!(d && d.self === d)) ALERT("T3 MessageChannel recebeu sem ciclo (normalização/bug).");
-    }catch(err){
-      ALERT("T3 erro ao inspecionar receiver: " + String(err));
-    }
-    try{ ch.port1.close(); ch.port2.close(); }catch(e2){}
-    next();
-  };
-
-  try{
-    ch.port2.postMessage(mkCycle("T3_CYC"));
-  }catch(e){
-    ALERT("T3 postMessage lançou: " + String(e));
-    try{ ch.port1.close(); ch.port2.close(); }catch(e2){}
-    return next();
-  }
-
-  // timeout de segurança
-  setTimeout(function(){
-    if(!done){
-      done = true;
-      ALERT("T3 timeout: MessageChannel não entregou onmessage.");
-      try{ ch.port1.close(); ch.port2.close(); }catch(e2){}
-      next();
-    }
-  }, 800);
-});
-
-/* T4: Worker roundtrip (divergência entre superfícies) */
-addTest(4, "Worker structured clone roundtrip", function(next){
-  if(typeof Worker === "undefined") return next();
-  var code = "onmessage=function(e){try{var d=e.data; postMessage({ok:true, cyc: !!(d&&d.self===d)});}catch(err){postMessage({ok:false, err:String(err)});}};";
-  var w;
-  try{
-    w = new Worker(URL.createObjectURL(new Blob([code], {type:"text/javascript"})));
-  }catch(e){
-    // sem ALERTA: PS4 pode restringir blob worker
-    return next();
-  }
-  var done = false;
-  w.onmessage = function(e){
-    if(done) return;
-    done = true;
-    try{
-      var r = e.data;
-      if(!r || r.ok !== true){
-        ALERT("T4 Worker respondeu falha: " + (r && r.err ? r.err : "sem dados"));
-      } else {
-        if(r.cyc !== true) ALERT("T4 Worker aceitou mas NÃO preservou ciclo (divergência).");
-      }
-    }catch(err){
-      ALERT("T4 erro ao processar resposta: " + String(err));
-    }
-    try{ w.terminate(); }catch(e2){}
-    next();
-  };
-  try{ w.postMessage(mkCycle("T4_CYC")); }catch(e3){
-    ALERT("T4 Worker postMessage lançou: " + String(e3));
-    try{ w.terminate(); }catch(e4){}
-    return next();
-  }
-  setTimeout(function(){
-    if(!done){
-      done = true;
-      ALERT("T4 timeout: Worker não respondeu.");
-      try{ w.terminate(); }catch(e2){}
-      next();
-    }
-  }, 1200);
-});
-
-/* T5: replaceState commit determinismo (80 ops, throttle-safe)
-   Espera: seq final === 79 e assinatura estável
-*/
-addTest(5, "replaceState commit determinism (80)", function(next){
-  var i = 0;
-  function step(){
-    if(i >= 80){
-      var st = null, s = "";
-      try{ st = history.state; s = sigState(st); }catch(e){}
-      // aceita tanto object sem seq (se o engine normalizou), mas isso é alerta
-      if(!st || typeof st.seq !== "number") ALERT("T5 state.seq ausente/invalid após 80 replaceState. sig=" + s);
-      else if(st.seq !== 79) ALERT("T5 seq final inesperado: esperado 79, got " + st.seq + " sig=" + s);
-      return next();
-    }
-    safeReplaceState({ seq:i, tag:"T5", pad:"xxxxxxxx" }, baseURL + "#T5", function(err){
-      if(err){
-        ALERT("T5 replaceState lançou em i=" + i + ": " + String(err));
-        return next();
-      }
-      i++;
-      step();
-    });
-  }
-  step();
-});
-
-/* T6: popstate confiabilidade (1 back + 1 forward) */
-addTest(6, "popstate reliability (back/forward)", function(next){
-  var old = window.onpopstate;
-  var pops = 0;
-  window.onpopstate = function(){ pops++; };
-
-  safePushState({tag:"T6_A"}, baseURL + "#T6A", function(err1){
-    safePushState({tag:"T6_B"}, baseURL + "#T6B", function(err2){
-      if(err1 || err2){
-        window.onpopstate = old;
-        if(err1) ALERT("T6 push A lançou: " + String(err1));
-        if(err2) ALERT("T6 push B lançou: " + String(err2));
-        return next();
-      }
-      try{ history.back(); }catch(e){ ALERT("T6 back lançou: " + String(e)); }
-      setTimeout(function(){
-        try{ history.forward(); }catch(e2){ ALERT("T6 forward lançou: " + String(e2)); }
-        setTimeout(function(){
-          window.onpopstate = old;
-          if(pops < 2) ALERT("T6 popstate insuficiente (esperado 2, got " + pops + ").");
-          next();
-        }, 280);
-      }, 180);
-    });
-  });
-});
-
-/* T7: state não deve mudar após churn sem navegação */
-addTest(7, "state stability after churn (no navigation)", function(next){
-  safeReplaceState(mkCycle("T7_ISO"), baseURL + "#T7", function(err){
-    if(err){ ALERT("T7 replaceState lançou: " + String(err)); return next(); }
-    var s0 = sigState(history.state);
-    churn(3);
-    setTimeout(function(){
-      var s1 = sigState(history.state);
-      if(s1 !== s0) ALERT("T7 state mudou após churn sem navegação: " + s0 + " -> " + s1);
-      next();
-    }, 60);
-  });
-});
-
-/* T8: isolamento A/B com ciclo sob churn + back/forward */
-addTest(8, "A/B isolation under churn", function(next){
-  var old = window.onpopstate;
-  window.onpopstate = null;
-
-  safePushState(mkCycle("T8_A"), baseURL + "#T8A", function(e1){
-    safePushState(mkCycle("T8_B"), baseURL + "#T8B", function(e2){
-      if(e1||e2){
-        if(e1) ALERT("T8 push A lançou: " + String(e1));
-        if(e2) ALERT("T8 push B lançou: " + String(e2));
-        window.onpopstate = old;
-        return next();
-      }
-      // estamos em B
-      var sB0 = sigState(history.state);
-      if(sB0.indexOf("T8_B") === -1) ALERT("T8 esperava T8_B, veio: " + sB0);
-
-      var pops = 0;
-      window.onpopstate = function(){
-        pops++;
-        var h = String(location.hash || "");
-        var sg = sigState(history.state);
-        if(h === "#T8A" && sg.indexOf("T8_A") === -1) ALERT("T8 contaminação: hash T8A mas sig=" + sg);
-        if(h === "#T8B" && sg.indexOf("T8_B") === -1) ALERT("T8 contaminação: hash T8B mas sig=" + sg);
-        if(history.state && history.state.self !== history.state) ALERT("T8 ciclo quebrou em popstate: " + sg);
-      };
-
-      try{ history.back(); }catch(ex){ ALERT("T8 back lançou: " + String(ex)); }
-      setTimeout(function(){
-        churn(2);
-        try{ history.forward(); }catch(ex2){ ALERT("T8 forward lançou: " + String(ex2)); }
-        setTimeout(function(){
-          churn(2);
-          window.onpopstate = old;
-          if(pops < 2) ALERT("T8 popstate insuficiente (esperado 2, got " + pops + ").");
-          next();
-        }, 320);
-      }, 220);
-    });
-  });
-});
-
-/* T9: replaceState + back no mesmo tick (bounded) */
-addTest(9, "replace+back same tick (bounded)", function(next){
-  var old = window.onpopstate;
-  var got = 0;
-  window.onpopstate = function(){ got++; };
-
-  safePushState({tag:"T9_A"}, baseURL + "#T9A", function(e1){
-    safePushState({tag:"T9_B"}, baseURL + "#T9B", function(e2){
-      if(e1||e2){
-        window.onpopstate = old;
-        if(e1) ALERT("T9 push A lançou: " + String(e1));
-        if(e2) ALERT("T9 push B lançou: " + String(e2));
-        return next();
-      }
-      safeReplaceState({tag:"T9_B2"}, baseURL + "#T9B", function(er){
-        // mesmo tick: back
-        try{ history.back(); }catch(ex){ ALERT("T9 back lançou: " + String(ex)); }
-        setTimeout(function(){
-          window.onpopstate = old;
-          if(got < 1) ALERT("T9 timeout: back não gerou popstate.");
-          next();
-        }, 350);
-      });
-    });
-  });
-});
-
-/* T10: state payload moderado (8MB) – se aceito, não é bug; se causar inconsistência/crash, é sinal */
-addTest(10, "moderate payload in state (8MB)", function(next){
-  // 8MB string (~8 * 1024 * 1024 chars)
-  var chunk = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"; // 32
-  var s = "";
-  var i;
-  for(i=0;i<18;i++) s += chunk + chunk + chunk + chunk + chunk + chunk + chunk + chunk; // 32*8=256; 18*256=4608 chars; (pequeno)
-  // aumenta em loop controlado
-  var target = 8 * 1024 * 1024;
-  while(s.length < target) s += s; // duplica rápido
-  if(s.length > target) s = s.substring(0, target);
-
-  safeReplaceState({ tag:"T10", big:s }, baseURL + "#T10", function(err){
-    if(err){
-      // pode ser limite normal
-      return next();
-    }
-    // sanity: state existe e big tem tamanho esperado (ou foi normalizado)
-    var st = null;
-    try{ st = history.state; }catch(e){}
-    if(!st || !st.big || typeof st.big.length !== "number") ALERT("T10 state.big ausente após replaceState (normalização inesperada).");
-    else if(st.big.length !== target) ALERT("T10 state.big length diferente (normalização): esperado " + target + ", got " + st.big.length);
-    next();
-  });
-});
-
-/* =========================================================
-   CORE selection (mais valiosos para report)
-   ========================================================= */
-function selectCore(){
-  // ciclo + MessageChannel + commit determinism + state stability + A/B isolation
-  var ids = {1:1,2:1,3:1,5:1,7:1,8:1,9:1};
-  var out = [];
-  var i;
-  for(i=0;i<tests.length;i++){
-    if(ids[tests[i].id]) out.push(tests[i]);
-  }
-  return out;
-}
-
-/* =========================================================
-   Runners
-   ========================================================= */
-function runList(list){
+/* =========================
+   T6c: Blob.type -> iframe load
+   ALERTA only if clear anomaly (load but weird access errors not counted)
+   ========================= */
+function tBlobIframe(){
   clearLog();
-  setStatus("Iniciando " + list.length + " testes (throttled)...");
-  var start = now();
+  LOG("T6c start...");
+  if(!window.Blob || !window.URL){
+    LOG("Blob/URL não disponível.");
+    return;
+  }
 
-  runSeries((function(){
-    var arr = [];
-    var i;
-    for(i=0;i<list.length;i++){
-      (function(t){
-        arr.push(function(next){
-          setStatus("Rodando T" + t.id + " – " + t.name + " ...");
-          t.run(next);
-        });
-      })(list[i]);
+  var b = new Blob(["<b>hi</b>"], { type: "text/html\\nbad\\n" });
+  var url = URL.createObjectURL(b);
+  var f = document.getElementById("f");
+
+  f.onload = function(){
+    LOG("iframe onload");
+    try{
+      var doc = f.contentDocument;
+      if(doc && doc.body){
+        var txt = doc.body.textContent || "";
+        LOG("iframe body text: " + txt);
+      }
+    }catch(e){
+      LOG("iframe access blocked/erro: " + e);
     }
-    return arr;
-  })(), function(){
-    var dt = (now() - start);
-    setStatus("FINAL: " + list.length + " testes completos em " + (dt/1000).toFixed(2) + "s | ALERTAS=" + ALERT_COUNT);
-  });
+    safeRevoke(url);
+  };
+
+  try{
+    f.src = url;
+  }catch(e2){
+    ALERT("iframe src set falhou: " + e2);
+    safeRevoke(url);
+  }
 }
 
-function runAll(){ runList(tests); }
-function runCore(){ runList(selectCore()); }
+/* =========================
+   T6d: Blob.type -> FileReader DataURL
+   ALERTA if resulting data URL contains control chars
+   ========================= */
+function tBlobFileReader(){
+  clearLog();
+  LOG("T6d start...");
+  if(!window.FileReader || !window.Blob){
+    LOG("FileReader/Blob não disponível.");
+    return;
+  }
 
+  var b = new Blob(["hello"], { type: "text/plain\\nbad\\n" });
+  var r = new FileReader();
+
+  r.onload = function(){
+    var s = "";
+    try{ s = String(r.result || ""); }catch(e){}
+    LOG("dataURL prefix: " + s.slice(0, 80));
+    if(s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1){
+      ALERT("DataURL contém controle (\\n/\\r).");
+    }
+  };
+  r.onerror = function(){
+    LOG("FileReader error");
+  };
+
+  try{
+    r.readAsDataURL(b);
+  }catch(e2){
+    ALERT("readAsDataURL lançou: " + e2);
+  }
+}
+
+/* =========================
+   T6e: Headers accept newline?
+   ALERTA if Headers.set accepts newline in header value
+   ========================= */
+function tHeaders(){
+  clearLog();
+  LOG("T6e start...");
+  if(!window.Headers){
+    LOG("Headers não disponível.");
+    return;
+  }
+
+  var ok = true;
+  try{
+    var h = new Headers();
+    h.set("content-type", "text/plain\\nbad\\n");
+  }catch(e){
+    ok = false;
+    LOG("Headers.set lançou (bom): " + e);
+  }
+
+  if(ok){
+    ALERT("Headers aceitou newline em header value (ruim).");
+  }
+}
 </script>
 </body>
 </html>
