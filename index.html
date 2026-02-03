@@ -1,213 +1,292 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="pt-BR">
 <head>
-<meta charset="UTF-8" />
-<title>PS4 WebKit - History Write-Stuck Sanity (V2.2)</title>
-<style>
-  body { background:#000; color:#0f0; font-family: monospace; }
-  button { padding:10px 14px; margin:6px 6px 6px 0; font-size:14px; }
-  #log { white-space:pre-wrap; border:1px solid #0f0; padding:10px; margin-top:10px; }
-  .ok{color:#0f0} .warn{color:#ff0} .bad{color:#f66} .dim{color:#8f8}
-</style>
+<meta charset="utf-8">
+<title>POC-3 — Mapeamento do Desync</title>
 </head>
 <body>
-<h2>History API Sanity – Write Acceptance / Setup Stickiness (V2.2)</h2>
+
+<h2>POC-3 — Mapeamento do Desync silencioso</h2>
+<p>O engine retornou seq=196 após burst de 200 em dois testes diferentes.
+Isso significa que os últimos replaceState foram ignorados silenciosamente.
+Estes testes mapeiam exatamente isso.</p>
 
 <div>
-  <button onclick="resetAndShow()">Reset (BASE/A + BASE/B)</button>
-  <button onclick="runAcceptanceProbe()">Run Acceptance Probe (replaceState loop)</button>
-  <button onclick="runRecoveryProbe()">Run Setup Recovery Probe (apply BASE)</button>
-  <button onclick="clearLog()">Limpar</button>
+  <button id="btn1" onclick="run_T1()">T1 — Mapa do último seq retornado</button>
+  <button id="btn2" onclick="run_T2()">T2 — Os objetos perdidos (197-199)</button>
+  <button id="btn3" onclick="run_T3()">T3 — Desync em burst menor (abaixo do threshold)</button>
+  <button onclick="resetLog()">RESET</button>
 </div>
-
-<div style="margin-top:8px">
-  <label>Max i:
-    <input id="maxI" type="number" value="80" min="1" step="1">
-  </label>
-  <label style="margin-left:10px">Readback steps:
-    <select id="rbMode">
-      <option value="immediate">immediate</option>
-      <option value="microtask">microtask</option>
-      <option value="raf">raf</option>
-      <option value="all" selected>all (immediate+microtask+raf)</option>
-    </select>
-  </label>
-  <label style="margin-left:10px">
-    <input id="gc" type="checkbox"> GC pressure leve
-  </label>
-</div>
-
-<div id="log"></div>
+<br>
+<pre id="log"></pre>
 
 <script>
-const $ = (id)=>document.getElementById(id);
-const logEl = $("log");
+(function(){
+"use strict";
 
-function now(){ return (performance.now()).toFixed(2); }
-function L(msg, cls="dim"){
-  const line = `[${now()}] ${msg}\n`;
-  if(cls==="ok") logEl.innerHTML += `<span class="ok">${escapeHtml(line)}</span>`;
-  else if(cls==="warn") logEl.innerHTML += `<span class="warn">${escapeHtml(line)}</span>`;
-  else if(cls==="bad") logEl.innerHTML += `<span class="bad">${escapeHtml(line)}</span>`;
-  else logEl.innerHTML += `<span class="dim">${escapeHtml(line)}</span>`;
-  logEl.scrollTop = logEl.scrollHeight;
-}
-function escapeHtml(s){
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
-function clearLog(){ logEl.textContent=""; }
+const $log = document.getElementById("log");
+function log(m)     { $log.textContent += m + "\n"; }
+function logOK(m)   { $log.textContent += "[OK]   " + m + "\n"; }
+function logWARN(m) { $log.textContent += "[WARN] " + m + "\n"; }
+function logSep(t)  { $log.textContent += "\n=== " + t + " ===\n"; }
+window.resetLog     = function(){ $log.textContent = ""; };
 
-function safeStateSummary(st){
-  if(!st) return "null";
-  try{
-    // resumo curto e estável
-    const o = {};
-    if ("kind" in st) o.kind = st.kind;
-    if ("entry" in st) o.entry = st.entry;
-    if ("id" in st) o.id = st.id;
-    if ("stamp" in st) o.stamp = st.stamp;
-    if ("marker" in st) o.marker = st.marker;
-    return JSON.stringify(o);
-  }catch(e){
-    return "[unserializable]";
-  }
-}
+function randHex(n){ n=n||4; return ((Math.random()*(1<<24))|0).toString(16).padStart(6,"0").slice(0,n); }
+function hrefNoHash(){ return location.href.split("#")[0]; }
 
-function tick(){ return new Promise(r=>setTimeout(r,0)); }
-function micro(){ return Promise.resolve(); }
-function raf(){ return new Promise(r=>requestAnimationFrame(()=>r())); }
+// ============================================================
+// T1 — Mapa do último seq retornado por burst
+//
+// Testa burst de 50 até 500 em passos.
+// Para cada burst: faz os replaceState, lê history.state,
+// compara seq retornado vs seq esperado (último do loop).
+// Mapeia: "em burst=N, o engine comitou até seq=X"
+// ============================================================
+window.run_T1 = async function(){
+  document.getElementById("btn1").disabled = true;
+  $log.textContent = "";
+  logSep("T1 — Mapa do último seq comitado pelo engine");
+  log("Para cada tamanho de burst, verifica qual seq history.state retorna.");
+  log("Se seq < burst-1, o engine ignorou os últimos replaceState.\n");
 
-function makeState(kind, extra){
-  // objeto NOVO sempre (evita “mesma referência”)
-  const st = Object.assign({ kind, stamp: Date.now() }, extra||{});
-  return st;
-}
+  const bursts = [10, 20, 50, 100, 150, 200, 250, 300, 400, 500];
+  var resultados = [];
 
-function isExpectedB(){
-  const st = history.state;
-  return (location.hash === "#B" && st && st.kind==="BASE" && st.entry==="B");
-}
+  for(var b=0; b<bursts.length; b++){
+    var size = bursts[b];
+    var runId = "M_"+Date.now().toString(16)+"_"+randHex(4);
 
-async function resetAllVerified(retries=3){
-  for(let k=1;k<=retries;k++){
-    history.replaceState(makeState("BASE",{entry:"A"}), "", "#A");
-    history.pushState(makeState("BASE",{entry:"B"}), "", "#B");
-    await tick();
+    // Setup limpo
+    history.replaceState({ tok:"BASE", run:runId }, "", hrefNoHash());
+    history.pushState({ tok:"ENTRY", run:runId }, "", hrefNoHash());
 
-    const ok = isExpectedB();
-    L(`[SETUP] attempt=${k} href=${location.href}`, ok?"ok":"bad");
-    L(`[SETUP] history.length=${history.length}`, ok?"ok":"bad");
-    L(`[SETUP] state=${safeStateSummary(history.state)}`, ok?"ok":"bad");
-
-    if(ok){
-      L(`[SETUP] OK: BASE/B aplicado e hash #B.`, "ok");
-      return true;
+    // Burst sincrono
+    for(var k=0; k<size; k++){
+      history.replaceState({ tok:"B", run:runId, seq:k }, "", hrefNoHash());
     }
-    L(`[SETUP] FAIL: setup não “grudou”. Possível engine desync/no-op.`, "bad");
-    await tick();
+
+    // Lê IMEDIATAMENTE após loop (sem await, sem setTimeout)
+    var st = history.state;
+    var seqRetornado = st ? st.seq : null;
+    var seqEsperado  = size - 1;
+    var delta        = seqRetornado !== null ? (seqEsperado - seqRetornado) : null;
+
+    log("burst=" + size + " → esperado seq=" + seqEsperado + " | retornou seq=" + seqRetornado + " | delta=" + delta);
+    resultados.push({ size:size, esperado:seqEsperado, retornou:seqRetornado, delta:delta });
+
+    // Pequeno delay entre bursts
+    await new Promise(function(r){ setTimeout(r, 30); });
   }
-  L(`[FATAL] ENGINE DESYNC: setup write failed após retries.`, "bad");
-  L(`[ACTION] Recarregue a página manualmente (reload) e rode novamente.`, "warn");
-  return false;
-}
 
-async function resetAndShow(){
-  await resetAllVerified(3);
-}
-
-function gcPressureLight(){
-  // leve e curto (não quer DoS)
-  const a = [];
-  for(let i=0;i<200;i++){
-    a.push(new Uint8Array(0x2000));
+  // Relatório
+  logSep("RELATÓRIO T1");
+  log("");
+  log("burst | esperado | retornou | delta (ignorados)");
+  log("------|----------|----------|------------------");
+  for(var i=0; i<resultados.length; i++){
+    var r = resultados[i];
+    var marker = r.delta > 0 ? " <<<" : "";
+    log("  " + String(r.size).padStart(4) + " | " + String(r.esperado).padStart(6) + "   | " + String(r.retornou).padStart(6) + "   | " + String(r.delta).padStart(3) + marker);
   }
-  return a;
-}
+  log("");
 
-async function readbackCheck(expectId, mode){
-  // retorna {ok, gotId, phase}
-  const phases = (mode==="all") ? ["immediate","microtask","raf"] : [mode];
-  for(const ph of phases){
-    if(ph==="microtask") await micro();
-    if(ph==="raf") await raf();
+  // Análise do padrão
+  var comDelta = [];
+  for(var i=0; i<resultados.length; i++){
+    if(resultados[i].delta > 0) comDelta.push(resultados[i]);
+  }
+  if(comDelta.length === 0){
+    logOK("Sem delta em nenhum burst. O seq=196 anterior pode ter sido timing.");
+  } else {
+    logWARN("Delta encontrado em " + comDelta.length + " bursts.");
+    log("O engine ignorou silenciosamente os últimos replaceState nesses casos.");
 
-    const st = history.state;
-    const got = (st && typeof st==="object" && "id" in st) ? st.id : undefined;
-    if(got === expectId){
-      return { ok:true, gotId: got, phase: ph };
+    // Verifica se o delta é consistente
+    var deltas = comDelta.map(function(r){ return r.delta; });
+    var todos_iguais = deltas.every(function(d){ return d === deltas[0]; });
+    if(todos_iguais){
+      log("Delta é CONSISTENTE: sempre " + deltas[0] + " replaceState ignorados.");
+    } else {
+      log("Deltas variáveis: " + JSON.stringify(deltas));
     }
   }
-  // último observado:
-  const st = history.state;
-  const got = (st && typeof st==="object" && "id" in st) ? st.id : undefined;
-  return { ok:false, gotId: got, phase: phases[phases.length-1] };
-}
 
-async function runAcceptanceProbe(){
-  clearLog();
-  const maxI = Math.max(1, parseInt($("maxI").value||"80",10));
-  const rbMode = $("rbMode").value;
-  const doGC = $("gc").checked;
+  document.getElementById("btn1").disabled = false;
+};
 
-  L(`===== ACCEPTANCE PROBE =====`, "ok");
-  const okSetup = await resetAllVerified(3);
-  if(!okSetup) return;
+// ============================================================
+// T2 — Os objetos perdidos
+//
+// Se o engine ignorou seq 197, 198, 199:
+//   - Os objetos passados nesses replaceState foram serializados?
+//   - O que aconteceu com a memória deles?
+//   - Eles existem acessíveis de alguma forma?
+//
+// Teste: passa objetos com marcadores únicos nos últimos
+// replaceState, depois tenta acessar de várias formas.
+// ============================================================
+window.run_T2 = async function(){
+  document.getElementById("btn2").disabled = true;
+  $log.textContent = "";
+  logSep("T2 — Destino dos objetos nos replaceState ignorados");
+  log("Se o engine ignorou os últimos replaceState, o que aconteceu com os objetos?\n");
 
-  let firstFail = null;
-  let lastOk = null;
+  const BURST = 200;
+  const runId = "T2_"+Date.now().toString(16)+"_"+randHex(4);
 
-  for(let i=1;i<=maxI;i++){
-    const st = makeState("BURST",{ id:i, marker:`M${i}`, payload:"X".repeat(64) });
-    history.replaceState(st, "", "#B"); // mantém hash, só troca state
-    if(doGC && (i % 10 === 0)) gcPressureLight();
+  // Setup
+  history.replaceState({ tok:"BASE", run:runId }, "", hrefNoHash());
+  history.pushState({ tok:"ENTRY", idx:1, run:runId }, "", hrefNoHash());
+  history.pushState({ tok:"ENTRY2", idx:2, run:runId }, "", hrefNoHash());
 
-    const rb = await readbackCheck(i, rbMode);
+  // Marcadores únicos para os últimos 10 replaceState
+  // Usa strings muito específicas que não poderiam aparecer por acidente
+  var marcadores = {};
+  for(var k=0; k<BURST; k++){
+    var marker = null;
+    if(k >= BURST - 10){
+      // Últimos 10: marcador único
+      marker = "MARKER_PERDIDO_" + k + "_" + randHex(8);
+      marcadores[k] = marker;
+    }
+    history.replaceState({
+      tok: "B",
+      run: runId,
+      seq: k,
+      marker: marker,
+      // Dado grande nos últimos para maximizar pressão de memória
+      data: k >= BURST-10 ? new Array(1000).fill("DADO_" + k) : null
+    }, "", hrefNoHash());
+  }
 
-    if(!rb.ok){
-      if(firstFail === null){
-        firstFail = { i, got: rb.gotId, phase: rb.phase };
-        L(`[FAIL] i=${i} readback got=${rb.gotId} (phase=${rb.phase})`, "bad");
-        L(`[STATE] history.state=${safeStateSummary(history.state)}`, "bad");
-        // mais uma tentativa imediata para confirmar persistência
-        await tick();
-        const rb2 = await readbackCheck(i, "immediate");
-        L(`[CONFIRM] immediate recheck ok=${rb2.ok} got=${rb2.gotId}`, rb2.ok?"warn":"bad");
-      } else {
-        // depois do primeiro fail, só amostra
-        if(i % 5 === 0) L(`[after-fail] i=${i} got=${rb.gotId}`, "warn");
+  log("Burst de " + BURST + " concluído.");
+  log("Marcadores únicos nos últimos 10 (seq 190-199):\n");
+  var keys = Object.keys(marcadores);
+  for(var i=0; i<keys.length; i++){
+    log("  seq=" + keys[i] + " → " + marcadores[keys[i]]);
+  }
+  log("");
+
+  // Lê history.state
+  var st = history.state;
+  log("history.state retornou seq=" + (st?st.seq:"null"));
+  log("marker retornado: " + (st?st.marker:"null"));
+  log("");
+
+  if(st && st.seq !== null && st.seq < BURST-1){
+    log("Engine comitou até seq=" + st.seq + ". Objetos seq=" + (st.seq+1) + " a " + (BURST-1) + " foram ignorados.");
+    log("");
+
+    // Tenta encontrar os marcadores perdidos via:
+    // 1. Navegar para trás e verificar popstate states
+    // 2. Verificar se history.state muda sem navegação
+
+    log("Tentando recuperar via back() + popstate...");
+    var encontrados = [];
+
+    // back para idx=1
+    var pop1 = await new Promise(function(resolve){
+      var done = false;
+      window.onpopstate = function(ev){
+        if(done) return;
+        done = true;
+        resolve(ev.state);
+      };
+      setTimeout(function(){ if(!done){ done=true; resolve(null); }}, 3000);
+      history.back();
+    });
+
+    if(pop1){
+      log("popstate chegou: seq=" + pop1.seq + " marker=" + pop1.marker);
+      if(pop1.marker && pop1.marker.indexOf("MARKER_PERDIDO") !== -1){
+        encontrados.push(pop1.seq);
+        log("  MARCADOR ENCONTRADO no popstate!");
       }
     } else {
-      lastOk = i;
-      if(i % 10 === 0) L(`[OK] i=${i} (phase=${rb.phase})`, "ok");
+      log("popstate não chegou (timeout).");
+    }
+    log("");
+
+    // Relatório
+    if(encontrados.length > 0){
+      logWARN("Marcadores dos replaceState 'ignorados' foram encontrados via popstate.");
+      log("Isso significa que o engine processou mas não expôs via history.state.");
+    } else {
+      log("Marcadores não encontrados via popstate.");
+      log("Os objetos dos replaceState ignorados não são acessíveis pelo JS.");
+      logWARN("Se foram serializados mas não são acessíveis, onde estão na memória?");
     }
 
-    // se entrou em fail, não precisa ir até o fim — mas deixo rodar até maxI se você quiser.
-    if(firstFail && i - firstFail.i >= 8) break;
+  } else {
+    logOK("Engine comitou até o último seq. Sem objetos perdidos nesta execução.");
   }
 
-  L(`----- SUMMARY -----`, "ok");
-  L(`lastOk=${lastOk} firstFail=${firstFail ? JSON.stringify(firstFail) : "none"}`, firstFail?"warn":"ok");
+  document.getElementById("btn2").disabled = false;
+};
 
-  // Agora testa se o setup ainda "gruda" depois do colapso:
-  L(`----- POST-COLLAPSE SETUP CHECK -----`, "warn");
-  const okSetup2 = await resetAllVerified(3);
-  L(`postCollapseSetupOK=${okSetup2}`, okSetup2?"ok":"bad");
-}
+// ============================================================
+// T3 — Desync em burst menor
+//
+// O desync (seq=196 em burst=200) aconteceu com burst acima
+// do threshold de timeout. Mas o que acontece com burst
+// ABAIXO do timeout (burst=10-15, onde popstate ainda chega)?
+//
+// Se o desync acontece mesmo com burst pequeno, é comportamento
+// mais fundamental do engine.
+// Se acontece só com burst grande, está ligado à mesma condição
+// que causa o timeout.
+// ============================================================
+window.run_T3 = async function(){
+  document.getElementById("btn3").disabled = true;
+  $log.textContent = "";
+  logSep("T3 — Desync em bursts pequenos (abaixo do timeout)");
+  log("Testa se o engine ignora replaceState mesmo com burst pequeno.");
+  log("5 repetições por tamanho.\n");
 
-async function runRecoveryProbe(){
-  clearLog();
-  L(`===== SETUP RECOVERY PROBE =====`, "ok");
+  const bursts = [5, 10, 15, 20, 25, 30];
+  const reps = 5;
 
-  // tenta várias vezes, sem rodar burst.
-  for(let t=1;t<=6;t++){
-    const ok = await resetAllVerified(3);
-    L(`[RECOVERY] trial=${t} ok=${ok}`, ok?"ok":"bad");
-    if(!ok) break;
-    await tick();
+  for(var b=0; b<bursts.length; b++){
+    var size = bursts[b];
+    logSep("burst=" + size + " (" + reps + " reps)");
+    var deltas = [];
+
+    for(var r=0; r<reps; r++){
+      var runId = "S_"+Date.now().toString(16)+"_"+randHex(4);
+      history.replaceState({ tok:"BASE", run:runId }, "", hrefNoHash());
+      history.pushState({ tok:"E", run:runId }, "", hrefNoHash());
+
+      // Burst
+      for(var k=0; k<size; k++){
+        history.replaceState({ tok:"B", run:runId, seq:k }, "", hrefNoHash());
+      }
+
+      // Lê imediatamente
+      var st = history.state;
+      var seqR = st ? st.seq : null;
+      var esperado = size - 1;
+      var delta = seqR !== null ? (esperado - seqR) : -1;
+      deltas.push(delta);
+
+      log("  rep " + (r+1) + ": esperado=" + esperado + " retornou=" + seqR + " delta=" + delta + (delta > 0 ? " <<<" : ""));
+
+      await new Promise(function(r2){ setTimeout(r2, 20); });
+    }
+
+    // Resumo
+    var comDelta = deltas.filter(function(d){ return d > 0; });
+    if(comDelta.length > 0){
+      logWARN("Desync em " + comDelta.length + "/" + reps + " reps. Deltas: " + JSON.stringify(comDelta));
+    } else {
+      logOK("Sem desync. Engine comitou todos os replaceState.");
+    }
   }
 
-  L(`(Se isso falhar SEM burst, então há algo externo interferindo.)`, "dim");
-}
+  document.getElementById("btn3").disabled = false;
+};
+
+})();
 </script>
 </body>
 </html>
+
