@@ -3,419 +3,463 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>PS4 WebKit — PoC History DESYNC (V3-HEAT A-only + Patches)</title>
+  <title>PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches</title>
   <style>
-    body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0b0b0b; color:#d6ffd6; margin:0; }
-    .wrap { padding: 12px; }
-    h1 { font-size: 16px; margin: 0 0 10px; }
-    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin: 10px 0; }
-    button { padding: 8px 10px; font-size: 14px; cursor:pointer; }
-    input { width: 92px; padding: 6px 6px; background:#111; color:#d6ffd6; border:1px solid #2a2a2a; }
-    label { display:flex; align-items:center; gap:6px; }
-    .panel { border:1px solid #222; padding: 10px; border-radius: 8px; background:#0f0f0f; }
-    #log { white-space: pre-wrap; font-size: 12px; line-height: 1.25; border:1px solid #222; padding:10px; border-radius:8px; background:#060606; min-height: 260px; }
-    .hint { font-size: 12px; opacity: .85; }
+    body { background:#000; color:#0f0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin:0; }
+    header { padding:12px 12px 8px; border-bottom:1px solid #0a0; }
+    h1 { font-size:14px; margin:0 0 6px; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    button { background:#020; color:#0f0; border:1px solid #0a0; padding:8px 10px; font:inherit; cursor:pointer; }
+    button:hover { background:#040; }
+    input { background:#010; color:#0f0; border:1px solid #0a0; padding:6px 8px; width:88px; font:inherit; }
+    label { display:flex; gap:6px; align-items:center; }
+    .pill { border:1px solid #0a0; padding:2px 8px; border-radius:999px; font-size:12px; }
+    main { padding:10px 12px 14px; }
+    #log { white-space:pre-wrap; line-height:1.25; font-size:12px; }
+    .mutator { position:fixed; left:-9999px; top:-9999px; width:1px; height:1px; overflow:hidden; }
   </style>
 </head>
 <body>
-<div class="wrap">
+<header>
   <h1>PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches (PUSH/REPLACE instrumentation, DESYNC_I, recovery)</h1>
-
-  <div class="panel">
-    <div class="row">
-      <button id="runOnceBtn">Run once</button>
-      <button id="loopBtn">Loop</button>
-      <button id="stopBtn">Stop</button>
-      <button id="clearBtn">Clear</button>
-    </div>
-
-    <div class="row">
-      <label>timeoutA <input id="timeoutA" type="number" value="700" min="10" step="10"></label>
-      <label>timeoutB <input id="timeoutB" type="number" value="1600" min="10" step="10"></label>
-      <label>loop iters <input id="iters" type="number" value="30" min="1" step="1"></label>
-      <label>warmN <input id="warmN" type="number" value="70" min="0" step="1"></label>
-      <label>targetLen <input id="targetLen" type="number" value="50" min="2" step="1"></label>
-    </div>
-
-    <div class="hint">
-      Objetivo: aumentar pressão mantendo A-only, capturar <b>STUCK_NAV</b> e (com patch) <b>DESYNC_I</b> / <b>DESYNC_TAG</b>.
-      <br/>Patch: instrumenta push/replace (NOHREF/NOLEN/EXC), adiciona checagem por <code>state.i</code> e recovery após STUCK.
-    </div>
+  <div class="row" style="margin-bottom:8px;">
+    <button id="runOnce">Run once</button>
+    <button id="loop">Loop</button>
+    <button id="stop">Stop</button>
+    <button id="clear">Clear</button>
+    <span class="pill" id="status">idle</span>
   </div>
 
-  <div style="height:10px"></div>
+  <div class="row">
+    <label>timeoutA <input id="tmoA" type="number" value="700" min="50" step="50"></label>
+    <label>timeoutB <input id="tmoB" type="number" value="1600" min="50" step="50"></label>
+    <label>loop iters <input id="iters" type="number" value="30" min="1" step="1"></label>
+    <label>warmN <input id="warmN" type="number" value="70" min="0" step="1"></label>
+    <label>targetLen <input id="targetLen" type="number" value="50" min="2" step="1"></label>
+    <label>padLen <input id="padLen" type="number" value="24" min="0" step="1"></label>
+    <label>probeDelta <input id="probeDelta" type="number" value="-2" max="-1" step="1"></label>
+  </div>
+</header>
+
+<main>
   <div id="log"></div>
-</div>
+</main>
+
+<!-- DOM churn targets (kept offscreen) -->
+<div class="mutator" id="mutator"></div>
 
 <script>
-(() => {
-  "use strict";
+/* ============================================================
+   PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches
+   - A-only, state.i monotônico (forte para DESYNC_I)
+   - Instrumentação push/replace: NOHREF / NOLEN / EXC
+   - Checagem DESYNC por state.i e tag
+   - STUCK_NAV mais “cirúrgico” (pop+hash+h/ state iguais)
+   - Recovery após STUCK (sem “exploit”, só re-sincronização)
+   ============================================================ */
 
-  // ----------------------------
-  // UI + logging
-  // ----------------------------
+(function () {
+  // ---------- UI ----------
   const $ = (id) => document.getElementById(id);
   const logEl = $("log");
+  const statusEl = $("status");
 
   function nowISO() { return new Date().toISOString(); }
-  function log(msg) { logEl.textContent += `[${nowISO()}] ${msg}\n`; logEl.scrollTop = logEl.scrollHeight; }
-  function clearLog() { logEl.textContent = ""; }
+  function log(s) {
+    const line = `[${nowISO()}] ${s}\n`;
+    logEl.textContent += line;
+    // mantém scroll no fim
+    try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}
+  }
+  function setStatus(s) { statusEl.textContent = s; }
 
-  // ----------------------------
-  // helpers
-  // ----------------------------
-  function rnd32() { return (Math.random() * 0x100000000) >>> 0; }
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  // ---------- PRNG ----------
+  function rnd32() {
+    // xorshift32
+    let x = (rnd32._x | 0) || 0x12345678;
+    x ^= (x << 13); x |= 0;
+    x ^= (x >>> 17);
+    x ^= (x << 5); x |= 0;
+    rnd32._x = x;
+    return (x >>> 0);
+  }
 
+  // ---------- Config ----------
+  function cfg() {
+    return {
+      tmoA: +$("tmoA").value || 700,
+      tmoB: +$("tmoB").value || 1600,
+      iters: +$("iters").value || 30,
+      warmN: +$("warmN").value || 70,
+      targetLen: +$("targetLen").value || 50,
+      padLen: +$("padLen").value || 0,
+      probeDelta: +$("probeDelta").value || -2,
+    };
+  }
+
+  // ---------- Modelo local (ring) ----------
+  const model = [];
+  function modelPush(i) { model.push(i); if (model.length > 600) model.shift(); }
+  function modelReplace(i) { if (model.length) model[model.length - 1] = i; else model.push(i); }
+  function expectForDelta(delta) {
+    const idx = model.length - 1 + delta; // delta negativo
+    if (idx < 0 || idx >= model.length) return null;
+    return model[idx];
+  }
+
+  // ---------- Hash builder ----------
+  function mkHash(tag, i, padLen) {
+    // Hash “barulhento” para churn: inclui i e um padding variável.
+    // (O padding não é para exploração — só para pressão de parsing/URL.)
+    const pad = padLen > 0 ? ("-" + "x".repeat(Math.max(0, padLen))) : "";
+    return `#${tag}-${i}-${rnd32()}${pad}`;
+  }
+
+  // ---------- State builder ----------
   function mkState(tag, i) {
     return { tag, i, stamp: Date.now(), rnd: rnd32() };
   }
 
-  function mkHash(i, padLen=0) {
-    // V3-HEAT style: #A-i-rnd-<pad>
-    const r = rnd32();
-    const pad = padLen > 0 ? ("x".repeat(padLen)) : "";
-    return `#A-${i}-${r}-${pad}`;
-  }
-
-  function parseHashI(href) {
-    // expects ...#A-<i>-...
+  // ---------- Instrumentação push/replace ----------
+  function replaceStateInstr(state, url) {
+    const len0 = safeLen();
+    const href0 = safeHref();
     try {
-      const idx = href.indexOf("#A-");
-      if (idx < 0) return null;
-      const rest = href.slice(idx + 3);
-      const dash = rest.indexOf("-");
-      if (dash < 0) return null;
-      const iStr = rest.slice(0, dash);
-      const i = Number(iStr);
-      return Number.isFinite(i) ? i : null;
-    } catch (_) { return null; }
-  }
-
-  function getStateSafe() {
-    try { return history.state; } catch (_) { return null; }
-  }
-
-  // ----------------------------
-  // PATCH 1: instrumented replace/push
-  // ----------------------------
-  function replaceA(i, padLen=0) {
-    const beforeHref = location.href;
-    try {
-      history.replaceState(mkState(`A:${i}`, i), "", mkHash(i, padLen));
+      history.replaceState(state, "", url);
     } catch (e) {
       log(`[REPLACE_EXC] ${String(e)}`);
       return false;
     }
-    const afterHref = location.href;
-    if (afterHref === beforeHref) log(`[REPLACE_NOHREF] i=${i} href did not change`);
+    const href1 = safeHref();
+    const len1 = safeLen();
+    if (href1 === href0) log(`[REPLACE_NOHREF] i=${state.i} href did not change`);
+    if (len1 !== len0) log(`[REPLACE_LENCHG] i=${state.i} len ${len0} -> ${len1}`);
     return true;
   }
 
-  function pushA(i, padLen=0) {
-    const beforeHref = location.href;
-    const len0 = history.length;
+  function pushStateInstr(state, url) {
+    const len0 = safeLen();
+    const href0 = safeHref();
     try {
-      history.pushState(mkState(`A:${i}`, i), "", mkHash(i, padLen));
+      history.pushState(state, "", url);
     } catch (e) {
       log(`[PUSH_EXC] ${String(e)}`);
       return false;
     }
-    const afterHref = location.href;
-    const len1 = history.length;
-    if (afterHref === beforeHref) log(`[PUSH_NOHREF] i=${i} href did not change`);
-    if (len1 === len0) log(`[PUSH_NOLEN] i=${i} history.length did not change (len=${len1})`);
+    const href1 = safeHref();
+    const len1 = safeLen();
+    if (href1 === href0) log(`[PUSH_NOHREF] i=${state.i} href did not change`);
+    if (len1 === len0) log(`[PUSH_NOLEN] i=${state.i} history.length did not change (len=${len1})`);
     return true;
   }
 
-  // ----------------------------
-  // "heat": DOM churn pressure
-  // ----------------------------
-  function domChurn(rounds=18) {
-    // keeps it simple and deterministic-ish: create/remove nodes, attributes, text nodes.
-    const root = document.createElement("div");
-    root.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden;";
-    document.body.appendChild(root);
+  function safeLen() {
+    try { return history.length | 0; } catch (e) { return -1; }
+  }
+  function safeHref() {
+    try { return String(location.href); } catch (e) { return "<nohref>"; }
+  }
+  function safeState() {
+    try { return history.state; } catch (e) { return null; }
+  }
 
-    for (let r=0; r<rounds; r++) {
-      const box = document.createElement("div");
-      box.className = "bx" + r;
-      box.style.cssText = `width:${(r%7)+1}px;height:${(r%11)+1}px;`;
-      box.setAttribute("data-r", String(rnd32()));
-      box.appendChild(document.createTextNode("x".repeat((r%23)+1)));
-      root.appendChild(box);
+  // ---------- DOM churn ----------
+  const mut = $("mutator");
+  function domChurn(rounds) {
+    // pressão leve/média: cria/remove nós, mexe em atributos/texto
+    // sem usar APIs “exóticas” que podem não existir no PS4.
+    for (let r = 0; r < rounds; r++) {
+      const n = document.createElement("div");
+      n.className = "n" + (rnd32() & 0xff);
+      n.textContent = "x".repeat(20 + (rnd32() % 80));
+      mut.appendChild(n);
 
-      // mild subtree mutation
-      if (r % 3 === 0) {
-        box.innerHTML = `<span data-k="${rnd32()}">${"y".repeat((r%17)+1)}</span>`;
-      }
-      if (r % 4 === 0) {
-        box.style.transform = `translateZ(0) rotate(${r}deg)`;
-      }
-      if (r % 5 === 0) {
-        box.removeAttribute("data-r");
-        box.setAttribute("data-r2", String(rnd32()));
-      }
+      // pequenas mutações
+      if (r % 3 === 0) n.setAttribute("data-k", String(rnd32()));
+      if (r % 4 === 0) n.style.cssText = "display:block; width:" + (10 + (rnd32()%90)) + "px;";
     }
-
-    // cleanup
-    try { root.remove(); } catch (_) {}
+    // remove uma parte
+    let kill = Math.min(mut.childNodes.length, Math.max(1, (rounds / 2) | 0));
+    while (kill-- > 0 && mut.firstChild) mut.removeChild(mut.firstChild);
   }
 
-  // ----------------------------
-  // warmup: maintain A-only, aim history.length ~= targetLen
-  // ----------------------------
-  async function warmupAOnly(warmN, targetLen) {
-    // Strategy:
-    // - replaceState to "A:0" at current entry (keeps A-only)
-    // - pushState up to targetLen (but bounded) using A:1 (same tag family) and random pad
-    // - then do some go(-k)/go(0) shuffles lightly
-    const padLen = 1 + (rnd32() % 24);
-
-    // ensure we are on something A-ish
-    replaceA(0, padLen);
-
-    // push until history.length is at least targetLen (best-effort)
-    let guard = Math.min(warmN, 140); // keep bounded
-    while (history.length < targetLen && guard-- > 0) {
-      pushA(1, padLen);
-      // tiny yield to let browser settle
-      if ((guard % 7) === 0) await sleep(0);
-    }
-
-    // additional warm churn
-    for (let j=0; j<Math.min(warmN, 120); j++) {
-      // keep A-only: alternate replace and push with varying i (still A:*)
-      const i = (j % 2 === 0) ? 0 : 1;
-      const pad = 1 + (rnd32() % 32);
-      if (j % 3 === 0) replaceA(i, pad);
-      else pushA(i, pad);
-
-      if ((j % 9) === 0) domChurn(10 + (j % 10));
-      if ((j % 11) === 0) await sleep(0);
-    }
+  // ---------- Eventos de navegação ----------
+  let popArmed = false, hashArmed = false;
+  let gotPop = false, gotHash = false;
+  function armEvents() {
+    gotPop = false; gotHash = false;
+    popArmed = true; hashArmed = true;
   }
 
-  // ----------------------------
-  // event waiters
-  // ----------------------------
-  function armEventLatch() {
-    const latch = { pop:false, hash:false, popEv:null, hashEv:null };
-    function onPop(ev) { latch.pop = true; latch.popEv = ev; }
-    function onHash(ev) { latch.hash = true; latch.hashEv = ev; }
-    window.addEventListener("popstate", onPop, { once:false });
-    window.addEventListener("hashchange", onHash, { once:false });
-    latch.detach = () => {
-      try { window.removeEventListener("popstate", onPop); } catch(_) {}
-      try { window.removeEventListener("hashchange", onHash); } catch(_) {}
-    };
-    return latch;
-  }
+  window.addEventListener("popstate", function () {
+    if (!popArmed) return;
+    gotPop = true;
+  }, true);
 
-  async function waitForAnyEventOrTimeout(latch, ms) {
-    const t0 = Date.now();
-    while ((Date.now() - t0) < ms) {
-      if (latch.pop || latch.hash) return true;
-      await sleep(16);
-    }
-    return false;
-  }
+  window.addEventListener("hashchange", function () {
+    if (!hashArmed) return;
+    gotHash = true;
+  }, true);
 
-  // ----------------------------
-  // PATCH 3: recovery poke after STUCK_NAV
-  // ----------------------------
-  async function recoveryPoke() {
-    const before = location.href;
+  // ---------- Recovery após STUCK ----------
+  function recoverySequence(reason) {
+    // Objetivo: “descolar” a fila de navegação/eventos.
+    // Sem exploração: só troca hash, replaceState e um go(0) opcional.
+    const st = safeState() || {};
+    const recI = (st.i == null) ? -1 : st.i;
+    log(`[RECOVERY] reason=${reason} at i=${recI} href=${safeHref()} len=${safeLen()}`);
 
-    // 1) direct hash poke
-    try { location.hash = "#REC-" + ((Math.random()*1e6)|0); } catch(_) {}
-    await sleep(30);
+    // 1) força microtask-ish via postMessage
+    try { window.postMessage("ping-" + rnd32(), "*"); } catch (e) {}
 
-    // 2) replace/push poke
-    replaceA(0, 4);
-    pushA(1, 6);
-    await sleep(30);
-
-    // 3) go(0) poke (forces traversal processing sometimes)
-    try { history.go(0); } catch(_) {}
-    await sleep(50);
-
-    log(`[RECOVERY] before=${before} after=${location.href} hlen=${history.length}`);
-  }
-
-  // ----------------------------
-  // core scenario A (A-only): warmup + churn + go/back probe
-  // Adds DESYNC_I and DESYNC_TAG (tag is now A:<i>)
-  // ----------------------------
-  async function runScenarioA(cfg) {
-    const { timeoutA, timeoutB, warmN, targetLen } = cfg;
-
-    // report BASE snapshot
-    log(`[BASE] :: href=${location.href} hlen=${history.length} state=${JSON.stringify(getStateSafe())}`);
-
-    log(`=== Scenario A: WARMUP(A-only) + DOM churn + go/back probes ===`);
-
-    // warmup pressure (keeps A-only)
-    await warmupAOnly(warmN, targetLen);
-
-    // snapshot after warm
-    log(`[A WARM] :: href=${location.href} hlen=${history.length} state=${JSON.stringify(getStateSafe())}`);
-
-    // Ensure we have a deterministic "current=1 / previous=0" pair right before probe
-    // (so we can flag DESYNC_I if traversal returns wrong i)
-    // We do: replace to A:0 then push to A:1, then probe go(-1..-3)
-    const padLen = 2 + (rnd32() % 28);
-    replaceA(0, padLen);
-    pushA(1, padLen);
-
-    // DOM churn right before traversal
-    domChurn(18 + (rnd32() % 12));
-
-    // Choose delta in [-1, -3] (matches your logs)
-    const delta = -1 - (rnd32() % 3);
-
-    const preHref = location.href;
-    const preState = getStateSafe();
-    const preI = preState && typeof preState === "object" ? preState.i : null;
-    const preTag = preState && typeof preState === "object" ? preState.tag : null;
-
-    log(`[A PRE] :: href=${preHref} hlen=${history.length} state=${JSON.stringify(preState)}`);
-
-    // Expect: after delta traversal, i should become 0 if delta=-1
-    // For delta=-2/-3, we accept i in {0,1} but we still detect wrong/unchanged traversal.
-    // Strongest signal: no events and no href change.
-    const latch = armEventLatch();
-
-    // fire traversal
+    // 2) força mudança de hash (via replace) para acordar parser
     try {
-      if (delta === -1) history.back();
-      else history.go(delta);
-    } catch (e) {
-      log(`[GO_EXC] delta=${delta} ${String(e)}`);
-    }
+      const tag = "A";
+      const url = mkHash(tag, recI, 8);
+      replaceStateInstr(Object.assign({}, st, { tag: "A:REC" }), url);
+    } catch (e) {}
 
-    // initial wait
-    let got = await waitForAnyEventOrTimeout(latch, timeoutA);
-
-    // retry path (as you already do): if nothing, wait longer
-    if (!got) {
-      log(`[WARN] A initial=STUCK_NAV delta=${delta} -> retry timeoutB(${timeoutB})`);
-      got = await waitForAnyEventOrTimeout(latch, timeoutB);
-    }
-
-    const postHref = location.href;
-    const postState = getStateSafe();
-    const postI = postState && typeof postState === "object" ? postState.i : null;
-    const postTag = postState && typeof postState === "object" ? postState.tag : null;
-
-    latch.detach();
-
-    // ----------------------------
-    // verdict logic
-    // ----------------------------
-    const gotPop = !!latch.pop;
-    const gotHash = !!latch.hash;
-
-    // expectedTag is based on our last pushed entry (A:1). After delta=-1, we expect A:0.
-    // Since we do replaceA(0) then pushA(1), a successful back/go(-1) should land on A:0.
-    const expectTag = (delta === -1) ? "A:0" : null;
-    const expectI = (delta === -1) ? 0 : null;
-
-    let kind = "OK";
-    let desyncTag = false;
-    let desyncI = false;
-
-    if (expectTag && postTag && postTag !== expectTag) { desyncTag = true; }
-    if (typeof expectI === "number" && postI !== null && postI !== expectI) { desyncI = true; }
-
-    // STUCK_NAV: no events + href unchanged (strong signal)
-    const stuck = (!gotPop && !gotHash && postHref === preHref);
-
-    if (stuck) kind = "STUCK_NAV";
-    else if (desyncTag) kind = "DESYNC_TAG";
-    else if (desyncI) kind = "DESYNC_I";
-
-    log(`[A POST] :: href=${postHref} hlen=${history.length} state=${JSON.stringify(postState)}`);
-    log(`[A VERDICT] ${kind} | delta=${delta} gotPop=${gotPop} gotHash=${gotHash} preI=${preI} postI=${postI} preTag=${preTag} postTag=${postTag}`);
-
-    if (kind !== "OK") {
-      log(`[A STATE] ${JSON.stringify(postState)}`);
-    }
-
-    // recovery poke after STUCK to avoid the loop staying contaminated
-    if (kind === "STUCK_NAV") {
-      await recoveryPoke();
-    }
-
-    return { kind, delta, gotPop, gotHash, preHref, postHref };
+    // 3) tenta refresh da entrada atual
+    try { history.go(0); } catch (e) {}
   }
 
-  // ----------------------------
-  // run harness (once / loop)
-  // ----------------------------
+  // ---------- Motor do cenário A (A-only) ----------
+  let gI = 0; // monotônico (forte)
   let stopFlag = false;
 
-  function readCfg() {
+  function snapshot(label) {
+    const st = safeState();
+    log(`[${label}] :: href=${safeHref()} hlen=${safeLen()} state=${safeJson(st)}`);
+  }
+  function safeJson(x) { try { return JSON.stringify(x); } catch (e) { return String(x); } }
+
+  function warmupAOnly(warmN, targetLen, padLen) {
+    // “A-only”: mistura replace/push para esquentar
+    // Atualiza o modelo local (esperado) em paralelo.
+    for (let k = 0; k < warmN; k++) {
+      const i = ++gI;
+      const tag = "A";
+      const st = mkState(tag, i);
+      const url = mkHash(tag, i, padLen);
+
+      // alterna padrões pra variar
+      let ok = false;
+      if ((k % 3) === 0) {
+        ok = replaceStateInstr(st, url);
+        if (ok) modelReplace(i);
+      } else {
+        ok = pushStateInstr(st, url);
+        if (ok) modelPush(i);
+      }
+
+      // tenta chegar perto do targetLen (quando o engine permitir)
+      // (no PS4 pode “saturar”: PUSH_NOLEN vira sinal de pressão)
+      if (safeLen() >= targetLen && (k % 5) === 0) {
+        // churn extra quando saturado
+        domChurn(10 + (rnd32() % 10));
+      }
+    }
+  }
+
+  function runScenarioA(cfgObj) {
+    const { tmoA, tmoB, warmN, targetLen, padLen, probeDelta } = cfgObj;
+
+    log(`RUN once | href=${safeHref()} hlen=${safeLen()} CFG tmoA=${tmoA} tmoB=${tmoB} warmN=${warmN} targetLen=${targetLen} padLen=${padLen} probeDelta=${probeDelta}`);
+    snapshot("BASE");
+    log("=== Scenario A: WARMUP(A-only) + DOM churn + go/back probes ===");
+
+    // garante entrada base com A
+    if (!safeState() || !safeState().tag) {
+      const i0 = ++gI;
+      const st0 = mkState("A", i0);
+      replaceStateInstr(st0, mkHash("A", i0, padLen));
+      modelReplace(i0);
+    }
+
+    // WARMUP + pressão
+    warmupAOnly(warmN, targetLen, padLen);
+
+    // churn final antes do probe
+    domChurn(20 + (rnd32() % 30));
+
+    // PRE snapshot (após warm)
+    snapshot("A WARM");
+
+    // define PRE explícito (garante topo com i conhecido)
+    const preI = ++gI;
+    const preTag = "A:1"; // tag “composta” pra detectar DESYNC_TAG (se aparecer algo fora)
+    const preState = mkState(preTag, preI);
+    const preUrl = mkHash("A", preI, padLen);
+    // mistura: faz push (preferido) — mas pode saturar
+    if (pushStateInstr(preState, preUrl)) modelPush(preI);
+    snapshot("A PRE");
+
+    // go/back probe
+    const preHref = safeHref();
+    const preLen = safeLen();
+    const preStSnap = safeState();
+    const expectedI = expectForDelta(probeDelta);
+
+    armEvents();
+
+    // tenta navegar
+    let fired = false;
+    try { history.go(probeDelta); fired = true; } catch (e) { log(`[GO_EXC] ${String(e)}`); }
+
+    // espera tmoA; se não respondeu, STUCK inicial e retry tmoB
+    return waitProbe(tmoA).then(function (r1) {
+      if (!fired) {
+        return verdict("GO_FAIL", probeDelta, expectedI, preHref, preLen, preStSnap);
+      }
+      if (r1.stuckLike) {
+        log(`[WARN] A initial=STUCK_NAV delta=${probeDelta} -> retry timeoutB(${tmoB})`);
+        // rearm e espera mais
+        armEvents();
+        return waitProbe(tmoB).then(function (r2) {
+          if (r2.stuckLike) {
+            // Recovery após STUCK
+            recoverySequence("STUCK_NAV");
+            return verdict("STUCK_NAV", probeDelta, expectedI, preHref, preLen, preStSnap);
+          }
+          return verdict("OK_AFTER_RETRY", probeDelta, expectedI, preHref, preLen, preStSnap);
+        });
+      }
+      return verdict("OK", probeDelta, expectedI, preHref, preLen, preStSnap);
+    });
+  }
+
+  function waitProbe(ms) {
+    return new Promise(function (resolve) {
+      const t0 = Date.now();
+      setTimeout(function () {
+        const postHref = safeHref();
+        const postSt = safeState();
+        const stuckLike = (!gotPop && !gotHash); // base; “cirúrgico” é no verdict()
+        resolve({ dt: Date.now() - t0, postHref, postSt, stuckLike });
+      }, ms);
+    });
+  }
+
+  function verdict(baseKind, delta, expectedI, preHref, preLen, preStSnap) {
+    const postHref = safeHref();
+    const postLen = safeLen();
+    const postSt = safeState();
+
+    const preI = preStSnap && preStSnap.i;
+    const postI = postSt && postSt.i;
+    const preTag = preStSnap && preStSnap.tag;
+    const postTag = postSt && postSt.tag;
+
+    // STUCK “forte”: sem eventos + href igual + state igual (i+stamp)
+    const sameState =
+      postSt && preStSnap &&
+      postSt.i === preStSnap.i &&
+      postSt.stamp === preStSnap.stamp;
+
+    const stuckStrong = (!gotPop && !gotHash && postHref === preHref && sameState);
+
+    let kind = baseKind;
+    if (stuckStrong) kind = "STUCK_NAV";
+
+    // DESYNC_TAG: algo fora de A-only
+    if (postTag && String(postTag).indexOf("A") !== 0) {
+      kind = (kind === "STUCK_NAV") ? "STUCK_NAV+DESYNC_TAG" : "DESYNC_TAG";
+    }
+
+    // DESYNC_I forte: expectedI conhecido e diferente do postI
+    if (expectedI !== null && (postI !== expectedI)) {
+      // não marca se for STUCK (porque postI==preI normalmente)
+      if (kind === "STUCK_NAV") {
+        // mantém STUCK (mais importante)
+      } else {
+        kind = "DESYNC_I";
+      }
+    }
+
+    snapshot("A POST");
+
+    log(`[A VERDICT] ${kind} | delta=${delta} gotPop=${gotPop} gotHash=${gotHash} preI=${preI} postI=${postI} expI=${expectedI} preTag=${preTag} postTag=${postTag} len=${preLen}->${postLen}`);
+
+    if (kind === "STUCK_NAV" || String(kind).indexOf("STUCK") === 0) {
+      log(`[A STATE] ${safeJson(postSt)}`);
+    }
+
     return {
-      timeoutA: Math.max(10, parseInt($("timeoutA").value, 10) || 700),
-      timeoutB: Math.max(10, parseInt($("timeoutB").value, 10) || 1600),
-      iters: Math.max(1, parseInt($("iters").value, 10) || 30),
-      warmN: Math.max(0, parseInt($("warmN").value, 10) || 70),
-      targetLen: Math.max(2, parseInt($("targetLen").value, 10) || 50),
+      kind,
+      gotPop, gotHash,
+      preI, postI,
+      expectedI,
+      preTag, postTag,
+      preHref, postHref,
+      preLen, postLen
     };
   }
 
-  async function runOnce() {
-    const cfg = readCfg();
-    stopFlag = false;
-    log(`RUN once | href=${location.href} hlen=${history.length} CFG tmoA=${cfg.timeoutA} tmoB=${cfg.timeoutB} warmN=${cfg.warmN} targetLen=${cfg.targetLen}`);
-    await runScenarioA(cfg);
-  }
+  // ---------- Loop ----------
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   async function runLoop() {
-    const cfg = readCfg();
     stopFlag = false;
+    setStatus("looping");
 
-    let OK=0, STUCK=0, DESYNC=0, LOST_EVENT=0;
-    log(`=== LOOP START iters=${cfg.iters} ===`);
+    const C = cfg();
+    let ok = 0, stuck = 0, desync = 0, lost = 0;
 
-    for (let it=1; it<=cfg.iters; it++) {
-      if (stopFlag) { log(`=== LOOP STOPPED at iter ${it}/${cfg.iters} ===`); break; }
+    log(`=== LOOP START iters=${C.iters} ===`);
+    for (let it = 1; it <= C.iters; it++) {
+      if (stopFlag) break;
+      log(`### ITER ${it}/${C.iters} ###`);
+      log("------------------------------------------------------------");
 
-      log(`### ITER ${it}/${cfg.iters} ###`);
-      log(`------------------------------------------------------------`);
-      log(`RUN once | href=${location.href} hlen=${history.length} CFG tmoA=${cfg.timeoutA} tmoB=${cfg.timeoutB} warmN=${cfg.warmN} targetLen=${cfg.targetLen}`);
+      let res;
+      try {
+        res = await runScenarioA(C);
+      } catch (e) {
+        log(`[LOOP_EXC] ${String(e)}`);
+        res = { kind: "EXC" };
+      }
 
-      const r = await runScenarioA(cfg);
+      if (res.kind === "OK" || res.kind === "OK_AFTER_RETRY") ok++;
+      else if (String(res.kind).indexOf("STUCK") === 0) stuck++;
+      else if (String(res.kind).indexOf("DESYNC") === 0) desync++;
+      else if (res.kind === "LOST_EVENT") lost++;
 
-      if (r.kind === "OK") OK++;
-      else if (r.kind === "STUCK_NAV") STUCK++;
-      else if (r.kind === "DESYNC_TAG" || r.kind === "DESYNC_I") DESYNC++;
-      else LOST_EVENT++;
-
-      await sleep(120); // breathing room between iterations
+      // pequeno respiro + churn leve pra variar janela
+      await sleep(120 + (rnd32() % 120));
     }
 
-    log(`=== LOOP SUMMARY ===`);
-    log(`OK=${OK} STUCK=${STUCK} LOST_EVENT=${LOST_EVENT} DESYNC=${DESYNC}`);
-    log(`=== LOOP END ===`);
+    log("=== LOOP SUMMARY ===");
+    log(`OK=${ok} STUCK=${stuck} LOST_EVENT=${lost} DESYNC=${desync}`);
+    log("=== LOOP END ===");
+    setStatus(stopFlag ? "stopped" : "idle");
   }
 
-  // ----------------------------
-  // wire UI
-  // ----------------------------
-  $("runOnceBtn").addEventListener("click", () => runOnce().catch(e => log(`[FATAL] ${String(e)}`)));
-  $("loopBtn").addEventListener("click", () => runLoop().catch(e => log(`[FATAL] ${String(e)}`)));
-  $("stopBtn").addEventListener("click", () => { stopFlag = true; log(`[STOP] requested`); });
-  $("clearBtn").addEventListener("click", () => clearLog());
+  // ---------- Botões ----------
+  $("clear").onclick = () => { logEl.textContent = ""; setStatus("idle"); };
+  $("stop").onclick = () => { stopFlag = true; setStatus("stopping"); };
 
-  // initial baseline stamp (keeps your style)
-  try {
-    // keep A-ish baseline at load
-    history.replaceState(mkState("A:0", 0), "", mkHash(0, 2));
-  } catch (_) {}
+  $("runOnce").onclick = async () => {
+    stopFlag = false;
+    setStatus("running");
+    try { await runScenarioA(cfg()); }
+    catch (e) { log(`[RUN_EXC] ${String(e)}`); }
+    setStatus("idle");
+  };
 
-  log(`[READY] href=${location.href} hlen=${history.length} state=${JSON.stringify(getStateSafe())}`);
+  $("loop").onclick = () => runLoop();
+
+  // ---------- Boot log ----------
+  // Coloca uma base A inicial para evitar state null
+  (function initBase() {
+    const st = safeState();
+    if (!st || !st.tag) {
+      const i0 = ++gI;
+      const base = mkState("A:BASE", i0);
+      replaceStateInstr(base, mkHash("A", i0, cfg().padLen));
+      modelReplace(i0);
+    }
+    snapshot("INIT");
+  })();
 })();
 </script>
 </body>
