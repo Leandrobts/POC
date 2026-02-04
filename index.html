@@ -1,385 +1,70 @@
 <!doctype html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8">
-  <title>PS4 WebKit – CRLF Headers V3 (agressivo, logic-impact)</title>
-</head>
-<body>
-  <h2>PS4 WebKit – V3 agressiva (Headers/Response/Request/Blob propagation)</h2>
-  <p>Objetivo: ir além de “string suja” e tentar provar <b>impacto lógico</b>: split/shadowing, inconsistência cross-API, propagação em Blob/DataURL.</p>
-
-  <button onclick="clearLog()">Limpar</button>
-  <button onclick="runAll()">Rodar tudo (auto)</button>
-
-  <hr>
-  <button onclick="T1_splitEnumeration()">T1 Split via enumeration</button>
-  <button onclick="T2_shadowContentType()">T2 Shadow Content-Type</button>
-  <button onclick="T3_crossApiMismatch()">T3 Cross-API mismatch (Headers/Response/Request)</button>
-  <button onclick="T4_blobPropagationFromResponse()">T4 Response→Blob→DataURL propagation</button>
-  <button onclick="T5_fetchLateValidation()">T5 Fetch late validation vs store</button>
-  <button onclick="T6_locationPoison()">T6 Location poisoning (302)</button>
-
-  <hr>
-  <pre id="log"></pre>
-
+<meta charset="utf-8">
+<title>PS4 WebKit – CRLF Diagnostic V3.1</title>
+<h3>CRLF Diagnostic V3.1 (charcodes + A(real) vs B(literal))</h3>
+<button onclick="run()">Run</button>
+<pre id="log"></pre>
 <script>
-/* =========================
-   ALERTA logger (ES5)
-   ========================= */
-var $log = document.getElementById("log");
-var ALERTS = 0;
-var STRONG = 0; // split/shadow/inconsistency
-var WEAK = 0;   // only preserves controls
-
-function clearLog(){
-  try{ $log.textContent = ""; }catch(e){}
-  ALERTS = 0; STRONG = 0; WEAK = 0;
-}
-function LOG(m){
-  try{ $log.textContent += m + "\n"; }catch(e){}
-}
-function ALERT_WEAK(m){
-  ALERTS++; WEAK++;
-  LOG("[ALERTA] " + m);
-}
-function ALERT_STRONG(m){
-  ALERTS++; STRONG++;
-  LOG("[ALERTA-FORTE] " + m);
-}
-
-function hasCTL(s){
-  if(s == null) return false;
+var L=document.getElementById('log');
+function log(s){ L.textContent += s + "\n"; }
+function codes(s, max){
   s = String(s);
-  return (s.indexOf("\n") !== -1) || (s.indexOf("\r") !== -1);
+  var out=[], i, n=Math.min(s.length, max||40);
+  for(i=0;i<n;i++) out.push(s.charCodeAt(i));
+  return out.join(",");
 }
-function safeEntries(headers){
-  var out = [];
+function trySet(val){
+  var ok=true, err="";
   try{
-    if(headers && headers.forEach){
-      headers.forEach(function(v,k){ out.push([String(k), String(v)]); });
-    }
-  }catch(e){}
-  return out;
-}
-function countKey(out, key){
-  var i, n=0;
-  key = String(key).toLowerCase();
-  for(i=0;i<out.length;i++){
-    if(String(out[i][0]).toLowerCase() === key) n++;
-  }
-  return n;
-}
-function getKey(out, key){
-  var i;
-  key = String(key).toLowerCase();
-  for(i=0;i<out.length;i++){
-    if(String(out[i][0]).toLowerCase() === key) return out[i][1];
-  }
-  return null;
-}
-
-/* =========================
-   T1: Split via enumeration
-   - Store x-test = "a\r\nx-evil: 1"
-   - STRONG if x-evil appears as a distinct header in enumeration or get('x-evil') works.
-   ========================= */
-function T1_splitEnumeration(){
-  LOG("T1 start...");
-  if(!window.Headers){
-    LOG("Headers não disponível.");
-    return;
-  }
-  var h = new Headers();
-  var v = "a\r\nx-evil: 1";
-  var ok = true;
-  try{ h.set("x-test", v); }catch(e){ ok=false; LOG("Headers.set lançou (bom): " + e); }
-  if(!ok) return;
-
-  var gv = null, ge = null;
-  try{ gv = h.get("x-test"); }catch(e2){}
-  try{ ge = h.get("x-evil"); }catch(e3){}
-  LOG("get(x-test): " + gv);
-  LOG("get(x-evil): " + ge);
-
-  if(hasCTL(gv)) ALERT_WEAK("T1 preservou CR/LF em x-test value: " + gv);
-
-  var ent = safeEntries(h);
-  LOG("entries count: " + ent.length);
-
-  // STRONG condition: header split surfaced
-  if(ge && ge !== "null" && ge !== "") ALERT_STRONG("T1 POSSÍVEL SPLIT: get('x-evil') retornou: " + ge);
-
-  var evilFromEnum = getKey(ent, "x-evil");
-  if(evilFromEnum != null) ALERT_STRONG("T1 SPLIT via enumeration: x-evil apareceu como header separado: " + evilFromEnum);
-
-  // Secondary: if enumeration contains more than 1 entry, check if any value contains CRLF
-  var i;
-  for(i=0;i<ent.length;i++){
-    if(hasCTL(ent[i][1])) ALERT_WEAK("T1 entry contém CTL: " + ent[i][0] + "=" + ent[i][1]);
-  }
-}
-
-/* =========================
-   T2: Shadow Content-Type
-   - content-type value contains a second content-type line.
-   - STRONG if enumeration shows 2 content-type entries, or get('content-type') is truncated/altered unexpectedly.
-   ========================= */
-function T2_shadowContentType(){
-  LOG("T2 start...");
-  if(!window.Headers){
-    LOG("Headers não disponível.");
-    return;
-  }
-  var h = new Headers();
-  var v = "text/plain\r\ncontent-type: text/html";
-  var ok = true;
-  try{ h.set("content-type", v); }catch(e){ ok=false; LOG("Headers.set lançou (bom): " + e); }
-  if(!ok) return;
-
-  var g = null;
-  try{ g = h.get("content-type"); }catch(e2){}
-  LOG("get(content-type): " + g);
-
-  if(hasCTL(g)) ALERT_WEAK("T2 preservou CR/LF em content-type: " + g);
-
-  var ent = safeEntries(h);
-  var ctCount = countKey(ent, "content-type");
-  LOG("content-type entries: " + ctCount);
-
-  if(ctCount >= 2){
-    ALERT_STRONG("T2 DUPLICAÇÃO: content-type apareceu " + ctCount + "x em enumeration (shadowing provável).");
-    var ct2 = getKey(ent.slice(1), "content-type");
-    if(ct2 != null) LOG("content-type #2: " + ct2);
-  }
-
-  // If engine normalizes by truncating at first token, g should be "text/plain" (or similar).
-  // STRONG if g equals "text/html" or contains only second part.
-  if(g && String(g).toLowerCase().indexOf("text/html") !== -1 && String(g).toLowerCase().indexOf("text/plain") === -1){
-    ALERT_STRONG("T2 SHADOW: get(content-type) parece ter 'vencido' pelo segundo header (text/html).");
-  }
-}
-
-/* =========================
-   T3: Cross-API mismatch (Headers vs Response vs Request)
-   - Same header injected, compare get() results and enumerations
-   - STRONG if mismatch between layers (normalization differs), or split appears only in one layer
-   ========================= */
-function T3_crossApiMismatch(){
-  LOG("T3 start...");
-  if(!window.Headers || !window.Response){
-    LOG("Headers/Response não disponível.");
-    return;
-  }
-  var h = new Headers();
-  var inj = "a\r\nx-evil: 1";
-  try{ h.set("x-test", inj); }catch(e){ LOG("Headers.set lançou (bom): " + e); return; }
-
-  var entH = safeEntries(h);
-  var splitH = (getKey(entH, "x-evil") != null);
-
-  var r;
-  try{ r = new Response("ok", { headers: h }); }catch(e2){
-    LOG("new Response lançou: " + e2);
-    // If it throws here but Headers accepted, that's an inconsistency too
-    ALERT_STRONG("T3 Inconsistência: Headers aceitou, mas Response(headers:Headers) lançou.");
-    return;
-  }
-
-  var entR = safeEntries(r.headers);
-  var splitR = (getKey(entR, "x-evil") != null);
-
-  LOG("Headers entries=" + entH.length + " split=" + splitH);
-  LOG("Response entries=" + entR.length + " split=" + splitR);
-
-  // Compare x-test get across layers
-  var gh=null, gr=null;
-  try{ gh = h.get("x-test"); }catch(e3){}
-  try{ gr = r.headers.get("x-test"); }catch(e4){}
-  LOG("get x-test (Headers): " + gh);
-  LOG("get x-test (Response): " + gr);
-
-  if(String(gh) !== String(gr)){
-    ALERT_STRONG("T3 mismatch: valor de x-test difere entre Headers e Response: ["+gh+"] vs ["+gr+"]");
-  }
-
-  if(splitH !== splitR){
-    ALERT_STRONG("T3 mismatch: split aparece em uma camada mas não na outra (Headers split="+splitH+", Response split="+splitR+")");
-  }
-
-  // Request layer if available
-  if(window.Request){
-    var req = null;
-    try{ req = new Request("data:text/plain,hi", { headers: h }); }catch(e5){
-      // If Request rejects but Headers accepted => inconsistency
-      ALERT_STRONG("T3 Inconsistência: Headers aceitou, mas Request(headers) lançou: " + e5);
-      return;
-    }
-    var entQ = safeEntries(req.headers);
-    var splitQ = (getKey(entQ, "x-evil") != null);
-    LOG("Request entries=" + entQ.length + " split=" + splitQ);
-
-    var gq=null;
-    try{ gq = req.headers.get("x-test"); }catch(e6){}
-    LOG("get x-test (Request): " + gq);
-
-    if(String(gq) !== String(gh) || String(gq) !== String(gr)){
-      ALERT_STRONG("T3 mismatch: valor x-test difere em Request vs outras camadas.");
-    }
-    if(splitQ !== splitH || splitQ !== splitR){
-      ALERT_STRONG("T3 mismatch: split diverge em Request.");
-    }
-  } else {
-    LOG("Request não disponível.");
-  }
-}
-
-/* =========================
-   T4: Response -> Blob -> DataURL propagation
-   - Create Response with content-type containing LF
-   - Convert to blob and then FileReader dataURL; check if CTL persists.
-   - STRONG if propagation chain preserves CTL across boundaries.
-   ========================= */
-function T4_blobPropagationFromResponse(){
-  LOG("T4 start...");
-  if(!window.Response || !window.FileReader || !window.Blob){
-    LOG("Response/FileReader/Blob não disponível.");
-    return;
-  }
-  var ct = "text/plain\nbad\n";
-  var r;
-  try{ r = new Response("hello", { headers: { "content-type": ct } }); }catch(e){
-    LOG("new Response lançou (bom): " + e);
-    return;
-  }
-  var got = null;
-  try{ got = r.headers.get("content-type"); }catch(e2){}
-  LOG("Response CT: " + got);
-  if(hasCTL(got)) ALERT_WEAK("T4 Response preservou CTL em Content-Type: " + got);
-
-  r.blob().then(function(b){
-    var bt = "";
-    try{ bt = String(b.type || ""); }catch(e3){}
-    LOG("Blob.type from response: " + bt);
-
-    // If Blob.type contains CTL, this is a strong cross-boundary propagation.
-    if(hasCTL(bt)) ALERT_STRONG("T4 PROPAGAÇÃO FORTE: Response(Content-Type) -> Blob.type preservou CTL: " + bt);
-
-    var fr = new FileReader();
-    fr.onload = function(){
-      var s = "";
-      try{ s = String(fr.result || ""); }catch(e4){}
-      LOG("DataURL prefix: " + s.slice(0, 120));
-      if(hasCTL(s)) ALERT_STRONG("T4 PROPAGAÇÃO FORTE: DataURL contém CTL vindo de Response->Blob.");
-    };
-    fr.onerror = function(){ LOG("FileReader error"); };
-    try{ fr.readAsDataURL(b); }catch(e5){ ALERT_WEAK("T4 readAsDataURL lançou: " + e5); }
-  }).catch(function(e){
-    LOG("blob() error: " + e);
-  });
-}
-
-/* =========================
-   T5: Fetch late validation vs store
-   - Create Headers with CRLF; if fetch() rejects later (TypeError) but storage accepted, that is inconsistent.
-   - Try fetch(data:) with Request carrying injected headers.
-   ========================= */
-function T5_fetchLateValidation(){
-  LOG("T5 start...");
-  if(!window.Headers || !window.fetch || !window.Request){
-    LOG("Headers/fetch/Request não disponível.");
-    return;
-  }
-  var h = new Headers();
-  var inj = "a\r\nx-evil: 1";
-  try{ h.set("x-test", inj); }catch(e){ LOG("Headers.set lançou (bom): " + e); return; }
-
-  var req;
-  try{
-    req = new Request("data:text/plain,ok", { method:"GET", headers: h });
-  }catch(e2){
-    ALERT_STRONG("T5 Request rejeitou headers CRLF após Headers aceitar (inconsistência): " + e2);
-    return;
-  }
-
-  fetch(req).then(function(r){
-    LOG("fetch resolved. status=" + r.status);
-    // If fetch succeeded, try to read headers back; not much, but note success
-    ALERT_WEAK("T5 fetch aceitou Request com header CRLF (validação tardia não ocorreu).");
-    return r.text();
-  }).then(function(t){
-    LOG("body: " + t);
-  }).catch(function(e){
-    // This is strong: validation occurs only at fetch time, not at Headers.set
-    ALERT_STRONG("T5 fetch REJEITOU tardiamente um Request com CRLF (TypeError/erro): " + e);
-  });
-}
-
-/* =========================
-   T6: Location poisoning (302)
-   - Create 302 Response with Location containing CRLF; check if preserved.
-   - STRONG if Response preserves CRLF in Location; even stronger if new Request(Location) accepts.
-   ========================= */
-function T6_locationPoison(){
-  LOG("T6 start...");
-  if(!window.Response){
-    LOG("Response não disponível.");
-    return;
-  }
-  var loc = "data:text/plain,ok\r\nx-evil: 1";
-  var r;
-  try{
-    r = new Response("", { status: 302, headers: { "Location": loc } });
+    var h = new Headers();
+    h.set("x-test", val);
+    var g = h.get("x-test");
+    return {ok:true, got:g, gotCodes:codes(g,60)};
   }catch(e){
-    LOG("new Response lançou (bom): " + e);
-    return;
-  }
-  var gl = null;
-  try{ gl = r.headers.get("location"); }catch(e2){}
-  LOG("Response Location: " + gl);
-
-  if(hasCTL(gl)){
-    ALERT_STRONG("T6 Location preservou CR/LF (ruim): " + gl);
-  }
-
-  // Try to feed back into URL/Request parsers (not exploitation; just validation check)
-  if(window.Request){
-    try{
-      var req = new Request("data:text/plain,hi", { headers: { "Referer": gl } });
-      // If it reaches here, it accepted CTL in another header too
-      ALERT_STRONG("T6 Request aceitou Referer contendo CR/LF (validação geral fraca).");
-    }catch(e3){
-      LOG("Request com Referer CTL lançou (bom): " + e3);
-    }
+    return {ok:false, err:String(e)};
   }
 }
+function run(){
+  L.textContent="";
+  log("UA: " + navigator.userAgent);
 
-/* =========================
-   Auto runner (sequencial)
-   ========================= */
-function runAll(){
-  clearLog();
-  LOG("AUTO start...");
-  try{ T1_splitEnumeration(); }catch(e){}
-  setTimeout(function(){
-    try{ T2_shadowContentType(); }catch(e){}
-    setTimeout(function(){
-      try{ T3_crossApiMismatch(); }catch(e){}
-      setTimeout(function(){
-        try{ T6_locationPoison(); }catch(e){}
-        setTimeout(function(){
-          try{ T5_fetchLateValidation(); }catch(e){}
-          setTimeout(function(){
-            try{ T4_blobPropagationFromResponse(); }catch(e){}
-            setTimeout(function(){
-              LOG("AUTO done. ALERTAS=" + ALERTS + " | FORTES=" + STRONG + " | FRACOS=" + WEAK);
-              LOG("Interpretação: FORTES (split/shadow/mismatch/propagação cross-boundary) são os melhores para evitar 'Informational'.");
-            }, 1400);
-          }, 600);
-        }, 400);
-      }, 300);
-    }, 200);
-  }, 200);
+  // A: LF/CRLF reais
+  var A_LF   = "a\nb";
+  var A_CRLF = "a\r\nb";
+  // B: texto literal "\n" e "\r\n"
+  var B_LF   = "a\\nb";
+  var B_CRLF = "a\\r\\nb";
+
+  log("--- Headers.set A_LF (real LF) ---");
+  var r1 = trySet(A_LF);
+  log("ok=" + r1.ok + (r1.ok ? (" got=" + JSON.stringify(r1.got) + " codes=" + r1.gotCodes) : (" err=" + r1.err)));
+
+  log("--- Headers.set B_LF (literal \\\\n) ---");
+  var r2 = trySet(B_LF);
+  log("ok=" + r2.ok + (r2.ok ? (" got=" + JSON.stringify(r2.got) + " codes=" + r2.gotCodes) : (" err=" + r2.err)));
+
+  log("--- Headers.set A_CRLF (real CRLF) ---");
+  var r3 = trySet(A_CRLF);
+  log("ok=" + r3.ok + (r3.ok ? (" got=" + JSON.stringify(r3.got) + " codes=" + r3.gotCodes) : (" err=" + r3.err)));
+
+  log("--- Headers.set B_CRLF (literal \\\\r\\\\n) ---");
+  var r4 = trySet(B_CRLF);
+  log("ok=" + r4.ok + (r4.ok ? (" got=" + JSON.stringify(r4.got) + " codes=" + r4.gotCodes) : (" err=" + r4.err)));
+
+  // Blob.type + FileReader DataURL (confirmar se entra LF real)
+  log("\n--- Blob.type + DataURL check ---");
+  var blobA = new Blob(["hello"], {type:"text/plain\nbad\n"});   // LF real
+  var blobB = new Blob(["hello"], {type:"text/plain\\nbad\\n"}); // literal \n
+
+  log("blobA.type=" + JSON.stringify(blobA.type) + " codes=" + codes(blobA.type,60));
+  log("blobB.type=" + JSON.stringify(blobB.type) + " codes=" + codes(blobB.type,60));
+
+  var fr = new FileReader();
+  fr.onload = function(){
+    var s = String(fr.result||"");
+    log("DataURL(A) prefix=" + JSON.stringify(s.slice(0,80)));
+    log("DataURL(A) codes=" + codes(s.slice(0,80),80));
+  };
+  fr.readAsDataURL(blobA);
 }
 </script>
-</body>
-</html>
