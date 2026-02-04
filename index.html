@@ -2,37 +2,40 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8" />
-<title>PS4 WebKit – TRIAGE V2 (10 testes) Media/CSS/DOM</title>
+<title>PS4 WebKit – TRIAGE V3 (10 testes) Media/CSS/DOM + Watchdog</title>
 <style>
   body { background:#000; color:#0f0; font-family:monospace; }
   button, input { margin:4px; font-size:14px; }
   #log { white-space:pre-wrap; font-size:12px; line-height:1.25; }
   .row { margin:8px 0; }
-  .box { width:240px; height:140px; background:#300; margin:8px 0; }
+  .box { width:260px; height:160px; background:#222; margin:8px 0; }
 </style>
 </head>
 <body>
-<h2>PS4 WebKit – Memory Corruption TRIAGE V2 (10 testes)</h2>
-
-<div class="row">
-  <button onclick="runOne(1)">Test 1</button>
-  <button onclick="runOne(2)">Test 2</button>
-  <button onclick="runOne(3)">Test 3</button>
-  <button onclick="runOne(4)">Test 4</button>
-  <button onclick="runOne(5)">Test 5</button>
-  <button onclick="runOne(6)">Test 6</button>
-  <button onclick="runOne(7)">Test 7</button>
-  <button onclick="runOne(8)">Test 8</button>
-  <button onclick="runOne(9)">Test 9</button>
-  <button onclick="runOne(10)">Test 10</button>
-</div>
+<h2>PS4 WebKit – Memory Corruption TRIAGE V3 (Media/CSS/DOM) + Watchdog</h2>
 
 <div class="row">
   <button onclick="runAll()">Run ALL (1..10)</button>
   <button onclick="clearLog()">Clear</button>
   <label style="margin-left:10px;">Loop N:
-    <input id="loopN" type="number" value="1" min="1" max="50" style="width:70px;">
+    <input id="loopN" type="number" value="20" min="1" max="200" style="width:80px;">
   </label>
+  <label style="margin-left:10px;">Intensity (1-6):
+    <input id="intensity" type="number" value="3" min="1" max="6" style="width:60px;">
+  </label>
+</div>
+
+<div class="row">
+  <button onclick="runOne(1)">T1</button>
+  <button onclick="runOne(2)">T2</button>
+  <button onclick="runOne(3)">T3</button>
+  <button onclick="runOne(4)">T4</button>
+  <button onclick="runOne(5)">T5</button>
+  <button onclick="runOne(6)">T6</button>
+  <button onclick="runOne(7)">T7</button>
+  <button onclick="runOne(8)">T8</button>
+  <button onclick="runOne(9)">T9</button>
+  <button onclick="runOne(10)">T10</button>
 </div>
 
 <pre id="log"></pre>
@@ -42,35 +45,11 @@ const logEl = document.getElementById("log");
 function ts(){ return new Date().toISOString(); }
 function log(m){ logEl.textContent += `[${ts()}] ${m}\n`; }
 function clearLog(){ logEl.textContent=""; }
-
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-async function runOne(n){
-  log(`\n=== TEST ${n} START ===`);
-  try{
-    await tests[n]();
-  }catch(e){
-    log(`[EXC] ${e && e.message ? e.message : e}`);
-  }
-  log(`=== TEST ${n} END ===`);
-}
+function I(){ return Math.max(1, Math.min(6, parseInt(document.getElementById("intensity").value||"3",10))); }
+function LOOPN(){ return Math.max(1, Math.min(200, parseInt(document.getElementById("loopN").value||"20",10))); }
 
-async function runAll(){
-  const N = Math.max(1, Math.min(50, parseInt(document.getElementById("loopN").value||"1",10)));
-  log(`\n=== RUN ALL START loopN=${N} ===`);
-  for(let k=1;k<=N;k++){
-    log(`\n--- LOOP ${k}/${N} ---`);
-    for(let i=1;i<=10;i++){
-      await runOne(i);
-      await sleep(40);
-    }
-  }
-  log(`\n=== RUN ALL END ===`);
-}
-
-/* =========================================================
-   Helper: cria/remonta container para reduzir interferência
-   ========================================================= */
 function freshRoot(){
   let old=document.getElementById("root");
   if(old) old.remove();
@@ -80,161 +59,265 @@ function freshRoot(){
   return r;
 }
 
-/* =========================================================
-   10 TESTES
-   ========================================================= */
+/* =========================
+   WATCHDOG (lag detector)
+   ========================= */
+let wd = { on:false, last:0, maxLag:0, hits:0 };
+function watchdogStart(){
+  if(wd.on) return;
+  wd.on=true; wd.last=performance.now(); wd.maxLag=0; wd.hits=0;
+  const tick = ()=>{
+    if(!wd.on) return;
+    const now=performance.now();
+    const dt=now-wd.last; wd.last=now;
+    // target 50ms tick; se passar muito, houve lag/freeze
+    const lag = Math.max(0, dt-50);
+    if(lag>0){
+      wd.maxLag = Math.max(wd.maxLag, lag);
+      wd.hits++;
+      if(lag>200) log(`[WD_LAG] lag=${lag.toFixed(1)}ms (dt=${dt.toFixed(1)}ms)`);
+    }
+    setTimeout(tick, 50);
+  };
+  setTimeout(tick, 50);
+}
+function watchdogStop(){
+  wd.on=false;
+  log(`[WD_SUM] hits=${wd.hits} maxLag=${wd.maxLag.toFixed(1)}ms`);
+}
+
+/* =========================
+   GC pressure leve
+   ========================= */
+function gcPressure(level){
+  // level 1..6 (leve->moderado)
+  const n = 200 * level;
+  const arr=[];
+  for(let i=0;i<n;i++){
+    arr.push(new Uint8Array(1024)); // 1KB
+  }
+  // strings para pressionar allocator de forma diferente
+  let s="";
+  for(let i=0;i<50*level;i++) s += "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+  return {arr, s};
+}
+
+/* =========================
+   Runner
+   ========================= */
+async function runOne(n){
+  watchdogStart();
+  log(`\n=== TEST ${n} START (I=${I()}) ===`);
+  try{ await tests[n](); }
+  catch(e){ log(`[EXC] ${e && e.message ? e.message : e}`); }
+  log(`=== TEST ${n} END ===`);
+  await sleep(20);
+}
+
+async function runAll(){
+  watchdogStart();
+  const N=LOOPN();
+  log(`\n=== RUN ALL START loopN=${N} I=${I()} ===`);
+  for(let k=1;k<=N;k++){
+    log(`\n--- LOOP ${k}/${N} ---`);
+    for(let t=1;t<=10;t++){
+      await runOne(t);
+    }
+  }
+  log(`\n=== RUN ALL END ===`);
+  watchdogStop();
+}
+
+/* =========================
+   10 testes novos (V3)
+   ========================= */
 const tests = {
-  1: async function(){ // Media: rapid src swap + remove + load()
+
+  // T1: Media reentrancy via events + remove/reattach + load/play probes
+  1: async function(){
     const root=freshRoot();
     const v=document.createElement("video");
     root.appendChild(v);
-    v.onloadedmetadata=()=>log("[video] loadedmetadata");
-    v.onerror=()=>log("[video] error");
-    log("[phase] set src then load()");
-    v.src = "data:video/mp4;base64,"; // inválido de propósito
-    try { v.load(); log("[phase] load() OK"); } catch(e){ log("[phase] load() EXC"); }
-    await sleep(10);
-    log("[phase] swap src rapidly");
-    v.src = "";
-    try { v.load(); log("[phase] load()2 OK"); } catch(e){ log("[phase] load()2 EXC"); }
-    await sleep(10);
-    log("[phase] remove during pending events");
-    v.remove();
-    // acesso pós-remove (não é prova sozinho, mas bom para pegar UAF real se houver)
-    try { log(`[post] readyState=${v.readyState} networkState=${v.networkState}`); } catch(e){ log("[post] access EXC"); }
-    await sleep(30);
+
+    let ev=0;
+    const h = (name)=>()=>{ ev++; if(ev<10) log(`[video] ${name}`); };
+    v.onloadedmetadata=h("loadedmetadata");
+    v.oncanplay=h("canplay");
+    v.onerror=h("error");
+
+    const rounds = 8*I();
+    for(let r=0;r<rounds;r++){
+      v.src = (r&1) ? "data:video/mp4;base64," : "";
+      try{ v.load(); }catch(e){}
+      if(r===Math.floor(rounds/2)){
+        // remove/reattach no meio
+        v.remove();
+        root.appendChild(v);
+        log("[phase] detach+reattach video");
+      }
+      // chamar play() (pode falhar; aqui só registramos)
+      try{
+        const p=v.play();
+        if(p && p.catch) p.catch(()=>{});
+      }catch(e){}
+      if(r%4===0) await sleep(1);
+    }
+    log(`[post] readyState=${v.readyState} networkState=${v.networkState} ev=${ev}`);
+    gcPressure(I()); // leve
   },
 
-  2: async function(){ // Media: create/remove many <track> nodes quickly
+  // T2: TextTrack/track list churn + remove during event microtask
+  2: async function(){
     const root=freshRoot();
     const v=document.createElement("video");
     root.appendChild(v);
-    log("[phase] add/remove tracks in burst");
-    for(let i=0;i<60;i++){
+
+    const rounds = 60*I();
+    for(let i=0;i<rounds;i++){
       const tr=document.createElement("track");
       tr.kind="subtitles";
-      tr.label="x"+i;
+      tr.label="t"+i;
       v.appendChild(tr);
-      if((i&1)===0) tr.remove();
-      if(i%10===0) await sleep(1);
+      if((i%3)===0) tr.remove();
+      if(i%25===0) await sleep(1);
     }
-    log("[phase] remove video");
-    v.remove();
-    await sleep(20);
+    // microtask + remove
+    Promise.resolve().then(()=>{ try{ v.remove(); }catch(e){} });
+    await sleep(5);
+    try{ log(`[post] tracks=${v.textTracks ? v.textTracks.length : "na"}`); }catch(e){ log("[post] textTracks EXC"); }
+    gcPressure(I());
   },
 
-  3: async function(){ // CSS: filter+transform + detach/reattach around rAF
+  // T3: CSS filter+transform + forced layout reads in rAF chain + detach mid-chain
+  3: async function(){
     const root=freshRoot();
     const d=document.createElement("div");
     d.className="box";
-    d.textContent="CSS box";
+    d.textContent="CSS chain";
     root.appendChild(d);
 
     await new Promise(resolve=>{
       requestAnimationFrame(()=>{
-        log("[phase] apply heavy-ish styles");
-        d.style.filter="blur(6px)";
-        d.style.transform="translateZ(0) scale(1.01) rotate(0.01deg)";
-        d.style.willChange="transform, filter";
+        d.style.willChange="transform,filter";
+        d.style.filter="blur(8px)";
+        d.style.transform="translateZ(0) scale(1.02) rotate(0.02deg)";
+        // força layout várias vezes
+        for(let k=0;k<20*I();k++){
+          try{ d.getBoundingClientRect(); }catch(e){}
+        }
         requestAnimationFrame(()=>{
-          log("[phase] detach then reattach before reading layout");
-          d.remove();
-          root.appendChild(d);
+          if(I()>=3){
+            d.remove();
+            root.appendChild(d);
+            log("[phase] detach+reattach during rAF");
+          }
           try{
             const r=d.getBoundingClientRect();
             log(`[post] rect w=${r.width} h=${r.height}`);
-          }catch(e){
-            log("[post] getBoundingClientRect EXC");
-          }
+          }catch(e){ log("[post] rect EXC"); }
           resolve();
         });
       });
     });
-    await sleep(20);
+    gcPressure(I());
   },
 
-  4: async function(){ // CSS/Layout: forced reflow loop + remove mid-loop
+  // T4: Style recalculation storm + remove/replace node while reading layout
+  4: async function(){
     const root=freshRoot();
-    const d=document.createElement("div");
+    let d=document.createElement("div");
     d.className="box";
     root.appendChild(d);
 
-    log("[phase] reflow storm (bounded)");
-    for(let i=0;i<120;i++){
-      d.style.width = (200 + (i%30)) + "px";
-      // força layout:
-      try { d.offsetHeight; } catch(e){ log("[offsetHeight EXC]"); }
-      if(i===60){
-        log("[phase] remove at midpoint");
-        d.remove();
+    const it = 200*I();
+    for(let i=0;i<it;i++){
+      d.style.padding = (i%16)+"px";
+      d.style.borderRadius = (i%20)+"px";
+      // leitura de layout
+      try{ d.offsetWidth; d.offsetHeight; }catch(e){}
+      if(i===Math.floor(it/2)){
+        const nd=document.createElement("div");
+        nd.className="box";
+        root.replaceChild(nd, d);
+        d=nd;
+        log("[phase] replaceChild midpoint");
       }
-      if(i%25===0) await sleep(1);
+      if(i%60===0) await sleep(1);
     }
-    // pós-remove
-    try{ log("[post] offsetHeight="+d.offsetHeight); }catch(e){ log("[post] offsetHeight EXC"); }
-    await sleep(20);
+    try{ log(`[post] ow=${d.offsetWidth} oh=${d.offsetHeight}`); }catch(e){ log("[post] offset EXC"); }
+    gcPressure(I());
   },
 
-  5: async function(){ // DOM: MutationObserver reentrancy + remove subtree
+  // T5: MutationObserver reentrancy + subtree move between two parents
+  5: async function(){
     const root=freshRoot();
-    const host=document.createElement("div");
-    root.appendChild(host);
+    const a=document.createElement("div");
+    const b=document.createElement("div");
+    root.appendChild(a); root.appendChild(b);
 
     let hits=0;
-    const mo=new MutationObserver((muts)=>{
-      hits += muts.length;
-      // reentrância: muta durante callback
-      if(hits < 40){
-        const s=document.createElement("span");
-        s.textContent="x";
-        host.appendChild(s);
-        if(hits % 7 === 0 && host.firstChild) host.firstChild.remove();
+    const mo=new MutationObserver(()=>{
+      hits++;
+      if(hits<60){
+        const n=document.createElement("span");
+        n.textContent="x";
+        a.appendChild(n);
+        // move subtree back/forth durante observer
+        if(hits%5===0){
+          try{ b.appendChild(a); }catch(e){}
+          try{ root.appendChild(a); }catch(e){}
+        }
       }
     });
-    mo.observe(host,{childList:true,subtree:true});
-
-    log("[phase] kick mutations then remove host while observer active");
-    for(let i=0;i<10;i++){
-      const p=document.createElement("p");
-      p.textContent="p"+i;
-      host.appendChild(p);
+    mo.observe(a,{childList:true,subtree:true});
+    for(let i=0;i<10*I();i++){
+      a.appendChild(document.createElement("p"));
     }
-    await sleep(5);
-    host.remove(); // remove durante observer ainda vivo
+    await sleep(10);
+    a.remove();
     await sleep(10);
     mo.disconnect();
-    log("[post] observer hits="+hits);
+    log(`[post] hits=${hits}`);
+    gcPressure(I());
   },
 
-  6: async function(){ // DOM: Range/Selection + node removal
+  // T6: Range + remove/replace text nodes + commonAncestorContainer probing
+  6: async function(){
     const root=freshRoot();
     const p=document.createElement("p");
-    p.textContent="ABCDEFGHIJ0123456789KLMNOPQRST";
+    p.textContent="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     root.appendChild(p);
 
-    const range=document.createRange();
-    range.setStart(p.firstChild, 2);
-    range.setEnd(p.firstChild, 10);
-
-    log("[phase] remove text node then use range");
     const tn=p.firstChild;
+    const range=document.createRange();
+    range.setStart(tn, 3);
+    range.setEnd(tn, 20);
+
+    // remove text, inserir novo, tentar usar range
     tn.remove();
+    p.appendChild(document.createTextNode("repl_"+("x".repeat(30*I()))));
 
     try{
-      const frag=range.cloneContents();
-      log("[post] cloneContents childNodes="+frag.childNodes.length);
-    }catch(e){
-      log("[post] range.cloneContents EXC");
-    }
-    await sleep(20);
+      const c=range.commonAncestorContainer;
+      log(`[post] commonAncestor nodeType=${c ? c.nodeType : "null"}`);
+    }catch(e){ log("[post] commonAncestor EXC"); }
+
+    try{
+      const frag=range.extractContents();
+      log(`[post] extractContents childNodes=${frag.childNodes.length}`);
+    }catch(e){ log("[post] extractContents EXC"); }
+
+    gcPressure(I());
   },
 
-  7: async function(){ // SVG: animate + remove during begin
+  // T7: SVG animate + remove root svg during begin + query bbox on removed elements
+  7: async function(){
     const root=freshRoot();
     const svgNS="http://www.w3.org/2000/svg";
     const svg=document.createElementNS(svgNS,"svg");
-    svg.setAttribute("width","300");
+    svg.setAttribute("width","320");
     svg.setAttribute("height","120");
+    const g=document.createElementNS(svgNS,"g");
     const rect=document.createElementNS(svgNS,"rect");
     rect.setAttribute("x","0"); rect.setAttribute("y","10");
     rect.setAttribute("width","50"); rect.setAttribute("height","50");
@@ -243,77 +326,90 @@ const tests = {
     anim.setAttribute("attributeName","x");
     anim.setAttribute("from","0");
     anim.setAttribute("to","240");
-    anim.setAttribute("dur","0.05s");
+    anim.setAttribute("dur","0.03s");
     anim.setAttribute("repeatCount","1");
     rect.appendChild(anim);
-    svg.appendChild(rect);
+    g.appendChild(rect);
+    svg.appendChild(g);
     root.appendChild(svg);
 
-    log("[phase] start SVG animate then remove rect immediately");
     try{ anim.beginElement(); log("[phase] beginElement OK"); }catch(e){ log("[phase] beginElement EXC"); }
-    rect.remove();
-    // tenta acessar bbox (pode tocar layout interno)
+
+    if(I()>=2){
+      svg.remove();
+      log("[phase] svg removed immediately");
+    }
+
     try{
       const bb=rect.getBBox();
-      log(`[post] getBBox w=${bb.width} h=${bb.height}`);
-    }catch(e){
-      log("[post] getBBox EXC");
-    }
-    await sleep(30);
+      log(`[post] rect bbox w=${bb.width} h=${bb.height}`);
+    }catch(e){ log("[post] rect getBBox EXC"); }
+
+    gcPressure(I());
+    await sleep(20);
   },
 
-  8: async function(){ // Iframe: set srcdoc, mutate, remove during load-ish
+  // T8: iframe srcdoc churn + remove while accessing contentDocument
+  8: async function(){
     const root=freshRoot();
     const f=document.createElement("iframe");
-    f.style.width="320px";
-    f.style.height="160px";
+    f.style.width="320px"; f.style.height="160px";
     root.appendChild(f);
 
-    log("[phase] set srcdoc");
-    f.srcdoc = "<!doctype html><meta charset=utf-8><body><div id=a>hi</div><script>setTimeout(()=>{document.getElementById('a').textContent='ok';},1)<\/script></body>";
-    await sleep(10);
-
-    log("[phase] remove iframe then try access contentWindow");
-    f.remove();
-    try{
-      const w=f.contentWindow;
-      log("[post] contentWindow is "+(w? "present":"null"));
-    }catch(e){
-      log("[post] contentWindow EXC");
+    const rounds=6*I();
+    for(let r=0;r<rounds;r++){
+      f.srcdoc = "<!doctype html><meta charset=utf-8><body><div id=a>hi</div><script>Promise.resolve().then(()=>{document.getElementById('a').textContent='ok';});<\/script></body>";
+      await sleep(3);
+      try{
+        const d=f.contentDocument;
+        log(`[phase] contentDocument ${d ? "OK" : "null"} r=${r}`);
+      }catch(e){ log("[phase] contentDocument EXC"); }
+      if(r===Math.floor(rounds/2)){
+        f.remove();
+        root.appendChild(f);
+        log("[phase] detach+reattach iframe");
+      }
     }
-    await sleep(30);
+
+    f.remove();
+    try{ log("[post] contentWindow "+(f.contentWindow ? "present":"null")); }catch(e){ log("[post] contentWindow EXC"); }
+    gcPressure(I());
   },
 
-  9: async function(){ // Canvas: resize + context use after detach
+  // T9: canvas resize storm + context ops after detach + ImageData churn
+  9: async function(){
     const root=freshRoot();
     const c=document.createElement("canvas");
     c.width=320; c.height=180;
     root.appendChild(c);
-
     const ctx=c.getContext("2d");
-    log("[phase] draw + resize loop then remove canvas mid-loop");
-    for(let i=0;i<80;i++){
-      try{
-        ctx.fillRect(i%50, i%40, 20, 10);
-      }catch(e){
-        log("[ctx fillRect EXC]");
+
+    const it=120*I();
+    for(let i=0;i<it;i++){
+      try{ ctx.fillRect(i%80, i%60, 20, 10); }catch(e){}
+      if(i%12===0){
+        c.width = 320 + (i%5);
+        c.height = 180 + (i%5);
       }
-      if(i===40){
+      if(i===Math.floor(it/2)){
         c.remove();
-        log("[phase] canvas removed");
+        log("[phase] canvas removed midpoint");
       }
-      if(i%10===0){
-        c.width = 320 + (i%3);
-        c.height = 180 + (i%3);
+      if(i%40===0){
+        try{
+          const id=ctx.getImageData(0,0,2,2);
+          // toca a buffer
+          id.data[0]^=0xFF;
+        }catch(e){}
       }
-      if(i%20===0) await sleep(1);
+      if(i%50===0) await sleep(1);
     }
-    // pós-remove ainda tentando usar ctx
     try{ ctx.getImageData(0,0,1,1); log("[post] getImageData OK"); }catch(e){ log("[post] getImageData EXC"); }
-    await sleep(20);
+    gcPressure(I());
   },
 
-  10: async function(){ // DOM: event dispatch on detached subtree + reattach during handler
+  // T10: event reentrancy: dispatch + remove target + redispatch + layout read
+  10: async function(){
     const root=freshRoot();
     const wrap=document.createElement("div");
     const btn=document.createElement("button");
@@ -321,20 +417,22 @@ const tests = {
     wrap.appendChild(btn);
     root.appendChild(wrap);
 
+    let fired=0;
     btn.addEventListener("click", ()=>{
-      log("[handler] click: detach+reattach wrap");
-      wrap.remove();
-      root.appendChild(wrap);
-      // força layout no meio do handler
-      try{ wrap.offsetHeight; log("[handler] offsetHeight OK"); }catch(e){ log("[handler] offsetHeight EXC"); }
-    }, {capture:true});
+      fired++;
+      if(fired===1){
+        // remove durante handler
+        wrap.remove();
+        // tenta forçar layout de elemento removido
+        try{ wrap.offsetHeight; }catch(e){}
+        // reattach e redispatch síncrono
+        root.appendChild(wrap);
+        try{ btn.click(); }catch(e){}
+      }
+    }, true);
 
-    log("[phase] dispatch click then remove root immediately");
-    btn.click();
-    root.remove();
-    // pós-remove
-    try{ btn.click(); log("[post] click again OK"); }catch(e){ log("[post] click EXC"); }
-    await sleep(20);
+    try{ btn.click(); log(`[post] fired=${fired}`); }catch(e){ log("[post] click EXC"); }
+    gcPressure(I());
   },
 };
 </script>
