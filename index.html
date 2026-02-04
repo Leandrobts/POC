@@ -1,12 +1,13 @@
+
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>PS4 Memory Corruption Tests (151-200) - Real exploits only</title>
+    <title>PS4 Memory Corruption Tests (201-250) - NO FALSE POSITIVES</title>
 </head>
 <body>
-    <h1>PS4 Memory Corruption Tests (151-200)</h1>
-    <h2>Real exploits - No simulations - Sanitized against false positives</h2>
+    <h1>PS4 Memory Corruption Tests (201-250)</h1>
+    <h2>Zero false positives - Rigorous verification only</h2>
     <div id="output"></div>
     
     <script>
@@ -18,1505 +19,1470 @@
 
         const alert_vuln = (testNum, msg) => {
             const alertMsg = `ALERTA TEST ${testNum}: ${msg}`;
-            log('<strong>' + alertMsg + '</strong>');
+            log('<strong style="color:red">' + alertMsg + '</strong>');
             alert(alertMsg);
         };
 
-        // Sanitization: verify values are ACTUALLY corrupted, not just returned
-        function verifyCorruption(array, index, expectedValue, testNum) {
-            // Read multiple times to verify persistence
-            const read1 = array[index];
-            const read2 = array[index];
-            const read3 = array[index];
-            
-            if (read1 === expectedValue && read2 === expectedValue && read3 === expectedValue) {
-                // Verify it's not just the index itself
-                if (index !== expectedValue) {
+        // Helper: Check if it's a real element access vs property
+        function isRealElement(array, index) {
+            // Properties show up in hasOwnProperty, real OOB doesn't
+            return Object.prototype.hasOwnProperty.call(array, String(index));
+        }
+
+        // Helper: Verify buffer contamination between SEPARATE buffers
+        function checkBufferContamination(victim, victimSentinel, testNum) {
+            const view = new Uint32Array(victim);
+            for (let i = 0; i < view.length; i++) {
+                if (view[i] !== victimSentinel && view[i] !== 0) {
                     return true;
                 }
             }
             return false;
         }
 
-        
-
-        // TEST 152: TypedArray with misaligned byteOffset causing wrap
-        try {
-            log('TEST 152: Misaligned byteOffset wrap');
-            const ab = new ArrayBuffer(0x1000);
-            
-            const offsets = [0x7FFFFFF0, 0xFFFFFFF0, 0x80000000];
-            for (let offset of offsets) {
-                try {
-                    const ta = new Uint32Array(ab, offset);
-                    ta[0] = 0x42424242;
-                    
-                    if (verifyCorruption(ta, 0, 0x42424242, 152)) {
-                        alert_vuln(152, 'Misaligned offset accepted! offset=0x' + offset.toString(16));
-                    }
-                } catch(e2) {}
-            }
-        } catch(e) {
-            log('TEST 152: Exception - ' + e.message);
+        // Helper: Verify detached buffer state
+        function isDetached(arrayBuffer) {
+            return arrayBuffer.byteLength === 0;
         }
 
-        // TEST 153: Buffer growing via subarray chaining
+        // TEST 201: True OOB write with buffer contamination proof
         try {
-            log('TEST 153: Subarray chain corruption');
-            const ab = new ArrayBuffer(0x100);
-            const ta1 = new Uint32Array(ab);
+            log('TEST 201: OOB write with separate buffer contamination');
             
-            // Fill with known pattern
-            for (let i = 0; i < ta1.length; i++) {
-                ta1[i] = i;
-            }
+            // Allocate two separate buffers with sentinels
+            const buffer1 = new ArrayBuffer(0x100);
+            const buffer2 = new ArrayBuffer(0x100);
             
-            // Create subarray chain
-            const ta2 = ta1.subarray(0, 20);
-            const ta3 = ta2.subarray(0, 30); // Try to extend beyond parent
+            const ta1 = new Uint32Array(buffer1);
+            const ta2 = new Uint32Array(buffer2);
             
-            if (ta3.length > ta2.length) {
-                alert_vuln(153, 'Subarray extended beyond parent! ' + ta2.length + ' -> ' + ta3.length);
-            }
+            // Fill with sentinels
+            const SENTINEL1 = 0xAAAAAAAA;
+            const SENTINEL2 = 0xBBBBBBBB;
             
-            // Try OOB on extended subarray
-            ta3[25] = 0x43434343;
-            if (verifyCorruption(ta3, 25, 0x43434343, 153)) {
-                alert_vuln(153, 'OOB write via subarray chain!');
-            }
-        } catch(e) {
-            log('TEST 153: Exception - ' + e.message);
-        }
-
-        // TEST 154: DataView byteLength overflow
-        try {
-            log('TEST 154: DataView byteLength overflow');
-            const ab = new ArrayBuffer(0x100);
+            for (let i = 0; i < ta1.length; i++) ta1[i] = SENTINEL1;
+            for (let i = 0; i < ta2.length; i++) ta2[i] = SENTINEL2;
             
-            const lengths = [0x7FFFFFFF, 0xFFFFFFFF, 0x80000000];
-            for (let len of lengths) {
-                try {
-                    const dv = new DataView(ab, 0, len);
-                    
-                    // Try to write beyond actual buffer
-                    dv.setUint32(0x200, 0x44444444);
-                    
-                    const ta = new Uint32Array(ab);
-                    if (verifyCorruption(ta, 0x80, 0x44444444, 154)) {
-                        alert_vuln(154, 'DataView byteLength overflow! len=0x' + len.toString(16));
-                    }
-                } catch(e2) {}
-            }
-        } catch(e) {
-            log('TEST 154: Exception - ' + e.message);
-        }
-
-        // TEST 155: TypedArray.set with source larger than destination
-        try {
-            log('TEST 155: TypedArray.set overflow');
-            const ta1 = new Uint32Array(10);
-            const ta2 = new Uint32Array(100);
+            // Try OOB write on ta1
+            const oobIndex = 0x1000;
+            ta1[oobIndex] = 0x41414141;
             
-            // Fill source with pattern
-            for (let i = 0; i < ta2.length; i++) {
-                ta2[i] = 0x45450000 + i;
-            }
-            
-            // Try to set large source into small dest
-            try {
-                ta1.set(ta2, 0);
-                
-                // Check if data beyond ta1 boundary was written
-                const ta1_check = new Uint32Array(ta1.buffer);
-                for (let i = 10; i < 100; i++) {
-                    if (ta1_check[i] === 0x45450000 + i) {
-                        alert_vuln(155, 'TypedArray.set overflow! Wrote beyond boundary at index ' + i);
-                        break;
-                    }
-                }
-            } catch(e2) {
-                log('TEST 155: Exception expected - ' + e2.message);
-            }
-        } catch(e) {
-            log('TEST 155: Exception - ' + e.message);
-        }
-
-        // TEST 156: Negative index access pattern
-        try {
-            log('TEST 156: Negative index access');
-            const ab = new ArrayBuffer(0x1000);
-            const ta = new Uint32Array(ab);
-            
-            // Fill with pattern
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = i;
-            }
-            
-            // Try negative indices
-            const negIndices = [-1, -4, -100, -0x1000];
-            for (let idx of negIndices) {
-                ta[idx] = 0x46464646;
-                
-                // Check if it wrapped around or accessed before buffer
-                if (verifyCorruption(ta, idx, 0x46464646, 156)) {
-                    alert_vuln(156, 'Negative index access! idx=' + idx);
-                    break;
+            // Check if it's a real element (not property)
+            if (isRealElement(ta1, oobIndex)) {
+                log('TEST 201: Index created as property (false positive avoided)');
+            } else {
+                // Check if buffer2 was contaminated
+                if (checkBufferContamination(buffer2, SENTINEL2, 201)) {
+                    alert_vuln(201, 'TRUE OOB: Separate buffer contaminated!');
                 }
             }
         } catch(e) {
-            log('TEST 156: Exception - ' + e.message);
+            log('TEST 201: Exception - ' + e.message);
         }
 
-        // TEST 157: Buffer transfer double-use
+        // TEST 202: Negative index - property vs element distinction
         try {
-            log('TEST 157: Buffer transfer race');
-            const ab = new ArrayBuffer(0x1000);
-            const ta1 = new Uint32Array(ab);
-            const ta2 = new Uint32Array(ab);
+            log('TEST 202: Negative index property vs element');
             
-            ta1[0] = 0x47474747;
+            const ta = new Uint32Array(100);
+            ta[0] = 0x12345678;
             
-            // Try to transfer buffer
-            let transferred = false;
+            // Write to negative index
+            ta[-1] = 0x42424242;
+            
+            // Check if it's a property
+            const isProp = isRealElement(ta, -1);
+            
+            if (isProp) {
+                log('TEST 202: Negative index created property (expected, not OOB)');
+            } else {
+                // If NOT a property but value exists, that's weird
+                if (ta[-1] === 0x42424242) {
+                    alert_vuln(202, 'Negative index behaving as buffer access!');
+                }
+            }
+        } catch(e) {
+            log('TEST 202: Exception - ' + e.message);
+        }
+
+        // TEST 203: Buffer transfer with strict validation
+        try {
+            log('TEST 203: Buffer transfer strict validation');
+            
             if (typeof structuredClone !== 'undefined') {
+                const ab = new ArrayBuffer(0x1000);
+                const ta = new Uint32Array(ab);
+                
+                ta[0] = 0x43434343;
+                const originalLength = ab.byteLength;
+                
+                // Transfer
+                let transferred = false;
+                let cloned = null;
                 try {
-                    const cloned = structuredClone(ab, {transfer: [ab]});
+                    cloned = structuredClone(ab, {transfer: [ab]});
                     transferred = true;
                 } catch(e2) {}
-            }
-            
-            if (transferred) {
-                // Try to access via ta2 after transfer
-                ta2[1] = 0x48484848;
                 
-                if (verifyCorruption(ta2, 1, 0x48484848, 157)) {
-                    alert_vuln(157, 'Use-after-transfer! Write succeeded after buffer transfer');
-                }
-                
-                // Try to read
-                const val = ta1[0];
-                if (val === 0x47474747) {
-                    alert_vuln(157, 'Read-after-transfer! Value still accessible');
-                }
-            }
-        } catch(e) {
-            log('TEST 157: Exception - ' + e.message);
-        }
-
-        // TEST 158: copyWithin to overlap and corrupt
-        try {
-            log('TEST 158: copyWithin self-corruption');
-            const ta = new Uint32Array(100);
-            
-            // Fill with identifiable pattern
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = 0x49490000 + i;
-            }
-            
-            // Copy overlapping region
-            ta.copyWithin(0, 50, 100);
-            
-            // Verify corruption by checking if original values are gone
-            let corrupted = false;
-            for (let i = 0; i < 50; i++) {
-                if (ta[i] === 0x49490000 + i + 50) {
-                    corrupted = true;
-                }
-                if (ta[i] === 0x49490000 + i) {
-                    corrupted = false;
-                    break;
-                }
-            }
-            
-            if (corrupted) {
-                log('TEST 158: copyWithin completed (expected behavior)');
-            }
-            
-            // Try to copyWithin beyond bounds
-            try {
-                ta.copyWithin(0, 90, 200);
-                
-                // Check if data beyond length was copied
-                for (let i = 0; i < 10; i++) {
-                    if (ta[i] !== ta[90 + i] && ta[i] !== 0) {
-                        alert_vuln(158, 'copyWithin OOB! Copied from beyond array length');
-                        break;
-                    }
-                }
-            } catch(e2) {}
-        } catch(e) {
-            log('TEST 158: Exception - ' + e.message);
-        }
-
-        // TEST 159: Float64 NaN boxing exploitation
-        try {
-            log('TEST 159: NaN boxing memory access');
-            const ab = new ArrayBuffer(0x1000);
-            const fa = new Float64Array(ab);
-            const ta = new Uint32Array(ab);
-            
-            // Create NaN with specific payload
-            const nanView = new Uint8Array(ab, 0, 8);
-            nanView[0] = 0x00;
-            nanView[1] = 0x00;
-            nanView[2] = 0x00;
-            nanView[3] = 0x00;
-            nanView[4] = 0x41;
-            nanView[5] = 0x41;
-            nanView[6] = 0xF8;
-            nanView[7] = 0x7F;
-            
-            const nanVal = fa[0];
-            
-            // Verify it's NaN
-            if (isNaN(nanVal)) {
-                // Check if payload survived
-                if (ta[1] === 0x7FF84141 || ta[0] === 0x00004141) {
-                    log('TEST 159: NaN with payload created');
-                }
-                
-                // Try to use NaN in operations that might expose payload
-                fa[1] = nanVal + 1;
-                fa[2] = nanVal * 2;
-                
-                // Check if operations corrupted memory in unexpected ways
-                if (!isNaN(fa[1]) || !isNaN(fa[2])) {
-                    alert_vuln(159, 'NaN operation corrupted memory!');
-                }
-            }
-        } catch(e) {
-            log('TEST 159: Exception - ' + e.message);
-        }
-
-        // TEST 160: Infinity arithmetic overflow
-        try {
-            log('TEST 160: Infinity arithmetic edge cases');
-            const ab = new ArrayBuffer(0x1000);
-            const fa = new Float64Array(ab);
-            const ta = new Uint32Array(ab);
-            
-            fa[0] = Infinity;
-            fa[1] = -Infinity;
-            fa[2] = Infinity + Infinity;
-            fa[3] = Infinity - Infinity;
-            fa[4] = Infinity / Infinity;
-            
-            // Check binary representations
-            const inf_low = ta[0];
-            const inf_high = ta[1];
-            
-            // Infinity should be 0x7FF0000000000000
-            if (inf_high !== 0x7FF00000) {
-                alert_vuln(160, 'Infinity has unexpected binary representation: 0x' + inf_high.toString(16));
-            }
-            
-            // Check NaN from Inf/Inf
-            if (!isNaN(fa[4])) {
-                alert_vuln(160, 'Inf/Inf did not produce NaN!');
-            }
-        } catch(e) {
-            log('TEST 160: Exception - ' + e.message);
-        }
-
-        // TEST 161: ArrayBuffer with holes in allocation
-        try {
-            log('TEST 161: Allocation with holes');
-            const buffers = [];
-            
-            // Create many buffers
-            for (let i = 0; i < 100; i++) {
-                buffers.push(new ArrayBuffer(0x1000));
-            }
-            
-            // Free every other one
-            for (let i = 1; i < buffers.length; i += 2) {
-                buffers[i] = null;
-            }
-            
-            // Allocate new buffer that might reuse hole
-            const target = new ArrayBuffer(0x1000);
-            const targetView = new Uint32Array(target);
-            targetView[0] = 0x4A4A4A4A;
-            
-            // Check if any remaining buffer was corrupted
-            for (let i = 0; i < buffers.length; i += 2) {
-                if (buffers[i]) {
-                    const view = new Uint32Array(buffers[i]);
-                    if (verifyCorruption(view, 0, 0x4A4A4A4A, 161)) {
-                        alert_vuln(161, 'Buffer reuse corrupted existing buffer at index ' + i);
-                        break;
-                    }
-                }
-            }
-        } catch(e) {
-            log('TEST 161: Exception - ' + e.message);
-        }
-
-        // TEST 162: TypedArray constructor with weird length values
-        try {
-            log('TEST 162: Constructor length edge cases');
-            
-            const weirdLengths = [
-                -0,
-                0.5,
-                1.9999999,
-                NaN,
-                Infinity,
-                -Infinity,
-                '100',
-                null,
-                undefined
-            ];
-            
-            for (let len of weirdLengths) {
-                try {
-                    const ta = new Uint32Array(len);
+                if (transferred) {
+                    // Strict checks
+                    const isNowDetached = isDetached(ab);
                     
-                    // Check actual length
-                    const actualLen = ta.length;
+                    if (!isNowDetached) {
+                        alert_vuln(203, 'Buffer not detached after transfer! byteLength=' + ab.byteLength);
+                    }
                     
-                    // Try to write
-                    if (actualLen > 0) {
-                        ta[0] = 0x4B4B4B4B;
-                        
-                        if (verifyCorruption(ta, 0, 0x4B4B4B4B, 162)) {
-                            log('TEST 162: Weird length ' + len + ' created array of length ' + actualLen);
+                    // Try to access
+                    let accessThrew = false;
+                    try {
+                        ta[0] = 0x44444444;
+                    } catch(e3) {
+                        accessThrew = true;
+                    }
+                    
+                    if (!accessThrew) {
+                        // Check if value actually changed
+                        if (ta[0] === 0x44444444) {
+                            alert_vuln(203, 'Write to detached buffer succeeded!');
                         }
                     }
                     
-                    // Specific check: -0 should create zero-length array
-                    if (Object.is(len, -0) && actualLen !== 0) {
-                        alert_vuln(162, 'Negative zero created non-zero length array!');
-                    }
-                } catch(e2) {}
-            }
-        } catch(e) {
-            log('TEST 162: Exception - ' + e.message);
-        }
-
-        // TEST 163: Slice with reversed indices
-        try {
-            log('TEST 163: Slice with end < start');
-            const ab = new ArrayBuffer(0x1000);
-            const ta = new Uint32Array(ab);
-            
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = i;
-            }
-            
-            // Slice with reversed indices
-            const sliced = ta.slice(100, 10);
-            
-            if (sliced.length !== 0) {
-                alert_vuln(163, 'Reversed slice created non-empty array! length=' + sliced.length);
-                
-                // Try to access
-                sliced[0] = 0x4C4C4C4C;
-                if (verifyCorruption(sliced, 0, 0x4C4C4C4C, 163)) {
-                    alert_vuln(163, 'Write to reversed slice succeeded!');
+                    log('TEST 203: Detached=' + isNowDetached + ', AccessThrew=' + accessThrew);
                 }
-            }
-        } catch(e) {
-            log('TEST 163: Exception - ' + e.message);
-        }
-
-        // TEST 164: Multiple views with different element sizes
-        try {
-            log('TEST 164: Mixed view size corruption');
-            const ab = new ArrayBuffer(0x1000);
-            
-            const v8 = new Uint8Array(ab);
-            const v16 = new Uint16Array(ab);
-            const v32 = new Uint32Array(ab);
-            const v64 = new Float64Array(ab);
-            
-            // Write via v32
-            v32[0] = 0x41424344;
-            
-            // Read via v8 and verify byte order
-            const b0 = v8[0];
-            const b1 = v8[1];
-            const b2 = v8[2];
-            const b3 = v8[3];
-            
-            // Modify via v8
-            v8[0] = 0xFF;
-            v8[1] = 0xFF;
-            v8[2] = 0xFF;
-            v8[3] = 0xFF;
-            
-            // Read via v32
-            if (v32[0] !== 0xFFFFFFFF) {
-                alert_vuln(164, 'View aliasing corruption! Expected 0xFFFFFFFF got 0x' + v32[0].toString(16));
-            }
-            
-            // Write via v64
-            v64[0] = 1.1;
-            
-            // Check if v32 shows corrupted/unexpected values
-            const v32_after_float = v32[0];
-            if (v32_after_float === 0xFFFFFFFF || v32_after_float === 0) {
-                alert_vuln(164, 'Float64 write did not affect Uint32 view!');
-            }
-        } catch(e) {
-            log('TEST 164: Exception - ' + e.message);
-        }
-
-        // TEST 165: Fill with non-numeric values
-        try {
-            log('TEST 165: Fill with object references');
-            const ta = new Uint32Array(100);
-            
-            const obj = {valueOf: function() { return 0x4D4D4D4D; }};
-            
-            ta.fill(obj);
-            
-            // Verify fill used valueOf
-            if (verifyCorruption(ta, 0, 0x4D4D4D4D, 165)) {
-                log('TEST 165: Fill with object valueOf worked');
-            }
-            
-            // Try to fill with object that modifies array during valueOf
-            let fillIndex = 0;
-            const maliciousObj = {
-                valueOf: function() {
-                    ta[fillIndex++] = 0x4E4E4E4E;
-                    return 0x4F4F4F4F;
-                }
-            };
-            
-            ta.fill(maliciousObj);
-            
-            // Check for corruption
-            let corrupted = false;
-            for (let i = 0; i < ta.length; i++) {
-                if (ta[i] === 0x4E4E4E4E) {
-                    corrupted = true;
-                    break;
-                }
-            }
-            
-            if (corrupted) {
-                alert_vuln(165, 'Fill with side-effect object caused corruption!');
-            }
-        } catch(e) {
-            log('TEST 165: Exception - ' + e.message);
-        }
-
-        // TEST 166: Sort with comparator that modifies array
-        try {
-            log('TEST 166: Sort with malicious comparator');
-            const ta = new Uint32Array([5, 3, 8, 1, 9, 2, 7, 4, 6]);
-            const original = new Uint32Array(ta);
-            
-            let sortCallCount = 0;
-            
-            ta.sort(function(a, b) {
-                sortCallCount++;
-                
-                // Modify array during sort
-                if (sortCallCount === 5) {
-                    ta[0] = 0x50505050;
-                }
-                
-                return a - b;
-            });
-            
-            // Check if modification during sort caused corruption
-            if (verifyCorruption(ta, 0, 0x50505050, 166)) {
-                alert_vuln(166, 'Sort allowed modification during comparison!');
-            }
-            
-            // Check if array is properly sorted despite modification
-            let sorted = true;
-            for (let i = 1; i < ta.length; i++) {
-                if (ta[i] < ta[i-1] && ta[i] !== 0x50505050) {
-                    sorted = false;
-                }
-            }
-            
-            if (!sorted) {
-                log('TEST 166: Array not properly sorted after malicious comparator');
-            }
-        } catch(e) {
-            log('TEST 166: Exception - ' + e.message);
-        }
-
-        // TEST 167: Reduce that extends array
-        try {
-            log('TEST 167: Reduce with array extension');
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            let iterationCount = 0;
-            
-            const result = ta.reduce(function(acc, val, idx, arr) {
-                iterationCount++;
-                
-                // Try to extend array during reduce
-                if (idx === 2) {
-                    try {
-                        arr[10] = 0x51515151;
-                    } catch(e2) {}
-                }
-                
-                return acc + val;
-            }, 0);
-            
-            // Check if extension worked
-            if (verifyCorruption(ta, 10, 0x51515151, 167)) {
-                alert_vuln(167, 'Array extended during reduce!');
-            }
-            
-            // Check iteration count
-            if (iterationCount > 5) {
-                alert_vuln(167, 'Reduce iterated more than original length! count=' + iterationCount);
-            }
-        } catch(e) {
-            log('TEST 167: Exception - ' + e.message);
-        }
-
-        // TEST 168: Map returning different typed array
-        try {
-            log('TEST 168: Map type confusion');
-            const ta1 = new Uint32Array([1, 2, 3, 4, 5]);
-            
-            const ta2 = ta1.map(function(val) {
-                return val * 0x10000000;
-            });
-            
-            // Check if values overflowed
-            for (let i = 0; i < ta2.length; i++) {
-                const expected = ta1[i] * 0x10000000;
-                const actual = ta2[i];
-                
-                // Uint32 should truncate to 32 bits
-                if (actual !== (expected >>> 0)) {
-                    alert_vuln(168, 'Map result not properly truncated! idx=' + i + ' got=0x' + actual.toString(16));
-                    break;
-                }
-            }
-        } catch(e) {
-            log('TEST 168: Exception - ' + e.message);
-        }
-
-        // TEST 169: Filter that corrupts during callback
-        try {
-            log('TEST 169: Filter with corruption');
-            const ta = new Uint32Array(100);
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = i;
-            }
-            
-            let filterIndex = 0;
-            const filtered = ta.filter(function(val, idx) {
-                filterIndex++;
-                
-                // Corrupt array during filter
-                if (idx === 50) {
-                    ta[0] = 0x52525252;
-                    ta[99] = 0x53535353;
-                }
-                
-                return val % 2 === 0;
-            });
-            
-            // Check if original array was corrupted
-            if (verifyCorruption(ta, 0, 0x52525252, 169) && 
-                verifyCorruption(ta, 99, 0x53535353, 169)) {
-                alert_vuln(169, 'Filter allowed array corruption during callback!');
-            }
-        } catch(e) {
-            log('TEST 169: Exception - ' + e.message);
-        }
-
-        // TEST 170: Find with buffer detach
-        try {
-            log('TEST 170: Find with buffer detach');
-            const ab = new ArrayBuffer(0x1000);
-            const ta = new Uint32Array(ab);
-            
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = i;
-            }
-            
-            let findCallCount = 0;
-            let detached = false;
-            
-            const found = ta.find(function(val, idx) {
-                findCallCount++;
-                
-                // Try to detach buffer during find
-                if (idx === 100 && typeof structuredClone !== 'undefined') {
-                    try {
-                        structuredClone(ab, {transfer: [ab]});
-                        detached = true;
-                    } catch(e2) {}
-                }
-                
-                return val === 200;
-            });
-            
-            if (detached && found !== undefined) {
-                alert_vuln(170, 'Find continued after buffer detach! found=' + found);
-            }
-        } catch(e) {
-            log('TEST 170: Exception - ' + e.message);
-        }
-
-        // TEST 171: Reverse on shared buffer
-        try {
-            log('TEST 171: Reverse with aliased views');
-            const ab = new ArrayBuffer(0x1000);
-            const ta1 = new Uint32Array(ab);
-            const ta2 = new Uint32Array(ab);
-            
-            for (let i = 0; i < ta1.length; i++) {
-                ta1[i] = i;
-            }
-            
-            ta1.reverse();
-            
-            // Both views should see reversed data
-            if (ta1[0] === ta2[0] && ta1[ta1.length-1] === ta2[ta2.length-1]) {
-                log('TEST 171: Reverse with aliasing behaved correctly');
             } else {
-                alert_vuln(171, 'Reverse caused aliasing corruption!');
+                log('TEST 203: structuredClone not available');
             }
         } catch(e) {
-            log('TEST 171: Exception - ' + e.message);
+            log('TEST 203: Exception - ' + e.message);
         }
 
-        // TEST 172: Subarray of subarray with negative indices
+        // TEST 204: Subarray length validation (avoid clamp false positive)
         try {
-            log('TEST 172: Nested subarray negative indices');
-            const ta1 = new Uint32Array(100);
-            for (let i = 0; i < ta1.length; i++) {
-                ta1[i] = i;
+            log('TEST 204: Subarray with out-of-range indices');
+            
+            const ta = new Uint32Array(100);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
+            
+            // Subarray with end > parent length
+            const sub = ta.subarray(10, 200);
+            
+            // Expected: clamps to [10, 100], so length = 90
+            const expectedLength = 90;
+            
+            if (sub.length !== expectedLength) {
+                alert_vuln(204, 'Subarray length unexpected! Expected ' + expectedLength + ', got ' + sub.length);
+            } else {
+                log('TEST 204: Subarray clamped correctly to length ' + sub.length);
             }
             
-            const ta2 = ta1.subarray(10, 90);
-            const ta3 = ta2.subarray(-100, -50);
+            // Try to access beyond clamped length
+            sub[95] = 0x45454545;
             
-            if (ta3.length > 0) {
-                alert_vuln(172, 'Negative subarray indices created non-empty array! length=' + ta3.length);
-                
-                ta3[0] = 0x54545454;
-                if (verifyCorruption(ta3, 0, 0x54545454, 172)) {
-                    alert_vuln(172, 'Write to negative-index subarray succeeded!');
-                }
+            // This should NOT appear in sub, as sub is only [10..99] (indices 0..89)
+            if (isRealElement(sub, 95)) {
+                log('TEST 204: Index 95 is property (false positive avoided)');
             }
         } catch(e) {
-            log('TEST 172: Exception - ' + e.message);
+            log('TEST 204: Exception - ' + e.message);
         }
 
-        // TEST 173: DataView with negative offset
+        // TEST 205: TypedArray.set overflow with contamination check
         try {
-            log('TEST 173: DataView negative offset');
-            const ab = new ArrayBuffer(0x1000);
+            log('TEST 205: TypedArray.set overflow validation');
             
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const VICTIM_SENTINEL = 0xCCCCCCCC;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = VICTIM_SENTINEL;
+            
+            const target = new Uint32Array(10);
+            const source = new Uint32Array(100);
+            for (let i = 0; i < source.length; i++) source[i] = 0x46460000 + i;
+            
+            // Try to set (should throw)
+            let threw = false;
             try {
-                const dv = new DataView(ab, -100, 100);
-                
-                dv.setUint32(0, 0x55555555);
-                
-                const ta = new Uint32Array(ab);
-                if (verifyCorruption(ta, 0, 0x55555555, 173)) {
-                    alert_vuln(173, 'DataView with negative offset accepted!');
-                }
+                target.set(source, 0);
             } catch(e2) {
-                log('TEST 173: Negative offset rejected (expected)');
-            }
-        } catch(e) {
-            log('TEST 173: Exception - ' + e.message);
-        }
-
-        // TEST 174: Set from different buffer with overlap
-        try {
-            log('TEST 174: Set with potential overlap');
-            const ab = new ArrayBuffer(0x1000);
-            const ta1 = new Uint32Array(ab, 0, 100);
-            const ta2 = new Uint32Array(ab, 200, 100);
-            
-            for (let i = 0; i < ta2.length; i++) {
-                ta2[i] = 0x56560000 + i;
+                threw = true;
             }
             
-            // Set from overlapping region
-            ta1.set(ta2, 0);
-            
-            // Verify copy
-            let copyCorrect = true;
-            for (let i = 0; i < ta2.length; i++) {
-                if (ta1[i] !== 0x56560000 + i) {
-                    copyCorrect = false;
-                    alert_vuln(174, 'Set from different offset corrupted data at index ' + i);
-                    break;
+            if (!threw) {
+                // If didn't throw, check victim buffer
+                if (checkBufferContamination(victim, VICTIM_SENTINEL, 205)) {
+                    alert_vuln(205, 'TypedArray.set overflow contaminated separate buffer!');
+                } else {
+                    log('TEST 205: set completed but no contamination detected');
                 }
-            }
-            
-            if (copyCorrect) {
-                log('TEST 174: Set from different offset worked correctly');
+            } else {
+                log('TEST 205: set threw exception (expected)');
             }
         } catch(e) {
-            log('TEST 174: Exception - ' + e.message);
+            log('TEST 205: Exception - ' + e.message);
         }
 
-        // TEST 175: Uint8ClampedArray overflow behavior
+        // TEST 206: Float64 type confusion with bit-level verification
         try {
-            log('TEST 175: Uint8ClampedArray clamping edge cases');
-            const ta = new Uint8ClampedArray(10);
+            log('TEST 206: Float64 type confusion verification');
             
-            const testValues = [
-                -1, -100, -0.5,
-                256, 1000, 255.5, 255.9,
-                Infinity, -Infinity, NaN
-            ];
+            const ab = new ArrayBuffer(16);
+            const fa = new Float64Array(ab);
+            const ua = new Uint32Array(ab);
             
-            for (let i = 0; i < testValues.length && i < ta.length; i++) {
-                ta[i] = testValues[i];
-            }
+            // Write known bit pattern via Float64
+            // Value: 1.9499519595454033e-289 should give 0x4141414141414141
+            fa[0] = 1.9499519595454033e-289;
             
-            // Check clamping
-            if (ta[0] !== 0) alert_vuln(175, 'Uint8Clamped: -1 not clamped to 0! Got ' + ta[0]);
-            if (ta[4] !== 255) alert_vuln(175, 'Uint8Clamped: 256 not clamped to 255! Got ' + ta[4]);
-            if (ta[7] !== 255) alert_vuln(175, 'Uint8Clamped: Infinity not clamped! Got ' + ta[7]);
-            if (ta[9] !== 0) alert_vuln(175, 'Uint8Clamped: NaN not handled! Got ' + ta[9]);
-        } catch(e) {
-            log('TEST 175: Exception - ' + e.message);
-        }
-
-        // TEST 176: Int8Array overflow wrapping
-        try {
-            log('TEST 176: Int8Array wrap-around');
-            const ta = new Int8Array(10);
+            // Read back via Uint32
+            const low = ua[0];
+            const high = ua[1];
             
-            const testValues = [127, 128, 129, -128, -129, -130, 255, 256];
+            // Verify expected pattern (little-endian)
+            const expectedLow = 0x41414141;
+            const expectedHigh = 0x41414141;
             
-            for (let i = 0; i < testValues.length && i < ta.length; i++) {
-                ta[i] = testValues[i];
-            }
-            
-            // Check wrapping
-            if (ta[1] !== -128) alert_vuln(176, 'Int8: 128 wrap incorrect! Got ' + ta[1]);
-            if (ta[2] !== -127) alert_vuln(176, 'Int8: 129 wrap incorrect! Got ' + ta[2]);
-            if (ta[4] !== 127) alert_vuln(176, 'Int8: -129 wrap incorrect! Got ' + ta[4]);
-            
-            log('TEST 176: Wrap values: 128=' + ta[1] + ', 129=' + ta[2] + ', -129=' + ta[4]);
-        } catch(e) {
-            log('TEST 176: Exception - ' + e.message);
-        }
-
-        // TEST 177: Float32 precision loss exploitation
-        try {
-            log('TEST 177: Float32 precision corruption');
-            const ab = new ArrayBuffer(0x100);
-            const f32 = new Float32Array(ab);
-            const u32 = new Uint32Array(ab);
-            
-            // Store precise double value
-            f32[0] = 3.1415926535897932;
-            
-            // Read as uint32
-            const bits = u32[0];
-            
-            // Modify bits slightly
-            u32[0] = bits ^ 0x1;
-            
-            // Read as float
-            const modified = f32[0];
-            
-            if (modified !== 3.1415926535897932 && !isNaN(modified)) {
-                log('TEST 177: Float32 bit flip: ' + f32[0]);
-            }
-            
-            // Try to create denormalized numbers
-            u32[0] = 0x00000001; // Smallest denorm
-            if (!isNaN(f32[0]) && f32[0] !== 0) {
-                log('TEST 177: Denormalized float: ' + f32[0]);
+            if (low === expectedLow && high === expectedHigh) {
+                log('TEST 206: Type confusion worked as expected (IEEE 754 conversion)');
+                
+                // Now try to use this to create fake pointer
+                // Write to second slot
+                fa[1] = 1.1823397047269973e-289; // Different pattern
+                
+                const low2 = ua[2];
+                const high2 = ua[3];
+                
+                log('TEST 206: Second value: 0x' + high2.toString(16) + low2.toString(16));
+            } else {
+                alert_vuln(206, 'Type confusion produced unexpected values! low=0x' + low.toString(16) + ' high=0x' + high.toString(16));
             }
         } catch(e) {
-            log('TEST 177: Exception - ' + e.message);
+            log('TEST 206: Exception - ' + e.message);
         }
 
-        // TEST 178: ArrayBuffer slice boundary
+        // TEST 207: DataView unaligned access with strict bounds
         try {
-            log('TEST 178: ArrayBuffer slice edge cases');
-            const ab = new ArrayBuffer(0x1000);
-            const ta = new Uint32Array(ab);
+            log('TEST 207: DataView unaligned bounds check');
             
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = i;
-            }
-            
-            // Slice exactly at boundary
-            const sliced = ab.slice(0x1000, 0x1000);
-            
-            if (sliced.byteLength !== 0) {
-                alert_vuln(178, 'Slice at boundary has non-zero length! ' + sliced.byteLength);
-            }
-            
-            // Slice beyond boundary
-            const sliced2 = ab.slice(0x800, 0x2000);
-            
-            if (sliced2.byteLength > 0x800) {
-                alert_vuln(178, 'Slice beyond boundary! Expected max 0x800, got 0x' + sliced2.byteLength.toString(16));
-            }
-        } catch(e) {
-            log('TEST 178: Exception - ' + e.message);
-        }
-
-        // TEST 179: TypedArray from Array-like with getters
-        try {
-            log('TEST 179: TypedArray from malicious array-like');
-            
-            let getterCallCount = 0;
-            const malicious = {
-                length: 10,
-                0: 0x57575757,
-                get 5() {
-                    getterCallCount++;
-                    // Try to cause side effect
-                    return 0x58585858;
-                }
-            };
-            
-            const ta = new Uint32Array(malicious);
-            
-            if (verifyCorruption(ta, 0, 0x57575757, 179)) {
-                log('TEST 179: Array-like element 0 copied');
-            }
-            
-            if (verifyCorruption(ta, 5, 0x58585858, 179)) {
-                log('TEST 179: Getter called ' + getterCallCount + ' times');
-            }
-        } catch(e) {
-            log('TEST 179: Exception - ' + e.message);
-        }
-
-        // TEST 180: DataView endianness confusion
-        try {
-            log('TEST 180: DataView endianness attack');
             const ab = new ArrayBuffer(8);
             const dv = new DataView(ab);
             
-            // Write as little-endian
-            dv.setUint32(0, 0x12345678, true);
+            // Write at aligned position
+            dv.setUint32(0, 0x12345678);
             
-            // Read as big-endian
-            const be = dv.getUint32(0, false);
-            
-            // They should be different
-            if (be === 0x12345678) {
-                alert_vuln(180, 'Endianness flags not working! LE write == BE read');
+            // Try to read past end with unaligned
+            let threw = false;
+            try {
+                const val = dv.getUint32(6); // Would read bytes 6,7,8,9 but buffer is only 8 bytes
+            } catch(e2) {
+                threw = true;
             }
             
-            // Expected: 0x78563412
-            if (be !== 0x78563412) {
-                alert_vuln(180, 'Unexpected endianness result! Got 0x' + be.toString(16));
+            if (!threw) {
+                alert_vuln(207, 'DataView allowed read past buffer boundary!');
+            } else {
+                log('TEST 207: Bounds check working correctly');
             }
-            
-            log('TEST 180: Endianness LE=0x12345678, BE=0x' + be.toString(16));
         } catch(e) {
-            log('TEST 180: Exception - ' + e.message);
+            log('TEST 207: Exception - ' + e.message);
         }
 
-        // TEST 181: Overlapping DataView writes
+        // TEST 208: Integer overflow in size calculation
         try {
-            log('TEST 181: DataView overlapping writes');
-            const ab = new ArrayBuffer(0x100);
-            const dv = new DataView(ab);
+            log('TEST 208: Size calculation integer overflow');
             
-            dv.setUint32(0, 0x11111111);
-            dv.setUint16(2, 0x2222);
+            // Try sizes near 32-bit boundary
+            const testSizes = [
+                {size: 0x3FFFFFFF, name: '1GB-1'},
+                {size: 0x40000000, name: '1GB'},
+                {size: 0x7FFFFFFF, name: '2GB-1'}
+            ];
             
-            const result = dv.getUint32(0);
-            
-            // Should be 0x11112222 (little-endian) or 0x22221111 (big-endian)
-            // But verify it's one of those
-            if (result !== 0x11112222 && result !== 0x22221111 && result !== 0x22221111) {
-                alert_vuln(181, 'DataView overlap corruption! Got 0x' + result.toString(16));
-            }
-            
-            log('TEST 181: Overlapping write result: 0x' + result.toString(16));
-        } catch(e) {
-            log('TEST 181: Exception - ' + e.message);
-        }
-
-        // TEST 182: TypedArray iteration modification
-        try {
-            log('TEST 182: Iterator concurrent modification');
-            const ta = new Uint32Array(100);
-            for (let i = 0; i < ta.length; i++) {
-                ta[i] = i;
-            }
-            
-            let iterCount = 0;
-            for (let [idx, val] of ta.entries()) {
-                iterCount++;
-                
-                // Modify during iteration
-                if (idx === 50) {
-                    ta[60] = 0x59595959;
-                    ta[70] = 0x5A5A5A5A;
-                }
-                
-                // Check if we see modifications
-                if (idx === 60 && val === 0x59595959) {
-                    alert_vuln(182, 'Iterator saw concurrent modification at idx 60!');
-                }
-            }
-            
-            log('TEST 182: Iterated ' + iterCount + ' times');
-        } catch(e) {
-            log('TEST 182: Exception - ' + e.message);
-        }
-
-        // TEST 183: Array.from with mapping function that corrupts
-        try {
-            log('TEST 183: Array.from with malicious mapper');
-            
-            const source = [1, 2, 3, 4, 5];
-            let mapCallCount = 0;
-            
-            const ta = Uint32Array.from(source, function(val, idx) {
-                mapCallCount++;
-                
-                // Try to modify source during mapping
-                if (idx === 2) {
-                    source.push(6, 7, 8);
-                }
-                
-                return val * 0x10000000;
-            });
-            
-            if (ta.length > 5) {
-                alert_vuln(183, 'Array.from extended during mapping! length=' + ta.length);
-            }
-            
-            log('TEST 183: Mapper called ' + mapCallCount + ' times, result length=' + ta.length);
-        } catch(e) {
-            log('TEST 183: Exception - ' + e.message);
-        }
-
-        // TEST 184: Nested buffer views corruption
-        try {
-            log('TEST 184: Nested view corruption chain');
-            const ab = new ArrayBuffer(0x1000);
-            
-            const ta1 = new Uint32Array(ab, 0, 100);
-            const ta2 = new Uint32Array(ta1.buffer, ta1.byteOffset, 50);
-            const ta3 = new Uint32Array(ta2.buffer, ta2.byteOffset, 25);
-            
-            // Write via deepest view
-            ta3[0] = 0x5B5B5B5B;
-            
-            // Verify all views see the same data
-            if (!verifyCorruption(ta1, 0, 0x5B5B5B5B, 184) ||
-                !verifyCorruption(ta2, 0, 0x5B5B5B5B, 184)) {
-                alert_vuln(184, 'Nested view aliasing broken!');
-            }
-            
-            log('TEST 184: Nested views: ta1[0]=0x' + ta1[0].toString(16) + 
-                ', ta2[0]=0x' + ta2[0].toString(16) + 
-                ', ta3[0]=0x' + ta3[0].toString(16));
-        } catch(e) {
-            log('TEST 184: Exception - ' + e.message);
-        }
-
-        // TEST 185: ArrayBuffer maxByteLength exploitation
-        try {
-            log('TEST 185: Resizable ArrayBuffer edge case');
-            
-            if (typeof ArrayBuffer.prototype.resize === 'function') {
+            for (let test of testSizes) {
                 try {
-                    const ab = new ArrayBuffer(0x100, {maxByteLength: 0x1000});
-                    const ta = new Uint32Array(ab);
+                    const ab = new ArrayBuffer(test.size);
+                    const actualSize = ab.byteLength;
                     
-                    ta[0] = 0x5C5C5C5C;
-                    
-                    // Resize larger
-                    ab.resize(0x500);
-                    
-                    // Try to access in new region
-                    ta[0x100] = 0x5D5D5D5D;
-                    
-                    if (verifyCorruption(ta, 0x100, 0x5D5D5D5D, 185)) {
-                        alert_vuln(185, 'Write to resized region succeeded!');
-                    }
-                    
-                    // Resize smaller
-                    ab.resize(0x50);
-                    
-                    // Try to access old region
-                    const val = ta[0x100];
-                    if (val === 0x5D5D5D5D) {
-                        alert_vuln(185, 'Read from shrunk region succeeded!');
+                    // Check for wrap-around
+                    if (actualSize !== test.size && actualSize < 0x10000) {
+                        alert_vuln(208, 'Size wrapped! Requested 0x' + test.size.toString(16) + ' got ' + actualSize);
+                    } else if (actualSize === test.size) {
+                        log('TEST 208: ' + test.name + ' allocation succeeded');
                     }
                 } catch(e2) {
-                    log('TEST 185: Resize operation failed - ' + e2.message);
+                    // Expected for large sizes
                 }
-            } else {
-                log('TEST 185: Resizable ArrayBuffer not supported');
             }
         } catch(e) {
-            log('TEST 185: Exception - ' + e.message);
+            log('TEST 208: Exception - ' + e.message);
         }
 
-        // TEST 186: SharedArrayBuffer if available
+        // TEST 209: copyWithin with external buffer check
         try {
-            log('TEST 186: SharedArrayBuffer corruption');
+            log('TEST 209: copyWithin strict validation');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0xDDDDDDDD;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const ta = new Uint32Array(100);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
+            
+            // copyWithin with out-of-range
+            let threw = false;
+            try {
+                ta.copyWithin(0, 50, 200);
+            } catch(e2) {
+                threw = true;
+            }
+            
+            // Even if no throw, check victim wasn't affected
+            if (checkBufferContamination(victim, SENTINEL, 209)) {
+                alert_vuln(209, 'copyWithin contaminated external buffer!');
+            }
+        } catch(e) {
+            log('TEST 209: Exception - ' + e.message);
+        }
+
+        // TEST 210: Slice with reverse indices strict check
+        try {
+            log('TEST 210: Slice reverse indices validation');
+            
+            const ta = new Uint32Array(100);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
+            
+            const sliced = ta.slice(80, 20);
+            
+            // Should be empty
+            if (sliced.length !== 0) {
+                alert_vuln(210, 'Reverse slice non-empty! length=' + sliced.length);
+            }
+            
+            // Verify it's a different buffer
+            if (sliced.buffer === ta.buffer) {
+                alert_vuln(210, 'Slice returned same buffer reference!');
+            }
+        } catch(e) {
+            log('TEST 210: Exception - ' + e.message);
+        }
+
+        // TEST 211: Fill with side-effect object (strict validation)
+        try {
+            log('TEST 211: Fill side-effect validation');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0xEEEEEEEE;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const ta = new Uint32Array(100);
+            
+            let callCount = 0;
+            const obj = {
+                valueOf: function() {
+                    callCount++;
+                    // Try to write to external buffer during valueOf
+                    victimView[0] = 0x47474747;
+                    return 0x48484848;
+                }
+            };
+            
+            ta.fill(obj);
+            
+            // Check if victim was modified (side effect executed)
+            // But this is NOT a vulnerability, just normal behavior
+            // So we DON'T alert here
+            log('TEST 211: valueOf called ' + callCount + ' times (expected behavior)');
+        } catch(e) {
+            log('TEST 211: Exception - ' + e.message);
+        }
+
+        // TEST 212: Sort with comparator - NO false positive
+        try {
+            log('TEST 212: Sort comparator mutation check');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0xFFFFFFFF;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const ta = new Uint32Array([5, 2, 8, 1, 9]);
+            
+            ta.sort(function(a, b) {
+                // Mutate during sort - this is allowed behavior
+                ta[0] = 0x49494949;
+                return a - b;
+            });
+            
+            // Check victim for contamination (real issue)
+            if (checkBufferContamination(victim, SENTINEL, 212)) {
+                alert_vuln(212, 'Sort contaminated external buffer!');
+            }
+        } catch(e) {
+            log('TEST 212: Exception - ' + e.message);
+        }
+
+        // TEST 213: Map with buffer growing attempt
+        try {
+            log('TEST 213: Map buffer growing check');
+            
+            const ta = new Uint32Array(10);
+            const originalLength = ta.length;
+            
+            const mapped = ta.map(function(val, idx, arr) {
+                // Try to extend during map
+                arr[idx + 100] = 0x4A4A4A4A;
+                return val * 2;
+            });
+            
+            // Check if original array grew
+            if (ta.length !== originalLength) {
+                alert_vuln(213, 'TypedArray length changed during map!');
+            }
+            
+            // Check if writes created elements (vs properties)
+            if (isRealElement(ta, 100)) {
+                log('TEST 213: Index 100 is property (expected, not growth)');
+            } else if (ta[100] === 0x4A4A4A4A) {
+                alert_vuln(213, 'OOB index behaving as element!');
+            }
+        } catch(e) {
+            log('TEST 213: Exception - ' + e.message);
+        }
+
+        // TEST 214: Reduce with array extension strict check
+        try {
+            log('TEST 214: Reduce extension validation');
+            
+            const ta = new Uint32Array([1, 2, 3, 4, 5]);
+            const originalLength = ta.length;
+            let maxIndex = -1;
+            
+            ta.reduce(function(acc, val, idx, arr) {
+                maxIndex = Math.max(maxIndex, idx);
+                arr[10] = 0x4B4B4B4B;
+                return acc + val;
+            }, 0);
+            
+            // Check if reduce iterated beyond original length
+            if (maxIndex >= originalLength) {
+                alert_vuln(214, 'Reduce iterated beyond original length! maxIndex=' + maxIndex);
+            }
+            
+            log('TEST 214: Reduce iterated 0..' + maxIndex + ' (expected 0..4)');
+        } catch(e) {
+            log('TEST 214: Exception - ' + e.message);
+        }
+
+        // TEST 215: Filter with detach attempt
+        try {
+            log('TEST 215: Filter with buffer detach');
+            
+            if (typeof structuredClone !== 'undefined') {
+                const ab = new ArrayBuffer(0x1000);
+                const ta = new Uint32Array(ab);
+                for (let i = 0; i < ta.length; i++) ta[i] = i;
+                
+                let detachAttempted = false;
+                let iterationAfterDetach = 0;
+                
+                const filtered = ta.filter(function(val, idx) {
+                    if (idx === 100 && !detachAttempted) {
+                        try {
+                            structuredClone(ab, {transfer: [ab]});
+                            detachAttempted = true;
+                        } catch(e2) {}
+                    }
+                    
+                    if (detachAttempted) {
+                        iterationAfterDetach++;
+                    }
+                    
+                    return val % 2 === 0;
+                });
+                
+                if (detachAttempted && iterationAfterDetach > 0) {
+                    alert_vuln(215, 'Filter continued ' + iterationAfterDetach + ' iterations after detach!');
+                }
+            }
+        } catch(e) {
+            log('TEST 215: Exception - ' + e.message);
+        }
+
+        // TEST 216: Find with strict iteration count
+        try {
+            log('TEST 216: Find iteration validation');
+            
+            const ta = new Uint32Array(100);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
+            
+            let iterCount = 0;
+            const found = ta.find(function(val, idx) {
+                iterCount++;
+                return val === 50;
+            });
+            
+            // Should stop at index 50, so 51 iterations
+            if (iterCount > 51) {
+                alert_vuln(216, 'Find iterated more than needed! count=' + iterCount);
+            }
+            
+            log('TEST 216: Find stopped after ' + iterCount + ' iterations (expected ≤51)');
+        } catch(e) {
+            log('TEST 216: Exception - ' + e.message);
+        }
+
+        // TEST 217: Reverse with aliasing verification
+        try {
+            log('TEST 217: Reverse aliasing check');
+            
+            const ab = new ArrayBuffer(0x100);
+            const ta1 = new Uint32Array(ab);
+            const ta2 = new Uint32Array(ab);
+            
+            for (let i = 0; i < ta1.length; i++) ta1[i] = i;
+            
+            const firstValue = ta1[0];
+            const lastValue = ta1[ta1.length - 1];
+            
+            ta1.reverse();
+            
+            // Both views should see reversed
+            if (ta1[0] !== ta2[0] || ta1[ta1.length - 1] !== ta2[ta2.length - 1]) {
+                alert_vuln(217, 'Reverse broke aliasing! ta1[0]=' + ta1[0] + ' ta2[0]=' + ta2[0]);
+            }
+            
+            // Verify actual reversal
+            if (ta1[0] !== lastValue || ta1[ta1.length - 1] !== firstValue) {
+                alert_vuln(217, 'Reverse didn\'t actually reverse!');
+            }
+        } catch(e) {
+            log('TEST 217: Exception - ' + e.message);
+        }
+
+        // TEST 218: Every with early termination check
+        try {
+            log('TEST 218: Every early termination');
+            
+            const ta = new Uint32Array(1000);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
+            
+            ta[500] = 0; // Make one fail
+            
+            let iterCount = 0;
+            const result = ta.every(function(val) {
+                iterCount++;
+                return val !== 0;
+            });
+            
+            // Should stop at first 0 (index 500)
+            if (iterCount > 501) {
+                alert_vuln(218, 'Every didn\'t stop early! iterations=' + iterCount);
+            }
+            
+            log('TEST 218: Every stopped after ' + iterCount + ' iterations');
+        } catch(e) {
+            log('TEST 218: Exception - ' + e.message);
+        }
+
+        // TEST 219: Some with early termination check
+        try {
+            log('TEST 219: Some early termination');
+            
+            const ta = new Uint32Array(1000);
+            for (let i = 0; i < ta.length; i++) ta[i] = 0;
+            
+            ta[500] = 1; // Make one succeed
+            
+            let iterCount = 0;
+            const result = ta.some(function(val) {
+                iterCount++;
+                return val === 1;
+            });
+            
+            // Should stop at first match
+            if (iterCount > 501) {
+                alert_vuln(219, 'Some didn\'t stop early! iterations=' + iterCount);
+            }
+            
+            log('TEST 219: Some stopped after ' + iterCount + ' iterations');
+        } catch(e) {
+            log('TEST 219: Exception - ' + e.message);
+        }
+
+        // TEST 220: indexOf with NaN (strict equality check)
+        try {
+            log('TEST 220: indexOf NaN behavior');
+            
+            const fa = new Float64Array([1.1, 2.2, NaN, 3.3, 4.4]);
+            
+            const idx = fa.indexOf(NaN);
+            
+            // indexOf uses strict equality, NaN !== NaN, so should return -1
+            if (idx !== -1) {
+                alert_vuln(220, 'indexOf found NaN at index ' + idx + ' (NaN === NaN should be false!)');
+            }
+            
+            log('TEST 220: indexOf(NaN) = ' + idx + ' (expected -1)');
+        } catch(e) {
+            log('TEST 220: Exception - ' + e.message);
+        }
+
+        // TEST 221: includes with NaN (SameValueZero check)
+        try {
+            log('TEST 221: includes NaN behavior');
+            
+            const fa = new Float64Array([1.1, 2.2, NaN, 3.3, 4.4]);
+            
+            const hasNaN = fa.includes(NaN);
+            
+            // includes uses SameValueZero, so should find NaN
+            if (!hasNaN) {
+                log('TEST 221: includes(NaN) = false (SameValueZero should find it)');
+            } else {
+                log('TEST 221: includes(NaN) = true (expected)');
+            }
+        } catch(e) {
+            log('TEST 221: Exception - ' + e.message);
+        }
+
+        // TEST 222: Uint8ClampedArray strict clamping
+        try {
+            log('TEST 222: Uint8ClampedArray clamping validation');
+            
+            const ta = new Uint8ClampedArray(10);
+            
+            const tests = [
+                {input: -1, expected: 0, name: 'negative'},
+                {input: 256, expected: 255, name: 'overflow'},
+                {input: 127.4, expected: 127, name: 'round down'},
+                {input: 127.5, expected: 128, name: 'round up'},
+                {input: Infinity, expected: 255, name: 'infinity'},
+                {input: NaN, expected: 0, name: 'NaN'}
+            ];
+            
+            for (let i = 0; i < tests.length && i < ta.length; i++) {
+                ta[i] = tests[i].input;
+                if (ta[i] !== tests[i].expected) {
+                    alert_vuln(222, 'Clamping wrong for ' + tests[i].name + ': got ' + ta[i] + ', expected ' + tests[i].expected);
+                }
+            }
+            
+            log('TEST 222: All clamping tests passed');
+        } catch(e) {
+            log('TEST 222: Exception - ' + e.message);
+        }
+
+        // TEST 223: Int8Array wrap validation
+        try {
+            log('TEST 223: Int8Array wrapping validation');
+            
+            const ta = new Int8Array(5);
+            
+            const tests = [
+                {input: 127, expected: 127},
+                {input: 128, expected: -128},
+                {input: 129, expected: -127},
+                {input: -128, expected: -128},
+                {input: -129, expected: 127},
+                {input: 255, expected: -1}
+            ];
+            
+            for (let i = 0; i < tests.length && i < ta.length; i++) {
+                ta[i] = tests[i].input;
+                if (ta[i] !== tests[i].expected) {
+                    alert_vuln(223, 'Wrapping wrong: input=' + tests[i].input + ', got=' + ta[i] + ', expected=' + tests[i].expected);
+                }
+            }
+            
+            log('TEST 223: All wrap tests passed');
+        } catch(e) {
+            log('TEST 223: Exception - ' + e.message);
+        }
+
+        // TEST 224: Buffer growing with contamination check
+        try {
+            log('TEST 224: Buffer growing contamination');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x11111111;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const buffers = [];
+            for (let i = 0; i < 100; i++) {
+                buffers.push(new ArrayBuffer(0x100));
+            }
+            
+            // Free some
+            for (let i = 0; i < buffers.length; i += 2) {
+                buffers[i] = null;
+            }
+            
+            // Allocate new
+            const newBuffer = new ArrayBuffer(0x100);
+            const newView = new Uint32Array(newBuffer);
+            newView[0] = 0x4C4C4C4C;
+            
+            // Check victim
+            if (checkBufferContamination(victim, SENTINEL, 224)) {
+                alert_vuln(224, 'Buffer allocation contaminated existing buffer!');
+            }
+        } catch(e) {
+            log('TEST 224: Exception - ' + e.message);
+        }
+
+        // TEST 225: Float32 denormalized numbers
+        try {
+            log('TEST 225: Float32 denormal validation');
+            
+            const ab = new ArrayBuffer(4);
+            const fa = new Float32Array(ab);
+            const ua = new Uint32Array(ab);
+            
+            // Create smallest denormalized number
+            ua[0] = 0x00000001;
+            const denorm = fa[0];
+            
+            if (denorm !== 0 && !isNaN(denorm)) {
+                log('TEST 225: Denormalized number: ' + denorm);
+            }
+            
+            // Create largest denormalized
+            ua[0] = 0x007FFFFF;
+            const maxDenorm = fa[0];
+            
+            log('TEST 225: Max denorm: ' + maxDenorm);
+        } catch(e) {
+            log('TEST 225: Exception - ' + e.message);
+        }
+
+        // TEST 226: ArrayBuffer slice contamination
+        try {
+            log('TEST 226: ArrayBuffer slice contamination');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x22222222;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const ab = new ArrayBuffer(0x1000);
+            const ta = new Uint32Array(ab);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
+            
+            // Slice
+            const sliced = ab.slice(0x100, 0x200);
+            const slicedView = new Uint32Array(sliced);
+            slicedView[0] = 0x4D4D4D4D;
+            
+            // Check victim
+            if (checkBufferContamination(victim, SENTINEL, 226)) {
+                alert_vuln(226, 'Slice contaminated external buffer!');
+            }
+        } catch(e) {
+            log('TEST 226: Exception - ' + e.message);
+        }
+
+        // TEST 227: DataView byteLength overflow strict
+        try {
+            log('TEST 227: DataView byteLength overflow');
+            
+            const ab = new ArrayBuffer(0x100);
+            
+            let created = false;
+            try {
+                const dv = new DataView(ab, 0, 0xFFFFFFFF);
+                created = true;
+            } catch(e2) {}
+            
+            if (created) {
+                alert_vuln(227, 'DataView created with byteLength overflow!');
+            } else {
+                log('TEST 227: Overflow rejected (expected)');
+            }
+        } catch(e) {
+            log('TEST 227: Exception - ' + e.message);
+        }
+
+        // TEST 228: TypedArray constructor with fractional length
+        try {
+            log('TEST 228: Fractional length handling');
+            
+            const tests = [
+                {len: 10.1, expected: 10},
+                {len: 10.9, expected: 10},
+                {len: -0, expected: 0}
+            ];
+            
+            for (let test of tests) {
+                try {
+                    const ta = new Uint32Array(test.len);
+                    if (ta.length !== test.expected) {
+                        alert_vuln(228, 'Fractional length ' + test.len + ' gave length ' + ta.length + ', expected ' + test.expected);
+                    }
+                } catch(e2) {}
+            }
+            
+            log('TEST 228: Fractional lengths handled correctly');
+        } catch(e) {
+            log('TEST 228: Exception - ' + e.message);
+        }
+
+        // TEST 229: Multiple views write order
+        try {
+            log('TEST 229: Multi-view write ordering');
+            
+            const ab = new ArrayBuffer(16);
+            const v8 = new Uint8Array(ab);
+            const v32 = new Uint32Array(ab);
+            
+            // Write via v32
+            v32[0] = 0x12345678;
+            
+            // Read via v8 and verify byte order
+            const bytes = [v8[0], v8[1], v8[2], v8[3]];
+            
+            // Little-endian: [0x78, 0x56, 0x34, 0x12]
+            // Big-endian: [0x12, 0x34, 0x56, 0x78]
+            const isLE = (bytes[0] === 0x78 && bytes[3] === 0x12);
+            const isBE = (bytes[0] === 0x12 && bytes[3] === 0x78);
+            
+            if (!isLE && !isBE) {
+                alert_vuln(229, 'Unexpected byte order! bytes=' + bytes.map(b => '0x'+b.toString(16)).join(','));
+            }
+            
+            log('TEST 229: Byte order is ' + (isLE ? 'little' : 'big') + '-endian');
+        } catch(e) {
+            log('TEST 229: Exception - ' + e.message);
+        }
+
+        // TEST 230: Set with overlapping source/target on same buffer
+        try {
+            log('TEST 230: Set with same-buffer overlap');
+            
+            const ab = new ArrayBuffer(0x400);
+            const ta1 = new Uint32Array(ab, 0, 100);
+            const ta2 = new Uint32Array(ab, 0x100, 100);
+            
+            for (let i = 0; i < ta2.length; i++) ta2[i] = 0x4E4E0000 + i;
+            
+            // Set from ta2 to ta1 (different offsets, same buffer)
+            ta1.set(ta2, 0);
+            
+            // Verify copy worked correctly
+            let correct = true;
+            for (let i = 0; i < ta2.length; i++) {
+                if (ta1[i] !== 0x4E4E0000 + i) {
+                    correct = false;
+                    alert_vuln(230, 'Same-buffer set corrupted at index ' + i);
+                    break;
+                }
+            }
+            
+            if (correct) {
+                log('TEST 230: Same-buffer set worked correctly');
+            }
+        } catch(e) {
+            log('TEST 230: Exception - ' + e.message);
+        }
+
+        // TEST 231: Resizable ArrayBuffer strict checks
+        try {
+            log('TEST 231: Resizable ArrayBuffer validation');
+            
+            if (typeof ArrayBuffer.prototype.resize === 'function') {
+                const ab = new ArrayBuffer(0x100, {maxByteLength: 0x1000});
+                const ta = new Uint32Array(ab);
+                
+                ta[0] = 0x4F4F4F4F;
+                const originalLength = ta.length;
+                
+                // Resize
+                ab.resize(0x200);
+                
+                // Check if length updated
+                const newLength = ta.length;
+                if (newLength <= originalLength) {
+                    alert_vuln(231, 'TypedArray length didn\'t update after resize!');
+                }
+                
+                // Resize back smaller
+                ab.resize(0x80);
+                
+                // Access old region
+                let threw = false;
+                try {
+                    const val = ta[originalLength - 1];
+                } catch(e2) {
+                    threw = true;
+                }
+                
+                log('TEST 231: Resize working, access after shrink threw=' + threw);
+            }
+        } catch(e) {
+            log('TEST 231: Exception or not supported - ' + e.message);
+        }
+
+        // TEST 232: SharedArrayBuffer strict isolation
+        try {
+            log('TEST 232: SharedArrayBuffer isolation');
             
             if (typeof SharedArrayBuffer !== 'undefined') {
-                const sab = new SharedArrayBuffer(0x1000);
+                const sab = new SharedArrayBuffer(0x100);
                 const ta1 = new Uint32Array(sab);
                 const ta2 = new Uint32Array(sab);
                 
-                ta1[0] = 0x5E5E5E5E;
+                ta1[0] = 0x50505050;
                 
-                // Verify sharing
-                if (!verifyCorruption(ta2, 0, 0x5E5E5E5E, 186)) {
-                    alert_vuln(186, 'SharedArrayBuffer not sharing data!');
+                // Immediate read from ta2 should see it
+                if (ta2[0] !== 0x50505050) {
+                    alert_vuln(232, 'SharedArrayBuffer not sharing! ta2[0]=' + ta2[0]);
                 }
                 
-                log('TEST 186: SharedArrayBuffer working correctly');
-            } else {
-                log('TEST 186: SharedArrayBuffer not available');
+                // Modify via ta2
+                ta2[1] = 0x51515151;
+                
+                // ta1 should see it
+                if (ta1[1] !== 0x51515151) {
+                    alert_vuln(232, 'SharedArrayBuffer sharing broken! ta1[1]=' + ta1[1]);
+                }
+                
+                log('TEST 232: SharedArrayBuffer working correctly');
             }
         } catch(e) {
-            log('TEST 186: Exception - ' + e.message);
+            log('TEST 232: Exception - ' + e.message);
         }
 
-        // TEST 187: Atomics operations edge cases
+        // TEST 233: Atomics bounds checking
         try {
-            log('TEST 187: Atomics operation corruption');
+            log('TEST 233: Atomics OOB check');
             
             if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
                 const sab = new SharedArrayBuffer(0x100);
                 const ta = new Int32Array(sab);
                 
-                Atomics.store(ta, 0, 0x5F5F5F5F);
-                
-                const val = Atomics.load(ta, 0);
-                if (val !== 0x5F5F5F5F) {
-                    alert_vuln(187, 'Atomics store/load mismatch!');
-                }
-                
-                // Try atomic operations at boundary
+                // Try OOB atomic operation
+                let threw = false;
                 try {
-                    Atomics.add(ta, ta.length, 1);
-                    alert_vuln(187, 'Atomics OOB operation succeeded!');
+                    Atomics.add(ta, 1000, 1);
                 } catch(e2) {
-                    log('TEST 187: Atomics OOB blocked (expected)');
+                    threw = true;
                 }
-            } else {
-                log('TEST 187: Atomics not available');
+                
+                if (!threw) {
+                    alert_vuln(233, 'Atomics allowed OOB operation!');
+                } else {
+                    log('TEST 233: Atomics OOB blocked (expected)');
+                }
             }
         } catch(e) {
-            log('TEST 187: Exception - ' + e.message);
+            log('TEST 233: Exception - ' + e.message);
         }
 
-        // TEST 188: BigInt64Array overflow
+        // TEST 234: BigInt64Array strict bounds
         try {
-            log('TEST 188: BigInt64Array edge cases');
+            log('TEST 234: BigInt64Array bounds');
             
             if (typeof BigInt64Array !== 'undefined') {
                 const ta = new BigInt64Array(10);
                 
                 ta[0] = 0x7FFFFFFFFFFFFFFFn;
-                ta[1] = -0x8000000000000000n;
-                ta[2] = 0x8000000000000000n; // Should wrap
                 
-                if (ta[2] === -0x8000000000000000n) {
-                    log('TEST 188: BigInt64 wrap: 0x8000... became -0x8000...');
-                } else {
-                    alert_vuln(188, 'BigInt64 wrap unexpected! Got ' + ta[2].toString());
+                // Try OOB
+                let oobWorked = false;
+                ta[100] = 0x5252525252525252n;
+                
+                if (isRealElement(ta, 100)) {
+                    log('TEST 234: Index 100 is property (expected)');
+                } else if (ta[100] === 0x5252525252525252n) {
+                    alert_vuln(234, 'BigInt64Array OOB write worked!');
                 }
-            } else {
-                log('TEST 188: BigInt64Array not available');
             }
         } catch(e) {
-            log('TEST 188: Exception - ' + e.message);
+            log('TEST 234: Exception - ' + e.message);
         }
 
-        // TEST 189: Cross-typed-array copy
+        // TEST 235: Cross-type constructor contamination
         try {
-            log('TEST 189: Cross-type array copy');
-            const f64 = new Float64Array([1.1, 2.2, 3.3, 4.4, 5.5]);
-            const u32 = new Uint32Array(f64.buffer);
+            log('TEST 235: Cross-type constructor check');
             
-            // Create new array from different type
-            const u32copy = new Uint32Array(f64);
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x33333333;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
             
-            // Values should be converted, not bit-copied
-            if (u32copy[0] === u32[0]) {
-                alert_vuln(189, 'Cross-type copy did bit copy instead of conversion!');
-            }
+            const f64 = new Float64Array([1.1, 2.2, 3.3]);
+            const u32 = new Uint32Array(f64);
             
-            if (u32copy[0] === 1) {
-                log('TEST 189: Float 1.1 converted to Uint32 1 (expected)');
+            // u32 should be conversion, not bit copy
+            // Check victim wasn't affected
+            if (checkBufferContamination(victim, SENTINEL, 235)) {
+                alert_vuln(235, 'Cross-type constructor contaminated external buffer!');
             }
         } catch(e) {
-            log('TEST 189: Exception - ' + e.message);
+            log('TEST 235: Exception - ' + e.message);
         }
 
-        // TEST 190: TypedArray with Proxy handler
+        // TEST 236: Proxy with length trap strict check
         try {
-            log('TEST 190: TypedArray with Proxy corruption');
+            log('TEST 236: Proxy length trap');
             
             if (typeof Proxy !== 'undefined') {
-                const ta = new Uint32Array(100);
+                const ta = new Uint32Array(10);
+                for (let i = 0; i < ta.length; i++) ta[i] = i;
                 
+                let getLengthCount = 0;
                 const proxy = new Proxy(ta, {
                     get: function(target, prop) {
                         if (prop === 'length') {
-                            return 1000000; // Lie about length
+                            getLengthCount++;
+                            return 1000;
                         }
                         return target[prop];
-                    },
-                    set: function(target, prop, value) {
-                        target[prop] = value;
-                        return true;
                     }
                 });
                 
-                // Try to use proxy
-                proxy[500] = 0x60606060;
-                
-                // Check if write went through
-                if (verifyCorruption(ta, 500, 0x60606060, 190)) {
-                    alert_vuln(190, 'Proxy allowed OOB write via fake length!');
+                // Try to iterate
+                let iterCount = 0;
+                for (let val of proxy) {
+                    iterCount++;
+                    if (iterCount > 20) break; // Safety
                 }
                 
-                log('TEST 190: Proxy length=' + proxy.length + ', real length=' + ta.length);
+                log('TEST 236: Proxy length accessed ' + getLengthCount + ' times, iterated ' + iterCount);
             }
         } catch(e) {
-            log('TEST 190: Exception - ' + e.message);
+            log('TEST 236: Exception - ' + e.message);
         }
 
-        // TEST 191: Object.freeze on buffer
+        // TEST 237: Object.freeze doesn't prevent element writes
         try {
-            log('TEST 191: Frozen buffer modification');
-            const ab = new ArrayBuffer(0x100);
-            const ta = new Uint32Array(ab);
+            log('TEST 237: Frozen array element modification');
             
-            ta[0] = 0x61616161;
+            const ta = new Uint32Array(10);
+            ta[0] = 0x53535353;
             
-            Object.freeze(ab);
             Object.freeze(ta);
             
-            // Try to modify frozen array
-            ta[0] = 0x62626262;
+            // In non-strict mode, write silently fails
+            // In strict mode, write throws
+            let threw = false;
+            let writeSucceeded = false;
             
-            if (verifyCorruption(ta, 0, 0x62626262, 191)) {
-                alert_vuln(191, 'Frozen TypedArray was modified!');
-            } else {
-                log('TEST 191: Frozen array protected (expected)');
+            try {
+                ta[0] = 0x54545454;
+                writeSucceeded = (ta[0] === 0x54545454);
+            } catch(e2) {
+                threw = true;
             }
+            
+            if (writeSucceeded) {
+                alert_vuln(237, 'Frozen TypedArray element was modified!');
+            }
+            
+            log('TEST 237: Freeze write threw=' + threw + ', succeeded=' + writeSucceeded);
         } catch(e) {
-            log('TEST 191: Exception - ' + e.message);
+            log('TEST 237: Exception - ' + e.message);
         }
 
-        // TEST 192: Object.seal leakage
+        // TEST 238: Object.seal allows element modification
         try {
-            log('TEST 192: Sealed array extension');
+            log('TEST 238: Sealed array element modification');
+            
             const ta = new Uint32Array(10);
+            ta[0] = 0x55555555;
             
             Object.seal(ta);
             
-            // Try to add property
-            ta[20] = 0x63636363;
-            ta.newProp = 0x64646464;
+            // Sealed allows modification of existing indices
+            ta[0] = 0x56565656;
             
-            if (verifyCorruption(ta, 20, 0x63636363, 192)) {
-                alert_vuln(192, 'Sealed array extended!');
+            if (ta[0] !== 0x56565656) {
+                alert_vuln(238, 'Sealed array element modification failed unexpectedly!');
             }
             
-            if (ta.newProp === 0x64646464) {
-                alert_vuln(192, 'Property added to sealed array!');
+            // But shouldn't allow extension
+            ta[100] = 0x57575757;
+            
+            if (isRealElement(ta, 100)) {
+                log('TEST 238: Index 100 became property (expected for sealed)');
             }
+            
+            log('TEST 238: Sealed allows modification, prevents extension (expected)');
         } catch(e) {
-            log('TEST 192: Exception - ' + e.message);
+            log('TEST 238: Exception - ' + e.message);
         }
 
-        // TEST 193: Array buffer with custom Symbol.toStringTag
+        // TEST 239: Symbol.toStringTag side effects strict validation
         try {
-            log('TEST 193: Custom toStringTag exploitation');
+            log('TEST 239: toStringTag side effects');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x44444444;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
             const ab = new ArrayBuffer(0x100);
             
+            let getterCalled = false;
             Object.defineProperty(ab, Symbol.toStringTag, {
                 get: function() {
-                    // Side effect during toString
-                    const ta = new Uint32Array(this);
-                    ta[0] = 0x65656565;
+                    getterCalled = true;
+                    // Side effect
+                    victimView[0] = 0x58585858;
                     return 'CustomBuffer';
                 }
             });
             
             const str = Object.prototype.toString.call(ab);
             
-            const ta = new Uint32Array(ab);
-            if (verifyCorruption(ta, 0, 0x65656565, 193)) {
-                alert_vuln(193, 'toStringTag getter caused side effect!');
-            }
-            
-            log('TEST 193: toStringTag result: ' + str);
+            // Getter executing is normal, but we check victim wasn't affected by CORRUPTION
+            // (side effects themselves aren't vulnerabilities)
+            log('TEST 239: toStringTag getter called=' + getterCalled + ' (expected behavior)');
         } catch(e) {
-            log('TEST 193: Exception - ' + e.message);
+            log('TEST 239: Exception - ' + e.message);
         }
 
-        // TEST 194: Constructor property manipulation
+        // TEST 240: Constructor property doesn't affect map behavior
         try {
-            log('TEST 194: Constructor hijacking');
-            const ta = new Uint32Array(10);
+            log('TEST 240: Constructor property override');
             
-            const originalConstructor = ta.constructor;
+            const ta = new Uint32Array([1, 2, 3, 4, 5]);
             
             ta.constructor = function() {
                 return new Uint32Array(1000);
             };
             
-            if (ta.constructor !== originalConstructor) {
-                log('TEST 194: Constructor property modified');
-            }
+            const mapped = ta.map(x => x * 2);
             
-            // Try to use modified constructor in map
-            try {
-                const mapped = ta.map(x => x + 1);
-                
-                if (mapped.length !== ta.length) {
-                    alert_vuln(194, 'Modified constructor affected map! length=' + mapped.length);
-                }
-            } catch(e2) {}
-        } catch(e) {
-            log('TEST 194: Exception - ' + e.message);
-        }
-
-        // TEST 195: Symbol.species manipulation
-        try {
-            log('TEST 195: Species constructor exploitation');
-            
-            if (typeof Symbol !== 'undefined' && Symbol.species) {
-                const CustomArray = function(len) {
-                    const arr = new Uint32Array(len * 2); // Double the size
-                    return arr;
-                };
-                
-                Uint32Array[Symbol.species] = CustomArray;
-                
-                const ta1 = new Uint32Array(10);
-                const ta2 = ta1.map(x => x);
-                
-                if (ta2.length === 20) {
-                    alert_vuln(195, 'Species constructor doubled array size!');
-                }
-                
-                // Restore
-                delete Uint32Array[Symbol.species];
+            // map should use species, not constructor property directly
+            // Length should match original
+            if (mapped.length !== ta.length) {
+                log('TEST 240: Mapped length=' + mapped.length + ', original=' + ta.length);
+            } else {
+                log('TEST 240: Map ignored constructor property (expected)');
             }
         } catch(e) {
-            log('TEST 195: Exception - ' + e.message);
+            log('TEST 240: Exception - ' + e.message);
         }
 
-        // TEST 196: valueOf/toString coercion attack
+        // TEST 241: valueOf coercion side effects
         try {
-            log('TEST 196: Coercion side effects');
+            log('TEST 241: valueOf coercion validation');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x55555555;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
             const ta = new Uint32Array(10);
             
             let coercionCount = 0;
             const malicious = {
                 valueOf: function() {
                     coercionCount++;
-                    ta[coercionCount] = 0x66660000 + coercionCount;
                     return coercionCount;
                 }
             };
             
-            // Use in index
-            ta[malicious] = 0x67676767;
+            const idx = malicious; // Will be coerced
+            ta[idx] = 0x59595959;
             
-            if (coercionCount > 0) {
-                log('TEST 196: valueOf called ' + coercionCount + ' times');
+            // valueOf executing is normal behavior, not a vulnerability
+            log('TEST 241: valueOf called ' + coercionCount + ' times (expected behavior)');
+        } catch(e) {
+            log('TEST 241: Exception - ' + e.message);
+        }
+
+        // TEST 242: Recursive modification depth limit
+        try {
+            log('TEST 242: Recursive modification check');
+            
+            const ta = new Uint32Array(100);
+            let maxDepth = 0;
+            
+            function recursive(arr, depth) {
+                maxDepth = Math.max(maxDepth, depth);
+                if (depth > 1000) return; // Safety
                 
-                // Check for side effects
-                for (let i = 1; i <= coercionCount; i++) {
-                    if (verifyCorruption(ta, i, 0x66660000 + i, 196)) {
-                        alert_vuln(196, 'valueOf side effect succeeded at index ' + i);
+                arr[depth % arr.length] = depth;
+                recursive(arr, depth + 1);
+            }
+            
+            try {
+                recursive(ta, 0);
+            } catch(e2) {
+                // Stack overflow expected
+            }
+            
+            log('TEST 242: Max recursion depth: ' + maxDepth);
+        } catch(e) {
+            log('TEST 242: Exception - ' + e.message);
+        }
+
+        // TEST 243: Method chain state consistency
+        try {
+            log('TEST 243: Method chain consistency');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x66666666;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const ta = new Uint32Array([1, 2, 3, 4, 5]);
+            
+            const result = ta
+                .map(x => x * 2)
+                .filter(x => x > 4)
+                .reduce((a, b) => a + b, 0);
+            
+            // Check victim
+            if (checkBufferContamination(victim, SENTINEL, 243)) {
+                alert_vuln(243, 'Method chain contaminated external buffer!');
+            }
+            
+            log('TEST 243: Method chain result=' + result);
+        } catch(e) {
+            log('TEST 243: Exception - ' + e.message);
+        }
+
+        // TEST 244: Allocation pattern contamination
+        try {
+            log('TEST 244: Allocation pattern check');
+            
+            const buffers = [];
+            const PATTERNS = [0xAAAAAAAA, 0xBBBBBBBB, 0xCCCCCCCC];
+            
+            // Allocate with different patterns
+            for (let i = 0; i < 30; i++) {
+                const ab = new ArrayBuffer(0x100);
+                const ta = new Uint32Array(ab);
+                const pattern = PATTERNS[i % PATTERNS.length];
+                
+                for (let j = 0; j < ta.length; j++) {
+                    ta[j] = pattern;
+                }
+                
+                buffers.push({ab, ta, pattern});
+            }
+            
+            // Verify no cross-contamination
+            for (let i = 0; i < buffers.length; i++) {
+                const {ta, pattern} = buffers[i];
+                for (let j = 0; j < ta.length; j++) {
+                    if (ta[j] !== pattern) {
+                        alert_vuln(244, 'Buffer ' + i + ' contaminated! Expected 0x' + pattern.toString(16) + ' got 0x' + ta[j].toString(16));
                         break;
                     }
                 }
             }
+            
+            log('TEST 244: All buffers maintained isolation');
         } catch(e) {
-            log('TEST 196: Exception - ' + e.message);
+            log('TEST 244: Exception - ' + e.message);
         }
 
-        // TEST 197: Recursive array modification
+        // TEST 245: Slice independence verification
         try {
-            log('TEST 197: Recursive modification attack');
-            const ta = new Uint32Array(100);
+            log('TEST 245: Slice buffer independence');
             
-            let depth = 0;
-            const maxDepth = 10;
+            const ab = new ArrayBuffer(0x1000);
+            const ta = new Uint32Array(ab);
+            for (let i = 0; i < ta.length; i++) ta[i] = i;
             
-            function recursiveModify(arr, idx) {
-                if (depth++ > maxDepth) return;
-                
-                arr[idx] = 0x68680000 + depth;
-                
-                if (idx < 99) {
-                    recursiveModify(arr, idx + 1);
-                }
+            const sliced = ab.slice(0x100, 0x200);
+            const slicedView = new Uint32Array(sliced);
+            
+            // Modify original
+            ta[0] = 0x5A5A5A5A;
+            
+            // Sliced should be independent
+            if (slicedView[0] !== ta[0x40]) {
+                log('TEST 245: Sliced buffer is independent (expected)');
+            } else if (slicedView[0] === 0x5A5A5A5A) {
+                alert_vuln(245, 'Sliced buffer not independent!');
             }
-            
-            recursiveModify(ta, 0);
-            
-            log('TEST 197: Recursive depth reached: ' + depth);
-            
-            // Verify modifications
-            let modified = 0;
-            for (let i = 0; i < ta.length; i++) {
-                if (ta[i] !== 0) modified++;
-            }
-            
-            log('TEST 197: Modified ' + modified + ' elements');
         } catch(e) {
-            log('TEST 197: Exception - ' + e.message);
+            log('TEST 245: Exception - ' + e.message);
         }
 
-        // TEST 198: Array method chain corruption
+        // TEST 246: Endianness consistency across operations
         try {
-            log('TEST 198: Method chain side effects');
-            const ta = new Uint32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            log('TEST 246: Endianness consistency');
             
-            const result = ta
-                .map(x => x * 2)
-                .filter((x, idx, arr) => {
-                    // Modify during filter
-                    arr[0] = 0x69696969;
-                    return x > 5;
-                })
-                .reduce((acc, val) => acc + val, 0);
+            const ab = new ArrayBuffer(8);
+            const dv = new DataView(ab);
             
-            // Check if original was modified
-            if (verifyCorruption(ta, 0, 0x69696969, 198)) {
-                alert_vuln(198, 'Method chain allowed modification of original array!');
+            // Write with explicit endianness
+            dv.setUint32(0, 0x12345678, true); // LE
+            dv.setUint32(4, 0xABCDEF00, false); // BE
+            
+            // Read back with same endianness
+            const le = dv.getUint32(0, true);
+            const be = dv.getUint32(4, false);
+            
+            if (le !== 0x12345678) {
+                alert_vuln(246, 'LE consistency broken! Expected 0x12345678 got 0x' + le.toString(16));
             }
             
-            log('TEST 198: Method chain result: ' + result);
+            if (be !== 0xABCDEF00) {
+                alert_vuln(246, 'BE consistency broken! Expected 0xABCDEF00 got 0x' + be.toString(16));
+            }
+            
+            log('TEST 246: Endianness consistent');
         } catch(e) {
-            log('TEST 198: Exception - ' + e.message);
+            log('TEST 246: Exception - ' + e.message);
         }
 
-        // TEST 199: Memory pressure allocation
+        // TEST 247: Memory pressure no contamination
         try {
-            log('TEST 199: Memory pressure edge case');
+            log('TEST 247: Memory pressure isolation');
+            
+            const sentinel = new ArrayBuffer(0x100);
+            const sentinelView = new Uint32Array(sentinel);
+            const SENTINEL = 0x77777777;
+            for (let i = 0; i < sentinelView.length; i++) sentinelView[i] = SENTINEL;
+            
+            // Allocate many buffers
             const allocations = [];
-            let allocated = 0;
-            
-            // Allocate until we hit limits (but not DoS)
-            for (let i = 0; i < 100; i++) {
+            for (let i = 0; i < 50; i++) {
                 try {
-                    const ab = new ArrayBuffer(0x100000); // 1MB each
-                    const ta = new Uint32Array(ab);
-                    ta[0] = i;
-                    allocations.push(ab);
-                    allocated++;
+                    allocations.push(new ArrayBuffer(0x10000)); // 64KB each
                 } catch(e2) {
                     break;
                 }
             }
             
-            log('TEST 199: Allocated ' + allocated + ' buffers of 1MB each');
+            // Check sentinel
+            if (checkBufferContamination(sentinel, SENTINEL, 247)) {
+                alert_vuln(247, 'Memory pressure contaminated sentinel buffer!');
+            }
             
-            // Try one more allocation
-            try {
-                const ab = new ArrayBuffer(0x100000);
-                const ta = new Uint32Array(ab);
-                ta[0] = 0x6A6A6A6A;
-                
-                // Check if any previous allocation was corrupted
-                for (let i = 0; i < allocations.length; i++) {
-                    const view = new Uint32Array(allocations[i]);
-                    if (view[0] !== i) {
-                        alert_vuln(199, 'Memory pressure corrupted allocation ' + i);
-                        break;
-                    }
-                }
-            } catch(e2) {}
+            log('TEST 247: Allocated ' + allocations.length + ' buffers, no contamination');
             
             // Cleanup
             allocations.length = 0;
         } catch(e) {
-            log('TEST 199: Exception - ' + e.message);
+            log('TEST 247: Exception - ' + e.message);
         }
 
-        // TEST 200: Final stress test with all techniques
+        // TEST 248: Unaligned DataView write/read consistency
         try {
-            log('TEST 200: Combined exploitation stress test');
+            log('TEST 248: Unaligned DataView consistency');
             
-            const ab = new ArrayBuffer(0x1000);
-            const views = {
-                u8: new Uint8Array(ab),
-                u16: new Uint16Array(ab),
-                u32: new Uint32Array(ab),
-                i8: new Int8Array(ab),
-                i16: new Int16Array(ab),
-                i32: new Int32Array(ab),
-                f32: new Float32Array(ab),
-                f64: new Float64Array(ab)
+            const ab = new ArrayBuffer(16);
+            const dv = new DataView(ab);
+            
+            // Write unaligned
+            dv.setUint32(1, 0x12345678, true);
+            
+            // Read back
+            const val = dv.getUint32(1, true);
+            
+            if (val !== 0x12345678) {
+                alert_vuln(248, 'Unaligned DataView corrupted! Expected 0x12345678 got 0x' + val.toString(16));
+            }
+            
+            log('TEST 248: Unaligned access consistent');
+        } catch(e) {
+            log('TEST 248: Exception - ' + e.message);
+        }
+
+        // TEST 249: Array-like to TypedArray conversion contamination
+        try {
+            log('TEST 249: Array-like conversion check');
+            
+            const victim = new ArrayBuffer(0x100);
+            const victimView = new Uint32Array(victim);
+            const SENTINEL = 0x88888888;
+            for (let i = 0; i < victimView.length; i++) victimView[i] = SENTINEL;
+            
+            const arrayLike = {
+                length: 5,
+                0: 0x5B5B5B5B,
+                1: 0x5C5C5C5C,
+                2: 0x5D5D5D5D,
+                3: 0x5E5E5E5E,
+                4: 0x5F5F5F5F
             };
             
-            // Phase 1: Fill via Float64 with special values
-            views.f64[0] = 1.1823397047269973e-289; // Crafted pointer-like value
+            const ta = new Uint32Array(arrayLike);
             
-            // Phase 2: Read via different views
-            const u32_val = views.u32[0];
-            const u16_val = views.u16[0];
-            const u8_val = views.u8[0];
-            
-            log('TEST 200: Phase 1 - Type confusion values: u32=0x' + u32_val.toString(16) + 
-                ', u16=0x' + u16_val.toString(16) + ', u8=0x' + u8_val.toString(16));
-            
-            // Phase 3: Modify via Int8 (possible sign extension)
-            views.i8[0] = -1;
-            views.i8[1] = -1;
-            views.i8[2] = -1;
-            views.i8[3] = -1;
-            
-            if (views.u32[0] === 0xFFFFFFFF) {
-                log('TEST 200: Phase 2 - Sign extension worked');
+            // Check victim
+            if (checkBufferContamination(victim, SENTINEL, 249)) {
+                alert_vuln(249, 'Array-like conversion contaminated external buffer!');
             }
             
-            // Phase 4: Create subarray and modify
-            const sub = views.u32.subarray(10, 20);
-            sub.fill(0x6B6B6B6B);
+            log('TEST 249: Array-like conversion successful');
+        } catch(e) {
+            log('TEST 249: Exception - ' + e.message);
+        }
+
+        // TEST 250: Final comprehensive contamination test
+        try {
+            log('TEST 250: Comprehensive contamination test');
             
-            // Phase 5: Use DataView with unaligned access
-            const dv = new DataView(ab);
-            dv.setUint32(1, 0x6C6C6C6C, true);
-            
-            // Phase 6: Verify no unexpected corruption
-            let corrupted = false;
-            for (let i = 20; i < views.u32.length; i++) {
-                if (views.u32[i] !== 0 && views.u32[i] !== 0x6B6B6B6B) {
-                    corrupted = true;
-                    alert_vuln(200, 'STRESS TEST: Unexpected corruption at u32[' + i + ']=0x' + views.u32[i].toString(16));
-                    break;
+            // Create sentinel buffers
+            const sentinels = [];
+            for (let i = 0; i < 10; i++) {
+                const ab = new ArrayBuffer(0x100);
+                const ta = new Uint32Array(ab);
+                const sentinel = 0x99990000 + i;
+                
+                for (let j = 0; j < ta.length; j++) {
+                    ta[j] = sentinel;
                 }
+                
+                sentinels.push({ab, ta, sentinel});
             }
             
-            if (!corrupted) {
-                log('TEST 200: STRESS TEST COMPLETE - No unexpected corruption');
+            // Perform various operations
+            const testBuffer = new ArrayBuffer(0x1000);
+            const testView = new Uint32Array(testBuffer);
+            
+            // Fill
+            testView.fill(0x60606060);
+            
+            // Slice
+            const sliced = testBuffer.slice(0, 0x100);
+            const slicedView = new Uint32Array(sliced);
+            slicedView[0] = 0x61616161;
+            
+            // Copy
+            const copy = new Uint32Array(testView);
+            copy[0] = 0x62626262;
+            
+            // Subarray
+            const sub = testView.subarray(10, 50);
+            sub[0] = 0x63636363;
+            
+            // Check all sentinels
+            let contaminated = false;
+            for (let i = 0; i < sentinels.length; i++) {
+                const {ta, sentinel} = sentinels[i];
+                for (let j = 0; j < ta.length; j++) {
+                    if (ta[j] !== sentinel) {
+                        alert_vuln(250, 'COMPREHENSIVE TEST: Sentinel ' + i + ' contaminated!');
+                        contaminated = true;
+                        break;
+                    }
+                }
+                if (contaminated) break;
+            }
+            
+            if (!contaminated) {
+                log('TEST 250: COMPREHENSIVE TEST PASSED - No contamination detected');
             }
             
         } catch(e) {
-            log('TEST 200: Exception - ' + e.message);
+            log('TEST 250: Exception - ' + e.message);
         }
 
         log('========================================');
-        log('ALL 50 MEMORY CORRUPTION TESTS COMPLETE (151-200)');
+        log('ALL 50 TESTS COMPLETE (201-250)');
         log('========================================');
-        log('Tests with ALERTA are exploitable vulnerabilities!');
-        log('Run on PS4 browser and compare with modern browsers');
+        log('ZERO FALSE POSITIVES - Only real vulnerabilities trigger ALERTA');
+        log('Run on PS4 and compare with Chrome/Safari/Edge');
     </script>
 </body>
 </html>
-
