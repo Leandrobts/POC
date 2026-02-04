@@ -4,33 +4,24 @@
 <head>
   <meta charset="utf-8">
   <title>PS4 – 25x ArrayBuffer Detach Races (Full Corrected)</title>
-  <style>
-    body { font-family: sans-serif; background: #1a1a1a; color: #ccc; padding: 20px; }
-    h2 { color: #fff; }
-    #log { background: #000; color: #0f0; padding: 15px; border-radius: 5px; overflow-y: scroll; max-height: 500px; font-family: monospace; }
-    button { padding: 10px 20px; cursor: pointer; background: #444; color: #fff; border: none; margin-right: 10px; }
-    button:hover { background: #666; }
-    .alerta { color: #ff4444; font-weight: bold; }
-  </style>
 </head>
 <body>
-<h2>PS4 – 25x ArrayBuffer / TypedArray Detachment Races (PARTE 1)</h2>
-<p>Status: <span id="status">Aguardando...</span></p>
+<h2>PS4 – 25x ArrayBuffer / TypedArray detachment races (PARTE 1: T1–T25)</h2>
+<p>Log apenas <b>[ALERTA]</b>. Se o browser travar ou reiniciar, o teste anterior foi o gatilho.</p>
 
 <button onclick="clearLog()">Limpar Log</button>
-<button onclick="runAll()">Rodar 25 Testes</button>
+<button onclick="runAll()">Rodar Todos os 25 Testes</button>
 
-<div id="log"></div>
+<pre id="log" style="background: #f4f4f4; border: 1px solid #ccc; padding: 10px; min-height: 300px; font-family: monospace;"></pre>
 
 <script>
-/* ==========================================================
-   HARNESS DE COMPATIBILIDADE E SEGURANÇA (PS4 WEBKIT)
-   ========================================================== */
+/* ============================================================
+   HARNESS DE COMPATIBILIDADE E UTILITÁRIOS
+   ============================================================ */
 var L = document.getElementById("log");
-var ST = document.getElementById("status");
 var ALERTS = 0;
 
-// Polyfill para browsers sem Promise (FWs antigos)
+// Polyfill de Promise para firmwares/engines mais antigas
 if (typeof Promise === "undefined") {
     window.Promise = {
         resolve: function() {
@@ -39,372 +30,269 @@ if (typeof Promise === "undefined") {
     };
 }
 
-function log(s) { 
-    var div = document.createElement("div");
-    div.innerHTML = s;
-    L.appendChild(div);
-    L.scrollTop = L.scrollHeight;
-}
+function log(s){ L.textContent += s + "\n"; }
+function ALERT(s){ ALERTS++; log("[ALERTA] " + s); }
+function clearLog(){ L.textContent=""; ALERTS=0; }
 
-function ALERT(s) { 
-    ALERTS++; 
-    log("<span class='alerta'>[ALERTA] " + s + "</span>"); 
-}
+function now(){ return Date.now ? Date.now() : (new Date()).getTime(); }
+function sleep(ms, cb){ setTimeout(cb, ms); }
 
-function clearLog() { L.innerHTML = ""; ALERTS = 0; ST.textContent = "Aguardando..."; }
-
-function now() { return Date.now ? Date.now() : (new Date()).getTime(); }
-
-function sleep(ms, cb) { setTimeout(cb, ms); }
-
-function u8hash(u8) {
+function u8hash(u8){
   var h = 2166136261>>>0, i;
-  for(i=0; i<u8.length; i++){ h ^= u8[i]; h = (h * 16777619)>>>0; }
-  return ("00000000" + h.toString(16)).slice(-8);
+  for(i=0;i<u8.length;i++){ h ^= u8[i]; h = (h * 16777619)>>>0; }
+  return ("00000000"+h.toString(16)).slice(-8);
 }
 
-function makeAB(n) {
+function makeAB(n){
   var ab = new ArrayBuffer(n);
   var u8 = new Uint8Array(ab);
-  for(var i=0; i<u8.length; i++) u8[i] = (i*131 + 7) & 255;
+  for(var i=0;i<u8.length;i++) u8[i] = (i*131 + 7) & 255;
   return ab;
 }
 
-function mkWorker() {
+/* Criação segura do Worker para testes de transferência */
+function mkWorker(){
   try {
     if(typeof Worker === "undefined" || typeof Blob === "undefined") return null;
-    var code =
-      "self.onmessage=function(e){" +
-      "  var d=e.data;" +
-      "  if(d && d.cmd==='hold'){ self._buf=d.buf; self.postMessage({held:1}); }" +
-      "  if(d && d.cmd==='release'){ var b=self._buf; self._buf=null; self.postMessage({buf:b}, [b]); }" +
-      "};";
+    var code = "self.onmessage=function(e){ var d=e.data; if(d && d.cmd==='hold'){ self._buf=d.buf; self.postMessage({held:1}); } if(d && d.cmd==='release'){ var b=self._buf; self._buf=null; self.postMessage({buf:b}, [b]); } };";
     var blob = new Blob([code], {type:"application/javascript"});
     var url = URL.createObjectURL(blob);
     return new Worker(url);
   } catch(e) { return null; }
 }
-
 var W = mkWorker();
 
-function detachViaMessageChannel(ab, cb) {
+/* Funções de Detach com tratamento de erro para não quebrar a sequência */
+function detachViaMessageChannel(ab, cb){
   try {
     var ch = new MessageChannel();
-    ch.port2.onmessage = function() { 
-        try { ch.port1.close(); ch.port2.close(); } catch(e) {} 
-        cb(true); 
-    };
-    try {
-        ch.port1.postMessage({buf:ab}, [ab]); 
-    } catch(err) {
-        cb(false, err);
-        return;
-    }
-    setTimeout(function(){ cb(true); }, 20);
-  } catch(e) {
-    cb(false, e);
-  }
+    ch.port2.onmessage = function(){ cb(true); };
+    ch.port1.postMessage({buf:ab}, [ab]); 
+    setTimeout(function(){ cb(true); }, 25);
+  } catch(e) { cb(false, e); }
 }
 
-function detachViaWorkerHold(ab, cb) {
-  if(!W) { cb(false, "no worker"); return; }
+function detachViaWorkerHold(ab, cb){
+  if(!W){ cb(false, "no worker"); return; }
   var done = false;
-  W.onmessage = function(ev) {
-    if(done) return;
-    if(ev.data && (ev.data.held || ev.data.err)) {
-        done = true;
-        cb(!!ev.data.held, ev.data.err);
-    }
-  };
-  try {
-    W.postMessage({cmd:"hold", buf:ab}, [ab]);
-  } catch(e) {
-    if(!done) { done = true; cb(false, e); }
-  }
-  setTimeout(function(){ if(!done){ done=true; cb(true); } }, 50);
+  W.onmessage = function(ev){ if(!done){ done=true; cb(true); } };
+  try { W.postMessage({cmd:"hold", buf:ab}, [ab]); } catch(e){ if(!done){ done=true; cb(false); } }
+  setTimeout(function(){ if(!done){ done=true; cb(true); } }, 40);
 }
 
-function checkInvariants(tag, ab, u8Before, view) {
+/* Validador de Invariantes: Checa se a memória "fantasma" ainda existe */
+function checkInvariants(tag, ab, u8Before, view){
   var bl = -1, vbl = -1;
-  try { bl = ab.byteLength; } catch(e) {}
-  try { vbl = view ? view.byteLength : -1; } catch(e2) {}
-
-  var det = (bl === 0);
-  if(det && vbl > 0) ALERT(tag + ": Inconsistência! view.byteLength=" + vbl + " mas ab.byteLength=0");
-
-  if(det && view) {
+  try{ bl = ab.byteLength; }catch(e){}
+  try{ vbl = view ? view.byteLength : -1; }catch(e2){}
+  if(bl === 0 && vbl > 0) ALERT(tag + ": Inconsistência Crítica! view.byteLength=" + vbl + " com ab.byteLength=0");
+  if(bl === 0 && view){
     var ghost = 0;
     try {
-      var checkLen = Math.min(8, view.length);
-      for(var i=0; i<checkLen; i++) {
-        if(view[i] === u8Before[i]) ghost++;
-      }
-    } catch(e3) {}
-    if(ghost >= 6) ALERT(tag + ": Ghost Read! Dados ainda acessíveis após detach. ghost=" + ghost);
+      for(var i=0; i<Math.min(8, view.length); i++){ if(view[i] === u8Before[i]) ghost++; }
+    } catch(e3){}
+    if(ghost >= 6) ALERT(tag + ": Ghost Read! Dados originais acessíveis após detach.");
   }
 }
 
-/* ==========================================================
-   DEFINIÇÃO DOS 25 TESTES (T1–T25)
-   ========================================================== */
+/* Runner: Executa os testes em série com atraso para evitar engasgos da engine */
 var tests = [];
-function add(id, name, fn) { tests.push({id:id, name:name, run:fn}); }
+function add(id, name, fn){ tests.push({id:id, name:name, run:fn}); }
 
-// T1: MessageChannel básico
-add(1, "MessageChannel detach (imediato)", function(next){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0), view = new Uint8Array(ab);
-  detachViaMessageChannel(ab, function(){ checkInvariants("T1", ab, before, view); next(); });
-});
-
-// T2: Worker hold básico
-add(2, "Worker detach (hold)", function(next){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0), view = new Uint8Array(ab);
-  detachViaWorkerHold(ab, function(ok){ if(ok) checkInvariants("T2", ab, before, view); next(); });
-});
-
-// T3: Microtask race
-add(3, "Microtask detach during read loop", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try { for(var i=0; i<512; i++) { var x = u8[i]; } } catch(e){}
-  sleep(30, function(){ checkInvariants("T3", ab, before, u8); next(); });
-});
-
-// T4: Timeout race
-add(4, "Timeout detach during write loop", function(next){
-  var ab = makeAB(2048), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try { for(var i=0; i<512; i++) { u8[i] ^= 0x5a; } } catch(e){}
-  sleep(40, function(){ checkInvariants("T4", ab, before, u8); next(); });
-});
-
-// T5: DataView read race
-add(5, "DataView read while detach", function(next){
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), dv = new DataView(ab);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try { for(var i=0; i<16; i++) dv.getUint32(i*4, true); } catch(e){}
-  sleep(30, function(){ checkInvariants("T5", ab, before, new Uint8Array(ab)); next(); });
-});
-
-// T6: Sort comparator race
-add(6, "Uint32Array.sort comparator detach", function(next){
-  var ab = makeAB(1024), before = new Uint8Array(ab).slice(0), u32 = new Uint32Array(ab);
-  var fired = 0;
-  try {
-    u32.sort(function(a, b){
-      if(++fired === 2) detachViaMessageChannel(ab, function(){});
-      return a - b;
-    });
-  } catch(e){}
-  sleep(40, function(){ checkInvariants("T6", ab, before, new Uint8Array(ab)); next(); });
-});
-
-// T7: Double transfer
-add(7, "Double-transfer attempt", function(next){
-  var ab = makeAB(128), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(ok){
-    if(ok) detachViaMessageChannel(ab, function(){});
-    checkInvariants("T7", ab, before, new Uint8Array(ab));
-    next();
-  });
-});
-
-// T8: Slice after detach
-add(8, "Slice after detach", function(next){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(ok){
-    if(ok) {
-        try {
-            var ab2 = ab.slice(0);
-            if(ab.byteLength === 0 && ab2.byteLength > 0) ALERT("T8: slice gerou buffer válido em AB dettachado");
-        } catch(e){}
-    }
-    checkInvariants("T8", ab, before, new Uint8Array(ab));
-    next();
-  });
-});
-
-// T9: StructuredClone
-add(9, "structuredClone transfer", function(next){
-  if(typeof structuredClone === "undefined") { log("T9: Ignorado (sem structuredClone)"); return next(); }
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0);
-  try { structuredClone({b:ab}, {transfer:[ab]}); } catch(e){}
-  sleep(20, function(){ checkInvariants("T9", ab, before, new Uint8Array(ab)); next(); });
-});
-
-// T10: Subarray behavior
-add(10, "subarray view after detach", function(next){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), sub = u8.subarray(16, 32), before = u8.slice(0);
-  detachViaMessageChannel(ab, function(){
-    try { if(ab.byteLength === 0 && sub.byteLength > 0) ALERT("T10: subarray.byteLength > 0 após detach"); } catch(e){}
-    checkInvariants("T10", ab, before, u8);
-    next();
-  });
-});
-
-// T11: Promise Chain
-add(11, "Promise chain post-detach reads", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  detachViaMessageChannel(ab, function(){});
-  Promise.resolve().then(function(){
-    checkInvariants("T11", ab, before, u8);
-    next();
-  });
-});
-
-// T12: JSON toJSON side-effect
-add(12, "toJSON side-effect detach", function(next){
-  var ab = makeAB(256), u8 = new Uint8Array(ab), before = u8.slice(0);
-  var o = { toJSON: function(){ detachViaMessageChannel(ab, function(){}); return 1; } };
-  try { JSON.stringify(o); } catch(e){}
-  sleep(30, function(){ checkInvariants("T12", ab, before, u8); next(); });
-});
-
-// T13: Map callback detach
-add(13, "TypedArray map callback detach", function(next){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0);
-  var c = 0;
-  try { u8.map(function(v){ if(++c === 3) detachViaMessageChannel(ab, function(){}); return v; }); } catch(e){}
-  sleep(30, function(){ checkInvariants("T13", ab, before, u8); next(); });
-});
-
-// T14: Reduce detach
-add(14, "TypedArray reduce detach", function(next){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0);
-  var c = 0;
-  try { u8.reduce(function(acc, v){ if(++c === 2) detachViaMessageChannel(ab, function(){}); return acc + v; }, 0); } catch(e){}
-  sleep(30, function(){ checkInvariants("T14", ab, before, u8); next(); });
-});
-
-// T15: Set from other TA race
-add(15, "TypedArray.set with detach race", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  var src = new Uint8Array(256); src.fill(0x41);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try { u8.set(src, 0); } catch(e){}
-  sleep(30, function(){ checkInvariants("T15", ab, before, u8); next(); });
-});
-
-// T16: New view after detach
-add(16, "Create new view after detach", function(next){
-  var ab = makeAB(128), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(){
-    try {
-        var u8 = new Uint8Array(ab);
-        if(ab.byteLength === 0 && u8.byteLength > 0) ALERT("T16: Novo Uint8Array criado com tamanho > 0 em AB dettachado");
-    } catch(e){}
-    checkInvariants("T16", ab, before, null);
-    next();
-  });
-});
-
-// T17: copyWithin race
-add(17, "copyWithin detach race", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try { u8.copyWithin(0, 16, 128); } catch(e){}
-  sleep(30, function(){ checkInvariants("T17", ab, before, u8); next(); });
-});
-
-// T18: fill race
-add(18, "fill detach race", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try { u8.fill(0x7f); } catch(e){}
-  sleep(40, function(){ checkInvariants("T18", ab, before, u8); next(); });
-});
-
-// T19: DataView set race
-add(19, "DataView write while detach", function(next){
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), dv = new DataView(ab);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try { for(var i=0; i<16; i++) dv.setUint32(i*4, 0x41414141, true); } catch(e){}
-  sleep(40, function(){ checkInvariants("T19", ab, before, new Uint8Array(ab)); next(); });
-});
-
-// T20: Array.from/join race
-add(20, "Array.from/join with detach", function(next){
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), u16 = new Uint16Array(ab);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try { Array.prototype.join.call(u16, ","); } catch(e){}
-  sleep(30, function(){ checkInvariants("T20", ab, before, new Uint8Array(ab)); next(); });
-});
-
-// T21: New allocation pressure
-add(21, "Post-detach memory pressure", function(next){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(){
-      var junk = [];
-      try { for(var i=0; i<50; i++) junk.push(new Uint8Array(1024 * 1024)); } catch(e){}
-      checkInvariants("T21", ab, before, new Uint8Array(ab));
-      next();
-  });
-});
-
-// T22: Buffer ref persistence
-add(22, "Keep buffer ref + detach", function(next){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0);
-  var bufRef = u8.buffer;
-  detachViaMessageChannel(bufRef, function(){
-    checkInvariants("T22", ab, before, u8);
-    next();
-  });
-});
-
-// T23: Two-stage timeout
-add(23, "Two-stage timeout detach", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  setTimeout(function(){ checkInvariants("T23", ab, before, u8); next(); }, 60);
-});
-
-// T24: Math consuming values
-add(24, "Math ops while detach", function(next){
-  var ab = makeAB(2048), u32 = new Uint32Array(ab), before = new Uint8Array(ab).slice(0);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  var s = 0;
-  try { for(var i=0; i<64; i++) s = Math.sqrt(s + u32[i]); } catch(e){}
-  sleep(30, function(){ checkInvariants("T24", ab, before, new Uint8Array(ab)); next(); });
-});
-
-// T25: indexOf scan
-add(25, "indexOf scan detach race", function(next){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try { u8.indexOf(0x41); } catch(e){}
-  sleep(40, function(){ checkInvariants("T25", ab, before, u8); next(); });
-});
-
-/* ==========================================================
-   RUNNER PRINCIPAL
-   ========================================================== */
-function runSeries(list, done) {
-  var i = 0;
-  function step() {
+function runSeries(list, done){
+  var i=0;
+  function step(){
     if(i >= list.length) return done && done();
     var t = list[i++];
-    ST.textContent = "Rodando T" + t.id + "...";
-    log("<b>T" + t.id + "</b>: " + t.name);
+    log("T" + t.id + " -> " + t.name);
     try {
-      t.run(function(){ setTimeout(step, 20); });
+      t.run(function(){ setTimeout(step, 15); });
     } catch(e) {
-      log("Erro crítico no Harness T" + t.id + ": " + e.message);
-      setTimeout(step, 20);
+      log(" ! Erro no Runner T" + t.id + ": " + e.message);
+      setTimeout(step, 15);
     }
   }
   step();
 }
 
-function runAll() {
+function runAll(){
   clearLog();
-  ST.textContent = "Iniciando...";
-  var start = now();
+  log("Iniciando bateria completa de 25 testes...");
   runSeries(tests, function(){
-    var dt = (now() - start) / 1000;
-    ST.textContent = "Finalizado em " + dt.toFixed(2) + "s";
-    log("<br>=== FIM DOS TESTES === ALERTAS=" + ALERTS);
+    log("\n=== CONCLUÍDO === Alertas: " + ALERTS);
   });
 }
+
+/* ============================================================
+   DEFINIÇÃO DOS 25 TESTES (T1 - T25)
+   ============================================================ */
+
+// T1-T2: Métodos básicos de detach
+add(1, "MessageChannel detach (imediato)", function(n){
+  var ab = makeAB(256), before = new Uint8Array(ab).slice(0), view = new Uint8Array(ab);
+  detachViaMessageChannel(ab, function(){ checkInvariants("T1", ab, before, view); n(); });
+});
+add(2, "Worker detach (hold)", function(n){
+  var ab = makeAB(256), before = new Uint8Array(ab).slice(0), view = new Uint8Array(ab);
+  detachViaWorkerHold(ab, function(ok){ if(ok) checkInvariants("T2", ab, before, view); n(); });
+});
+
+// T3-T5: Race conditions em loops de leitura/escrita
+add(3, "Microtask detach during read loop", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ for(var i=0;i<512;i++){ var x = u8[i]; } }catch(e){}
+  sleep(30, function(){ checkInvariants("T3", ab, before, u8); n(); });
+});
+add(4, "Timeout detach during write loop", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ for(var i=0;i<256;i++){ u8[i] ^= 0x5a; } }catch(e){}
+  sleep(40, function(){ checkInvariants("T4", ab, before, u8); n(); });
+});
+add(5, "DataView read while detach", function(n){
+  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), dv = new DataView(ab);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ for(var i=0;i<16;i++) dv.getUint32(i*4, true); }catch(e){}
+  sleep(30, function(){ checkInvariants("T5", ab, before, new Uint8Array(ab)); n(); });
+});
+
+// T6-T8: Comportamentos de API (Sort, Double transfer, Slice)
+add(6, "Uint32Array.sort comparator detach", function(n){
+  var ab = makeAB(1024), u32 = new Uint32Array(ab), before = new Uint8Array(ab).slice(0);
+  var fired=0;
+  try {
+    u32.sort(function(a,b){
+      if(++fired === 2) detachViaMessageChannel(ab, function(){});
+      return a-b;
+    });
+  } catch(e){}
+  sleep(40, function(){ checkInvariants("T6", ab, before, new Uint8Array(ab)); n(); });
+});
+add(7, "Double-transfer attempt", function(n){
+  var ab = makeAB(128), before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    if(ok) detachViaMessageChannel(ab, function(){});
+    checkInvariants("T7", ab, before, new Uint8Array(ab)); n();
+  });
+});
+add(8, "Slice after detach", function(n){
+  var ab = makeAB(256), before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    try{ var ab2 = ab.slice(0); if(ab.byteLength===0 && ab2.byteLength>0) ALERT("T8: slice gerou buffer ativo"); }catch(e){}
+    n();
+  });
+});
+
+// T9-T11: Clonagem estruturada e Subarrays
+add(9, "structuredClone transfer", function(n){
+  if(typeof structuredClone !== "function") { log("T9: Ignorado (sem structuredClone)"); return n(); }
+  var ab = makeAB(512), before = new Uint8Array(ab).slice(0);
+  try { structuredClone({b:ab}, {transfer:[ab]}); } catch(e){}
+  sleep(20, function(){ checkInvariants("T9", ab, before, new Uint8Array(ab)); n(); });
+});
+add(10, "subarray view behavior after detach", function(n){
+  var ab = makeAB(512), u8 = new Uint8Array(ab), sub = u8.subarray(16, 32), before = u8.slice(0);
+  detachViaMessageChannel(ab, function(){
+    try{ if(ab.byteLength===0 && sub.byteLength>0) ALERT("T10: subarray ativo após detach do pai"); }catch(e){}
+    n();
+  });
+});
+add(11, "Promise chain post-detach reads", function(n){
+  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0);
+  detachViaMessageChannel(ab, function(){});
+  Promise.resolve().then(function(){ checkInvariants("T11", ab, before, u8); n(); });
+});
+
+// T12-T15: Efeitos colaterais em callbacks (JSON, Map, Reduce, Set)
+add(12, "toJSON side-effect detach", function(n){
+  var ab = makeAB(256), u8 = new Uint8Array(ab), before = u8.slice(0);
+  var o = { toJSON: function(){ detachViaMessageChannel(ab, function(){}); return 1; } };
+  try{ JSON.stringify(o); }catch(e){}
+  sleep(30, function(){ checkInvariants("T12", ab, before, u8); n(); });
+});
+add(13, "TypedArray map callback detach", function(n){
+  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0), c=0;
+  try{ u8.map(function(v){ if(++c===3) detachViaMessageChannel(ab, function(){}); return v; }); }catch(e){}
+  sleep(30, function(){ checkInvariants("T13", ab, before, u8); n(); });
+});
+add(14, "TypedArray reduce detach", function(n){
+  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0), c=0;
+  try{ u8.reduce(function(acc,v){ if(++c===2) detachViaMessageChannel(ab, function(){}); return acc+v; }, 0); }catch(e){}
+  sleep(30, function(){ checkInvariants("T14", ab, before, u8); n(); });
+});
+add(15, "TypedArray.set with detach mid-way", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0), src = new Uint8Array(256);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ u8.set(src, 0); }catch(e){}
+  sleep(30, function(){ checkInvariants("T15", ab, before, u8); n(); });
+});
+
+// T16-T19: Manipulação de Memória (CopyWithin, Fill, DataView)
+add(16, "Create new view after detach", function(n){
+  var ab = makeAB(128), before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(){
+    try{ var u8 = new Uint8Array(ab); if(u8.byteLength > 0) ALERT("T16: Nova view criada com tamanho > 0"); }catch(e){}
+    n();
+  });
+});
+add(17, "copyWithin detach", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ u8.copyWithin(0, 16, 128); }catch(e){}
+  sleep(30, function(){ checkInvariants("T17", ab, before, u8); n(); });
+});
+add(18, "fill detach", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ u8.fill(0x7f); }catch(e){}
+  sleep(40, function(){ checkInvariants("T18", ab, before, u8); n(); });
+});
+add(19, "DataView write while detach", function(n){
+  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), dv = new DataView(ab);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ for(var i=0;i<16;i++) dv.setUint32(i*4, 0x41414141, true); }catch(e){}
+  sleep(40, function(){ checkInvariants("T19", ab, before, new Uint8Array(ab)); n(); });
+});
+
+// T20-T22: Conversões e Referências
+add(20, "Array.from(Uint16Array) with detach", function(n){
+  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), u16 = new Uint16Array(ab);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ Array.prototype.join.call(u16, ","); }catch(e){}
+  sleep(30, function(){ checkInvariants("T20", ab, before, new Uint8Array(ab)); n(); });
+});
+add(21, "Post-detach allocate new AB", function(n){
+  var ab = makeAB(256), before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(){
+    var junk=[]; for(var i=0;i<100;i++) junk.push(new Uint8Array(1024));
+    checkInvariants("T21", ab, before, new Uint8Array(ab)); n();
+  });
+});
+add(22, "Keep buffer ref + detach", function(n){
+  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0), bufRef = u8.buffer;
+  detachViaMessageChannel(bufRef, function(){ checkInvariants("T22", ab, before, u8); n(); });
+});
+
+// T23-T25: Timing e Busca
+add(23, "Two-stage timeout detach", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  setTimeout(function(){ checkInvariants("T23", ab, before, u8); n(); }, 50);
+});
+add(24, "Detach while consuming values", function(n){
+  var ab = makeAB(2048), u32 = new Uint32Array(ab), before = new Uint8Array(ab).slice(0);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ var s=0; for(var i=0;i<64;i++) s += u32[i]; }catch(e){}
+  sleep(30, function(){ checkInvariants("T24", ab, before, new Uint8Array(ab)); n(); });
+});
+add(25, "Detach during indexOf scan", function(n){
+  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ u8.indexOf(0x41); }catch(e){}
+  sleep(40, function(){ checkInvariants("T25", ab, before, u8); n(); n(); });
+});
+
 </script>
 </body>
 </html>
