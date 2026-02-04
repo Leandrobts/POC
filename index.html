@@ -1,70 +1,559 @@
 <!doctype html>
-<meta charset="utf-8">
-<title>PS4 WebKit – CRLF Diagnostic V3.1</title>
-<h3>CRLF Diagnostic V3.1 (charcodes + A(real) vs B(literal))</h3>
-<button onclick="run()">Run</button>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>PS4 – 25x ArrayBuffer Detach Races (Part 1)</title>
+</head>
+<body>
+<h2>PS4 – 25x ArrayBuffer / TypedArray detachment races (PARTE 1: T1–T25)</h2>
+<p>Log apenas <b>[ALERTA]</b>. Se travar/CE = sinal forte.</p>
+
+<button onclick="clearLog()">Limpar</button>
+<button onclick="runAll()">Rodar 25 testes</button>
+
 <pre id="log"></pre>
+
 <script>
-var L=document.getElementById('log');
+/* =======================
+   ALERTA-only harness (ES5)
+   ======================= */
+var L = document.getElementById("log");
+var ALERTS = 0;
+
 function log(s){ L.textContent += s + "\n"; }
-function codes(s, max){
-  s = String(s);
-  var out=[], i, n=Math.min(s.length, max||40);
-  for(i=0;i<n;i++) out.push(s.charCodeAt(i));
-  return out.join(",");
+function ALERT(s){ ALERTS++; log("[ALERTA] " + s); }
+function clearLog(){ L.textContent=""; ALERTS=0; }
+
+function now(){ return Date.now ? Date.now() : (new Date()).getTime(); }
+function sleep(ms, cb){ setTimeout(cb, ms); }
+
+function u8hash(u8){
+  var h = 2166136261>>>0, i;
+  for(i=0;i<u8.length;i++){ h ^= u8[i]; h = (h * 16777619)>>>0; }
+  return ("00000000"+h.toString(16)).slice(-8);
 }
-function trySet(val){
-  var ok=true, err="";
+
+function makeAB(n){
+  var ab = new ArrayBuffer(n);
+  var u8 = new Uint8Array(ab);
+  for(var i=0;i<u8.length;i++) u8[i] = (i*131 + 7) & 255;
+  return ab;
+}
+
+function isDetached(ab){
+  try{ return (ab.byteLength === 0); }catch(e){ return true; }
+}
+
+function mkWorker(){
+  // Worker via Blob URL (se suportado)
   try{
-    var h = new Headers();
-    h.set("x-test", val);
-    var g = h.get("x-test");
-    return {ok:true, got:g, gotCodes:codes(g,60)};
+    var code =
+      "self.onmessage=function(e){"+
+      "  var d=e.data;"+
+      "  if(d && d.cmd==='ping'){ self.postMessage({ok:1}); return; }"+
+      "  if(d && d.cmd==='hold'){ self._buf=d.buf; self.postMessage({held:1}); return; }"+
+      "  if(d && d.cmd==='release'){ var b=self._buf; self._buf=null; try{ self.postMessage({buf:b}, [b]); }catch(ex){ self.postMessage({err:String(ex)}); } return; }"+
+      "};";
+    var blob = new Blob([code], {type:"application/javascript"});
+    var url = URL.createObjectURL(blob);
+    var w = new Worker(url);
+    return w;
   }catch(e){
-    return {ok:false, err:String(e)};
+    return null;
   }
 }
-function run(){
-  L.textContent="";
-  log("UA: " + navigator.userAgent);
 
-  // A: LF/CRLF reais
-  var A_LF   = "a\nb";
-  var A_CRLF = "a\r\nb";
-  // B: texto literal "\n" e "\r\n"
-  var B_LF   = "a\\nb";
-  var B_CRLF = "a\\r\\nb";
+var W = mkWorker();
 
-  log("--- Headers.set A_LF (real LF) ---");
-  var r1 = trySet(A_LF);
-  log("ok=" + r1.ok + (r1.ok ? (" got=" + JSON.stringify(r1.got) + " codes=" + r1.gotCodes) : (" err=" + r1.err)));
-
-  log("--- Headers.set B_LF (literal \\\\n) ---");
-  var r2 = trySet(B_LF);
-  log("ok=" + r2.ok + (r2.ok ? (" got=" + JSON.stringify(r2.got) + " codes=" + r2.gotCodes) : (" err=" + r2.err)));
-
-  log("--- Headers.set A_CRLF (real CRLF) ---");
-  var r3 = trySet(A_CRLF);
-  log("ok=" + r3.ok + (r3.ok ? (" got=" + JSON.stringify(r3.got) + " codes=" + r3.gotCodes) : (" err=" + r3.err)));
-
-  log("--- Headers.set B_CRLF (literal \\\\r\\\\n) ---");
-  var r4 = trySet(B_CRLF);
-  log("ok=" + r4.ok + (r4.ok ? (" got=" + JSON.stringify(r4.got) + " codes=" + r4.gotCodes) : (" err=" + r4.err)));
-
-  // Blob.type + FileReader DataURL (confirmar se entra LF real)
-  log("\n--- Blob.type + DataURL check ---");
-  var blobA = new Blob(["hello"], {type:"text/plain\nbad\n"});   // LF real
-  var blobB = new Blob(["hello"], {type:"text/plain\\nbad\\n"}); // literal \n
-
-  log("blobA.type=" + JSON.stringify(blobA.type) + " codes=" + codes(blobA.type,60));
-  log("blobB.type=" + JSON.stringify(blobB.type) + " codes=" + codes(blobB.type,60));
-
-  var fr = new FileReader();
-  fr.onload = function(){
-    var s = String(fr.result||"");
-    log("DataURL(A) prefix=" + JSON.stringify(s.slice(0,80)));
-    log("DataURL(A) codes=" + codes(s.slice(0,80),80));
-  };
-  fr.readAsDataURL(blobA);
+function detachViaMessageChannel(ab, cb){
+  try{
+    var ch = new MessageChannel();
+    ch.port2.onmessage = function(){ try{ ch.port1.close(); ch.port2.close(); }catch(e){} cb(true); };
+    ch.port1.postMessage({buf:ab}, [ab]); // detaches sender ab
+    // If no onmessage triggers, still detached on sender in many engines.
+    setTimeout(function(){ cb(true); }, 20);
+  }catch(e){
+    cb(false, e);
+  }
 }
+
+function detachViaWorkerHold(ab, cb){
+  if(!W){ cb(false, "no worker"); return; }
+  var done = false;
+  function finish(ok, err){
+    if(done) return;
+    done = true;
+    cb(ok, err);
+  }
+  try{
+    W.onmessage = function(ev){
+      if(ev.data && ev.data.held) finish(true);
+      if(ev.data && ev.data.err) finish(false, ev.data.err);
+    };
+    W.postMessage({cmd:"hold", buf:ab}, [ab]); // detaches sender
+    setTimeout(function(){ finish(true); }, 30);
+  }catch(e){
+    finish(false, e);
+  }
+}
+
+/* Invariant checker:
+   - If detached, ab.byteLength==0 and views should reflect 0-length OR at least not allow stable reads of old bytes.
+   - ALERT if:
+     A) detach confirmed but ab.byteLength > 0
+     B) detach confirmed but reading via view still returns previous data consistently (ghost read)
+     C) view.byteLength contradicts ab.byteLength in weird ways (non-zero while ab is 0)
+*/
+function checkInvariants(tag, ab, u8Before, view){
+  var bl = 0, vbl = 0;
+  try{ bl = ab.byteLength; }catch(e){ bl = -1; }
+  try{ vbl = view ? view.byteLength : -1; }catch(e2){ vbl = -1; }
+
+  var det = (bl === 0);
+  if(det && vbl > 0) ALERT(tag + ": view.byteLength>0 com ab.byteLength==0 (contradição) vbl=" + vbl);
+
+  if(det){
+    // try read first 8 bytes if possible
+    var ghost = 0;
+    try{
+      if(view && view.length >= 8){
+        for(var i=0;i<8;i++){
+          if(view[i] === u8Before[i]) ghost++;
+        }
+      }
+    }catch(e3){}
+    if(ghost >= 6) ALERT(tag + ": leitura fantasma após detach (muitos bytes iguais ao antes). ghost=" + ghost);
+  }else{
+    // not detached: should still match original hash unless we wrote.
+    try{
+      var u8 = new Uint8Array(ab);
+      var h1 = u8hash(u8);
+      var h0 = u8hash(u8Before);
+      if(h1 !== h0) ALERT(tag + ": hash mudou sem escrita aparente (corrupção/alias?): " + h0 + " -> " + h1);
+    }catch(e4){}
+  }
+}
+
+/* =======================
+   Test runner
+   ======================= */
+var tests = [];
+function add(id, name, fn){ tests.push({id:id, name:name, run:fn}); }
+
+function runSeries(list, done){
+  var i=0;
+  function step(){
+    if(i>=list.length) return done && done();
+    var t = list[i++];
+    try{
+      t.run(function(){ setTimeout(step, 5); });
+    }catch(e){
+      ALERT("T"+t.id+" harness exception: " + e);
+      setTimeout(step, 5);
+    }
+  }
+  step();
+}
+
+function runAll(){
+  clearLog();
+  var start = now();
+  log("Iniciando 25 testes (Part 1)...");
+  runSeries(tests, function(){
+    var dt = (now()-start)/1000;
+    log("=== FINAL === dt=" + dt.toFixed(2) + "s ALERTAS=" + ALERTS);
+  });
+}
+
+/* =======================
+   T1–T25
+   ======================= */
+
+// T1: Detach via MessageChannel, immediate check
+add(1, "MessageChannel detach (imediato)", function(next){
+  var ab = makeAB(256);
+  var before = new Uint8Array(ab).slice(0);
+  var view = new Uint8Array(ab);
+  detachViaMessageChannel(ab, function(ok){
+    if(!ok) return next();
+    checkInvariants("T1", ab, before, view);
+    next();
+  });
+});
+
+// T2: Detach via Worker hold, immediate check
+add(2, "Worker detach (hold)", function(next){
+  var ab = makeAB(256);
+  var before = new Uint8Array(ab).slice(0);
+  var view = new Uint8Array(ab);
+  detachViaWorkerHold(ab, function(ok){
+    // ok may be false if worker unsupported; then skip quietly
+    if(ok) checkInvariants("T2", ab, before, view);
+    next();
+  });
+});
+
+// T3: Detach scheduled in microtask while reading loop
+add(3, "Microtask detach during read loop", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  var sum = 0;
+  Promise.resolve().then(function(){
+    detachViaMessageChannel(ab, function(){});
+  });
+  try{
+    for(var i=0;i<512;i++){ sum += u8[i]; }
+  }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T3", ab, before, u8);
+    next();
+  });
+});
+
+// T4: Detach scheduled setTimeout(0) during writes
+add(4, "Timeout detach during write loop", function(next){
+  var ab = makeAB(2048);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{
+    for(var i=0;i<512;i++){ u8[i] ^= 0x5a; }
+  }catch(e){}
+  sleep(30, function(){
+    checkInvariants("T4", ab, before, u8);
+    next();
+  });
+});
+
+// T5: DataView getUint32 while detach
+add(5, "DataView read while detach", function(next){
+  var ab = makeAB(512);
+  var before = new Uint8Array(ab).slice(0);
+  var dv = new DataView(ab);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  var x=0;
+  try{ for(var i=0;i<16;i++) x ^= dv.getUint32(i*4, true); }catch(e){}
+  sleep(20, function(){
+    // use Uint8Array view after
+    var u8 = new Uint8Array(ab);
+    checkInvariants("T5", ab, before, u8);
+    next();
+  });
+});
+
+// T6: TypedArray sort comparator with detach
+add(6, "Uint32Array.sort comparator detach", function(next){
+  var ab = makeAB(1024);
+  var before = new Uint8Array(ab).slice(0);
+  var u32 = new Uint32Array(ab);
+  // shuffle a bit
+  try{ for(var i=0;i<u32.length;i+=3) u32[i] ^= 0xdeadbeef; }catch(e){}
+  var fired=0;
+  try{
+    u32.sort(function(a,b){
+      fired++;
+      if(fired===2) detachViaMessageChannel(ab, function(){});
+      return a-b;
+    });
+  }catch(e2){}
+  sleep(30, function(){
+    checkInvariants("T6", ab, before, new Uint8Array(ab));
+    next();
+  });
+});
+
+// T7: Transfer same buffer twice
+add(7, "Double-transfer attempt", function(next){
+  var ab = makeAB(128);
+  var before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    if(ok){
+      // second detach attempt should be a no-op or throw; we just check invariants remain consistent
+      detachViaMessageChannel(ab, function(){});
+      checkInvariants("T7", ab, before, new Uint8Array(ab));
+    }
+    next();
+  });
+});
+
+// T8: Slice after detach (should be empty or throw)
+add(8, "slice after detach", function(next){
+  var ab = makeAB(256);
+  var before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    if(ok){
+      var bl=ab.byteLength;
+      try{
+        var ab2 = ab.slice(0);
+        if(bl===0 && ab2.byteLength>0) ALERT("T8: slice gerou buffer não-vazio após detach");
+      }catch(e){}
+      checkInvariants("T8", ab, before, new Uint8Array(ab));
+    }
+    next();
+  });
+});
+
+// T9: StructuredClone detach (if available)
+add(9, "structuredClone transfer", function(next){
+  if(typeof structuredClone !== "function") return next();
+  var ab = makeAB(512);
+  var before = new Uint8Array(ab).slice(0);
+  try{
+    structuredClone({b:ab}, {transfer:[ab]});
+    // ab should be detached now
+  }catch(e){}
+  sleep(10, function(){
+    checkInvariants("T9", ab, before, new Uint8Array(ab));
+    next();
+  });
+});
+
+// T10: Subarray view + detach
+add(10, "subarray view behavior after detach", function(next){
+  var ab = makeAB(512);
+  var u8 = new Uint8Array(ab);
+  var sub = u8.subarray(16, 32);
+  var before = u8.slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    if(ok){
+      // sub should reflect detach too
+      try{
+        if(ab.byteLength===0 && sub.byteLength>0) ALERT("T10: subarray byteLength>0 após detach");
+      }catch(e){}
+      checkInvariants("T10", ab, before, u8);
+    }
+    next();
+  });
+});
+
+// T11: Promise chain reads after detach
+add(11, "Promise chain post-detach reads", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  detachViaMessageChannel(ab, function(){});
+  Promise.resolve().then(function(){
+    // read attempts
+    var same=0;
+    try{
+      for(var i=0;i<8;i++) if(u8[i]===before[i]) same++;
+    }catch(e){}
+    if(ab.byteLength===0 && same>=6) ALERT("T11: ghost read em Promise.then após detach");
+    next();
+  });
+});
+
+// T12: Detach during JSON.stringify (via toJSON side effect)
+add(12, "toJSON side-effect detach", function(next){
+  var ab = makeAB(256);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  var o = {
+    toJSON: function(){
+      detachViaMessageChannel(ab, function(){});
+      return 1;
+    }
+  };
+  try{ JSON.stringify(o); }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T12", ab, before, u8);
+    next();
+  });
+});
+
+// T13: Detach during Array.prototype.map on TypedArray via callback
+add(13, "TypedArray map callback detach", function(next){
+  var ab = makeAB(512);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  var c=0;
+  try{
+    u8.map(function(v){
+      c++;
+      if(c===3) detachViaMessageChannel(ab, function(){});
+      return v;
+    });
+  }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T13", ab, before, u8);
+    next();
+  });
+});
+
+// T14: Detach during reduce
+add(14, "TypedArray reduce detach", function(next){
+  var ab = makeAB(512);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  var c=0;
+  try{
+    u8.reduce(function(acc,v){
+      c++;
+      if(c===2) detachViaMessageChannel(ab, function(){});
+      return acc+v;
+    }, 0);
+  }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T14", ab, before, u8);
+    next();
+  });
+});
+
+// T15: Detach during set() from another TA
+add(15, "TypedArray.set with detach mid-way", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  var src = new Uint8Array(256);
+  for(var i=0;i<src.length;i++) src[i]=0x41;
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ u8.set(src, 0); }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T15", ab, before, u8);
+    next();
+  });
+});
+
+// T16: Detach then create new view (should be 0 length)
+add(16, "Create new view after detach", function(next){
+  var ab = makeAB(128);
+  var before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    if(ok){
+      try{
+        var u8 = new Uint8Array(ab);
+        if(ab.byteLength===0 && u8.byteLength>0) ALERT("T16: new Uint8Array has byteLength>0 on detached AB");
+      }catch(e){}
+      checkInvariants("T16", ab, before, new Uint8Array(ab));
+    }
+    next();
+  });
+});
+
+// T17: Detach during typedarray.copyWithin
+add(17, "copyWithin detach", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ u8.copyWithin(0, 16, 128); }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T17", ab, before, u8);
+    next();
+  });
+});
+
+// T18: Detach during typedarray.fill
+add(18, "fill detach", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ u8.fill(0x7f); }catch(e){}
+  sleep(30, function(){
+    checkInvariants("T18", ab, before, u8);
+    next();
+  });
+});
+
+// T19: Detach during DataView setUint32
+add(19, "DataView write while detach", function(next){
+  var ab = makeAB(512);
+  var before = new Uint8Array(ab).slice(0);
+  var dv = new DataView(ab);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ for(var i=0;i<16;i++) dv.setUint32(i*4, 0x41414141, true); }catch(e){}
+  sleep(30, function(){
+    checkInvariants("T19", ab, before, new Uint8Array(ab));
+    next();
+  });
+});
+
+// T20: Detach during Uint16Array join via Array.from
+add(20, "Array.from(Uint16Array) with detach", function(next){
+  var ab = makeAB(512);
+  var before = new Uint8Array(ab).slice(0);
+  var u16 = new Uint16Array(ab);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  try{ Array.prototype.join.call(u16, ","); }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T20", ab, before, new Uint8Array(ab));
+    next();
+  });
+});
+
+// T21: Detach + post-detach second buffer writes shouldn't affect old hash
+add(21, "Post-detach allocate new AB shouldn't resurrect old", function(next){
+  var ab = makeAB(256);
+  var before = new Uint8Array(ab).slice(0);
+  detachViaMessageChannel(ab, function(ok){
+    if(ok){
+      // allocate new memory pressure
+      var junk=[];
+      for(var i=0;i<200;i++) junk.push(new Uint8Array(4096));
+      checkInvariants("T21", ab, before, new Uint8Array(ab));
+    }
+    next();
+  });
+});
+
+// T22: Detach while slicing view.buffer reference is kept
+add(22, "Keep buffer ref + detach", function(next){
+  var ab = makeAB(512);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  var bufRef = u8.buffer;
+  detachViaMessageChannel(bufRef, function(ok){
+    if(ok){
+      // u8 should reflect detach
+      checkInvariants("T22", ab, before, u8);
+    }
+    next();
+  });
+});
+
+// T23: Detach during setTimeout chain (two-stage)
+add(23, "Two-stage timeout detach", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  setTimeout(function(){
+    detachViaMessageChannel(ab, function(){});
+  }, 0);
+  setTimeout(function(){
+    // check later
+    checkInvariants("T23", ab, before, u8);
+    next();
+  }, 40);
+});
+
+// T24: Detach during Math operations using typed array values
+add(24, "Detach while consuming values", function(next){
+  var ab = makeAB(2048);
+  var u32 = new Uint32Array(ab);
+  var before = new Uint8Array(ab).slice(0);
+  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
+  var s=0;
+  try{ for(var i=0;i<64;i++) s = (s + (u32[i]>>>0))>>>0; }catch(e){}
+  sleep(20, function(){
+    checkInvariants("T24", ab, before, new Uint8Array(ab));
+    next();
+  });
+});
+
+// T25: Detach during typedarray.indexOf scan
+add(25, "Detach during indexOf scan", function(next){
+  var ab = makeAB(1024);
+  var u8 = new Uint8Array(ab);
+  var before = u8.slice(0);
+  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
+  try{ u8.indexOf(0x41); }catch(e){}
+  sleep(30, function(){
+    checkInvariants("T25", ab, before, u8);
+    next();
+  });
+});
 </script>
+</body>
+</html>
