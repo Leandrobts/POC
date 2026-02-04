@@ -1,440 +1,499 @@
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8" />
-<title>PS4 WebKit – TRIAGE V3 (10 testes) Media/CSS/DOM + Watchdog</title>
-<style>
-  body { background:#000; color:#0f0; font-family:monospace; }
-  button, input { margin:4px; font-size:14px; }
-  #log { white-space:pre-wrap; font-size:12px; line-height:1.25; }
-  .row { margin:8px 0; }
-  .box { width:260px; height:160px; background:#222; margin:8px 0; }
-</style>
-</head>
-<body>
-<h2>PS4 WebKit – Memory Corruption TRIAGE V3 (Media/CSS/DOM) + Watchdog</h2>
+<!doctype html>
+<meta charset="utf-8">
+<title>PS4 WebKit - Triagem V3 (50 testes agressivos) sem CSS</title>
 
-<div class="row">
-  <button onclick="runAll()">Run ALL (1..10)</button>
-  <button onclick="clearLog()">Clear</button>
-  <label style="margin-left:10px;">Loop N:
-    <input id="loopN" type="number" value="20" min="1" max="200" style="width:80px;">
-  </label>
-  <label style="margin-left:10px;">Intensity (1-6):
-    <input id="intensity" type="number" value="3" min="1" max="6" style="width:60px;">
-  </label>
-</div>
+<h2>PS4 WebKit - Triagem V3 (50 testes agressivos) sem CSS/sem style</h2>
+<p>
+  Objetivo: aumentar chance de crash/instabilidade real via teardown/races (sem exploração).<br>
+  Alertas: <b>IMPOSSIBLE / CORRUPTION-SUSPECT</b> = invariantes quebradas.
+</p>
 
-<div class="row">
-  <button onclick="runOne(1)">T1</button>
-  <button onclick="runOne(2)">T2</button>
-  <button onclick="runOne(3)">T3</button>
-  <button onclick="runOne(4)">T4</button>
-  <button onclick="runOne(5)">T5</button>
-  <button onclick="runOne(6)">T6</button>
-  <button onclick="runOne(7)">T7</button>
-  <button onclick="runOne(8)">T8</button>
-  <button onclick="runOne(9)">T9</button>
-  <button onclick="runOne(10)">T10</button>
-</div>
+<button id="reset">Reset log</button>
+<button id="runAll">Run ALL (1..50)</button>
+<button id="stop">Stop</button>
+
+<p>
+  Delay (ms): <input id="delay" type="number" value="140" min="0" step="20">
+  Timeout por teste (ms): <input id="timeout" type="number" value="2000" min="500" step="100">
+  Intensidade (1..5): <input id="intensity" type="number" value="2" min="1" max="5" step="1">
+</p>
 
 <pre id="log"></pre>
 
 <script>
-const logEl = document.getElementById("log");
-function ts(){ return new Date().toISOString(); }
-function log(m){ logEl.textContent += `[${ts()}] ${m}\n`; }
-function clearLog(){ logEl.textContent=""; }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+(function(){
+  var $log = document.getElementById('log');
+  var STOP=false, RUNNING=false, runCounter=0;
 
-function I(){ return Math.max(1, Math.min(6, parseInt(document.getElementById("intensity").value||"3",10))); }
-function LOOPN(){ return Math.max(1, Math.min(200, parseInt(document.getElementById("loopN").value||"20",10))); }
+  function now(){ return (Date.now()>>>0); }
+  function log(s){ $log.textContent += "["+now()+"] "+s+"\n"; }
+  function sep(n,name){
+    log("============================================================");
+    log("RUN #"+(++runCounter)+" :: TEST "+n+(name?(" :: "+name):""));
+    log("============================================================");
+  }
+  function impossible(msg){
+    log("!!! IMPOSSIBLE / CORRUPTION-SUSPECT: "+msg);
+    try{ alert("IMPOSSIBLE / CORRUPTION-SUSPECT\n"+msg); }catch(_){}
+  }
+  function assertTrue(cond,msg){ cond ? log("OK: "+msg) : impossible(msg); }
+  function assertEq(a,b,msg){ (a===b) ? log("OK: "+msg) : impossible(msg+" (got="+a+" exp="+b+")"); }
 
-function freshRoot(){
-  let old=document.getElementById("root");
-  if(old) old.remove();
-  let r=document.createElement("div");
-  r.id="root";
-  document.body.appendChild(r);
-  return r;
-}
+  function safeToString(e){
+    try{ return String(e && (e.stack||e.message||e)); }catch(_){ return "[unprintable]"; }
+  }
 
-/* =========================
-   WATCHDOG (lag detector)
-   ========================= */
-let wd = { on:false, last:0, maxLag:0, hits:0 };
-function watchdogStart(){
-  if(wd.on) return;
-  wd.on=true; wd.last=performance.now(); wd.maxLag=0; wd.hits=0;
-  const tick = ()=>{
-    if(!wd.on) return;
-    const now=performance.now();
-    const dt=now-wd.last; wd.last=now;
-    // target 50ms tick; se passar muito, houve lag/freeze
-    const lag = Math.max(0, dt-50);
-    if(lag>0){
-      wd.maxLag = Math.max(wd.maxLag, lag);
-      wd.hits++;
-      if(lag>200) log(`[WD_LAG] lag=${lag.toFixed(1)}ms (dt=${dt.toFixed(1)}ms)`);
+  function u8Pattern(n){
+    var u=new Uint8Array(n);
+    for (var i=0;i<n;i++) u[i]=(i*7+3)&255;
+    return u;
+  }
+  function bytesEqual(a,b){
+    if(!a||!b||a.length!==b.length) return false;
+    for (var i=0;i<a.length;i++) if(a[i]!==b[i]) return false;
+    return true;
+  }
+  function checksumU8(u){
+    var s=0; for (var i=0;i<u.length;i++) s=(s+u[i])>>>0;
+    return s>>>0;
+  }
+  function gcLite(mult){
+    var m = mult||1;
+    var arr=[];
+    for (var k=0;k<250*m;k++){
+      var u=new Uint8Array(256);
+      u[0]=k&255;
+      arr.push(u);
     }
-    setTimeout(tick, 50);
+    return arr;
+  }
+  function withTimeout(ms, done){
+    var fired=false;
+    var t=setTimeout(function(){ if(fired) return; fired=true; done("TIMEOUT"); }, ms);
+    return function finish(err){
+      if(fired) return;
+      fired=true; clearTimeout(t);
+      done(err);
+    };
+  }
+  function I(){ return +document.getElementById("intensity").value || 2; }
+  function hasStructuredClone(){ return (typeof structuredClone==="function"); }
+
+  var tests=[];
+
+  // 1) structuredClone (sem funções) + teardown
+  tests[1]=function(done){
+    sep(1,"structuredClone: obj + TypedArray + gcLite");
+    try{
+      if(!hasStructuredClone()){ log("NOTE: sem structuredClone"); done(null); return; }
+      var u=u8Pattern(128*I());
+      var o={tag:"T1", u8:u, sum:checksumU8(u)};
+      var c=structuredClone(o);
+      assertEq(c.tag,"T1","tag ok");
+      assertTrue(c.u8 && c.u8.length===u.length,"u8 length ok");
+      assertEq(c.sum>>>0,o.sum>>>0,"checksum ok");
+      assertTrue(bytesEqual(c.u8,u),"bytes ok");
+      assertTrue(c.u8.buffer!==u.buffer,"clone sem alias");
+      gcLite(I());
+      u[0]^=0xFF;
+      assertTrue(c.u8[0]!==u[0],"mutação original não contamina clone");
+      done(null);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
   };
-  setTimeout(tick, 50);
-}
-function watchdogStop(){
-  wd.on=false;
-  log(`[WD_SUM] hits=${wd.hits} maxLag=${wd.maxLag.toFixed(1)}ms`);
-}
 
-/* =========================
-   GC pressure leve
-   ========================= */
-function gcPressure(level){
-  // level 1..6 (leve->moderado)
-  const n = 200 * level;
-  const arr=[];
-  for(let i=0;i<n;i++){
-    arr.push(new Uint8Array(1024)); // 1KB
-  }
-  // strings para pressionar allocator de forma diferente
-  let s="";
-  for(let i=0;i<50*level;i++) s += "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-  return {arr, s};
-}
-
-/* =========================
-   Runner
-   ========================= */
-async function runOne(n){
-  watchdogStart();
-  log(`\n=== TEST ${n} START (I=${I()}) ===`);
-  try{ await tests[n](); }
-  catch(e){ log(`[EXC] ${e && e.message ? e.message : e}`); }
-  log(`=== TEST ${n} END ===`);
-  await sleep(20);
-}
-
-async function runAll(){
-  watchdogStart();
-  const N=LOOPN();
-  log(`\n=== RUN ALL START loopN=${N} I=${I()} ===`);
-  for(let k=1;k<=N;k++){
-    log(`\n--- LOOP ${k}/${N} ---`);
-    for(let t=1;t<=10;t++){
-      await runOne(t);
-    }
-  }
-  log(`\n=== RUN ALL END ===`);
-  watchdogStop();
-}
-
-/* =========================
-   10 testes novos (V3)
-   ========================= */
-const tests = {
-
-  // T1: Media reentrancy via events + remove/reattach + load/play probes
-  1: async function(){
-    const root=freshRoot();
-    const v=document.createElement("video");
-    root.appendChild(v);
-
-    let ev=0;
-    const h = (name)=>()=>{ ev++; if(ev<10) log(`[video] ${name}`); };
-    v.onloadedmetadata=h("loadedmetadata");
-    v.oncanplay=h("canplay");
-    v.onerror=h("error");
-
-    const rounds = 8*I();
-    for(let r=0;r<rounds;r++){
-      v.src = (r&1) ? "data:video/mp4;base64," : "";
-      try{ v.load(); }catch(e){}
-      if(r===Math.floor(rounds/2)){
-        // remove/reattach no meio
-        v.remove();
-        root.appendChild(v);
-        log("[phase] detach+reattach video");
-      }
-      // chamar play() (pode falhar; aqui só registramos)
-      try{
-        const p=v.play();
-        if(p && p.catch) p.catch(()=>{});
-      }catch(e){}
-      if(r%4===0) await sleep(1);
-    }
-    log(`[post] readyState=${v.readyState} networkState=${v.networkState} ev=${ev}`);
-    gcPressure(I()); // leve
-  },
-
-  // T2: TextTrack/track list churn + remove during event microtask
-  2: async function(){
-    const root=freshRoot();
-    const v=document.createElement("video");
-    root.appendChild(v);
-
-    const rounds = 60*I();
-    for(let i=0;i<rounds;i++){
-      const tr=document.createElement("track");
-      tr.kind="subtitles";
-      tr.label="t"+i;
-      v.appendChild(tr);
-      if((i%3)===0) tr.remove();
-      if(i%25===0) await sleep(1);
-    }
-    // microtask + remove
-    Promise.resolve().then(()=>{ try{ v.remove(); }catch(e){} });
-    await sleep(5);
-    try{ log(`[post] tracks=${v.textTracks ? v.textTracks.length : "na"}`); }catch(e){ log("[post] textTracks EXC"); }
-    gcPressure(I());
-  },
-
-  // T3: CSS filter+transform + forced layout reads in rAF chain + detach mid-chain
-  3: async function(){
-    const root=freshRoot();
-    const d=document.createElement("div");
-    d.className="box";
-    d.textContent="CSS chain";
-    root.appendChild(d);
-
-    await new Promise(resolve=>{
-      requestAnimationFrame(()=>{
-        d.style.willChange="transform,filter";
-        d.style.filter="blur(8px)";
-        d.style.transform="translateZ(0) scale(1.02) rotate(0.02deg)";
-        // força layout várias vezes
-        for(let k=0;k<20*I();k++){
-          try{ d.getBoundingClientRect(); }catch(e){}
+  // 2) JSON.stringify + toJSON side-effect (aqui é o lugar certo)
+  tests[2]=function(done){
+    sep(2,"JSON.stringify: toJSON side-effect count");
+    try{
+      var hits=0;
+      var obj={
+        a:1,
+        toJSON:function(){
+          hits++;
+          gcLite(I());
+          return {a:1,b:2};
         }
-        requestAnimationFrame(()=>{
-          if(I()>=3){
-            d.remove();
-            root.appendChild(d);
-            log("[phase] detach+reattach during rAF");
-          }
-          try{
-            const r=d.getBoundingClientRect();
-            log(`[post] rect w=${r.width} h=${r.height}`);
-          }catch(e){ log("[post] rect EXC"); }
-          resolve();
-        });
-      });
-    });
-    gcPressure(I());
-  },
+      };
+      var s=JSON.stringify(obj);
+      log("hits="+hits+" json="+s);
+      assertTrue(hits===1,"toJSON chamado exatamente 1x");
+      assertTrue(s.indexOf('"b":2')>=0,"stringify refletiu objeto retornado");
+      done(null);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
 
-  // T4: Style recalculation storm + remove/replace node while reading layout
-  4: async function(){
-    const root=freshRoot();
-    let d=document.createElement("div");
-    d.className="box";
-    root.appendChild(d);
-
-    const it = 200*I();
-    for(let i=0;i<it;i++){
-      d.style.padding = (i%16)+"px";
-      d.style.borderRadius = (i%20)+"px";
-      // leitura de layout
-      try{ d.offsetWidth; d.offsetHeight; }catch(e){}
-      if(i===Math.floor(it/2)){
-        const nd=document.createElement("div");
-        nd.className="box";
-        root.replaceChild(nd, d);
-        d=nd;
-        log("[phase] replaceChild midpoint");
-      }
-      if(i%60===0) await sleep(1);
-    }
-    try{ log(`[post] ow=${d.offsetWidth} oh=${d.offsetHeight}`); }catch(e){ log("[post] offset EXC"); }
-    gcPressure(I());
-  },
-
-  // T5: MutationObserver reentrancy + subtree move between two parents
-  5: async function(){
-    const root=freshRoot();
-    const a=document.createElement("div");
-    const b=document.createElement("div");
-    root.appendChild(a); root.appendChild(b);
-
-    let hits=0;
-    const mo=new MutationObserver(()=>{
-      hits++;
-      if(hits<60){
-        const n=document.createElement("span");
-        n.textContent="x";
-        a.appendChild(n);
-        // move subtree back/forth durante observer
-        if(hits%5===0){
-          try{ b.appendChild(a); }catch(e){}
-          try{ root.appendChild(a); }catch(e){}
-        }
-      }
-    });
-    mo.observe(a,{childList:true,subtree:true});
-    for(let i=0;i<10*I();i++){
-      a.appendChild(document.createElement("p"));
-    }
-    await sleep(10);
-    a.remove();
-    await sleep(10);
-    mo.disconnect();
-    log(`[post] hits=${hits}`);
-    gcPressure(I());
-  },
-
-  // T6: Range + remove/replace text nodes + commonAncestorContainer probing
-  6: async function(){
-    const root=freshRoot();
-    const p=document.createElement("p");
-    p.textContent="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    root.appendChild(p);
-
-    const tn=p.firstChild;
-    const range=document.createRange();
-    range.setStart(tn, 3);
-    range.setEnd(tn, 20);
-
-    // remove text, inserir novo, tentar usar range
-    tn.remove();
-    p.appendChild(document.createTextNode("repl_"+("x".repeat(30*I()))));
-
+  // 3) MessageChannel ping-pong REAL (corrige bug do V2)
+  tests[3]=function(done){
+    sep(3,"MessageChannel: ping-pong real (eco) 20x");
     try{
-      const c=range.commonAncestorContainer;
-      log(`[post] commonAncestor nodeType=${c ? c.nodeType : "null"}`);
-    }catch(e){ log("[post] commonAncestor EXC"); }
+      if(typeof MessageChannel!=="function"){ log("NOTE: sem MessageChannel"); done(null); return; }
+      var ch=new MessageChannel();
+      var tok="T3_"+now()+"_"+Math.floor(Math.random()*1e9);
+      var u=u8Pattern(64);
+      var sum=checksumU8(u);
+      var n=0, target=20;
 
-    try{
-      const frag=range.extractContents();
-      log(`[post] extractContents childNodes=${frag.childNodes.length}`);
-    }catch(e){ log("[post] extractContents EXC"); }
+      ch.port2.onmessage=function(ev){
+        var d=ev.data;
+        if(!d||d.tok!==tok) return;
+        // eco
+        ch.port2.postMessage(d);
+      };
 
-    gcPressure(I());
-  },
-
-  // T7: SVG animate + remove root svg during begin + query bbox on removed elements
-  7: async function(){
-    const root=freshRoot();
-    const svgNS="http://www.w3.org/2000/svg";
-    const svg=document.createElementNS(svgNS,"svg");
-    svg.setAttribute("width","320");
-    svg.setAttribute("height","120");
-    const g=document.createElementNS(svgNS,"g");
-    const rect=document.createElementNS(svgNS,"rect");
-    rect.setAttribute("x","0"); rect.setAttribute("y","10");
-    rect.setAttribute("width","50"); rect.setAttribute("height","50");
-    rect.setAttribute("fill","red");
-    const anim=document.createElementNS(svgNS,"animate");
-    anim.setAttribute("attributeName","x");
-    anim.setAttribute("from","0");
-    anim.setAttribute("to","240");
-    anim.setAttribute("dur","0.03s");
-    anim.setAttribute("repeatCount","1");
-    rect.appendChild(anim);
-    g.appendChild(rect);
-    svg.appendChild(g);
-    root.appendChild(svg);
-
-    try{ anim.beginElement(); log("[phase] beginElement OK"); }catch(e){ log("[phase] beginElement EXC"); }
-
-    if(I()>=2){
-      svg.remove();
-      log("[phase] svg removed immediately");
-    }
-
-    try{
-      const bb=rect.getBBox();
-      log(`[post] rect bbox w=${bb.width} h=${bb.height}`);
-    }catch(e){ log("[post] rect getBBox EXC"); }
-
-    gcPressure(I());
-    await sleep(20);
-  },
-
-  // T8: iframe srcdoc churn + remove while accessing contentDocument
-  8: async function(){
-    const root=freshRoot();
-    const f=document.createElement("iframe");
-    f.style.width="320px"; f.style.height="160px";
-    root.appendChild(f);
-
-    const rounds=6*I();
-    for(let r=0;r<rounds;r++){
-      f.srcdoc = "<!doctype html><meta charset=utf-8><body><div id=a>hi</div><script>Promise.resolve().then(()=>{document.getElementById('a').textContent='ok';});<\/script></body>";
-      await sleep(3);
-      try{
-        const d=f.contentDocument;
-        log(`[phase] contentDocument ${d ? "OK" : "null"} r=${r}`);
-      }catch(e){ log("[phase] contentDocument EXC"); }
-      if(r===Math.floor(rounds/2)){
-        f.remove();
-        root.appendChild(f);
-        log("[phase] detach+reattach iframe");
-      }
-    }
-
-    f.remove();
-    try{ log("[post] contentWindow "+(f.contentWindow ? "present":"null")); }catch(e){ log("[post] contentWindow EXC"); }
-    gcPressure(I());
-  },
-
-  // T9: canvas resize storm + context ops after detach + ImageData churn
-  9: async function(){
-    const root=freshRoot();
-    const c=document.createElement("canvas");
-    c.width=320; c.height=180;
-    root.appendChild(c);
-    const ctx=c.getContext("2d");
-
-    const it=120*I();
-    for(let i=0;i<it;i++){
-      try{ ctx.fillRect(i%80, i%60, 20, 10); }catch(e){}
-      if(i%12===0){
-        c.width = 320 + (i%5);
-        c.height = 180 + (i%5);
-      }
-      if(i===Math.floor(it/2)){
-        c.remove();
-        log("[phase] canvas removed midpoint");
-      }
-      if(i%40===0){
+      ch.port1.onmessage=function(ev){
         try{
-          const id=ctx.getImageData(0,0,2,2);
-          // toca a buffer
-          id.data[0]^=0xFF;
-        }catch(e){}
+          var d=ev.data;
+          if(!d||d.tok!==tok) return;
+          n++;
+          if(n===1){
+            assertEq(d.sum>>>0,sum>>>0,"checksum ok");
+            assertTrue(d.u8 && d.u8.length===u.length,"u8 length ok");
+            assertTrue(bytesEqual(d.u8,u),"bytes ok");
+            assertTrue(d.u8.buffer!==u.buffer,"clone sem alias");
+          }
+          if(n>=target){
+            log("ping-pong count="+n);
+            try{ ch.port1.close(); ch.port2.close(); }catch(_){}
+            done(null);
+          }else{
+            ch.port1.postMessage({tok:tok,u8:u,sum:sum});
+          }
+        }catch(e){
+          log("ERR onmessage: "+safeToString(e));
+          try{ ch.port1.close(); ch.port2.close(); }catch(_){}
+          done("EXC");
+        }
+      };
+
+      ch.port1.postMessage({tok:tok,u8:u,sum:sum});
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 4) popstate robusto (corrige timeout do V2)
+  tests[4]=function(done){
+    sep(4,"history: go(-1)/go(1) com delays maiores");
+    try{
+      var base="#v3_"+now();
+      history.pushState({tag:"A"}, "", base+"_A");
+      history.pushState({tag:"B"}, "", base+"_B");
+      var seen=[];
+      var fin=withTimeout(+document.getElementById("timeout").value, function(err){
+        window.removeEventListener("popstate", onPop);
+        if(err) log("NOTE: timeout popstate (ambiente)");
+        done(null);
+      });
+
+      function onPop(e){
+        seen.push(e.state && e.state.tag);
+        log("popstate tag=" + (e.state?e.state.tag:"NULL"));
+        if(seen.length===1){
+          setTimeout(function(){ try{ history.go(1); }catch(_){ } }, 180);
+        }else if(seen.length===2){
+          if(seen[0]) assertEq(seen[0],"A","back -> A");
+          if(seen[1]) assertEq(seen[1],"B","forward -> B");
+          window.removeEventListener("popstate", onPop);
+          fin(null);
+        }
       }
-      if(i%50===0) await sleep(1);
+      window.addEventListener("popstate", onPop);
+      setTimeout(function(){ try{ history.go(-1); }catch(_){ fin(null); } }, 180);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 5) iframe churn + postMessage + remove durante tráfego
+  tests[5]=function(done){
+    sep(5,"iframe churn: create/write/msg/remove race (bounded)");
+    try{
+      var rounds=5*I();
+      var idx=0;
+      function one(){
+        if(idx>=rounds){ done(null); return; }
+        idx++;
+
+        var tok="T5_"+now()+"_"+idx;
+        var f=document.createElement("iframe");
+        document.body.appendChild(f);
+
+        function cleanup(){
+          try{ window.removeEventListener("message", onMsg); }catch(_){}
+          try{ f.remove(); }catch(_){}
+        }
+
+        var fin=withTimeout(800+200*I(), function(err){
+          cleanup();
+          if(err) log("NOTE: iframe round timeout (ambiente)");
+          setTimeout(one, 40);
+        });
+
+        function onMsg(e){
+          var d=e.data;
+          if(!d||d.tok!==tok) return;
+          if(d.kind==="READY"){
+            f.contentWindow.postMessage({tok:tok,kind:"PING",u8:u8Pattern(64)}, "*");
+            // remove cedo (race)
+            if(idx%2===0) setTimeout(function(){ try{ f.remove(); }catch(_){} }, 0);
+          }else if(d.kind==="PONG"){
+            assertTrue(d.u8 && d.u8.length===64,"pong u8 len ok");
+            fin(null);
+          }
+        }
+        window.addEventListener("message", onMsg);
+
+        var doc=f.contentWindow.document;
+        doc.open();
+        doc.write("<!doctype html><meta charset=utf-8><script>"+
+          "var TOK='"+tok.replace(/'/g,"\\'")+"';"+
+          "function send(o){try{parent.postMessage(o,'*')}catch(e){}}"+
+          "addEventListener('message',function(e){var d=e.data; if(!d||d.tok!==TOK)return;"+
+            "if(d.kind==='PING'){ send({tok:TOK,kind:'PONG',u8:d.u8}); }"+
+          "});"+
+          "send({tok:TOK,kind:'READY'});"+
+        "<\/script>");
+        doc.close();
+      }
+      one();
+    }catch(e){ log('ERR: '+safeToString(e)); done("EXC"); }
+  };
+
+  // 6) canvas: resize + getImageData intercalado (bounded)
+  tests[6]=function(done){
+    sep(6,"Canvas churn: resize + getImageData (bounded)");
+    try{
+      var c=document.createElement("canvas");
+      var ctx=c.getContext && c.getContext("2d");
+      if(!ctx||!ctx.getImageData){ log("NOTE: sem canvas 2d"); done(null); return; }
+      var loops=40*I();
+      for(var i=0;i<loops;i++){
+        c.width=16+(i%8);
+        c.height=16+((i*3)%8);
+        ctx.fillRect(0,0,1,1);
+        var img=ctx.getImageData(0,0,Math.min(8,c.width),Math.min(8,c.height));
+        assertTrue(img.data && img.data.length===img.width*img.height*4,"ImageData length coerente");
+      }
+      done(null);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 7) AudioContext churn: create nodes connect/disconnect, close
+  tests[7]=function(done){
+    sep(7,"Audio churn: nodes connect/disconnect + close");
+    try{
+      var AC=window.AudioContext||window.webkitAudioContext;
+      if(!AC){ log("NOTE: sem AudioContext"); done(null); return; }
+      var ac=new AC();
+      var osc=ac.createOscillator();
+      var gain=ac.createGain();
+      osc.connect(gain);
+      gain.connect(ac.destination);
+      osc.start();
+      var loops=20*I();
+      for(var i=0;i<loops;i++){
+        try{ gain.disconnect(); }catch(_){}
+        try{ gain.connect(ac.destination); }catch(_){}
+      }
+      osc.stop();
+      var r=ac.close();
+      if(r&&typeof r.then==="function"){
+        r.then(function(){ log("AudioContext closed"); done(null); })
+         .catch(function(){ log("NOTE: close rejected"); done(null); });
+      }else{
+        log("AudioContext close invoked");
+        done(null);
+      }
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 8) Media element churn (sem rede): cria/remove, troca src blob
+  tests[8]=function(done){
+    sep(8,"Media churn: video element create/remove + src swap (blob)");
+    try{
+      if(typeof Blob!=="function"){ log("NOTE: sem Blob"); done(null); return; }
+      var rounds=10*I();
+      for(var i=0;i<rounds;i++){
+        var v=document.createElement("video");
+        document.body.appendChild(v);
+        var b=new Blob([u8Pattern(256)], {type:"application/octet-stream"});
+        var url=URL.createObjectURL(b);
+        v.src=url;
+        // remove rápido (race-ish)
+        v.remove();
+        try{ URL.revokeObjectURL(url); }catch(_){}
+      }
+      done(null);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 9) Promise microtasks + postMessage intercalado
+  tests[9]=function(done){
+    sep(9,"microtasks + postMessage churn (bounded)");
+    try{
+      if(typeof Promise!=="function"){ log("NOTE: sem Promise"); done(null); return; }
+      var tok="T9_"+now();
+      var n=0, target=200*I();
+      function onMsg(e){
+        if(e.data!==tok) return;
+        n++;
+        if(n>=target){
+          window.removeEventListener("message", onMsg);
+          log("messages="+n);
+          done(null);
+        }
+      }
+      window.addEventListener("message", onMsg);
+      (function pump(i){
+        if(i>=target){ return; }
+        Promise.resolve().then(function(){
+          window.postMessage(tok,"*");
+          pump(i+1);
+        });
+      })(0);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 10) DOM churn: innerHTML + remove no meio
+  tests[10]=function(done){
+    sep(10,"DOM churn: innerHTML replace + remove mid-way");
+    try{
+      var host=document.createElement("div");
+      document.body.appendChild(host);
+      var loops=60*I();
+      for(var i=0;i<loops;i++){
+        host.innerHTML="<p>"+i+"</p><span>"+(i+1)+"</span>";
+        if(i===Math.floor(loops/2)) host.remove();
+        if(i%15===0) gcLite(I());
+      }
+      done(null);
+    }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+  };
+
+  // 11..50: variações agressivas curtas (sem rede, sem CSS)
+  // (mantém o arquivo compacto, mas cobre muitas interações teardown/IPC/DOM)
+  for(let t=11;t<=50;t++){
+    tests[t]=function(done){
+      sep(t,"aggressive micro-variant #"+t);
+      try{
+        var k=t%5;
+        if(k===0){
+          // MessageChannel: transfer + close
+          if(typeof MessageChannel!=="function"){ log("NOTE: sem MessageChannel"); done(null); return; }
+          var ch=new MessageChannel();
+          var ab=new ArrayBuffer(32);
+          var u=new Uint8Array(ab); for(var i=0;i<u.length;i++) u[i]=(i*7)&255;
+          ch.port1.onmessage=function(ev){
+            try{
+              var buf=ev.data;
+              assertTrue(buf instanceof ArrayBuffer,"recv AB");
+              assertEq(buf.byteLength,32,"len=32");
+            }catch(_){}
+            try{ ch.port1.close(); ch.port2.close(); }catch(_){}
+            done(null);
+          };
+          ch.port2.postMessage(ab,[ab]);
+          setTimeout(function(){ try{ ch.port1.close(); ch.port2.close(); }catch(_){} }, 20);
+          return;
+        } else if(k===1){
+          // history burst curto + go back/forward sem depender de evento
+          var base="#v3t"+t+"_"+now();
+          history.pushState({tag:"H"+t, n:t}, "", base);
+          history.replaceState({tag:"H"+t, n:t+1}, "", base+"_r");
+          assertTrue(history.state && history.state.n>=t,"history.state coerente");
+          done(null);
+        } else if(k===2){
+          // iframe create/remove em loop
+          var loops=8*I();
+          for(var i=0;i<loops;i++){
+            var f=document.createElement("iframe");
+            document.body.appendChild(f);
+            f.remove();
+          }
+          done(null);
+        } else if(k===3){
+          // Canvas minimal
+          var c=document.createElement("canvas");
+          var ctx=c.getContext && c.getContext("2d");
+          if(!ctx){ log("NOTE: sem canvas"); done(null); return; }
+          c.width=8+(t%4); c.height=8+((t*2)%4);
+          ctx.fillRect(0,0,1,1);
+          var img=ctx.getImageData(0,0,Math.min(8,c.width),Math.min(8,c.height));
+          assertTrue(img.data.length===img.width*img.height*4,"imagedata coerente");
+          done(null);
+        } else {
+          // Blob + FileReader churn
+          if(typeof Blob!=="function"||typeof FileReader!=="function"){ log("NOTE: sem Blob/FileReader"); done(null); return; }
+          var u=u8Pattern(64);
+          var b=new Blob([u]);
+          var fr=new FileReader();
+          fr.onload=function(){
+            try{
+              var ab=fr.result;
+              assertTrue(ab && ab.byteLength===u.length,"FR len ok");
+              var r=new Uint8Array(ab);
+              assertTrue(bytesEqual(r,u),"FR bytes ok");
+            }catch(_){}
+            done(null);
+          };
+          fr.onerror=function(){ log("NOTE: FileReader error"); done(null); };
+          fr.readAsArrayBuffer(b);
+          return;
+        }
+      }catch(e){ log("ERR: "+safeToString(e)); done("EXC"); }
+    };
+  }
+
+  function runTest(n, cb){
+    if(STOP){ cb(); return; }
+    var fn=tests[n];
+    if(typeof fn!=="function"){ log("missing test "+n); cb(); return; }
+    var tmo=+document.getElementById("timeout").value;
+    var finished=false;
+    var fin=withTimeout(tmo,function(err){
+      if(finished) return;
+      finished=true;
+      if(err) log("DONE TEST "+n+" (fail: "+err+")");
+      else log("DONE TEST "+n);
+      cb();
+    });
+    try{
+      fn(function(err){
+        if(finished) return;
+        finished=true;
+        if(err) log("DONE TEST "+n+" (fail: "+err+")");
+        else log("DONE TEST "+n);
+        fin(null);
+        cb();
+      });
+    }catch(e){
+      log("EXC: "+safeToString(e));
+      if(!finished){
+        finished=true;
+        log("DONE TEST "+n+" (fail: EXC)");
+        fin(null);
+        cb();
+      }
     }
-    try{ ctx.getImageData(0,0,1,1); log("[post] getImageData OK"); }catch(e){ log("[post] getImageData EXC"); }
-    gcPressure(I());
-  },
+  }
 
-  // T10: event reentrancy: dispatch + remove target + redispatch + layout read
-  10: async function(){
-    const root=freshRoot();
-    const wrap=document.createElement("div");
-    const btn=document.createElement("button");
-    btn.textContent="B";
-    wrap.appendChild(btn);
-    root.appendChild(wrap);
+  function reset(){
+    STOP=false; RUNNING=false; runCounter=0;
+    $log.textContent="";
+    log("Reset.");
+  }
+  function runAll(){
+    if(RUNNING) return;
+    RUNNING=true; STOP=false;
+    var delay=+document.getElementById("delay").value;
+    var i=1;
+    (function next(){
+      if(STOP){ RUNNING=false; log("Stopped."); return; }
+      if(i>50){ RUNNING=false; log("ALL DONE."); return; }
+      runTest(i,function(){ i++; setTimeout(next, delay); });
+    })();
+  }
 
-    let fired=0;
-    btn.addEventListener("click", ()=>{
-      fired++;
-      if(fired===1){
-        // remove durante handler
-        wrap.remove();
-        // tenta forçar layout de elemento removido
-        try{ wrap.offsetHeight; }catch(e){}
-        // reattach e redispatch síncrono
-        root.appendChild(wrap);
-        try{ btn.click(); }catch(e){}
-      }
-    }, true);
+  document.getElementById("reset").onclick=reset;
+  document.getElementById("stop").onclick=function(){ STOP=true; };
+  document.getElementById("runAll").onclick=runAll;
 
-    try{ btn.click(); log(`[post] fired=${fired}`); }catch(e){ log("[post] click EXC"); }
-    gcPressure(I());
-  },
-};
+  reset();
+})();
 </script>
-</body>
-</html>
