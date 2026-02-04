@@ -1,298 +1,422 @@
-
 <!doctype html>
 <html lang="pt-BR">
 <head>
-  <meta charset="utf-8">
-  <title>PS4 – 25x ArrayBuffer Detach Races (Full Corrected)</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PS4 WebKit — PoC History DESYNC (V3-HEAT A-only + Patches)</title>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0b0b0b; color:#d6ffd6; margin:0; }
+    .wrap { padding: 12px; }
+    h1 { font-size: 16px; margin: 0 0 10px; }
+    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin: 10px 0; }
+    button { padding: 8px 10px; font-size: 14px; cursor:pointer; }
+    input { width: 92px; padding: 6px 6px; background:#111; color:#d6ffd6; border:1px solid #2a2a2a; }
+    label { display:flex; align-items:center; gap:6px; }
+    .panel { border:1px solid #222; padding: 10px; border-radius: 8px; background:#0f0f0f; }
+    #log { white-space: pre-wrap; font-size: 12px; line-height: 1.25; border:1px solid #222; padding:10px; border-radius:8px; background:#060606; min-height: 260px; }
+    .hint { font-size: 12px; opacity: .85; }
+  </style>
 </head>
 <body>
-<h2>PS4 – 25x ArrayBuffer / TypedArray detachment races (PARTE 1: T1–T25)</h2>
-<p>Log apenas <b>[ALERTA]</b>. Se o browser travar ou reiniciar, o teste anterior foi o gatilho.</p>
+<div class="wrap">
+  <h1>PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches (PUSH/REPLACE instrumentation, DESYNC_I, recovery)</h1>
 
-<button onclick="clearLog()">Limpar Log</button>
-<button onclick="runAll()">Rodar Todos os 25 Testes</button>
+  <div class="panel">
+    <div class="row">
+      <button id="runOnceBtn">Run once</button>
+      <button id="loopBtn">Loop</button>
+      <button id="stopBtn">Stop</button>
+      <button id="clearBtn">Clear</button>
+    </div>
 
-<pre id="log" style="background: #f4f4f4; border: 1px solid #ccc; padding: 10px; min-height: 300px; font-family: monospace;"></pre>
+    <div class="row">
+      <label>timeoutA <input id="timeoutA" type="number" value="700" min="10" step="10"></label>
+      <label>timeoutB <input id="timeoutB" type="number" value="1600" min="10" step="10"></label>
+      <label>loop iters <input id="iters" type="number" value="30" min="1" step="1"></label>
+      <label>warmN <input id="warmN" type="number" value="70" min="0" step="1"></label>
+      <label>targetLen <input id="targetLen" type="number" value="50" min="2" step="1"></label>
+    </div>
+
+    <div class="hint">
+      Objetivo: aumentar pressão mantendo A-only, capturar <b>STUCK_NAV</b> e (com patch) <b>DESYNC_I</b> / <b>DESYNC_TAG</b>.
+      <br/>Patch: instrumenta push/replace (NOHREF/NOLEN/EXC), adiciona checagem por <code>state.i</code> e recovery após STUCK.
+    </div>
+  </div>
+
+  <div style="height:10px"></div>
+  <div id="log"></div>
+</div>
 
 <script>
-/* ============================================================
-   HARNESS DE COMPATIBILIDADE E UTILITÁRIOS
-   ============================================================ */
-var L = document.getElementById("log");
-var ALERTS = 0;
+(() => {
+  "use strict";
 
-// Polyfill de Promise para firmwares/engines mais antigas
-if (typeof Promise === "undefined") {
-    window.Promise = {
-        resolve: function() {
-            return { then: function(cb) { setTimeout(cb, 0); return this; } };
-        }
-    };
-}
+  // ----------------------------
+  // UI + logging
+  // ----------------------------
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
 
-function log(s){ L.textContent += s + "\n"; }
-function ALERT(s){ ALERTS++; log("[ALERTA] " + s); }
-function clearLog(){ L.textContent=""; ALERTS=0; }
+  function nowISO() { return new Date().toISOString(); }
+  function log(msg) { logEl.textContent += `[${nowISO()}] ${msg}\n`; logEl.scrollTop = logEl.scrollHeight; }
+  function clearLog() { logEl.textContent = ""; }
 
-function now(){ return Date.now ? Date.now() : (new Date()).getTime(); }
-function sleep(ms, cb){ setTimeout(cb, ms); }
+  // ----------------------------
+  // helpers
+  // ----------------------------
+  function rnd32() { return (Math.random() * 0x100000000) >>> 0; }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function u8hash(u8){
-  var h = 2166136261>>>0, i;
-  for(i=0;i<u8.length;i++){ h ^= u8[i]; h = (h * 16777619)>>>0; }
-  return ("00000000"+h.toString(16)).slice(-8);
-}
-
-function makeAB(n){
-  var ab = new ArrayBuffer(n);
-  var u8 = new Uint8Array(ab);
-  for(var i=0;i<u8.length;i++) u8[i] = (i*131 + 7) & 255;
-  return ab;
-}
-
-/* Criação segura do Worker para testes de transferência */
-function mkWorker(){
-  try {
-    if(typeof Worker === "undefined" || typeof Blob === "undefined") return null;
-    var code = "self.onmessage=function(e){ var d=e.data; if(d && d.cmd==='hold'){ self._buf=d.buf; self.postMessage({held:1}); } if(d && d.cmd==='release'){ var b=self._buf; self._buf=null; self.postMessage({buf:b}, [b]); } };";
-    var blob = new Blob([code], {type:"application/javascript"});
-    var url = URL.createObjectURL(blob);
-    return new Worker(url);
-  } catch(e) { return null; }
-}
-var W = mkWorker();
-
-/* Funções de Detach com tratamento de erro para não quebrar a sequência */
-function detachViaMessageChannel(ab, cb){
-  try {
-    var ch = new MessageChannel();
-    ch.port2.onmessage = function(){ cb(true); };
-    ch.port1.postMessage({buf:ab}, [ab]); 
-    setTimeout(function(){ cb(true); }, 25);
-  } catch(e) { cb(false, e); }
-}
-
-function detachViaWorkerHold(ab, cb){
-  if(!W){ cb(false, "no worker"); return; }
-  var done = false;
-  W.onmessage = function(ev){ if(!done){ done=true; cb(true); } };
-  try { W.postMessage({cmd:"hold", buf:ab}, [ab]); } catch(e){ if(!done){ done=true; cb(false); } }
-  setTimeout(function(){ if(!done){ done=true; cb(true); } }, 40);
-}
-
-/* Validador de Invariantes: Checa se a memória "fantasma" ainda existe */
-function checkInvariants(tag, ab, u8Before, view){
-  var bl = -1, vbl = -1;
-  try{ bl = ab.byteLength; }catch(e){}
-  try{ vbl = view ? view.byteLength : -1; }catch(e2){}
-  if(bl === 0 && vbl > 0) ALERT(tag + ": Inconsistência Crítica! view.byteLength=" + vbl + " com ab.byteLength=0");
-  if(bl === 0 && view){
-    var ghost = 0;
-    try {
-      for(var i=0; i<Math.min(8, view.length); i++){ if(view[i] === u8Before[i]) ghost++; }
-    } catch(e3){}
-    if(ghost >= 6) ALERT(tag + ": Ghost Read! Dados originais acessíveis após detach.");
+  function mkState(tag, i) {
+    return { tag, i, stamp: Date.now(), rnd: rnd32() };
   }
-}
 
-/* Runner: Executa os testes em série com atraso para evitar engasgos da engine */
-var tests = [];
-function add(id, name, fn){ tests.push({id:id, name:name, run:fn}); }
+  function mkHash(i, padLen=0) {
+    // V3-HEAT style: #A-i-rnd-<pad>
+    const r = rnd32();
+    const pad = padLen > 0 ? ("x".repeat(padLen)) : "";
+    return `#A-${i}-${r}-${pad}`;
+  }
 
-function runSeries(list, done){
-  var i=0;
-  function step(){
-    if(i >= list.length) return done && done();
-    var t = list[i++];
-    log("T" + t.id + " -> " + t.name);
+  function parseHashI(href) {
+    // expects ...#A-<i>-...
     try {
-      t.run(function(){ setTimeout(step, 15); });
-    } catch(e) {
-      log(" ! Erro no Runner T" + t.id + ": " + e.message);
-      setTimeout(step, 15);
+      const idx = href.indexOf("#A-");
+      if (idx < 0) return null;
+      const rest = href.slice(idx + 3);
+      const dash = rest.indexOf("-");
+      if (dash < 0) return null;
+      const iStr = rest.slice(0, dash);
+      const i = Number(iStr);
+      return Number.isFinite(i) ? i : null;
+    } catch (_) { return null; }
+  }
+
+  function getStateSafe() {
+    try { return history.state; } catch (_) { return null; }
+  }
+
+  // ----------------------------
+  // PATCH 1: instrumented replace/push
+  // ----------------------------
+  function replaceA(i, padLen=0) {
+    const beforeHref = location.href;
+    try {
+      history.replaceState(mkState(`A:${i}`, i), "", mkHash(i, padLen));
+    } catch (e) {
+      log(`[REPLACE_EXC] ${String(e)}`);
+      return false;
+    }
+    const afterHref = location.href;
+    if (afterHref === beforeHref) log(`[REPLACE_NOHREF] i=${i} href did not change`);
+    return true;
+  }
+
+  function pushA(i, padLen=0) {
+    const beforeHref = location.href;
+    const len0 = history.length;
+    try {
+      history.pushState(mkState(`A:${i}`, i), "", mkHash(i, padLen));
+    } catch (e) {
+      log(`[PUSH_EXC] ${String(e)}`);
+      return false;
+    }
+    const afterHref = location.href;
+    const len1 = history.length;
+    if (afterHref === beforeHref) log(`[PUSH_NOHREF] i=${i} href did not change`);
+    if (len1 === len0) log(`[PUSH_NOLEN] i=${i} history.length did not change (len=${len1})`);
+    return true;
+  }
+
+  // ----------------------------
+  // "heat": DOM churn pressure
+  // ----------------------------
+  function domChurn(rounds=18) {
+    // keeps it simple and deterministic-ish: create/remove nodes, attributes, text nodes.
+    const root = document.createElement("div");
+    root.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden;";
+    document.body.appendChild(root);
+
+    for (let r=0; r<rounds; r++) {
+      const box = document.createElement("div");
+      box.className = "bx" + r;
+      box.style.cssText = `width:${(r%7)+1}px;height:${(r%11)+1}px;`;
+      box.setAttribute("data-r", String(rnd32()));
+      box.appendChild(document.createTextNode("x".repeat((r%23)+1)));
+      root.appendChild(box);
+
+      // mild subtree mutation
+      if (r % 3 === 0) {
+        box.innerHTML = `<span data-k="${rnd32()}">${"y".repeat((r%17)+1)}</span>`;
+      }
+      if (r % 4 === 0) {
+        box.style.transform = `translateZ(0) rotate(${r}deg)`;
+      }
+      if (r % 5 === 0) {
+        box.removeAttribute("data-r");
+        box.setAttribute("data-r2", String(rnd32()));
+      }
+    }
+
+    // cleanup
+    try { root.remove(); } catch (_) {}
+  }
+
+  // ----------------------------
+  // warmup: maintain A-only, aim history.length ~= targetLen
+  // ----------------------------
+  async function warmupAOnly(warmN, targetLen) {
+    // Strategy:
+    // - replaceState to "A:0" at current entry (keeps A-only)
+    // - pushState up to targetLen (but bounded) using A:1 (same tag family) and random pad
+    // - then do some go(-k)/go(0) shuffles lightly
+    const padLen = 1 + (rnd32() % 24);
+
+    // ensure we are on something A-ish
+    replaceA(0, padLen);
+
+    // push until history.length is at least targetLen (best-effort)
+    let guard = Math.min(warmN, 140); // keep bounded
+    while (history.length < targetLen && guard-- > 0) {
+      pushA(1, padLen);
+      // tiny yield to let browser settle
+      if ((guard % 7) === 0) await sleep(0);
+    }
+
+    // additional warm churn
+    for (let j=0; j<Math.min(warmN, 120); j++) {
+      // keep A-only: alternate replace and push with varying i (still A:*)
+      const i = (j % 2 === 0) ? 0 : 1;
+      const pad = 1 + (rnd32() % 32);
+      if (j % 3 === 0) replaceA(i, pad);
+      else pushA(i, pad);
+
+      if ((j % 9) === 0) domChurn(10 + (j % 10));
+      if ((j % 11) === 0) await sleep(0);
     }
   }
-  step();
-}
 
-function runAll(){
-  clearLog();
-  log("Iniciando bateria completa de 25 testes...");
-  runSeries(tests, function(){
-    log("\n=== CONCLUÍDO === Alertas: " + ALERTS);
-  });
-}
+  // ----------------------------
+  // event waiters
+  // ----------------------------
+  function armEventLatch() {
+    const latch = { pop:false, hash:false, popEv:null, hashEv:null };
+    function onPop(ev) { latch.pop = true; latch.popEv = ev; }
+    function onHash(ev) { latch.hash = true; latch.hashEv = ev; }
+    window.addEventListener("popstate", onPop, { once:false });
+    window.addEventListener("hashchange", onHash, { once:false });
+    latch.detach = () => {
+      try { window.removeEventListener("popstate", onPop); } catch(_) {}
+      try { window.removeEventListener("hashchange", onHash); } catch(_) {}
+    };
+    return latch;
+  }
 
-/* ============================================================
-   DEFINIÇÃO DOS 25 TESTES (T1 - T25)
-   ============================================================ */
+  async function waitForAnyEventOrTimeout(latch, ms) {
+    const t0 = Date.now();
+    while ((Date.now() - t0) < ms) {
+      if (latch.pop || latch.hash) return true;
+      await sleep(16);
+    }
+    return false;
+  }
 
-// T1-T2: Métodos básicos de detach
-add(1, "MessageChannel detach (imediato)", function(n){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0), view = new Uint8Array(ab);
-  detachViaMessageChannel(ab, function(){ checkInvariants("T1", ab, before, view); n(); });
-});
-add(2, "Worker detach (hold)", function(n){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0), view = new Uint8Array(ab);
-  detachViaWorkerHold(ab, function(ok){ if(ok) checkInvariants("T2", ab, before, view); n(); });
-});
+  // ----------------------------
+  // PATCH 3: recovery poke after STUCK_NAV
+  // ----------------------------
+  async function recoveryPoke() {
+    const before = location.href;
 
-// T3-T5: Race conditions em loops de leitura/escrita
-add(3, "Microtask detach during read loop", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try{ for(var i=0;i<512;i++){ var x = u8[i]; } }catch(e){}
-  sleep(30, function(){ checkInvariants("T3", ab, before, u8); n(); });
-});
-add(4, "Timeout detach during write loop", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try{ for(var i=0;i<256;i++){ u8[i] ^= 0x5a; } }catch(e){}
-  sleep(40, function(){ checkInvariants("T4", ab, before, u8); n(); });
-});
-add(5, "DataView read while detach", function(n){
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), dv = new DataView(ab);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try{ for(var i=0;i<16;i++) dv.getUint32(i*4, true); }catch(e){}
-  sleep(30, function(){ checkInvariants("T5", ab, before, new Uint8Array(ab)); n(); });
-});
+    // 1) direct hash poke
+    try { location.hash = "#REC-" + ((Math.random()*1e6)|0); } catch(_) {}
+    await sleep(30);
 
-// T6-T8: Comportamentos de API (Sort, Double transfer, Slice)
-add(6, "Uint32Array.sort comparator detach", function(n){
-  var ab = makeAB(1024), u32 = new Uint32Array(ab), before = new Uint8Array(ab).slice(0);
-  var fired=0;
+    // 2) replace/push poke
+    replaceA(0, 4);
+    pushA(1, 6);
+    await sleep(30);
+
+    // 3) go(0) poke (forces traversal processing sometimes)
+    try { history.go(0); } catch(_) {}
+    await sleep(50);
+
+    log(`[RECOVERY] before=${before} after=${location.href} hlen=${history.length}`);
+  }
+
+  // ----------------------------
+  // core scenario A (A-only): warmup + churn + go/back probe
+  // Adds DESYNC_I and DESYNC_TAG (tag is now A:<i>)
+  // ----------------------------
+  async function runScenarioA(cfg) {
+    const { timeoutA, timeoutB, warmN, targetLen } = cfg;
+
+    // report BASE snapshot
+    log(`[BASE] :: href=${location.href} hlen=${history.length} state=${JSON.stringify(getStateSafe())}`);
+
+    log(`=== Scenario A: WARMUP(A-only) + DOM churn + go/back probes ===`);
+
+    // warmup pressure (keeps A-only)
+    await warmupAOnly(warmN, targetLen);
+
+    // snapshot after warm
+    log(`[A WARM] :: href=${location.href} hlen=${history.length} state=${JSON.stringify(getStateSafe())}`);
+
+    // Ensure we have a deterministic "current=1 / previous=0" pair right before probe
+    // (so we can flag DESYNC_I if traversal returns wrong i)
+    // We do: replace to A:0 then push to A:1, then probe go(-1..-3)
+    const padLen = 2 + (rnd32() % 28);
+    replaceA(0, padLen);
+    pushA(1, padLen);
+
+    // DOM churn right before traversal
+    domChurn(18 + (rnd32() % 12));
+
+    // Choose delta in [-1, -3] (matches your logs)
+    const delta = -1 - (rnd32() % 3);
+
+    const preHref = location.href;
+    const preState = getStateSafe();
+    const preI = preState && typeof preState === "object" ? preState.i : null;
+    const preTag = preState && typeof preState === "object" ? preState.tag : null;
+
+    log(`[A PRE] :: href=${preHref} hlen=${history.length} state=${JSON.stringify(preState)}`);
+
+    // Expect: after delta traversal, i should become 0 if delta=-1
+    // For delta=-2/-3, we accept i in {0,1} but we still detect wrong/unchanged traversal.
+    // Strongest signal: no events and no href change.
+    const latch = armEventLatch();
+
+    // fire traversal
+    try {
+      if (delta === -1) history.back();
+      else history.go(delta);
+    } catch (e) {
+      log(`[GO_EXC] delta=${delta} ${String(e)}`);
+    }
+
+    // initial wait
+    let got = await waitForAnyEventOrTimeout(latch, timeoutA);
+
+    // retry path (as you already do): if nothing, wait longer
+    if (!got) {
+      log(`[WARN] A initial=STUCK_NAV delta=${delta} -> retry timeoutB(${timeoutB})`);
+      got = await waitForAnyEventOrTimeout(latch, timeoutB);
+    }
+
+    const postHref = location.href;
+    const postState = getStateSafe();
+    const postI = postState && typeof postState === "object" ? postState.i : null;
+    const postTag = postState && typeof postState === "object" ? postState.tag : null;
+
+    latch.detach();
+
+    // ----------------------------
+    // verdict logic
+    // ----------------------------
+    const gotPop = !!latch.pop;
+    const gotHash = !!latch.hash;
+
+    // expectedTag is based on our last pushed entry (A:1). After delta=-1, we expect A:0.
+    // Since we do replaceA(0) then pushA(1), a successful back/go(-1) should land on A:0.
+    const expectTag = (delta === -1) ? "A:0" : null;
+    const expectI = (delta === -1) ? 0 : null;
+
+    let kind = "OK";
+    let desyncTag = false;
+    let desyncI = false;
+
+    if (expectTag && postTag && postTag !== expectTag) { desyncTag = true; }
+    if (typeof expectI === "number" && postI !== null && postI !== expectI) { desyncI = true; }
+
+    // STUCK_NAV: no events + href unchanged (strong signal)
+    const stuck = (!gotPop && !gotHash && postHref === preHref);
+
+    if (stuck) kind = "STUCK_NAV";
+    else if (desyncTag) kind = "DESYNC_TAG";
+    else if (desyncI) kind = "DESYNC_I";
+
+    log(`[A POST] :: href=${postHref} hlen=${history.length} state=${JSON.stringify(postState)}`);
+    log(`[A VERDICT] ${kind} | delta=${delta} gotPop=${gotPop} gotHash=${gotHash} preI=${preI} postI=${postI} preTag=${preTag} postTag=${postTag}`);
+
+    if (kind !== "OK") {
+      log(`[A STATE] ${JSON.stringify(postState)}`);
+    }
+
+    // recovery poke after STUCK to avoid the loop staying contaminated
+    if (kind === "STUCK_NAV") {
+      await recoveryPoke();
+    }
+
+    return { kind, delta, gotPop, gotHash, preHref, postHref };
+  }
+
+  // ----------------------------
+  // run harness (once / loop)
+  // ----------------------------
+  let stopFlag = false;
+
+  function readCfg() {
+    return {
+      timeoutA: Math.max(10, parseInt($("timeoutA").value, 10) || 700),
+      timeoutB: Math.max(10, parseInt($("timeoutB").value, 10) || 1600),
+      iters: Math.max(1, parseInt($("iters").value, 10) || 30),
+      warmN: Math.max(0, parseInt($("warmN").value, 10) || 70),
+      targetLen: Math.max(2, parseInt($("targetLen").value, 10) || 50),
+    };
+  }
+
+  async function runOnce() {
+    const cfg = readCfg();
+    stopFlag = false;
+    log(`RUN once | href=${location.href} hlen=${history.length} CFG tmoA=${cfg.timeoutA} tmoB=${cfg.timeoutB} warmN=${cfg.warmN} targetLen=${cfg.targetLen}`);
+    await runScenarioA(cfg);
+  }
+
+  async function runLoop() {
+    const cfg = readCfg();
+    stopFlag = false;
+
+    let OK=0, STUCK=0, DESYNC=0, LOST_EVENT=0;
+    log(`=== LOOP START iters=${cfg.iters} ===`);
+
+    for (let it=1; it<=cfg.iters; it++) {
+      if (stopFlag) { log(`=== LOOP STOPPED at iter ${it}/${cfg.iters} ===`); break; }
+
+      log(`### ITER ${it}/${cfg.iters} ###`);
+      log(`------------------------------------------------------------`);
+      log(`RUN once | href=${location.href} hlen=${history.length} CFG tmoA=${cfg.timeoutA} tmoB=${cfg.timeoutB} warmN=${cfg.warmN} targetLen=${cfg.targetLen}`);
+
+      const r = await runScenarioA(cfg);
+
+      if (r.kind === "OK") OK++;
+      else if (r.kind === "STUCK_NAV") STUCK++;
+      else if (r.kind === "DESYNC_TAG" || r.kind === "DESYNC_I") DESYNC++;
+      else LOST_EVENT++;
+
+      await sleep(120); // breathing room between iterations
+    }
+
+    log(`=== LOOP SUMMARY ===`);
+    log(`OK=${OK} STUCK=${STUCK} LOST_EVENT=${LOST_EVENT} DESYNC=${DESYNC}`);
+    log(`=== LOOP END ===`);
+  }
+
+  // ----------------------------
+  // wire UI
+  // ----------------------------
+  $("runOnceBtn").addEventListener("click", () => runOnce().catch(e => log(`[FATAL] ${String(e)}`)));
+  $("loopBtn").addEventListener("click", () => runLoop().catch(e => log(`[FATAL] ${String(e)}`)));
+  $("stopBtn").addEventListener("click", () => { stopFlag = true; log(`[STOP] requested`); });
+  $("clearBtn").addEventListener("click", () => clearLog());
+
+  // initial baseline stamp (keeps your style)
   try {
-    u32.sort(function(a,b){
-      if(++fired === 2) detachViaMessageChannel(ab, function(){});
-      return a-b;
-    });
-  } catch(e){}
-  sleep(40, function(){ checkInvariants("T6", ab, before, new Uint8Array(ab)); n(); });
-});
-add(7, "Double-transfer attempt", function(n){
-  var ab = makeAB(128), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(ok){
-    if(ok) detachViaMessageChannel(ab, function(){});
-    checkInvariants("T7", ab, before, new Uint8Array(ab)); n();
-  });
-});
-add(8, "Slice after detach", function(n){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(ok){
-    try{ var ab2 = ab.slice(0); if(ab.byteLength===0 && ab2.byteLength>0) ALERT("T8: slice gerou buffer ativo"); }catch(e){}
-    n();
-  });
-});
+    // keep A-ish baseline at load
+    history.replaceState(mkState("A:0", 0), "", mkHash(0, 2));
+  } catch (_) {}
 
-// T9-T11: Clonagem estruturada e Subarrays
-add(9, "structuredClone transfer", function(n){
-  if(typeof structuredClone !== "function") { log("T9: Ignorado (sem structuredClone)"); return n(); }
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0);
-  try { structuredClone({b:ab}, {transfer:[ab]}); } catch(e){}
-  sleep(20, function(){ checkInvariants("T9", ab, before, new Uint8Array(ab)); n(); });
-});
-add(10, "subarray view behavior after detach", function(n){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), sub = u8.subarray(16, 32), before = u8.slice(0);
-  detachViaMessageChannel(ab, function(){
-    try{ if(ab.byteLength===0 && sub.byteLength>0) ALERT("T10: subarray ativo após detach do pai"); }catch(e){}
-    n();
-  });
-});
-add(11, "Promise chain post-detach reads", function(n){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0);
-  detachViaMessageChannel(ab, function(){});
-  Promise.resolve().then(function(){ checkInvariants("T11", ab, before, u8); n(); });
-});
-
-// T12-T15: Efeitos colaterais em callbacks (JSON, Map, Reduce, Set)
-add(12, "toJSON side-effect detach", function(n){
-  var ab = makeAB(256), u8 = new Uint8Array(ab), before = u8.slice(0);
-  var o = { toJSON: function(){ detachViaMessageChannel(ab, function(){}); return 1; } };
-  try{ JSON.stringify(o); }catch(e){}
-  sleep(30, function(){ checkInvariants("T12", ab, before, u8); n(); });
-});
-add(13, "TypedArray map callback detach", function(n){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0), c=0;
-  try{ u8.map(function(v){ if(++c===3) detachViaMessageChannel(ab, function(){}); return v; }); }catch(e){}
-  sleep(30, function(){ checkInvariants("T13", ab, before, u8); n(); });
-});
-add(14, "TypedArray reduce detach", function(n){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0), c=0;
-  try{ u8.reduce(function(acc,v){ if(++c===2) detachViaMessageChannel(ab, function(){}); return acc+v; }, 0); }catch(e){}
-  sleep(30, function(){ checkInvariants("T14", ab, before, u8); n(); });
-});
-add(15, "TypedArray.set with detach mid-way", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0), src = new Uint8Array(256);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try{ u8.set(src, 0); }catch(e){}
-  sleep(30, function(){ checkInvariants("T15", ab, before, u8); n(); });
-});
-
-// T16-T19: Manipulação de Memória (CopyWithin, Fill, DataView)
-add(16, "Create new view after detach", function(n){
-  var ab = makeAB(128), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(){
-    try{ var u8 = new Uint8Array(ab); if(u8.byteLength > 0) ALERT("T16: Nova view criada com tamanho > 0"); }catch(e){}
-    n();
-  });
-});
-add(17, "copyWithin detach", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try{ u8.copyWithin(0, 16, 128); }catch(e){}
-  sleep(30, function(){ checkInvariants("T17", ab, before, u8); n(); });
-});
-add(18, "fill detach", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try{ u8.fill(0x7f); }catch(e){}
-  sleep(40, function(){ checkInvariants("T18", ab, before, u8); n(); });
-});
-add(19, "DataView write while detach", function(n){
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), dv = new DataView(ab);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try{ for(var i=0;i<16;i++) dv.setUint32(i*4, 0x41414141, true); }catch(e){}
-  sleep(40, function(){ checkInvariants("T19", ab, before, new Uint8Array(ab)); n(); });
-});
-
-// T20-T22: Conversões e Referências
-add(20, "Array.from(Uint16Array) with detach", function(n){
-  var ab = makeAB(512), before = new Uint8Array(ab).slice(0), u16 = new Uint16Array(ab);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try{ Array.prototype.join.call(u16, ","); }catch(e){}
-  sleep(30, function(){ checkInvariants("T20", ab, before, new Uint8Array(ab)); n(); });
-});
-add(21, "Post-detach allocate new AB", function(n){
-  var ab = makeAB(256), before = new Uint8Array(ab).slice(0);
-  detachViaMessageChannel(ab, function(){
-    var junk=[]; for(var i=0;i<100;i++) junk.push(new Uint8Array(1024));
-    checkInvariants("T21", ab, before, new Uint8Array(ab)); n();
-  });
-});
-add(22, "Keep buffer ref + detach", function(n){
-  var ab = makeAB(512), u8 = new Uint8Array(ab), before = u8.slice(0), bufRef = u8.buffer;
-  detachViaMessageChannel(bufRef, function(){ checkInvariants("T22", ab, before, u8); n(); });
-});
-
-// T23-T25: Timing e Busca
-add(23, "Two-stage timeout detach", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  setTimeout(function(){ checkInvariants("T23", ab, before, u8); n(); }, 50);
-});
-add(24, "Detach while consuming values", function(n){
-  var ab = makeAB(2048), u32 = new Uint32Array(ab), before = new Uint8Array(ab).slice(0);
-  Promise.resolve().then(function(){ detachViaMessageChannel(ab, function(){}); });
-  try{ var s=0; for(var i=0;i<64;i++) s += u32[i]; }catch(e){}
-  sleep(30, function(){ checkInvariants("T24", ab, before, new Uint8Array(ab)); n(); });
-});
-add(25, "Detach during indexOf scan", function(n){
-  var ab = makeAB(1024), u8 = new Uint8Array(ab), before = u8.slice(0);
-  setTimeout(function(){ detachViaMessageChannel(ab, function(){}); }, 0);
-  try{ u8.indexOf(0x41); }catch(e){}
-  sleep(40, function(){ checkInvariants("T25", ab, before, u8); n(); n(); });
-});
-
+  log(`[READY] href=${location.href} hlen=${history.length} state=${JSON.stringify(getStateSafe())}`);
+})();
 </script>
 </body>
 </html>
