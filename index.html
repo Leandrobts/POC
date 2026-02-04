@@ -1,466 +1,342 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches</title>
-  <style>
-    body { background:#000; color:#0f0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin:0; }
-    header { padding:12px 12px 8px; border-bottom:1px solid #0a0; }
-    h1 { font-size:14px; margin:0 0 6px; }
-    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-    button { background:#020; color:#0f0; border:1px solid #0a0; padding:8px 10px; font:inherit; cursor:pointer; }
-    button:hover { background:#040; }
-    input { background:#010; color:#0f0; border:1px solid #0a0; padding:6px 8px; width:88px; font:inherit; }
-    label { display:flex; gap:6px; align-items:center; }
-    .pill { border:1px solid #0a0; padding:2px 8px; border-radius:999px; font-size:12px; }
-    main { padding:10px 12px 14px; }
-    #log { white-space:pre-wrap; line-height:1.25; font-size:12px; }
-    .mutator { position:fixed; left:-9999px; top:-9999px; width:1px; height:1px; overflow:hidden; }
-  </style>
+<meta charset="UTF-8" />
+<title>PS4 WebKit – TRIAGE V2 (10 testes) Media/CSS/DOM</title>
+<style>
+  body { background:#000; color:#0f0; font-family:monospace; }
+  button, input { margin:4px; font-size:14px; }
+  #log { white-space:pre-wrap; font-size:12px; line-height:1.25; }
+  .row { margin:8px 0; }
+  .box { width:240px; height:140px; background:#300; margin:8px 0; }
+</style>
 </head>
 <body>
-<header>
-  <h1>PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches (PUSH/REPLACE instrumentation, DESYNC_I, recovery)</h1>
-  <div class="row" style="margin-bottom:8px;">
-    <button id="runOnce">Run once</button>
-    <button id="loop">Loop</button>
-    <button id="stop">Stop</button>
-    <button id="clear">Clear</button>
-    <span class="pill" id="status">idle</span>
-  </div>
+<h2>PS4 WebKit – Memory Corruption TRIAGE V2 (10 testes)</h2>
 
-  <div class="row">
-    <label>timeoutA <input id="tmoA" type="number" value="700" min="50" step="50"></label>
-    <label>timeoutB <input id="tmoB" type="number" value="1600" min="50" step="50"></label>
-    <label>loop iters <input id="iters" type="number" value="30" min="1" step="1"></label>
-    <label>warmN <input id="warmN" type="number" value="70" min="0" step="1"></label>
-    <label>targetLen <input id="targetLen" type="number" value="50" min="2" step="1"></label>
-    <label>padLen <input id="padLen" type="number" value="24" min="0" step="1"></label>
-    <label>probeDelta <input id="probeDelta" type="number" value="-2" max="-1" step="1"></label>
-  </div>
-</header>
+<div class="row">
+  <button onclick="runOne(1)">Test 1</button>
+  <button onclick="runOne(2)">Test 2</button>
+  <button onclick="runOne(3)">Test 3</button>
+  <button onclick="runOne(4)">Test 4</button>
+  <button onclick="runOne(5)">Test 5</button>
+  <button onclick="runOne(6)">Test 6</button>
+  <button onclick="runOne(7)">Test 7</button>
+  <button onclick="runOne(8)">Test 8</button>
+  <button onclick="runOne(9)">Test 9</button>
+  <button onclick="runOne(10)">Test 10</button>
+</div>
 
-<main>
-  <div id="log"></div>
-</main>
+<div class="row">
+  <button onclick="runAll()">Run ALL (1..10)</button>
+  <button onclick="clearLog()">Clear</button>
+  <label style="margin-left:10px;">Loop N:
+    <input id="loopN" type="number" value="1" min="1" max="50" style="width:70px;">
+  </label>
+</div>
 
-<!-- DOM churn targets (kept offscreen) -->
-<div class="mutator" id="mutator"></div>
+<pre id="log"></pre>
 
 <script>
-/* ============================================================
-   PS4 WebKit — PoC History DESYNC (V3-HEAT / A-only) + Patches
-   - A-only, state.i monotônico (forte para DESYNC_I)
-   - Instrumentação push/replace: NOHREF / NOLEN / EXC
-   - Checagem DESYNC por state.i e tag
-   - STUCK_NAV mais “cirúrgico” (pop+hash+h/ state iguais)
-   - Recovery após STUCK (sem “exploit”, só re-sincronização)
-   ============================================================ */
+const logEl = document.getElementById("log");
+function ts(){ return new Date().toISOString(); }
+function log(m){ logEl.textContent += `[${ts()}] ${m}\n`; }
+function clearLog(){ logEl.textContent=""; }
 
-(function () {
-  // ---------- UI ----------
-  const $ = (id) => document.getElementById(id);
-  const logEl = $("log");
-  const statusEl = $("status");
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-  function nowISO() { return new Date().toISOString(); }
-  function log(s) {
-    const line = `[${nowISO()}] ${s}\n`;
-    logEl.textContent += line;
-    // mantém scroll no fim
-    try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}
+async function runOne(n){
+  log(`\n=== TEST ${n} START ===`);
+  try{
+    await tests[n]();
+  }catch(e){
+    log(`[EXC] ${e && e.message ? e.message : e}`);
   }
-  function setStatus(s) { statusEl.textContent = s; }
+  log(`=== TEST ${n} END ===`);
+}
 
-  // ---------- PRNG ----------
-  function rnd32() {
-    // xorshift32
-    let x = (rnd32._x | 0) || 0x12345678;
-    x ^= (x << 13); x |= 0;
-    x ^= (x >>> 17);
-    x ^= (x << 5); x |= 0;
-    rnd32._x = x;
-    return (x >>> 0);
-  }
-
-  // ---------- Config ----------
-  function cfg() {
-    return {
-      tmoA: +$("tmoA").value || 700,
-      tmoB: +$("tmoB").value || 1600,
-      iters: +$("iters").value || 30,
-      warmN: +$("warmN").value || 70,
-      targetLen: +$("targetLen").value || 50,
-      padLen: +$("padLen").value || 0,
-      probeDelta: +$("probeDelta").value || -2,
-    };
-  }
-
-  // ---------- Modelo local (ring) ----------
-  const model = [];
-  function modelPush(i) { model.push(i); if (model.length > 600) model.shift(); }
-  function modelReplace(i) { if (model.length) model[model.length - 1] = i; else model.push(i); }
-  function expectForDelta(delta) {
-    const idx = model.length - 1 + delta; // delta negativo
-    if (idx < 0 || idx >= model.length) return null;
-    return model[idx];
-  }
-
-  // ---------- Hash builder ----------
-  function mkHash(tag, i, padLen) {
-    // Hash “barulhento” para churn: inclui i e um padding variável.
-    // (O padding não é para exploração — só para pressão de parsing/URL.)
-    const pad = padLen > 0 ? ("-" + "x".repeat(Math.max(0, padLen))) : "";
-    return `#${tag}-${i}-${rnd32()}${pad}`;
-  }
-
-  // ---------- State builder ----------
-  function mkState(tag, i) {
-    return { tag, i, stamp: Date.now(), rnd: rnd32() };
-  }
-
-  // ---------- Instrumentação push/replace ----------
-  function replaceStateInstr(state, url) {
-    const len0 = safeLen();
-    const href0 = safeHref();
-    try {
-      history.replaceState(state, "", url);
-    } catch (e) {
-      log(`[REPLACE_EXC] ${String(e)}`);
-      return false;
-    }
-    const href1 = safeHref();
-    const len1 = safeLen();
-    if (href1 === href0) log(`[REPLACE_NOHREF] i=${state.i} href did not change`);
-    if (len1 !== len0) log(`[REPLACE_LENCHG] i=${state.i} len ${len0} -> ${len1}`);
-    return true;
-  }
-
-  function pushStateInstr(state, url) {
-    const len0 = safeLen();
-    const href0 = safeHref();
-    try {
-      history.pushState(state, "", url);
-    } catch (e) {
-      log(`[PUSH_EXC] ${String(e)}`);
-      return false;
-    }
-    const href1 = safeHref();
-    const len1 = safeLen();
-    if (href1 === href0) log(`[PUSH_NOHREF] i=${state.i} href did not change`);
-    if (len1 === len0) log(`[PUSH_NOLEN] i=${state.i} history.length did not change (len=${len1})`);
-    return true;
-  }
-
-  function safeLen() {
-    try { return history.length | 0; } catch (e) { return -1; }
-  }
-  function safeHref() {
-    try { return String(location.href); } catch (e) { return "<nohref>"; }
-  }
-  function safeState() {
-    try { return history.state; } catch (e) { return null; }
-  }
-
-  // ---------- DOM churn ----------
-  const mut = $("mutator");
-  function domChurn(rounds) {
-    // pressão leve/média: cria/remove nós, mexe em atributos/texto
-    // sem usar APIs “exóticas” que podem não existir no PS4.
-    for (let r = 0; r < rounds; r++) {
-      const n = document.createElement("div");
-      n.className = "n" + (rnd32() & 0xff);
-      n.textContent = "x".repeat(20 + (rnd32() % 80));
-      mut.appendChild(n);
-
-      // pequenas mutações
-      if (r % 3 === 0) n.setAttribute("data-k", String(rnd32()));
-      if (r % 4 === 0) n.style.cssText = "display:block; width:" + (10 + (rnd32()%90)) + "px;";
-    }
-    // remove uma parte
-    let kill = Math.min(mut.childNodes.length, Math.max(1, (rounds / 2) | 0));
-    while (kill-- > 0 && mut.firstChild) mut.removeChild(mut.firstChild);
-  }
-
-  // ---------- Eventos de navegação ----------
-  let popArmed = false, hashArmed = false;
-  let gotPop = false, gotHash = false;
-  function armEvents() {
-    gotPop = false; gotHash = false;
-    popArmed = true; hashArmed = true;
-  }
-
-  window.addEventListener("popstate", function () {
-    if (!popArmed) return;
-    gotPop = true;
-  }, true);
-
-  window.addEventListener("hashchange", function () {
-    if (!hashArmed) return;
-    gotHash = true;
-  }, true);
-
-  // ---------- Recovery após STUCK ----------
-  function recoverySequence(reason) {
-    // Objetivo: “descolar” a fila de navegação/eventos.
-    // Sem exploração: só troca hash, replaceState e um go(0) opcional.
-    const st = safeState() || {};
-    const recI = (st.i == null) ? -1 : st.i;
-    log(`[RECOVERY] reason=${reason} at i=${recI} href=${safeHref()} len=${safeLen()}`);
-
-    // 1) força microtask-ish via postMessage
-    try { window.postMessage("ping-" + rnd32(), "*"); } catch (e) {}
-
-    // 2) força mudança de hash (via replace) para acordar parser
-    try {
-      const tag = "A";
-      const url = mkHash(tag, recI, 8);
-      replaceStateInstr(Object.assign({}, st, { tag: "A:REC" }), url);
-    } catch (e) {}
-
-    // 3) tenta refresh da entrada atual
-    try { history.go(0); } catch (e) {}
-  }
-
-  // ---------- Motor do cenário A (A-only) ----------
-  let gI = 0; // monotônico (forte)
-  let stopFlag = false;
-
-  function snapshot(label) {
-    const st = safeState();
-    log(`[${label}] :: href=${safeHref()} hlen=${safeLen()} state=${safeJson(st)}`);
-  }
-  function safeJson(x) { try { return JSON.stringify(x); } catch (e) { return String(x); } }
-
-  function warmupAOnly(warmN, targetLen, padLen) {
-    // “A-only”: mistura replace/push para esquentar
-    // Atualiza o modelo local (esperado) em paralelo.
-    for (let k = 0; k < warmN; k++) {
-      const i = ++gI;
-      const tag = "A";
-      const st = mkState(tag, i);
-      const url = mkHash(tag, i, padLen);
-
-      // alterna padrões pra variar
-      let ok = false;
-      if ((k % 3) === 0) {
-        ok = replaceStateInstr(st, url);
-        if (ok) modelReplace(i);
-      } else {
-        ok = pushStateInstr(st, url);
-        if (ok) modelPush(i);
-      }
-
-      // tenta chegar perto do targetLen (quando o engine permitir)
-      // (no PS4 pode “saturar”: PUSH_NOLEN vira sinal de pressão)
-      if (safeLen() >= targetLen && (k % 5) === 0) {
-        // churn extra quando saturado
-        domChurn(10 + (rnd32() % 10));
-      }
+async function runAll(){
+  const N = Math.max(1, Math.min(50, parseInt(document.getElementById("loopN").value||"1",10)));
+  log(`\n=== RUN ALL START loopN=${N} ===`);
+  for(let k=1;k<=N;k++){
+    log(`\n--- LOOP ${k}/${N} ---`);
+    for(let i=1;i<=10;i++){
+      await runOne(i);
+      await sleep(40);
     }
   }
+  log(`\n=== RUN ALL END ===`);
+}
 
-  function runScenarioA(cfgObj) {
-    const { tmoA, tmoB, warmN, targetLen, padLen, probeDelta } = cfgObj;
+/* =========================================================
+   Helper: cria/remonta container para reduzir interferência
+   ========================================================= */
+function freshRoot(){
+  let old=document.getElementById("root");
+  if(old) old.remove();
+  let r=document.createElement("div");
+  r.id="root";
+  document.body.appendChild(r);
+  return r;
+}
 
-    log(`RUN once | href=${safeHref()} hlen=${safeLen()} CFG tmoA=${tmoA} tmoB=${tmoB} warmN=${warmN} targetLen=${targetLen} padLen=${padLen} probeDelta=${probeDelta}`);
-    snapshot("BASE");
-    log("=== Scenario A: WARMUP(A-only) + DOM churn + go/back probes ===");
+/* =========================================================
+   10 TESTES
+   ========================================================= */
+const tests = {
+  1: async function(){ // Media: rapid src swap + remove + load()
+    const root=freshRoot();
+    const v=document.createElement("video");
+    root.appendChild(v);
+    v.onloadedmetadata=()=>log("[video] loadedmetadata");
+    v.onerror=()=>log("[video] error");
+    log("[phase] set src then load()");
+    v.src = "data:video/mp4;base64,"; // inválido de propósito
+    try { v.load(); log("[phase] load() OK"); } catch(e){ log("[phase] load() EXC"); }
+    await sleep(10);
+    log("[phase] swap src rapidly");
+    v.src = "";
+    try { v.load(); log("[phase] load()2 OK"); } catch(e){ log("[phase] load()2 EXC"); }
+    await sleep(10);
+    log("[phase] remove during pending events");
+    v.remove();
+    // acesso pós-remove (não é prova sozinho, mas bom para pegar UAF real se houver)
+    try { log(`[post] readyState=${v.readyState} networkState=${v.networkState}`); } catch(e){ log("[post] access EXC"); }
+    await sleep(30);
+  },
 
-    // garante entrada base com A
-    if (!safeState() || !safeState().tag) {
-      const i0 = ++gI;
-      const st0 = mkState("A", i0);
-      replaceStateInstr(st0, mkHash("A", i0, padLen));
-      modelReplace(i0);
+  2: async function(){ // Media: create/remove many <track> nodes quickly
+    const root=freshRoot();
+    const v=document.createElement("video");
+    root.appendChild(v);
+    log("[phase] add/remove tracks in burst");
+    for(let i=0;i<60;i++){
+      const tr=document.createElement("track");
+      tr.kind="subtitles";
+      tr.label="x"+i;
+      v.appendChild(tr);
+      if((i&1)===0) tr.remove();
+      if(i%10===0) await sleep(1);
     }
+    log("[phase] remove video");
+    v.remove();
+    await sleep(20);
+  },
 
-    // WARMUP + pressão
-    warmupAOnly(warmN, targetLen, padLen);
+  3: async function(){ // CSS: filter+transform + detach/reattach around rAF
+    const root=freshRoot();
+    const d=document.createElement("div");
+    d.className="box";
+    d.textContent="CSS box";
+    root.appendChild(d);
 
-    // churn final antes do probe
-    domChurn(20 + (rnd32() % 30));
-
-    // PRE snapshot (após warm)
-    snapshot("A WARM");
-
-    // define PRE explícito (garante topo com i conhecido)
-    const preI = ++gI;
-    const preTag = "A:1"; // tag “composta” pra detectar DESYNC_TAG (se aparecer algo fora)
-    const preState = mkState(preTag, preI);
-    const preUrl = mkHash("A", preI, padLen);
-    // mistura: faz push (preferido) — mas pode saturar
-    if (pushStateInstr(preState, preUrl)) modelPush(preI);
-    snapshot("A PRE");
-
-    // go/back probe
-    const preHref = safeHref();
-    const preLen = safeLen();
-    const preStSnap = safeState();
-    const expectedI = expectForDelta(probeDelta);
-
-    armEvents();
-
-    // tenta navegar
-    let fired = false;
-    try { history.go(probeDelta); fired = true; } catch (e) { log(`[GO_EXC] ${String(e)}`); }
-
-    // espera tmoA; se não respondeu, STUCK inicial e retry tmoB
-    return waitProbe(tmoA).then(function (r1) {
-      if (!fired) {
-        return verdict("GO_FAIL", probeDelta, expectedI, preHref, preLen, preStSnap);
-      }
-      if (r1.stuckLike) {
-        log(`[WARN] A initial=STUCK_NAV delta=${probeDelta} -> retry timeoutB(${tmoB})`);
-        // rearm e espera mais
-        armEvents();
-        return waitProbe(tmoB).then(function (r2) {
-          if (r2.stuckLike) {
-            // Recovery após STUCK
-            recoverySequence("STUCK_NAV");
-            return verdict("STUCK_NAV", probeDelta, expectedI, preHref, preLen, preStSnap);
+    await new Promise(resolve=>{
+      requestAnimationFrame(()=>{
+        log("[phase] apply heavy-ish styles");
+        d.style.filter="blur(6px)";
+        d.style.transform="translateZ(0) scale(1.01) rotate(0.01deg)";
+        d.style.willChange="transform, filter";
+        requestAnimationFrame(()=>{
+          log("[phase] detach then reattach before reading layout");
+          d.remove();
+          root.appendChild(d);
+          try{
+            const r=d.getBoundingClientRect();
+            log(`[post] rect w=${r.width} h=${r.height}`);
+          }catch(e){
+            log("[post] getBoundingClientRect EXC");
           }
-          return verdict("OK_AFTER_RETRY", probeDelta, expectedI, preHref, preLen, preStSnap);
+          resolve();
         });
-      }
-      return verdict("OK", probeDelta, expectedI, preHref, preLen, preStSnap);
+      });
     });
-  }
+    await sleep(20);
+  },
 
-  function waitProbe(ms) {
-    return new Promise(function (resolve) {
-      const t0 = Date.now();
-      setTimeout(function () {
-        const postHref = safeHref();
-        const postSt = safeState();
-        const stuckLike = (!gotPop && !gotHash); // base; “cirúrgico” é no verdict()
-        resolve({ dt: Date.now() - t0, postHref, postSt, stuckLike });
-      }, ms);
+  4: async function(){ // CSS/Layout: forced reflow loop + remove mid-loop
+    const root=freshRoot();
+    const d=document.createElement("div");
+    d.className="box";
+    root.appendChild(d);
+
+    log("[phase] reflow storm (bounded)");
+    for(let i=0;i<120;i++){
+      d.style.width = (200 + (i%30)) + "px";
+      // força layout:
+      try { d.offsetHeight; } catch(e){ log("[offsetHeight EXC]"); }
+      if(i===60){
+        log("[phase] remove at midpoint");
+        d.remove();
+      }
+      if(i%25===0) await sleep(1);
+    }
+    // pós-remove
+    try{ log("[post] offsetHeight="+d.offsetHeight); }catch(e){ log("[post] offsetHeight EXC"); }
+    await sleep(20);
+  },
+
+  5: async function(){ // DOM: MutationObserver reentrancy + remove subtree
+    const root=freshRoot();
+    const host=document.createElement("div");
+    root.appendChild(host);
+
+    let hits=0;
+    const mo=new MutationObserver((muts)=>{
+      hits += muts.length;
+      // reentrância: muta durante callback
+      if(hits < 40){
+        const s=document.createElement("span");
+        s.textContent="x";
+        host.appendChild(s);
+        if(hits % 7 === 0 && host.firstChild) host.firstChild.remove();
+      }
     });
-  }
+    mo.observe(host,{childList:true,subtree:true});
 
-  function verdict(baseKind, delta, expectedI, preHref, preLen, preStSnap) {
-    const postHref = safeHref();
-    const postLen = safeLen();
-    const postSt = safeState();
-
-    const preI = preStSnap && preStSnap.i;
-    const postI = postSt && postSt.i;
-    const preTag = preStSnap && preStSnap.tag;
-    const postTag = postSt && postSt.tag;
-
-    // STUCK “forte”: sem eventos + href igual + state igual (i+stamp)
-    const sameState =
-      postSt && preStSnap &&
-      postSt.i === preStSnap.i &&
-      postSt.stamp === preStSnap.stamp;
-
-    const stuckStrong = (!gotPop && !gotHash && postHref === preHref && sameState);
-
-    let kind = baseKind;
-    if (stuckStrong) kind = "STUCK_NAV";
-
-    // DESYNC_TAG: algo fora de A-only
-    if (postTag && String(postTag).indexOf("A") !== 0) {
-      kind = (kind === "STUCK_NAV") ? "STUCK_NAV+DESYNC_TAG" : "DESYNC_TAG";
+    log("[phase] kick mutations then remove host while observer active");
+    for(let i=0;i<10;i++){
+      const p=document.createElement("p");
+      p.textContent="p"+i;
+      host.appendChild(p);
     }
+    await sleep(5);
+    host.remove(); // remove durante observer ainda vivo
+    await sleep(10);
+    mo.disconnect();
+    log("[post] observer hits="+hits);
+  },
 
-    // DESYNC_I forte: expectedI conhecido e diferente do postI
-    if (expectedI !== null && (postI !== expectedI)) {
-      // não marca se for STUCK (porque postI==preI normalmente)
-      if (kind === "STUCK_NAV") {
-        // mantém STUCK (mais importante)
-      } else {
-        kind = "DESYNC_I";
+  6: async function(){ // DOM: Range/Selection + node removal
+    const root=freshRoot();
+    const p=document.createElement("p");
+    p.textContent="ABCDEFGHIJ0123456789KLMNOPQRST";
+    root.appendChild(p);
+
+    const range=document.createRange();
+    range.setStart(p.firstChild, 2);
+    range.setEnd(p.firstChild, 10);
+
+    log("[phase] remove text node then use range");
+    const tn=p.firstChild;
+    tn.remove();
+
+    try{
+      const frag=range.cloneContents();
+      log("[post] cloneContents childNodes="+frag.childNodes.length);
+    }catch(e){
+      log("[post] range.cloneContents EXC");
+    }
+    await sleep(20);
+  },
+
+  7: async function(){ // SVG: animate + remove during begin
+    const root=freshRoot();
+    const svgNS="http://www.w3.org/2000/svg";
+    const svg=document.createElementNS(svgNS,"svg");
+    svg.setAttribute("width","300");
+    svg.setAttribute("height","120");
+    const rect=document.createElementNS(svgNS,"rect");
+    rect.setAttribute("x","0"); rect.setAttribute("y","10");
+    rect.setAttribute("width","50"); rect.setAttribute("height","50");
+    rect.setAttribute("fill","red");
+    const anim=document.createElementNS(svgNS,"animate");
+    anim.setAttribute("attributeName","x");
+    anim.setAttribute("from","0");
+    anim.setAttribute("to","240");
+    anim.setAttribute("dur","0.05s");
+    anim.setAttribute("repeatCount","1");
+    rect.appendChild(anim);
+    svg.appendChild(rect);
+    root.appendChild(svg);
+
+    log("[phase] start SVG animate then remove rect immediately");
+    try{ anim.beginElement(); log("[phase] beginElement OK"); }catch(e){ log("[phase] beginElement EXC"); }
+    rect.remove();
+    // tenta acessar bbox (pode tocar layout interno)
+    try{
+      const bb=rect.getBBox();
+      log(`[post] getBBox w=${bb.width} h=${bb.height}`);
+    }catch(e){
+      log("[post] getBBox EXC");
+    }
+    await sleep(30);
+  },
+
+  8: async function(){ // Iframe: set srcdoc, mutate, remove during load-ish
+    const root=freshRoot();
+    const f=document.createElement("iframe");
+    f.style.width="320px";
+    f.style.height="160px";
+    root.appendChild(f);
+
+    log("[phase] set srcdoc");
+    f.srcdoc = "<!doctype html><meta charset=utf-8><body><div id=a>hi</div><script>setTimeout(()=>{document.getElementById('a').textContent='ok';},1)<\/script></body>";
+    await sleep(10);
+
+    log("[phase] remove iframe then try access contentWindow");
+    f.remove();
+    try{
+      const w=f.contentWindow;
+      log("[post] contentWindow is "+(w? "present":"null"));
+    }catch(e){
+      log("[post] contentWindow EXC");
+    }
+    await sleep(30);
+  },
+
+  9: async function(){ // Canvas: resize + context use after detach
+    const root=freshRoot();
+    const c=document.createElement("canvas");
+    c.width=320; c.height=180;
+    root.appendChild(c);
+
+    const ctx=c.getContext("2d");
+    log("[phase] draw + resize loop then remove canvas mid-loop");
+    for(let i=0;i<80;i++){
+      try{
+        ctx.fillRect(i%50, i%40, 20, 10);
+      }catch(e){
+        log("[ctx fillRect EXC]");
       }
-    }
-
-    snapshot("A POST");
-
-    log(`[A VERDICT] ${kind} | delta=${delta} gotPop=${gotPop} gotHash=${gotHash} preI=${preI} postI=${postI} expI=${expectedI} preTag=${preTag} postTag=${postTag} len=${preLen}->${postLen}`);
-
-    if (kind === "STUCK_NAV" || String(kind).indexOf("STUCK") === 0) {
-      log(`[A STATE] ${safeJson(postSt)}`);
-    }
-
-    return {
-      kind,
-      gotPop, gotHash,
-      preI, postI,
-      expectedI,
-      preTag, postTag,
-      preHref, postHref,
-      preLen, postLen
-    };
-  }
-
-  // ---------- Loop ----------
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  async function runLoop() {
-    stopFlag = false;
-    setStatus("looping");
-
-    const C = cfg();
-    let ok = 0, stuck = 0, desync = 0, lost = 0;
-
-    log(`=== LOOP START iters=${C.iters} ===`);
-    for (let it = 1; it <= C.iters; it++) {
-      if (stopFlag) break;
-      log(`### ITER ${it}/${C.iters} ###`);
-      log("------------------------------------------------------------");
-
-      let res;
-      try {
-        res = await runScenarioA(C);
-      } catch (e) {
-        log(`[LOOP_EXC] ${String(e)}`);
-        res = { kind: "EXC" };
+      if(i===40){
+        c.remove();
+        log("[phase] canvas removed");
       }
-
-      if (res.kind === "OK" || res.kind === "OK_AFTER_RETRY") ok++;
-      else if (String(res.kind).indexOf("STUCK") === 0) stuck++;
-      else if (String(res.kind).indexOf("DESYNC") === 0) desync++;
-      else if (res.kind === "LOST_EVENT") lost++;
-
-      // pequeno respiro + churn leve pra variar janela
-      await sleep(120 + (rnd32() % 120));
+      if(i%10===0){
+        c.width = 320 + (i%3);
+        c.height = 180 + (i%3);
+      }
+      if(i%20===0) await sleep(1);
     }
+    // pós-remove ainda tentando usar ctx
+    try{ ctx.getImageData(0,0,1,1); log("[post] getImageData OK"); }catch(e){ log("[post] getImageData EXC"); }
+    await sleep(20);
+  },
 
-    log("=== LOOP SUMMARY ===");
-    log(`OK=${ok} STUCK=${stuck} LOST_EVENT=${lost} DESYNC=${desync}`);
-    log("=== LOOP END ===");
-    setStatus(stopFlag ? "stopped" : "idle");
-  }
+  10: async function(){ // DOM: event dispatch on detached subtree + reattach during handler
+    const root=freshRoot();
+    const wrap=document.createElement("div");
+    const btn=document.createElement("button");
+    btn.textContent="B";
+    wrap.appendChild(btn);
+    root.appendChild(wrap);
 
-  // ---------- Botões ----------
-  $("clear").onclick = () => { logEl.textContent = ""; setStatus("idle"); };
-  $("stop").onclick = () => { stopFlag = true; setStatus("stopping"); };
+    btn.addEventListener("click", ()=>{
+      log("[handler] click: detach+reattach wrap");
+      wrap.remove();
+      root.appendChild(wrap);
+      // força layout no meio do handler
+      try{ wrap.offsetHeight; log("[handler] offsetHeight OK"); }catch(e){ log("[handler] offsetHeight EXC"); }
+    }, {capture:true});
 
-  $("runOnce").onclick = async () => {
-    stopFlag = false;
-    setStatus("running");
-    try { await runScenarioA(cfg()); }
-    catch (e) { log(`[RUN_EXC] ${String(e)}`); }
-    setStatus("idle");
-  };
-
-  $("loop").onclick = () => runLoop();
-
-  // ---------- Boot log ----------
-  // Coloca uma base A inicial para evitar state null
-  (function initBase() {
-    const st = safeState();
-    if (!st || !st.tag) {
-      const i0 = ++gI;
-      const base = mkState("A:BASE", i0);
-      replaceStateInstr(base, mkHash("A", i0, cfg().padLen));
-      modelReplace(i0);
-    }
-    snapshot("INIT");
-  })();
-})();
+    log("[phase] dispatch click then remove root immediately");
+    btn.click();
+    root.remove();
+    // pós-remove
+    try{ btn.click(); log("[post] click again OK"); }catch(e){ log("[post] click EXC"); }
+    await sleep(20);
+  },
+};
 </script>
 </body>
 </html>
