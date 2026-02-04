@@ -1,22 +1,26 @@
+
 <!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>PS4 WebKit – Blob.type Controls V2.1 (4 tests, ALERTA-only)</title>
+  <title>PS4 WebKit – Blob/Headers Controls V2.2 (sanity)</title>
 </head>
 <body>
-  <h2>PS4 WebKit – V2.1 (apenas 4 testes) – Blob.type com caracteres de controle</h2>
-  <p>Log apenas <b>[ALERTA]</b>. Tamanhos moderados. Sem CSS.</p>
+  <h2>PS4 WebKit – V2.2 (sanity) – controle em Headers/Blob.type</h2>
+  <p>Log apenas <b>[ALERTA]</b>. Sem CSS. Tamanhos moderados.</p>
 
   <button onclick="clearLog()">Limpar</button>
+  <button onclick="runAll()">Rodar tudo (auto)</button>
+  <hr>
+
   <button onclick="tBlobFetch()">T6b Blob.type → fetch (Content-Type)</button>
-  <button onclick="tBlobIframe()">T6c Blob.type → iframe load</button>
   <button onclick="tBlobFileReader()">T6d Blob.type → FileReader DataURL</button>
-  <button onclick="tHeaders()">T6e Headers reject newline?</button>
+  <button onclick="tHeadersLF()">T6e Headers aceita LF?</button>
+  <button onclick="tHeadersCRLF()">T6f Headers aceita CRLF + header injection?</button>
+  <button onclick="tResponseHeadersLF()">T6g Response(headers) preserva LF?</button>
 
   <hr>
   <pre id="log"></pre>
-  <iframe id="f" width="360" height="120"></iframe>
 
 <script>
 /* =========================
@@ -29,11 +33,9 @@ function clearLog(){
   try{ $log.textContent = ""; }catch(e){}
   ALERTS = 0;
 }
-
 function LOG(m){
   try{ $log.textContent += m + "\\n"; }catch(e){}
 }
-
 function ALERT(m){
   ALERTS++;
   LOG("[ALERTA] " + m);
@@ -45,10 +47,8 @@ function safeRevoke(url){
 
 /* =========================
    T6b: Blob.type -> fetch header content-type
-   ALERTA if response header contains control chars
    ========================= */
 function tBlobFetch(){
-  clearLog();
   LOG("T6b start...");
   if(!window.Blob || !window.fetch || !window.URL){
     LOG("fetch/Blob/URL não disponível.");
@@ -60,9 +60,7 @@ function tBlobFetch(){
 
   fetch(url).then(function(r){
     var ct = null;
-    try{
-      if(r.headers && r.headers.get) ct = r.headers.get("content-type");
-    }catch(e){}
+    try{ if(r.headers && r.headers.get) ct = r.headers.get("content-type"); }catch(e){}
     LOG("resp content-type: " + ct);
 
     if(ct && (ct.indexOf("\\n") !== -1 || ct.indexOf("\\r") !== -1)){
@@ -79,49 +77,9 @@ function tBlobFetch(){
 }
 
 /* =========================
-   T6c: Blob.type -> iframe load
-   ALERTA only if clear anomaly (load but weird access errors not counted)
-   ========================= */
-function tBlobIframe(){
-  clearLog();
-  LOG("T6c start...");
-  if(!window.Blob || !window.URL){
-    LOG("Blob/URL não disponível.");
-    return;
-  }
-
-  var b = new Blob(["<b>hi</b>"], { type: "text/html\\nbad\\n" });
-  var url = URL.createObjectURL(b);
-  var f = document.getElementById("f");
-
-  f.onload = function(){
-    LOG("iframe onload");
-    try{
-      var doc = f.contentDocument;
-      if(doc && doc.body){
-        var txt = doc.body.textContent || "";
-        LOG("iframe body text: " + txt);
-      }
-    }catch(e){
-      LOG("iframe access blocked/erro: " + e);
-    }
-    safeRevoke(url);
-  };
-
-  try{
-    f.src = url;
-  }catch(e2){
-    ALERT("iframe src set falhou: " + e2);
-    safeRevoke(url);
-  }
-}
-
-/* =========================
    T6d: Blob.type -> FileReader DataURL
-   ALERTA if resulting data URL contains control chars
    ========================= */
 function tBlobFileReader(){
-  clearLog();
   LOG("T6d start...");
   if(!window.FileReader || !window.Blob){
     LOG("FileReader/Blob não disponível.");
@@ -134,28 +92,20 @@ function tBlobFileReader(){
   r.onload = function(){
     var s = "";
     try{ s = String(r.result || ""); }catch(e){}
-    LOG("dataURL prefix: " + s.slice(0, 80));
+    LOG("dataURL prefix: " + s.slice(0, 100));
     if(s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1){
       ALERT("DataURL contém controle (\\n/\\r).");
     }
   };
-  r.onerror = function(){
-    LOG("FileReader error");
-  };
+  r.onerror = function(){ LOG("FileReader error"); };
 
-  try{
-    r.readAsDataURL(b);
-  }catch(e2){
-    ALERT("readAsDataURL lançou: " + e2);
-  }
+  try{ r.readAsDataURL(b); }catch(e2){ ALERT("readAsDataURL lançou: " + e2); }
 }
 
 /* =========================
-   T6e: Headers accept newline?
-   ALERTA if Headers.set accepts newline in header value
+   T6e: Headers accept LF?
    ========================= */
-function tHeaders(){
-  clearLog();
+function tHeadersLF(){
   LOG("T6e start...");
   if(!window.Headers){
     LOG("Headers não disponível.");
@@ -170,10 +120,95 @@ function tHeaders(){
     ok = false;
     LOG("Headers.set lançou (bom): " + e);
   }
+  if(ok) ALERT("Headers aceitou LF em header value (ruim).");
+}
+
+/* =========================
+   T6f: Headers accept CRLF + apparent injection?
+   - We only test acceptance and preservation via get().
+   - ALERTA if set() does not throw and get() contains CR or LF.
+   ========================= */
+function tHeadersCRLF(){
+  LOG("T6f start...");
+  if(!window.Headers){
+    LOG("Headers não disponível.");
+    return;
+  }
+
+  var ok = true;
+  var val = "a\\r\\nx-evil: 1";
+  var got = null;
+
+  try{
+    var h = new Headers();
+    h.set("x-test", val);
+    got = h.get("x-test");
+    LOG("Headers.get('x-test'): " + got);
+  }catch(e){
+    ok = false;
+    LOG("Headers.set lançou (bom): " + e);
+  }
 
   if(ok){
-    ALERT("Headers aceitou newline em header value (ruim).");
+    if(got && (got.indexOf("\\n") !== -1 || got.indexOf("\\r") !== -1)){
+      ALERT("Headers preservou CR/LF em value (muito ruim): " + got);
+    } else {
+      LOG("Accepted without preserving CR/LF (pode ter normalizado).");
+    }
   }
+}
+
+/* =========================
+   T6g: Response headers accept/preserve LF?
+   - Build Response with header containing LF, then read back.
+   ========================= */
+function tResponseHeadersLF(){
+  LOG("T6g start...");
+  if(!window.Response || !window.Headers){
+    LOG("Response/Headers não disponível.");
+    return;
+  }
+
+  var ct = "text/plain\\nbad\\n";
+  var r = null;
+  try{
+    r = new Response("x", { headers: { "content-type": ct } });
+  }catch(e){
+    LOG("new Response lançou (bom): " + e);
+    return;
+  }
+
+  var got = null;
+  try{ got = r.headers.get("content-type"); }catch(e2){}
+  LOG("Response.headers.get('content-type'): " + got);
+
+  if(got && (got.indexOf("\\n") !== -1 || got.indexOf("\\r") !== -1)){
+    ALERT("Response preservou controle em Content-Type: " + got);
+  }
+}
+
+/* =========================
+   Auto runner
+   ========================= */
+function runAll(){
+  clearLog();
+  LOG("AUTO start...");
+  try{ tHeadersLF(); }catch(e){}
+  setTimeout(function(){
+    try{ tHeadersCRLF(); }catch(e){}
+    setTimeout(function(){
+      try{ tResponseHeadersLF(); }catch(e){}
+      setTimeout(function(){
+        try{ tBlobFetch(); }catch(e){}
+        setTimeout(function(){
+          try{ tBlobFileReader(); }catch(e){}
+          setTimeout(function(){
+            LOG("AUTO done. ALERTAS=" + ALERTS);
+          }, 600);
+        }, 800);
+      }, 250);
+    }, 250);
+  }, 250);
 }
 </script>
 </body>
