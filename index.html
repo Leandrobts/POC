@@ -411,91 +411,170 @@
     checkDetachConsistency(301, 4);
   });
 
-  // 302 (FIX): MessageChannel transfer/clone invariants (no instanceof-only)
+// 302 (TIER S): MessageChannel transfer invariants + handshake + robust wait
 tests.push(async () => {
   if (typeof MessageChannel !== "function") return;
 
   const ch = new MessageChannel();
+
+  // Alguns WebKit exigem start() para drenar a fila de eventos
+  try { ch.port1.start && ch.port1.start(); } catch (_) {}
+  try { ch.port2.start && ch.port2.start(); } catch (_) {}
+
+  // Mantém referência viva (evita GC agressivo em runners)
+  if (!window.__mc_hold) window.__mc_hold = [];
+  window.__mc_hold.push(ch);
+
+  let got = undefined;
+  let fired = false;
+  let firedAt = 0;
+  let msgErr = false;
+
+  ch.port2.onmessage = (ev) => {
+    fired = true;
+    firedAt = Date.now();
+    got = ev.data;
+  };
+  ch.port2.onmessageerror = () => { msgErr = true; };
+
+  async function waitUntil(pred, msTotal) {
+    const t0 = Date.now();
+    while ((Date.now() - t0) < msTotal) {
+      if (pred()) return true;
+      // “tick” mais robusto que setTimeout(0) no PS4
+      await new Promise(r => setTimeout(r, 10));
+    }
+    return false;
+  }
+
+  // 1) HANDSHAKE: prova que o canal entrega mensagens
+  fired = false; got = undefined; msgErr = false;
+  let pingPostThrew = false;
+  try { ch.port1.postMessage({ t: "PING", k: (Math.random() * 1e9) | 0 }); }
+  catch (e) { pingPostThrew = true; }
+
+  if (pingPostThrew) {
+    // Se nem PING passa, não dá pra concluir nada sobre transfer
+    return;
+  }
+
+  const pingOk = await waitUntil(() => fired === true, 400);
+  if (!pingOk) {
+    // Sem handshake => não chame isso de corrupção
+    // (o canal pode estar “parado” / start() requerido / event loop não drenou)
+    return;
+  }
+
+  // 2) TRANSFER TEST
+  fired = false; got = undefined; msgErr = false;
+
   const ab = new ArrayBuffer(4096);
   const u8 = new Uint8Array(ab);
   u8[0] = 0xAA;
-
-  let got = undefined;
-  ch.port2.onmessage = (ev) => { got = ev.data; };
 
   let postThrew = false;
   try { ch.port1.postMessage(ab, [ab]); }
   catch (e) { postThrew = true; }
 
-  // Se nem conseguiu postar com transfer, não é sinal de corrupção.
   if (postThrew) return;
 
-  await Promise.resolve();
-  await new Promise(r => setTimeout(r, 0));
-
-  const tag = Object.prototype.toString.call(got);
-
-  // Classifica o payload recebido
-  const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
-  const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
+  // Espera entrega do payload
+  const recvOk = await waitUntil(() => fired === true || msgErr === true, 700);
 
   const senderLen = ab.byteLength;
 
-  // Interpretação:
-  // - transfer real: senderLen == 0
-  // - clone: senderLen == 4096
+  // Invariante 1: senderLen deve ser 0 (transfer) ou 4096 (clone/sem detach)
   if (senderLen !== 0 && senderLen !== 4096) {
-    alertVuln(302, "MessageChannel: sender ab.byteLength ficou em estado impossível.", { senderLen, tag });
+    alertVuln(302, "MessageChannel: sender ab.byteLength em estado impossível.", {
+      senderLen, recvOk, fired, msgErr
+    });
     return;
   }
 
-  // Se transfer aconteceu, receiver precisa conter os dados.
+  // Se transfer aconteceu (detach), receiver TEM que receber algo coerente
   if (senderLen === 0) {
-    if (!got) {
-      alertVuln(302, "MessageChannel: sender detacheou mas receiver não recebeu nada.", { tag, gotType: typeof got });
+    if (!recvOk || !fired) {
+      alertVuln(302, "MessageChannel: sender detacheou, mas evento não chegou no receiver (drop?).", {
+        senderLen, recvOk, fired, msgErr
+      });
       return;
     }
 
-    let r0 = null, rLen = null;
+    if (!got) {
+      alertVuln(302, "MessageChannel: sender detacheou, receiver recebeu evento mas payload é vazio.", {
+        tag: Object.prototype.toString.call(got),
+        gotType: typeof got,
+        msgErr
+      });
+      return;
+    }
+
+    const tag = Object.prototype.toString.call(got);
+
+    const isAB = (tag === "[object ArrayBuffer]") ||
+      (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+
+    const isView = (got && typeof got === "object" &&
+      typeof got.byteLength === "number" &&
+      got.buffer && typeof got.buffer === "object");
+
+    let rLen = null, r0 = null;
     try {
       if (isAB) {
         const r8 = new Uint8Array(got);
         rLen = r8.length;
         r0 = r8[0];
       } else if (isView) {
-        const r8 = (got instanceof Uint8Array) ? got : new Uint8Array(got.buffer);
+        // Não assuma Uint8Array diretamente: normalize com cuidado
+        const buf = got.buffer;
+        const r8 = new Uint8Array(buf);
         rLen = r8.length;
         r0 = r8[0];
       } else {
-        alertVuln(302, "MessageChannel: receiver não é ArrayBuffer nem view após sender detach.", { tag });
+        alertVuln(302, "MessageChannel: após detach, payload não é ArrayBuffer nem view.", { tag });
         return;
       }
     } catch (e) {
-      alertVuln(302, "MessageChannel: falha ao ler receiver após sender detach.", { tag, err: e && e.name });
+      alertVuln(302, "MessageChannel: erro ao ler payload após detach.", { tag, err: e && e.name });
       return;
     }
 
     if (rLen !== 4096 || r0 !== 0xAA) {
-      alertVuln(302, "MessageChannel: receiver conteúdo/len inesperado após transfer.", { tag, rLen, r0 });
+      alertVuln(302, "MessageChannel: payload inválido após transfer (len/byte0).", {
+        tag, rLen, r0
+      });
     }
+
     return;
   }
 
-  // Se NÃO houve transfer (clone), valida independência (mutação não deve refletir)
+  // Se não houve detach (clone), só alerta se houver aliasing (mutação refletida)
   if (senderLen === 4096) {
-    if (!got) return; // engines podem não entregar de forma previsível; não alerta.
+    if (!recvOk || !fired || !got) return;
+
+    const tag = Object.prototype.toString.call(got);
+    const isAB = (tag === "[object ArrayBuffer]") ||
+      (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+
+    const isView = (got && typeof got === "object" &&
+      typeof got.byteLength === "number" &&
+      got.buffer && typeof got.buffer === "object");
+
     if (!isAB && !isView) return;
 
     let r8;
     try {
-      r8 = isAB ? new Uint8Array(got) : (got instanceof Uint8Array ? got : new Uint8Array(got.buffer));
+      r8 = isAB ? new Uint8Array(got) : new Uint8Array(got.buffer);
     } catch (_) { return; }
 
     const before = r8[0];
     u8[0] = 0xBB; // muta sender
     const after = r8[0];
+
     if (before !== after) {
-      alertVuln(302, "MessageChannel: receiver refletiu mutação do sender (aliasing inesperado em clone).", { before, after, tag });
+      alertVuln(302, "MessageChannel: aliasing inesperado (clone refletiu mutação do sender).", {
+        before, after, tag
+      });
     }
   }
 });
