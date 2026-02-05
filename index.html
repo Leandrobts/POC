@@ -1,470 +1,108 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8" />
-  <title>PS4 Severity Harness — TypedArray/ArrayBuffer Impossible Invariants</title>
+  <title>Stress Test: TypedArray Impossible Invariants (Severity Check)</title>
+  <style>
+    body { font-family: monospace; background: #1a1a1a; color: #0f0; padding: 20px; }
+    .alert { color: #ff4444; font-weight: bold; border-left: 4px solid #ff4444; padding-left: 10px; margin: 10px 0; }
+    .info { color: #44aaff; }
+    #log { background: #000; padding: 15px; border-radius: 5px; overflow-x: auto; }
+  </style>
 </head>
 <body>
-  <h2>PS4 Severity Harness — Automatic (no exploit, no OOB/UAF)</h2>
-
-  <div>
-    <button id="btnReset">Reset log</button>
-    <button id="btnRun">Run ALL (auto)</button>
-    <button id="btnStop">Stop</button>
-  </div>
-
-  <div>
-    Runs por caso (N): <input id="runsN" type="number" value="80" min="1" step="10">
-    Delay (ms): <input id="delayMs" type="number" value="30" min="0" step="10">
-    Timeout por caso (ms): <input id="timeoutMs" type="number" value="1400" min="100" step="50">
-    Intensidade (1..5): <input id="intensity" type="number" value="3" min="1" max="5" step="1">
-    Auto-start: <input id="autoStart" type="checkbox" checked>
-  </div>
-
-  <pre id="log" style="white-space:pre-wrap;"></pre>
+  <h2>PS4 Severity Stress Test: Logic -> Exploitation Path</h2>
+  <button id="runBtn">Iniciar Teste de Estresse</button>
+  <pre id="log"></pre>
 
 <script>
-(() => {
-  "use strict";
+(function() {
+  const log = (msg, cls = "") => {
+    const div = document.createElement("div");
+    div.className = cls;
+    div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    document.getElementById("log").appendChild(div);
+  };
 
-  const $log = document.getElementById("log");
-  const $runsN = document.getElementById("runsN");
-  const $delayMs = document.getElementById("delayMs");
-  const $timeoutMs = document.getElementById("timeoutMs");
-  const $intensity = document.getElementById("intensity");
-  const $autoStart = document.getElementById("autoStart");
+  function testAccessorInjection() {
+    log("--- Fase 1: Accessor Injection (High Severity) ---", "info");
+    const ta = new Uint8Array(8);
+    
+    // Tenta injetar um getter em um índice numérico (Proibido pela Spec)
+    const success = Reflect.defineProperty(ta, "0", {
+      get: function() { 
+        log("!!! GETTER EXECUTADO EM TYPEDARRAY[0] !!!", "alert");
+        return 0xEE; 
+      },
+      configurable: true,
+      enumerable: true
+    });
 
-  let STOP = false;
-  let RUN_ID = 0;
-
-  function ts() { return Date.now(); }
-  function logLine(s) { $log.textContent += `[${ts()}] ${s}\n`; }
-  function resetLog() { $log.textContent = ""; logLine("Reset."); }
-  function stopNow() { STOP = true; logLine("STOP requested."); }
-
-  function safeJson(x) {
-    try { return JSON.stringify(x, null, 2); } catch (_) { return String(x); }
-  }
-
-  function markAlert(testId, msg, extra) {
-    const payload = extra ? ("\n" + safeJson(extra)) : "";
-    logLine(`ALERTA ${testId}: ${msg}${payload}`);
-  }
-
-  async function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  function xorshift32(seed) {
-    let x = seed >>> 0;
-    return () => {
-      x ^= (x << 13) >>> 0;
-      x ^= (x >>> 17) >>> 0;
-      x ^= (x << 5) >>> 0;
-      return x >>> 0;
-    };
-  }
-
-  function fillU8(u8, seed) {
-    const rnd = xorshift32(seed);
-    for (let i = 0; i < u8.length; i++) {
-      const r = rnd();
-      u8[i] = (r ^ (r >>> 8) ^ (r >>> 16) ^ (r >>> 24)) & 0xFF;
-    }
-  }
-
-  function blockXor32(u8, blockBytes) {
-    const nBlocks = Math.ceil(u8.length / blockBytes);
-    const out = new Uint32Array(nBlocks);
-    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-    for (let b = 0; b < nBlocks; b++) {
-      const start = b * blockBytes;
-      const end = Math.min(u8.length, start + blockBytes);
-      let acc = 0 >>> 0;
-      let i = start;
-      for (; i + 4 <= end; i += 4) acc ^= dv.getUint32(i, true);
-      for (; i < end; i++) acc ^= (u8[i] << (((i - start) & 3) * 8)) >>> 0;
-      out[b] = acc >>> 0;
-    }
-    return out;
-  }
-
-  function snapshot(u8, blockBytes) {
-    const sum = blockXor32(u8, blockBytes);
-    const spots = [];
-    const step = Math.max(1, Math.floor(u8.length / 16));
-    for (let i = 0; i < u8.length; i += step) spots.push(u8[i]);
-    return { len: u8.length, blockBytes, sum, spots };
-  }
-
-  function compare(u8, snap) {
-    if (u8.length !== snap.len) return { ok:false, reason:"len changed", got:u8.length, exp:snap.len };
-    const now = blockXor32(u8, snap.blockBytes);
-    if (now.length !== snap.sum.length) return { ok:false, reason:"blocks changed", got:now.length, exp:snap.sum.length };
-    for (let i = 0; i < now.length; i++) {
-      if (now[i] !== snap.sum[i]) return { ok:false, reason:"checksum mismatch", block:i, got:now[i]>>>0, exp:snap.sum[i]>>>0 };
-    }
-    const spots = [];
-    const step = Math.max(1, Math.floor(u8.length / 16));
-    for (let i = 0; i < u8.length; i += step) spots.push(u8[i]);
-    for (let k = 0; k < spots.length; k++) {
-      if (spots[k] !== snap.spots[k]) return { ok:false, reason:"spot mismatch", idx:k, got:spots[k], exp:snap.spots[k] };
-    }
-    return { ok:true };
-  }
-
-  function boundedChurn(intensity) {
-    // Best-effort “GC / allocator churn” sem travar.
-    const n1 = 40 * intensity;
-    const n2 = 160 * intensity;
-
-    const arr = [];
-    for (let i = 0; i < n1; i++) {
-      const ab = new ArrayBuffer(0x2000);
-      const u32 = new Uint32Array(ab);
-      for (let j = 0; j < u32.length; j += 64) u32[j] = (0xA5A5A5A5 ^ i ^ j) >>> 0;
-      arr.push(ab);
-    }
-    // Holes
-    const holes = [];
-    for (let i = 0; i < n2; i++) holes.push(new ArrayBuffer(0x100));
-    for (let i = 0; i < holes.length; i += 2) holes[i] = null;
-
-    // Objects
-    const objs = [];
-    for (let i = 0; i < 200 * intensity; i++) {
-      const o = { i, s: "x" + i, t: (i * 3) | 0 };
-      if ((i & 7) === 0) o.ab = new ArrayBuffer(0x80);
-      objs.push(o);
-    }
-
-    // drop refs
-    arr.length = 0; holes.length = 0; objs.length = 0;
-  }
-
-  function withTimeout(promise, ms) {
-    let t;
-    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
-    return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
-  }
-
-  // ===== Spec sanity helpers (no “exploit”) =====
-
-  function expectedSubarrayRange(len, begin, end) {
-    let b = begin | 0;
-    let e = (end === undefined) ? len : (end | 0);
-    if (b < 0) b = Math.max(len + b, 0); else b = Math.min(b, len);
-    if (e < 0) e = Math.max(len + e, 0); else e = Math.min(e, len);
-    if (e < b) e = b;
-    return { b, e, length: e - b };
-  }
-
-  function toKey(x) { return String(x); }
-
-  function runDescriptorMatrixOnTypedArray(TA, idxKey, intensity, runNo) {
-    const ab = new ArrayBuffer(64);
-    const ta = new TA(ab);
-
-    // seed some data
-    for (let i = 0; i < Math.min(ta.length, 8); i++) ta[i] = (i + 7) & 0xFF;
-
-    const testId = `${TA.name}[${idxKey}]#${runNo}`;
-
-    // Baselines
-    const has0_before = Object.prototype.hasOwnProperty.call(ta, idxKey);
-    const in_before = (idxKey in ta);
-    const keys_before = Object.keys(ta).slice(0, 10);
-    const ownKeys_before = (Reflect.ownKeys ? Reflect.ownKeys(ta).slice(0, 30) : []);
-
-    // Attempt defineProperty with "impossible" descriptor for numeric index
-    // For typed arrays, numeric indices are “integer-indexed exotic objects”:
-    // defineProperty should NOT allow configurable:true on an element index.
-    let dp = { ok:null, threw:false, err:null, desc:null, after:null };
-    try {
-      const ok = Reflect.defineProperty(ta, idxKey, {
-        value: 9,
-        writable: true,
-        enumerable: true,
-        configurable: true
-      });
-      dp.ok = ok;
-    } catch (e) {
-      dp.threw = true;
-      dp.err = (e && e.name) ? e.name : "ERR";
-    }
-
-    try { dp.desc = Object.getOwnPropertyDescriptor(ta, idxKey) || null; } catch (_) { dp.desc = { threw:true }; }
-    try { dp.after = ta[idxKey]; } catch (e) { dp.after = "THREW:" + ((e && e.name) ? e.name : "ERR"); }
-
-    // Mutate via normal element write
-    let afterWrite = { threw:false, err:null, v:null, desc:null };
-    try { ta[idxKey] = 0x33; } catch (e) { afterWrite.threw = true; afterWrite.err = (e && e.name) ? e.name : "ERR"; }
-    try { afterWrite.v = ta[idxKey]; } catch (e) { afterWrite.v = "THREW:" + ((e && e.name) ? e.name : "ERR"); }
-    try { afterWrite.desc = Object.getOwnPropertyDescriptor(ta, idxKey) || null; } catch (_) { afterWrite.desc = { threw:true }; }
-
-    // Delete attempts
-    let del1 = { ok:null, threw:false, err:null };
-    let del2 = { ok:null, threw:false, err:null };
-    try { del1.ok = delete ta[idxKey]; } catch (e) { del1.threw=true; del1.err=(e&&e.name)?e.name:"ERR"; }
-    try { del2.ok = Reflect.deleteProperty(ta, idxKey); } catch (e) { del2.threw=true; del2.err=(e&&e.name)?e.name:"ERR"; }
-
-    // Post state
-    const has0_after = Object.prototype.hasOwnProperty.call(ta, idxKey);
-    const in_after = (idxKey in ta);
-    const keys_after = Object.keys(ta).slice(0, 10);
-    const ownKeys_after = (Reflect.ownKeys ? Reflect.ownKeys(ta).slice(0, 30) : []);
-
-    // Contradiction checks (severity-oriented)
-    const desc = dp.desc;
-
-    // C1: If descriptor claims configurable:true, delete MUST succeed and property must disappear.
-    if (desc && desc.configurable === true) {
-      if (del2.ok !== true) {
-        markAlert(testId, "Descriptor says configurable:true but Reflect.deleteProperty returned false (contradiction).", {
-          dp, afterWrite, del1, del2, has0_before, has0_after, in_before, in_after,
-          keys_before, keys_after, ownKeys_before, ownKeys_after
-        });
-      } else {
-        if (has0_after || in_after) {
-          markAlert(testId, "Deleted configurable:true property but it still exists via hasOwnProperty/in (contradiction).", {
-            dp, afterWrite, del1, del2, has0_after, in_after, keys_after, ownKeys_after
-          });
-        }
-      }
-    }
-
-    // C2: Meta API disagreements (ownKeys/keys vs hasOwnProperty/in)
-    const okHasIn = (has0_after === in_after) || true; // not strictly required, but divergence is interesting
-    const okOwnHas = (ownKeys_after.includes(idxKey) === has0_after);
-    const okKeysHas = (keys_after.includes(idxKey) === has0_after);
-
-    if (!okOwnHas || !okKeysHas || !okHasIn) {
-      markAlert(testId, "Meta-object disagreement among ownKeys/Object.keys/hasOwnProperty/in (suspicious).", {
-        has0_before, has0_after, in_before, in_after,
-        keys_after, ownKeys_after, idxKey,
-        dp, del2
-      });
-    }
-
-    // C3: defineProperty succeeded when it should be rejected (strong spec violation)
-    if (dp.threw === false && dp.ok === true) {
-      // For integer indexed element keys, this should not accept configurable:true.
-      // Even if engine returns true, we treat as violation.
-      markAlert(testId, "Reflect.defineProperty on TA index accepted configurable:true (spec-violating / impossible invariant).", { dp });
-    }
-
-    // C4: Negative index keys must be plain properties, not “magic elements”
-    // If idxKey is negative-like, ensure it is NOT treated as element storage.
-    if (/^-/.test(idxKey)) {
-      // Writing ta[-1] must create/act like normal property, not affect buffer.
-      const victim = new Uint8Array(ab);
-      const snap = snapshot(victim, 32);
-      try { ta[idxKey] = 0x44; } catch (_) {}
-      const cmp = compare(victim, snap);
-      if (!cmp.ok) {
-        markAlert(testId, "Negative index write affected underlying buffer (IMPOSSIBLE).", { idxKey, cmp });
-      }
-    }
-
-    // Bounded churn + re-check (persistence)
-    if ((runNo & 7) === 0) boundedChurn(intensity);
-
-    return true;
-  }
-
-  function runArrayBufferProtoDescriptorChecks() {
-    const testId = "ArrayBuffer.prototype.byteLength";
-    let d = null;
-    try { d = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength") || null; } catch (e) { d = { threw:true, err:(e&&e.name)?e.name:"ERR" }; }
-
-    // Expect: accessor on prototype, non-enumerable; configurable is typically true in many engines for accessors,
-    // BUT writable should be undefined (accessor) and descriptor shape must make sense.
-    // Your earlier alert treated configurable as “impossible”; that may be a FALSE POSITIVE depending on engine.
-    // So here we only flag truly impossible shapes:
-    // - data descriptor with writable:true on prototype getter
-    // - enumerable:true (should be false)
-    // - value present together with get/set
-    if (d && !d.threw) {
-      const hasGetSet = ("get" in d) || ("set" in d);
-      const hasValueWritable = ("value" in d) || ("writable" in d);
-      if (hasGetSet && hasValueWritable) {
-        markAlert(testId, "Prototype descriptor mixes accessor + data fields (impossible descriptor shape).", { d });
-      }
-      if (d.enumerable === true) {
-        markAlert(testId, "ArrayBuffer.prototype.byteLength enumerable:true (unexpected/very suspicious).", { d });
-      }
-      // DO NOT flag configurable:true here: it is allowed for many built-ins.
+    if (success) {
+      log("SUCESSO: O motor aceitou um GETTER em um índice numérico!", "alert");
+      log("Valor lido: " + ta[0]);
     } else {
-      // If cannot read descriptor, note (not an alert)
-      logLine(`NOTE ${testId}: descriptor unavailable: ${safeJson(d)}`);
+      log("Falhou: O motor bloqueou a injeção de accessor (comportamento esperado).");
     }
   }
 
-  function runSubarrayClampFuzz(intensity) {
-    const testId = "SubarrayClampFuzz";
-    const ab = new ArrayBuffer(256);
-    const u8 = new Uint8Array(ab);
-    for (let i = 0; i < u8.length; i++) u8[i] = i & 0xFF;
+  function testJITCorruption() {
+    log("--- Fase 2: JIT Speculation Trap ---", "info");
+    const ta = new Uint8Array(16);
+    ta[0] = 0x11;
 
-    const cases = [
-      [-50, -20], [-300, -1], [-1, -300], [300, 400], [-300, 400],
-      [-128, 999], [999, -999], [-0, 10]
-    ];
+    // Função para o JIT otimizar
+    function readValue(arr) {
+      let x = arr[0];
+      let y = arr[0];
+      return x + y;
+    }
 
-    for (let k = 0; k < cases.length; k++) {
-      const begin = cases[k][0], end = cases[k][1];
-      const exp = expectedSubarrayRange(u8.length, begin, end);
-      const sub = u8.subarray(begin, end);
+    // "Aquecendo" o JIT
+    for (let i = 0; i < 10000; i++) readValue(ta);
 
-      if (sub.length !== exp.length) {
-        markAlert(testId, "Negative/Extreme subarray clamp produced wrong length.", { begin, end, exp, got: sub.length });
-        return;
-      }
-      if (sub.length > 0) {
-        const expFirst = u8[exp.b];
-        const expLast = u8[exp.e - 1];
-        const gotFirst = sub[0];
-        const gotLast = sub[sub.length - 1];
-        if (gotFirst !== expFirst || gotLast !== expLast) {
-          markAlert(testId, "Subarray content mismatch vs expected clamp mapping.", { begin, end, exp, expFirst, gotFirst, expLast, gotLast });
-          return;
-        }
-      }
-      if ((k & 3) === 0) boundedChurn(intensity);
+    // Agora aplica o bug
+    Reflect.defineProperty(ta, "0", {
+      value: 0x22,
+      configurable: true,
+      writable: true
+    });
+
+    const result = readValue(ta);
+    log("Resultado JIT (esperado 68): " + result);
+    
+    if (result !== 68) {
+      log("ALERTA: Inconsistência no JIT detectada!", "alert");
     }
   }
 
-  function runTypedArrayOORNoMutation(intensity) {
-    const testId = "TypedArrayOORNoMutation";
-    const victimAB = new ArrayBuffer(64 * 1024);
-    const victimU8 = new Uint8Array(victimAB);
-    fillU8(victimU8, 0xC0FFEE ^ intensity);
-    const snap = snapshot(victimU8, 256);
-
-    const u32 = new Uint32Array(victimAB);
-    const idx = u32.length; // OOR
-    let threw = false;
-    try { u32[idx] = 0xDEADBEEF; } catch (_) { threw = true; }
-    // Spec: OOR write is no-op (no throw) in most cases; some engines may throw in strict edge cases.
-    // We don't alert on throw; only if data changed.
-    const cmp = compare(victimU8, snap);
-    if (!cmp.ok) markAlert(testId, "OOR write mutated victim buffer (should be no-op).", { threw, cmp });
-  }
-
-  function runDoSStabilityProbe(intensity) {
-    const testId = "DoSStabilityProbe";
-    const ab = new ArrayBuffer(4096);
-    const ta = new Uint32Array(ab);
-
-    // Warm a little
-    for (let i = 0; i < ta.length; i++) ta[i] = i;
-
-    const loops = 2000 * intensity;
-    const t0 = performance.now();
-    let sum = 0;
-    for (let i = 0; i < loops; i++) {
-      // meta-ops that stress descriptor/keys paths
-      const d0 = Object.getOwnPropertyDescriptor(ta, "0");
-      const ks = Object.keys(ta);
-      sum ^= (d0 && d0.value ? d0.value : 0) ^ (ks.length | 0);
-    }
-    const t1 = performance.now();
-    const dt = t1 - t0;
-
-    logLine(`${testId}: loops=${loops} dt=${dt.toFixed(2)}ms checksum=${(sum>>>0)}`);
-
-    // No hard threshold; just flag extreme outliers that suggest pathological behavior
-    if (dt > 2500) {
-      markAlert(testId, "Pathological slowdown detected (possible DoS vector via meta-ops).", { loops, dt });
+  function testFrozenBypass() {
+    log("--- Fase 3: Object.freeze Integrity ---", "info");
+    const ta = new Uint8Array(8);
+    
+    // Define como configurável antes de congelar
+    Reflect.defineProperty(ta, "0", { value: 1, configurable: true });
+    Object.freeze(ta);
+    
+    // Tenta deletar algo de um objeto congelado
+    const deleted = delete ta[0];
+    if (deleted) {
+      log("ALERTA: Propriedade deletada de um objeto CONGELADO!", "alert");
+    } else {
+      log("O freeze foi respeitado para exclusão.");
     }
   }
 
-  async function runAll() {
-    STOP = false;
-    RUN_ID++;
-    const runId = RUN_ID;
-
-    const runsN = Math.max(1, parseInt($runsN.value || "80", 10));
-    const delayMs = Math.max(0, parseInt($delayMs.value || "0", 10));
-    const timeoutMs = Math.max(100, parseInt($timeoutMs.value || "1400", 10));
-    const intensity = Math.min(5, Math.max(1, parseInt($intensity.value || "3", 10)));
-
-    logLine("============================================================");
-    logLine("SEVERITY HARNESS: automatic matrix (TypedArray/ArrayBuffer)");
-    logLine("NO exploit primitives. Focus: impossible invariants + contradictions + stability.");
-    logLine(`Config :: N=${runsN} intensity=${intensity} timeout=${timeoutMs}ms delay=${delayMs}ms`);
-    logLine("============================================================");
-
-    // 0) Prototype sanity (avoid false positives from earlier “byteLength configurable” assumption)
-    try { runArrayBufferProtoDescriptorChecks(); } catch (e) { logLine("NOTE proto check failed: " + (e && e.message)); }
-
-    // 1) Subarray clamp fuzz
-    try { runSubarrayClampFuzz(intensity); } catch (e) { logLine("NOTE subarray fuzz failed: " + (e && e.message)); }
-
-    // 2) OOR no-mutation sanity
-    try { runTypedArrayOORNoMutation(intensity); } catch (e) { logLine("NOTE OOR check failed: " + (e && e.message)); }
-
-    // 3) Main severity matrix
-    const TA_LIST = [
-      Uint8Array, Uint16Array, Uint32Array,
-      Int8Array, Int16Array, Int32Array,
-      Float32Array, Float64Array
-    ].filter(Boolean);
-
-    // Indices: normal element keys + tricky keys
-    const IDX_LIST = [
-      0, 1, 2, 3,
-      "0", "1",
-      -1, "-1", "-0",
-      "00",
-      15, "15",
-      1024, "1024"
-    ].map(toKey);
-
-    for (let t = 0; t < TA_LIST.length; t++) {
-      if (STOP || runId !== RUN_ID) break;
-      for (let k = 0; k < IDX_LIST.length; k++) {
-        if (STOP || runId !== RUN_ID) break;
-
-        const TA = TA_LIST[t];
-        const idxKey = IDX_LIST[k];
-
-        for (let r = 1; r <= runsN; r++) {
-          if (STOP || runId !== RUN_ID) break;
-
-          const label = `${TA.name}:${idxKey}:run${r}`;
-          const p = Promise.resolve().then(() => {
-            runDescriptorMatrixOnTypedArray(TA, idxKey, intensity, r);
-            if ((r & 31) === 0) runDoSStabilityProbe(intensity);
-          });
-
-          try { await withTimeout(p, timeoutMs); }
-          catch (_) { /* silent: timeouts are not corruption proof */ }
-
-          if (delayMs) await wait(delayMs);
-        }
-
-        logLine(`DONE :: ${TA.name} idx=${idxKey}`);
-      }
+  document.getElementById("runBtn").onclick = () => {
+    document.getElementById("log").innerHTML = "";
+    try {
+      testAccessorInjection();
+      testJITCorruption();
+      testFrozenBypass();
+      log("\nTeste Finalizado. Se houver linhas vermelhas (ALERTA), o bug tem potencial para exploit.", "info");
+    } catch (e) {
+      log("CRASH/ERRO: " + e.message, "alert");
     }
-
-    logLine("============================================================");
-    logLine("ALL DONE. If you got ALERTA lines, copy them into the report.");
-    logLine("Tip: If ALERTA is stable across runs, that’s strong severity even without crashes.");
-    logLine("============================================================");
-  }
-
-  // UI wiring
-  document.getElementById("btnReset").onclick = resetLog;
-  document.getElementById("btnStop").onclick = stopNow;
-  document.getElementById("btnRun").onclick = runAll;
-
-  // init
-  resetLog();
-  logLine("Ready. This harness auto-runs if Auto-start is checked.");
-
-  if ($autoStart.checked) {
-    // avoid blocking initial rendering on slower browsers
-    setTimeout(() => { if (!STOP) runAll(); }, 50);
-  }
+  };
 })();
 </script>
 </body>
