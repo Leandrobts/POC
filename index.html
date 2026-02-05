@@ -1,52 +1,90 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <title>PS4 Memory Corruption Tests 302 (isolator baseline + variants)</title>
+  <meta charset="UTF-8" />
+  <title>PS4 - Test 302 Isolator (MessageChannel transfer/clone) - Rigorous</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: monospace; background:#0b0b0b; color:#e6e6e6; margin:16px; }
+    h1 { font-size: 18px; margin: 0 0 10px 0; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+    button, input, select { font-family: monospace; font-size: 14px; }
+    button { padding:6px 10px; }
+    input { width: 90px; padding:4px; }
+    select { padding:4px; }
+    .hint { opacity:0.85; font-size: 12px; line-height: 1.3; }
+    #log { white-space: pre-wrap; background:#111; border:1px solid #222; padding:10px; border-radius:8px; min-height: 280px; }
+    .ok { color:#7CFC00; }
+    .warn { color:#FFD700; }
+    .bad { color:#FF6B6B; }
+    .muted { opacity:0.8; }
+  </style>
 </head>
 <body>
-  <h1>PS4 Memory Corruption Tests (302) - Isolator (baseline-preserving)</h1>
+  <h1>PS4 Memory Corruption Tests (302) — MessageChannel transfer/clone invariants (rigorous)</h1>
 
-  <div>
+  <div class="row">
     <button id="btnReset">Reset log</button>
     <button id="btnRun">Run 302 isolator</button>
     <button id="btnStop">Stop</button>
   </div>
 
-  <div style="margin-top:8px;">
-    N (iterações): <input id="nIter" type="number" value="30" min="1" step="1">
-    Delay (ms): <input id="delayMs" type="number" value="80" min="0" step="10">
-    Timeout por iteração (ms): <input id="timeoutMs" type="number" value="1400" min="100" step="50">
-    Intensidade (1..5): <input id="intensity" type="number" value="3" min="1" max="5" step="1">
+  <div class="row">
+    <label>Modo:
+      <select id="mode">
+        <option value="baseline">baseline (canal novo, 1 post)</option>
+        <option value="reuse">reuse (sem restart, canal único)</option>
+        <option value="start_burst">start_burst (muitos transfers no início)</option>
+        <option value="pressure">pressure (alloc + microtasks)</option>
+      </select>
+    </label>
+
+    <label>N:
+      <input id="runs" type="number" value="30" min="1" step="5">
+    </label>
+
+    <label>Timeout (ms):
+      <input id="timeoutMs" type="number" value="1400" min="100" step="50">
+    </label>
+
+    <label>Delay entre iterações (ms):
+      <input id="delayMs" type="number" value="80" min="0" step="10">
+    </label>
+
+    <label>Intensidade (1..5):
+      <input id="intensity" type="number" value="3" min="1" max="5" step="1">
+    </label>
+
+    <label>Burst count:
+      <input id="burst" type="number" value="16" min="0" step="1">
+    </label>
   </div>
 
-  <div style="margin-top:8px;">
-    Modo:
-    <select id="mode">
-      <option value="baseline">baseline (sem start, canal novo, 1 post)</option>
-      <option value="reuse">reuse channel (sem start, canal único)</option>
-      <option value="nostart_burst">no-start + burst (16 posts in-flight)</option>
-      <option value="start_burst">start + burst (16 posts in-flight)</option>
-      <option value="teardown">teardown (close ports após post)</option>
-      <option value="pressure">pressure (alloc + microtasks)</option>
-      <option value="pressure_teardown">pressure + teardown</option>
-    </select>
-    Burst count:
-    <input id="burstCount" type="number" value="16" min="1" max="64" step="1">
+  <div class="hint">
+    <div>• Objetivo: separar <span class="warn">drop/atraso de entrega</span> de sinais reais. ALERTA só dispara quando: <b>sender detacha (byteLength=0)</b> + <b>PING OK</b> + <b>payload não chega até timeout</b>.</div>
+    <div>• Se no PS4 houver drop apenas em <i>pressure</i>, isso tende a ser starvation/DoS do pipeline de tasks, não corrupção.</div>
+    <div class="muted">Dica prática: para “caçar janela”, aumente Timeout e reduza Delay. Para confirmar DoS, veja se <b>ping_fail</b> sobe junto.</div>
   </div>
 
-  <pre id="log" style="white-space:pre-wrap; margin-top:10px;"></pre>
+  <pre id="log"></pre>
 
 <script>
 (() => {
   "use strict";
 
   const $log = document.getElementById("log");
+  const $mode = document.getElementById("mode");
+  const $runs = document.getElementById("runs");
+  const $timeoutMs = document.getElementById("timeoutMs");
+  const $delayMs = document.getElementById("delayMs");
+  const $intensity = document.getElementById("intensity");
+  const $burst = document.getElementById("burst");
+
   let STOP = false;
   let RUN_ID = 0;
 
   function ts() { return Date.now(); }
-  function logLine(s) { $log.textContent += `[${ts()}] ${s}\n`; }
+  function logLine(s) { $log.textContent += `[${ts()}] ${s}\n`; $log.scrollTop = $log.scrollHeight; }
   function resetLog() { $log.textContent = ""; logLine("Reset."); }
   function stopNow() { STOP = true; logLine("STOP requested."); }
 
@@ -54,60 +92,50 @@
     const extra = extraObj ? ("\n" + JSON.stringify(extraObj, null, 2)) : "";
     const full = `ALERTA TEST ${testNum}: ${msg}${extra}`;
     logLine(full);
-    alert(full);
-  }
-
-  // -------------------------
-  // Small bounded amplifiers
-  // -------------------------
-  function heapSpray(intensity) {
-    const count = 30 * intensity;
-    const size = 0x4000;
-    const keep = [];
-    for (let i = 0; i < count; i++) {
-      const ab = new ArrayBuffer(size);
-      const u32 = new Uint32Array(ab);
-      for (let j = 0; j < u32.length; j += 128) u32[j] = (0x41414141 ^ i ^ j) >>> 0;
-      keep.push(ab);
-    }
-    return keep;
-  }
-
-  function domChurn(intensity) {
-    const n = 60 * intensity;
-    const host = document.createElement("div");
-    document.body.appendChild(host);
-    for (let i = 0; i < n; i++) {
-      const d = document.createElement("div");
-      d.textContent = "x" + i;
-      host.appendChild(d);
-      if ((i & 3) === 0) host.removeChild(d);
-    }
-    host.remove();
-  }
-
-  function microtaskChurn(n) {
-    let p = Promise.resolve();
-    for (let i = 0; i < n; i++) p = p.then(() => {});
-    return p;
+    try { alert(full); } catch (_) {}
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  // -------------------------
-  // Robust payload classifier
-  // -------------------------
+  // Wait until predicate() becomes true OR timeout. Polling interval yields to task queue.
+  async function waitUntil(timeoutMs, intervalMs, predicate) {
+    const start = ts();
+    while ((ts() - start) < timeoutMs) {
+      if (predicate()) return { ok: true, dt: ts() - start };
+      await sleep(intervalMs);
+    }
+    return { ok: false, dt: ts() - start };
+  }
+
+  // Bounded pressure helpers (to simulate PS4 scheduling fragility without killing browser)
+  function heapPressure(intensity) {
+    const count = 30 * intensity;
+    const size = 0x4000;
+    const arr = [];
+    for (let i = 0; i < count; i++) {
+      const ab = new ArrayBuffer(size);
+      const u32 = new Uint32Array(ab);
+      for (let j = 0; j < u32.length; j += 128) u32[j] = (0x41414141 ^ i ^ j) >>> 0;
+      arr.push(ab);
+    }
+    return arr;
+  }
+  async function microtaskChurn(intensity) {
+    let p = Promise.resolve();
+    const n = 200 * intensity;
+    for (let i = 0; i < n; i++) p = p.then(() => {});
+    await p;
+  }
+
+  // Receiver classification helpers (no instanceof-only)
   function classifyPayload(got) {
     const tag = Object.prototype.toString.call(got);
-
     const isAB = (tag === "[object ArrayBuffer]") ||
-                 (got && typeof got === "object" && typeof got.byteLength === "number" &&
-                  typeof got.slice === "function" && typeof got.constructor === "function");
+      (got && typeof got.byteLength === "number" && typeof got.slice === "function");
 
-    // "view-ish": any TypedArray/DataView-like with .buffer and .byteLength
-    const isView = (got && typeof got === "object" && typeof got.byteLength === "number" &&
-                    got.buffer && typeof got.buffer === "object" &&
-                    typeof got.buffer.byteLength === "number");
+    const isView = (got && typeof got === "object" &&
+      typeof got.byteLength === "number" &&
+      got.buffer && typeof got.buffer === "object");
 
     return { tag, isAB, isView };
   }
@@ -115,389 +143,366 @@
   function readFirstByteAndLen(got, cls) {
     // returns { ok, rLen, r0, err }
     try {
-      let u8;
       if (cls.isAB) {
-        u8 = new Uint8Array(got);
-      } else if (cls.isView) {
-        // Prefer direct Uint8Array if it already is one; else wrap the underlying buffer.
-        if (Object.prototype.toString.call(got) === "[object Uint8Array]") u8 = got;
-        else u8 = new Uint8Array(got.buffer);
-      } else {
-        return { ok: false, err: "NOT_AB_NOR_VIEW" };
+        const r8 = new Uint8Array(got);
+        return { ok: true, rLen: r8.length, r0: r8.length ? r8[0] : null };
       }
-      return { ok: true, rLen: u8.length, r0: u8.length ? u8[0] : undefined };
+      if (cls.isView) {
+        const r8 = (got && got.BYTES_PER_ELEMENT === 1 && typeof got.length === "number")
+          ? got
+          : new Uint8Array(got.buffer);
+        return { ok: true, rLen: r8.length, r0: r8.length ? r8[0] : null };
+      }
+      return { ok: false, err: "NOT_AB_OR_VIEW" };
     } catch (e) {
       return { ok: false, err: (e && e.name) ? e.name : "ERR" };
     }
   }
 
-  // -------------------------
-  // Core: one iteration (single post)
-  // -------------------------
-  async function onePostIteration(opts) {
-    // opts: { startPorts, reuseChannelObj?, teardown, pressure, intensity, timeoutMs }
-    const intensity = opts.intensity;
+  // Core iteration: ping control + transfer, with strong classification
+  async function runOneIteration(state) {
+    const timeoutMs = state.timeoutMs;
+    const mode = state.mode;
 
-    if (opts.pressure) {
-      heapSpray(intensity);
-      domChurn(Math.max(1, intensity - 1));
-      await microtaskChurn(50 * intensity);
+    // Channel lifetime:
+    // - baseline/pressure/start_burst: new channel per iteration
+    // - reuse: keep single channel & ports
+    let ch = state.reuseChannel;
+    if (!ch) {
+      ch = new MessageChannel();
+      state.reuseChannel = (mode === "reuse") ? ch : null;
     }
 
-    const ch = opts.reuseChannelObj || new MessageChannel();
+    const port1 = ch.port1;
+    const port2 = ch.port2;
 
-    if (opts.startPorts) {
-      try { ch.port1.start && ch.port1.start(); } catch (_) {}
-      try { ch.port2.start && ch.port2.start(); } catch (_) {}
-    }
+    // PS4 engines can be picky about start(). We'll explicitly start() to avoid "message queue not pumping" false positives.
+    try { if (port1.start) port1.start(); } catch (_) {}
+    try { if (port2.start) port2.start(); } catch (_) {}
 
+    // PING control first
+    const pingToken = (state.seq++ >>> 0);
+    let pingOk = false;
+    let pingDt = null;
+
+    // Transfer payload
     const ab = new ArrayBuffer(4096);
     const u8 = new Uint8Array(ab);
     u8[0] = 0xAA;
 
-    let got = undefined;
-    let gotSet = false;
+    let gotTransfer = undefined;
+    let gotTransferSet = false;
+    let transferDt = null;
 
-    // Important: assign handler each iteration (matches many "original" patterns)
-    ch.port2.onmessage = (ev) => { got = ev.data; gotSet = true; };
-
-    let postThrew = false;
-    try {
-      // Baseline behavior: transfer attempt
-      ch.port1.postMessage(ab, [ab]);
-    } catch (e) {
-      postThrew = true;
-    }
-
-    if (postThrew) return { kind: "transfer_throw" };
-
-    if (opts.teardown) {
-      // Teardown ASAP after post (common race trigger)
-      try { ch.port1.close && ch.port1.close(); } catch (_) {}
-      // Keep port2 alive unless you want harsher teardown
-      if (opts.teardown === "hard") {
-        try { ch.port2.close && ch.port2.close(); } catch (_) {}
-        try { ch.port2.onmessage = null; } catch (_) {}
+    // Receiver handler: must accept BOTH ping and transfer without relying on instanceof
+    port2.onmessage = (ev) => {
+      const d = ev.data;
+      // Ping is an object with pingToken
+      if (d && typeof d === "object" && d.__ping__ === 0xC0DE && d.token === pingToken) {
+        pingOk = true;
+        return;
       }
-    }
-
-    // Wait for delivery (macro tick). We do NOT over-wait: we want to catch drops.
-    await Promise.resolve();
-    await sleep(0);
-
-    const senderLen = ab.byteLength;
-
-    // SenderLen invariant: should be 0 (transfer) or 4096 (clone/fallback).
-    if (senderLen !== 0 && senderLen !== 4096) {
-      return { kind: "senderlen_impossible", senderLen };
-    }
-
-    // If transfer path: we expect a message payload to arrive with the pattern.
-    if (senderLen === 0) {
-      if (!gotSet || got == null) {
-        return { kind: "drop_detach_path", gotSet, gotType: typeof got };
-      }
-
-      const cls = classifyPayload(got);
-      const r = readFirstByteAndLen(got, cls);
-
-      if (!r.ok) {
-        return { kind: "recv_unreadable", cls, err: r.err };
-      }
-
-      if (r.rLen !== 4096 || r.r0 !== 0xAA) {
-        return { kind: "recv_mismatch_after_transfer", cls, rLen: r.rLen, r0: r.r0 };
-      }
-
-      return { kind: "ok_detach" };
-    }
-
-    // Clone path: validate non-aliasing (receiver must not reflect sender mutation).
-    if (senderLen === 4096) {
-      // Some engines might not deliver anything quickly; do not call that corruption.
-      if (!gotSet || got == null) return { kind: "ok_clone_nodelivery" };
-
-      const cls = classifyPayload(got);
-      if (!cls.isAB && !cls.isView) return { kind: "ok_clone_unclassified", cls };
-
-      const r = readFirstByteAndLen(got, cls);
-      if (!r.ok) return { kind: "ok_clone_unreadable", cls, err: r.err };
-
-      const before = r.r0;
-      u8[0] = 0xBB;
-
-      const r2 = readFirstByteAndLen(got, cls);
-      if (r2.ok && r2.r0 !== before) {
-        return { kind: "aliasing_in_clone", cls, before, after: r2.r0 };
-      }
-
-      return { kind: "ok_clone" };
-    }
-
-    return { kind: "other" };
-  }
-
-  // -------------------------
-  // Burst: multiple posts in flight (higher chance to trigger PS4-only weirdness)
-  // -------------------------
-  async function burstIteration(opts) {
-    const intensity = opts.intensity;
-    const burstCount = opts.burstCount;
-
-    if (opts.pressure) {
-      heapSpray(intensity);
-      await microtaskChurn(80 * intensity);
-    }
-
-    const ch = opts.reuseChannelObj || new MessageChannel();
-
-    if (opts.startPorts) {
-      try { ch.port1.start && ch.port1.start(); } catch (_) {}
-      try { ch.port2.start && ch.port2.start(); } catch (_) {}
-    }
-
-    const results = [];
-    const recv = [];
-    let recvCount = 0;
-
-    ch.port2.onmessage = (ev) => {
-      recv.push(ev.data);
-      recvCount++;
+      // Transfer path: anything else captured
+      gotTransfer = d;
+      gotTransferSet = true;
     };
 
-    // Prepare burst ABs with distinct marker bytes.
-    const abs = [];
-    for (let i = 0; i < burstCount; i++) {
-      const ab = new ArrayBuffer(4096);
-      const u8 = new Uint8Array(ab);
-      u8[0] = (0xA0 + (i & 0x1F)) & 0xFF;
-      abs.push(ab);
+    // Optionally apply "pressure" BEFORE posting to increase chance of pipeline fragility
+    if (mode === "pressure") {
+      state._pressureKeep = heapPressure(state.intensity);
+      await microtaskChurn(state.intensity);
     }
 
-    // Post all quickly (in-flight)
-    let throwCount = 0;
-    for (let i = 0; i < abs.length; i++) {
-      try { ch.port1.postMessage(abs[i], [abs[i]]); }
-      catch (_) { throwCount++; }
+    // Send ping
+    let pingThrow = false;
+    try { port1.postMessage({ __ping__: 0xC0DE, token: pingToken }); }
+    catch (_) { pingThrow = true; }
+
+    if (pingThrow) {
+      state.stats.ping_throw++;
+      // If ping throws, transfer test is meaningless (environment issue)
+      return;
     }
 
-    if (throwCount) return { kind: "transfer_throw", throwCount };
-
-    if (opts.teardown) {
-      try { ch.port1.close && ch.port1.close(); } catch (_) {}
-      if (opts.teardown === "hard") {
-        try { ch.port2.close && ch.port2.close(); } catch (_) {}
-        try { ch.port2.onmessage = null; } catch (_) {}
+    // Wait for ping up to timeout
+    {
+      const w = await waitUntil(timeoutMs, 10, () => pingOk);
+      pingDt = w.ok ? w.dt : null;
+      if (!w.ok) {
+        state.stats.ping_fail++;
+        // We still continue; this is strong evidence of general delivery starvation/breakage.
+      } else {
+        state.stats.ping_ok++;
       }
     }
 
-    await Promise.resolve();
-    await sleep(0);
-
-    // SenderLen invariants (all)
-    for (let i = 0; i < abs.length; i++) {
-      const sl = abs[i].byteLength;
-      if (sl !== 0 && sl !== 4096) {
-        return { kind: "senderlen_impossible", idx: i, senderLen: sl };
+    // Mode start_burst: blast a few transfers quickly at the beginning of the run (only once)
+    if (mode === "start_burst" && !state.didBurst) {
+      state.didBurst = true;
+      const burstCount = state.burstCount;
+      for (let i = 0; i < burstCount; i++) {
+        const ab2 = new ArrayBuffer(64);
+        const v2 = new Uint8Array(ab2);
+        v2[0] = (0xA0 + (i & 0x1F)) & 0xFF;
+        try { port1.postMessage(ab2, [ab2]); } catch (_) {}
       }
     }
 
-    // Drops only count as suspicious if we actually detached many senders but received far fewer.
-    const detachedCount = abs.reduce((a, ab) => a + (ab.byteLength === 0 ? 1 : 0), 0);
+    // Now perform actual transfer under test
+    let transferThrow = false;
+    try { port1.postMessage(ab, [ab]); }
+    catch (_) { transferThrow = true; }
 
-    // Validate received payloads for detached ones: each should be AB/view and match the first byte markers.
-    // We tolerate reordering; we just ensure no "impossible" content.
-    let badPayload = null;
-    for (let i = 0; i < recv.length; i++) {
-      const cls = classifyPayload(recv[i]);
-      const r = readFirstByteAndLen(recv[i], cls);
-      if (!r.ok || r.rLen !== 4096) { badPayload = { i, cls, r }; break; }
-    }
-    if (badPayload) return { kind: "recv_bad_payload", badPayload };
-
-    if (detachedCount > 0 && recvCount === 0) {
-      return { kind: "drop_detach_path", detachedCount, recvCount };
+    if (transferThrow) {
+      state.stats.transfer_throw++;
+      return;
     }
 
-    // If we detached a lot but received far fewer, flag as suspicious "delivery loss" (PS4-only candidate).
-    if (detachedCount >= 4 && recvCount < Math.floor(detachedCount / 2)) {
-      return { kind: "drop_many", detachedCount, recvCount };
+    // SenderLen invariant
+    const senderLen = ab.byteLength;
+    if (senderLen !== 0 && senderLen !== 4096) {
+      state.stats.senderlen_impossible++;
+      alertVuln(302, "MessageChannel: sender ab.byteLength ficou em estado impossível.", { senderLen });
+      return;
     }
 
-    return { kind: "ok_burst", detachedCount, recvCount };
+    // Wait until transfer message arrives OR timeout
+    {
+      const w = await waitUntil(timeoutMs, 10, () => gotTransferSet);
+      transferDt = w.ok ? w.dt : null;
+
+      // Classify by detach vs clone path:
+      // - transfer real should detach sender (len=0)
+      // - clone path leaves senderLen=4096
+      if (senderLen === 0) {
+        if (!w.ok) {
+          // This is the controversial case: sender detached but receiver got nothing within timeout.
+          // ALERT only if ping worked => indicates channel is alive but transfer path dropped.
+          state.stats.drops_detach_path++;
+
+          if (pingOk) {
+            state.stats.alert_detach_drop_with_ping++;
+            alertVuln(302, "MessageChannel: sender detacheou, mas receiver não recebeu payload (drop) dentro da janela.", {
+              kind: "drop_detach_path",
+              pingOk: true,
+              pingDt,
+              gotSet: false,
+              gotType: typeof gotTransfer,
+              timeoutMs
+            });
+          } else {
+            // Not an alert: could be starvation / global delivery issue under load
+            logLine(`WARN: drop_detach_path sem ping (provável starvation/DoS). pingOk=false timeout=${timeoutMs}ms`);
+          }
+          return;
+        }
+
+        // Received something. Validate type + readability + content invariants.
+        const cls = classifyPayload(gotTransfer);
+        const rr = readFirstByteAndLen(gotTransfer, cls);
+        if (!rr.ok) {
+          state.stats.recv_unreadable++;
+          // Only alert if ping ok (channel alive) AND detach happened (transfer path) AND payload unreadable
+          if (pingOk) {
+            alertVuln(302, "MessageChannel: payload recebido após detach, mas não é legível como ArrayBuffer/view.", {
+              kind: "recv_unreadable",
+              tag: cls.tag,
+              err: rr.err,
+              pingDt,
+              transferDt
+            });
+          }
+          return;
+        }
+
+        // Expect length=4096 and first byte=0xAA (we only set byte 0; rest doesn't matter)
+        if (rr.rLen !== 4096 || rr.r0 !== 0xAA) {
+          state.stats.recv_bad_payload++;
+          if (pingOk) {
+            alertVuln(302, "MessageChannel: receiver conteúdo/len inesperado após transfer.", {
+              kind: "recv_bad_payload",
+              tag: cls.tag,
+              rLen: rr.rLen,
+              r0: rr.r0,
+              pingDt,
+              transferDt
+            });
+          }
+          return;
+        }
+
+        // OK detach path
+        state.stats.ok_detach++;
+        state.stats.dt_detach_sum += (transferDt || 0);
+        state.stats.dt_detach_count++;
+        return;
+      }
+
+      // Clone path (senderLen === 4096): may or may not deliver quickly; do NOT alert on missing delivery.
+      if (senderLen === 4096) {
+        if (!w.ok) {
+          state.stats.ok_clone_nodelivery++;
+          return;
+        }
+
+        // If it delivered, verify "no aliasing": sender mutation must NOT reflect in receiver view.
+        const cls = classifyPayload(gotTransfer);
+        if (!cls.isAB && !cls.isView) {
+          state.stats.ok_clone_other++;
+          return;
+        }
+
+        let r8;
+        try {
+          r8 = cls.isAB
+            ? new Uint8Array(gotTransfer)
+            : (gotTransfer && gotTransfer.BYTES_PER_ELEMENT === 1 ? gotTransfer : new Uint8Array(gotTransfer.buffer));
+        } catch (_) {
+          state.stats.ok_clone_other++;
+          return;
+        }
+
+        const before = r8[0];
+        u8[0] = 0xBB;
+        const after = r8[0];
+
+        if (before !== after) {
+          state.stats.aliasing_in_clone++;
+          alertVuln(302, "MessageChannel: receiver refletiu mutação do sender (aliasing inesperado em clone).", {
+            kind: "aliasing_in_clone",
+            before, after,
+            pingOk, pingDt, transferDt,
+            tag: Object.prototype.toString.call(gotTransfer)
+          });
+          return;
+        }
+
+        state.stats.ok_clone++;
+        return;
+      }
+    }
   }
 
-  // -------------------------
-  // Runner
-  // -------------------------
-  function withTimeout(promise, ms) {
-    let t;
-    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
-    return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+  function makeStats() {
+    return {
+      ok_detach: 0,
+      ok_clone: 0,
+      ok_clone_nodelivery: 0,
+      ok_clone_other: 0,
+
+      ping_ok: 0,
+      ping_fail: 0,
+      ping_throw: 0,
+
+      transfer_throw: 0,
+      senderlen_impossible: 0,
+
+      drops_detach_path: 0,
+      alert_detach_drop_with_ping: 0,
+
+      recv_unreadable: 0,
+      recv_bad_payload: 0,
+
+      aliasing_in_clone: 0,
+
+      dt_detach_sum: 0,
+      dt_detach_count: 0
+    };
   }
 
-  async function run() {
+  function fmtAvg(sum, count) {
+    if (!count) return "n/a";
+    return (sum / count).toFixed(1) + "ms";
+  }
+
+  async function runAll() {
+    if (typeof MessageChannel !== "function") {
+      logLine("SKIP: MessageChannel não disponível.");
+      return;
+    }
+
     STOP = false;
     RUN_ID++;
     const runId = RUN_ID;
 
-    const nIter = Math.max(1, parseInt(document.getElementById("nIter").value || "30", 10));
-    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value || "0", 10));
-    const timeoutMs = Math.max(100, parseInt(document.getElementById("timeoutMs").value || "1400", 10));
-    const intensity = Math.min(5, Math.max(1, parseInt(document.getElementById("intensity").value || "3", 10)));
-    const mode = document.getElementById("mode").value;
-    const burstCount = Math.min(64, Math.max(1, parseInt(document.getElementById("burstCount").value || "16", 10)));
+    const mode = $mode.value;
+    const runs = Math.max(1, parseInt($runs.value || "30", 10));
+    const timeoutMs = Math.max(100, parseInt($timeoutMs.value || "1400", 10));
+    const delayMs = Math.max(0, parseInt($delayMs.value || "80", 10));
+    const intensity = Math.min(5, Math.max(1, parseInt($intensity.value || "3", 10)));
+    const burstCount = Math.max(0, parseInt($burst.value || "0", 10));
+
+    const state = {
+      mode, runs, timeoutMs, delayMs, intensity, burstCount,
+      stats: makeStats(),
+      seq: 1,
+      didBurst: false,
+      reuseChannel: null,
+      _pressureKeep: null
+    };
 
     logLine("Pronto. Dica: se no PS4 der drop, aumente Timeout e reduza Delay para achar janela de falha.");
     logLine("============================================================");
-    logLine(`Run 302 isolator :: N=${nIter} timeout=${timeoutMs}ms delay=${delayMs}ms mode=${mode} intensity=${intensity} burst=${burstCount}`);
+    logLine(`Run 302 isolator :: N=${runs} timeout=${timeoutMs}ms delay=${delayMs}ms mode=${mode} intensity=${intensity} burst=${burstCount}`);
     logLine("============================================================");
 
-    const stats = {
-      ok_detach: 0,
-      ok_clone: 0,
-      ok_clone_nodelivery: 0,
-      ok_burst: 0,
-      transfer_throw: 0,
-      senderlen_impossible: 0,
-      aliasing_in_clone: 0,
-      drop_detach_path: 0,
-      drop_many: 0,
-      recv_mismatch_after_transfer: 0,
-      recv_unreadable: 0,
-      recv_bad_payload: 0,
-      timeouts: 0,
-      other: 0
-    };
-
-    // For modes that reuse channel, keep one MessageChannel instance.
-    let reuse = null;
-    if (mode === "reuse") reuse = new MessageChannel();
-    if (mode === "nostart_burst" || mode === "start_burst") reuse = new MessageChannel();
-    if (mode === "teardown" || mode === "pressure" || mode === "pressure_teardown") reuse = new MessageChannel();
-
-    for (let i = 0; i < nIter; i++) {
+    for (let i = 0; i < runs; i++) {
       if (STOP || runId !== RUN_ID) break;
 
+      // per-iteration banner (light)
+      // logLine(`-- iter ${i+1}/${runs} --`);
+
       try {
-        let res;
-
-        if (mode === "baseline") {
-          res = await withTimeout(onePostIteration({
-            startPorts: false,
-            reuseChannelObj: null,  // canal novo por iteração
-            teardown: false,
-            pressure: false,
-            intensity,
-            timeoutMs
-          }), timeoutMs);
-
-        } else if (mode === "reuse") {
-          res = await withTimeout(onePostIteration({
-            startPorts: false,
-            reuseChannelObj: reuse, // canal único
-            teardown: false,
-            pressure: false,
-            intensity,
-            timeoutMs
-          }), timeoutMs);
-
-        } else if (mode === "nostart_burst") {
-          res = await withTimeout(burstIteration({
-            startPorts: false,
-            reuseChannelObj: reuse,
-            teardown: false,
-            pressure: false,
-            intensity,
-            burstCount
-          }), timeoutMs);
-
-        } else if (mode === "start_burst") {
-          res = await withTimeout(burstIteration({
-            startPorts: true,
-            reuseChannelObj: reuse,
-            teardown: false,
-            pressure: false,
-            intensity,
-            burstCount
-          }), timeoutMs);
-
-        } else if (mode === "teardown") {
-          res = await withTimeout(onePostIteration({
-            startPorts: false,
-            reuseChannelObj: reuse,
-            teardown: "hard",
-            pressure: false,
-            intensity,
-            timeoutMs
-          }), timeoutMs);
-
-        } else if (mode === "pressure") {
-          res = await withTimeout(onePostIteration({
-            startPorts: false,
-            reuseChannelObj: reuse,
-            teardown: false,
-            pressure: true,
-            intensity,
-            timeoutMs
-          }), timeoutMs);
-
-        } else if (mode === "pressure_teardown") {
-          res = await withTimeout(onePostIteration({
-            startPorts: false,
-            reuseChannelObj: reuse,
-            teardown: "hard",
-            pressure: true,
-            intensity,
-            timeoutMs
-          }), timeoutMs);
-
-        } else {
-          res = { kind: "other" };
-        }
-
-        const k = res && res.kind ? res.kind : "other";
-        if (stats[k] === undefined) stats.other++;
-        else stats[k]++;
-
-        // ALERT policy: only "impossible / corruption-suspect" conditions
-        if (k === "senderlen_impossible") {
-          alertVuln(302, "MessageChannel: sender ab.byteLength ficou em estado impossível.", res);
-        } else if (k === "drop_detach_path") {
-          alertVuln(302, "MessageChannel: sender detacheou, mas receiver não recebeu payload (drop) dentro da janela.", res);
-        } else if (k === "drop_many") {
-          alertVuln(302, "MessageChannel: muitos detaches, mas poucas mensagens entregues (loss suspeito).", res);
-        } else if (k === "recv_unreadable") {
-          alertVuln(302, "MessageChannel: receiver chegou, mas falhou leitura como ArrayBuffer/view após detach.", res);
-        } else if (k === "recv_mismatch_after_transfer") {
-          alertVuln(302, "MessageChannel: receiver conteúdo/len inesperado após transfer real.", res);
-        } else if (k === "recv_bad_payload") {
-          alertVuln(302, "MessageChannel: payload recebido inválido (len != 4096 / tipo estranho) em burst.", res);
-        } else if (k === "aliasing_in_clone") {
-          alertVuln(302, "MessageChannel: aliasing inesperado (clone refletiu mutação do sender).", res);
-        }
-
+        await runOneIteration(state);
       } catch (e) {
-        stats.timeouts++;
-        // TIMEOUT sozinho não é corrupção, mas é útil: pode indicar janela ruim / dead path
+        // Exceptions alone are not corruption signals; count as "other" implicitly by silence.
+        logLine(`WARN: iteração falhou com exceção (${(e && e.name) ? e.name : "ERR"}).`);
       }
 
       if (delayMs) await sleep(delayMs);
     }
 
+    // Cleanup ports if not reuse (or even reuse) to reduce side effects
+    try {
+      if (state.reuseChannel) {
+        // For reuse, we keep it alive during run. After run, close to free.
+        state.reuseChannel.port1 && state.reuseChannel.port1.close && state.reuseChannel.port1.close();
+        state.reuseChannel.port2 && state.reuseChannel.port2.close && state.reuseChannel.port2.close();
+      }
+    } catch (_) {}
+
+    const s = state.stats;
+
     logLine("------------------------------------------------------------");
-    logLine(`RESULTADOS: ok_detach=${stats.ok_detach} ok_clone=${stats.ok_clone} ok_clone_nodelivery=${stats.ok_clone_nodelivery} ok_burst=${stats.ok_burst}`);
-    logLine(`          transfer_throw=${stats.transfer_throw} timeouts=${stats.timeouts}`);
-    logLine(`          drops(detach path)=${stats.drop_detach_path} drops_many=${stats.drop_many} senderlen_impossible=${stats.senderlen_impossible}`);
-    logLine(`          recv_mismatch=${stats.recv_mismatch_after_transfer} recv_unreadable=${stats.recv_unreadable} recv_bad_payload=${stats.recv_bad_payload}`);
-    logLine(`          aliasing_in_clone=${stats.aliasing_in_clone} other=${stats.other}`);
-    logLine("OK: nenhuma inconsistência detectada nas condições atuais.");
+    logLine(`RESULTADOS: ok_detach=${s.ok_detach} ok_clone=${s.ok_clone} ok_clone_nodelivery=${s.ok_clone_nodelivery} ok_clone_other=${s.ok_clone_other}`);
+    logLine(`          ping_ok=${s.ping_ok} ping_fail=${s.ping_fail} ping_throw=${s.ping_throw}`);
+    logLine(`          transfer_throw=${s.transfer_throw} senderlen_impossible=${s.senderlen_impossible}`);
+    logLine(`          drops(detach path)=${s.drops_detach_path} ALERT(drop+pingOK)=${s.alert_detach_drop_with_ping}`);
+    logLine(`          recv_unreadable=${s.recv_unreadable} recv_bad_payload=${s.recv_bad_payload} aliasing_in_clone=${s.aliasing_in_clone}`);
+    logLine(`          avg_detach_delivery=${fmtAvg(s.dt_detach_sum, s.dt_detach_count)}`);
+    logLine("------------------------------------------------------------");
+
+    if (s.alert_detach_drop_with_ping === 0 && s.senderlen_impossible === 0 && s.recv_bad_payload === 0 && s.aliasing_in_clone === 0 && s.recv_unreadable === 0) {
+      if (s.drops_detach_path > 0 && s.ping_fail > 0) {
+        logLine("OK: houve drops, mas junto com ping_fail => indica starvation/DoS/entrega instável (não evidencia corrupção).");
+      } else if (s.drops_detach_path > 0 && s.ping_ok > 0) {
+        logLine("OK: houve drops sem ALERTA (pingOk não coincidiu). Sugestão: aumente timeout e observe se vira 'delayed' vs 'drop'.");
+      } else {
+        logLine("OK: nenhuma inconsistência detectada nas condições atuais.");
+      }
+    } else {
+      logLine("OBS: houve ALERTA(s). Se repetir com ping_ok alto e alert_detach_drop_with_ping > 0, isso vira um bug de transfer/delivery mais sério.");
+    }
+
+    logLine("ALL DONE.");
   }
 
+  // UI wiring
   document.getElementById("btnReset").onclick = resetLog;
   document.getElementById("btnStop").onclick = stopNow;
-  document.getElementById("btnRun").onclick = run;
+  document.getElementById("btnRun").onclick = runAll;
 
+  // init
   resetLog();
 })();
 </script>
