@@ -1,118 +1,714 @@
-
 <!DOCTYPE html>
-<html lang="pt">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 Research: Sanity & Memory Scan</title>
-    <style>
-        body { background: #050505; color: #00ff00; font-family: 'Consolas', monospace; padding: 20px; }
-        #log { background: #000; border: 1px solid #444; padding: 15px; height: 500px; overflow-y: auto; white-space: pre-wrap; font-size: 13px; }
-        .critical { color: #ff3333; font-weight: bold; text-decoration: underline; }
-        .warning { color: #ffcc00; }
-        .success { color: #33ff33; }
-        .btn-container { margin: 15px 0; }
-        button { background: #222; color: #00ff00; border: 1px solid #00ff00; padding: 10px 25px; cursor: pointer; }
-        button:hover { background: #004400; }
-    </style>
+  <meta charset="UTF-8">
+  <title>PS4 Impact Harness — TypedArray/ArrayBuffer Impossible Invariants (Auto)</title>
 </head>
 <body>
+  <h1>PS4 Impact Harness — TypedArray/ArrayBuffer Impossible Invariants (Auto)</h1>
 
-    <h2>Harness de Investigação: Neutering Bypass + Memory Scan</h2>
-    
-    <div class="btn-container">
-        <button id="runBtn">Iniciar Varredura de Sanidade</button>
-    </div>
+  <div>
+    <button id="btnReset">Reset log</button>
+    <button id="btnRun">Run ALL</button>
+    <button id="btnStop">Stop</button>
+  </div>
 
-    <div id="log">Aguardando início...</div>
+  <div>
+    Repetições (N): <input id="repN" type="number" value="20" min="1" step="1">
+    Delay (ms): <input id="delayMs" type="number" value="50" min="0" step="10">
+    Timeout por teste (ms): <input id="timeoutMs" type="number" value="1500" min="100" step="50">
+  </div>
 
-    <script>
-        const $log = document.getElementById('log');
-        function print(msg, cls = "") {
-            const div = document.createElement('div');
-            div.className = cls;
-            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            $log.appendChild(div);
-            $log.scrollTop = $log.scrollHeight;
+  <pre id="log" style="white-space:pre-wrap;"></pre>
+
+<script>
+(() => {
+  "use strict";
+
+  // ============================================================
+  // Logging + control
+  // ============================================================
+  const $log = document.getElementById("log");
+  let STOP = false;
+  let RUN_ID = 0;
+
+  function ts(){ return Date.now(); }
+  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
+  function resetLog(){ $log.textContent=""; logLine("Reset."); }
+  function stopNow(){ STOP=true; logLine("STOP requested."); }
+
+  function alertVuln(testId, msg, extra){
+    const payload = extra ? ("\n" + JSON.stringify(extra, null, 2)) : "";
+    const full = `ALERTA ${testId}: ${msg}${payload}`;
+    logLine(full);
+    try { alert(full); } catch(_) {}
+  }
+
+  function info(testId, msg, extra){
+    const payload = extra ? (" " + JSON.stringify(extra)) : "";
+    logLine(`INFO ${testId}: ${msg}${payload}`);
+  }
+
+  // ============================================================
+  // Utilities: checksum model (XOR blocks + spots)
+  // ============================================================
+  function xorshift32(seed){
+    let x = seed >>> 0;
+    return () => {
+      x ^= (x << 13) >>> 0;
+      x ^= (x >>> 17) >>> 0;
+      x ^= (x << 5) >>> 0;
+      return x >>> 0;
+    };
+  }
+
+  function fillVictim(u8, seed){
+    const rnd = xorshift32(seed);
+    for (let i=0;i<u8.length;i++){
+      const r = rnd();
+      u8[i] = (r ^ (r>>>8) ^ (r>>>16) ^ (r>>>24)) & 0xFF;
+    }
+  }
+
+  function blockXor32(u8, blockBytes){
+    const nBlocks = Math.ceil(u8.length / blockBytes);
+    const out = new Uint32Array(nBlocks);
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+
+    for (let b=0;b<nBlocks;b++){
+      const start = b * blockBytes;
+      const end = Math.min(u8.length, start + blockBytes);
+      let acc = 0 >>> 0;
+
+      let i = start;
+      for (; i+4 <= end; i+=4) acc ^= dv.getUint32(i, true);
+      for (; i < end; i++){
+        acc ^= (u8[i] << (((i-start) & 3) * 8)) >>> 0;
+      }
+      out[b] = acc >>> 0;
+    }
+    return out;
+  }
+
+  function snapshotVictim(u8, blockBytes){
+    const sum = blockXor32(u8, blockBytes);
+    const spots = [];
+    const step = Math.max(1, Math.floor(u8.length / 16));
+    for (let i=0;i<u8.length;i+=step) spots.push(u8[i]);
+    return { len:u8.length, blockBytes, sum, spots };
+  }
+
+  function compareSnapshot(u8, snap){
+    if (u8.length !== snap.len){
+      return { ok:false, reason:"victim length changed", gotLen:u8.length, expLen:snap.len };
+    }
+    const now = blockXor32(u8, snap.blockBytes);
+    if (now.length !== snap.sum.length){
+      return { ok:false, reason:"checksum blocks length mismatch", gotBlocks:now.length, expBlocks:snap.sum.length };
+    }
+    for (let i=0;i<now.length;i++){
+      if (now[i] !== snap.sum[i]){
+        const start = i * snap.blockBytes;
+        const end = Math.min(u8.length, start + 32);
+        const bytes = [];
+        for (let j=start;j<end;j++) bytes.push(u8[j]);
+        return {
+          ok:false,
+          reason:"checksum mismatch",
+          blockIndex:i,
+          exp: snap.sum[i]>>>0,
+          got: now[i]>>>0,
+          first32BytesOfBlock: bytes
+        };
+      }
+    }
+    const step = Math.max(1, Math.floor(u8.length / 16));
+    let k=0;
+    for (let i=0;i<u8.length;i+=step){
+      if (u8[i] !== snap.spots[k]){
+        return { ok:false, reason:"spot sample mismatch", spotIndex:k, exp:snap.spots[k], got:u8[i] };
+      }
+      k++;
+    }
+    return { ok:true };
+  }
+
+  function makeVictim(bytes, seed){
+    const ab = new ArrayBuffer(bytes);
+    const u8 = new Uint8Array(ab);
+    fillVictim(u8, seed);
+    return { ab, u8 };
+  }
+
+  // ============================================================
+  // Engine operations: detach / clone / cross-realm
+  // ============================================================
+  function tryDetach(ab){
+    // Detach is best-effort. If not supported, we treat as "not available".
+    if (typeof structuredClone === "function"){
+      try { structuredClone(ab, { transfer:[ab] }); return { ok:true, method:"structuredClone" }; } catch(e){}
+    }
+    // Some engines: window.postMessage with transfer list (may be blocked)
+    if (typeof postMessage === "function"){
+      try { postMessage("x", "*", [ab]); return { ok:true, method:"postMessage" }; } catch(e){}
+    }
+    return { ok:false, method:null };
+  }
+
+  function makeIframe(){
+    const f = document.createElement("iframe");
+    f.style.display = "none";
+    document.body.appendChild(f);
+    return f;
+  }
+  function killIframe(f){
+    try { f.remove(); } catch(_){}
+  }
+
+  // ============================================================
+  // Expectations (invariants)
+  // ============================================================
+  function isDataDesc(d){
+    return d && ("value" in d || "writable" in d) && !("get" in d) && !("set" in d);
+  }
+
+  // TypedArray integer index property is a special exotic element in spec.
+  // We treat "configurable:true for an index" as "impossible".
+  function typedArrayIndexDescImpossible(desc){
+    if (!desc) return false;
+    // We flag only strong impossible: configurable true.
+    if (desc.configurable === true) return true;
+    return false;
+  }
+
+  function arrayBufferByteLengthDescImpossible(desc){
+    if (!desc) return true; // missing is suspicious (very old/odd)
+    // Strong: byteLength should not be configurable or writable in normal engines.
+    // We only flag configurable true or writable true if present.
+    if (desc.configurable === true) return true;
+    if (desc.writable === true) return true;
+    return false;
+  }
+
+  // ============================================================
+  // Impact tests (no exploitation): Integrity/Hardening/Proxy/Clone
+  // ============================================================
+  // Hardening function used in real apps (descriptor-driven)
+  function descriptorDrivenHarden(obj){
+    // Goal: lock down "configurable" properties that claim configurable=true.
+    // If descriptors lie, hardening becomes inconsistent.
+    const keys = Reflect.ownKeys(obj);
+    let changed = 0, attempted = 0;
+
+    for (const k of keys){
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(obj, k); } catch(_) { continue; }
+      if (!d) continue;
+      if (d.configurable === true){
+        attempted++;
+        try {
+          const nd = Object.assign({}, d, { configurable:false });
+          const ok = Reflect.defineProperty(obj, k, nd);
+          if (ok) changed++;
+        } catch(_) {}
+      }
+    }
+    return { keys: keys.length, attempted, changed };
+  }
+
+  function makeTypedArrayForIndexTests(){
+    const ta = new Uint8Array(8);
+    for (let i=0;i<ta.length;i++) ta[i]=i;
+    return ta;
+  }
+
+  // ============================================================
+  // Test Runner helpers
+  // ============================================================
+  function withTimeout(promise, ms){
+    let t;
+    const timeout = new Promise((_, rej) => {
+      t = setTimeout(() => rej(new Error("TIMEOUT")), ms);
+    });
+    return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+  }
+
+  async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  // ============================================================
+  // Test list
+  // ============================================================
+  const tests = [];
+
+  // ------------------------------------------------------------
+  // T1: ArrayBuffer.byteLength descriptor invariants (strong)
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T1/AB.byteLength.desc";
+    const desc = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength");
+    if (arrayBufferByteLengthDescImpossible(desc)){
+      alertVuln(id, "ArrayBuffer.prototype.byteLength descriptor in 'impossible' state.", desc);
+    } else {
+      info(id, "Descriptor looks normal.", { configurable:desc.configurable, writable:desc.writable });
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T2: TypedArray fundamental descriptors (length/byteLength/byteOffset)
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T2/TA.core.desc";
+    const ta = makeTypedArrayForIndexTests();
+    const props = ["length","byteLength","byteOffset"];
+    const out = {};
+    for (const p of props){
+      try { out[p] = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ta), p) || Object.getOwnPropertyDescriptor(ta, p); }
+      catch(e){ out[p] = { error: e && e.name ? e.name : "ERR" }; }
+    }
+    // We don't ALERT unless clearly impossible; most engines have accessor on %TypedArray%.prototype
+    // So we only record info.
+    info(id, "Collected core descriptors.", out);
+  });
+
+  // ------------------------------------------------------------
+  // T3: TypedArray index defineProperty => descriptor impossible? (your bug)
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T3/TA.index.defineProperty.impossible";
+    const ta = makeTypedArrayForIndexTests();
+
+    // establish baseline
+    const base = Object.getOwnPropertyDescriptor(ta, "0"); // usually undefined (exotic), but may appear in buggy engine
+    const beforeVal = ta[0];
+
+    // Attempt to defineProperty on "0"
+    let dp = { threw:false, err:null, ok:null, desc:null };
+    try {
+      dp.ok = Reflect.defineProperty(ta, "0", { value: 9, writable:true, enumerable:true, configurable:true });
+    } catch(e){
+      dp.threw = true;
+      dp.err = e && e.name ? e.name : "ERR";
+    }
+
+    // Re-read descriptor
+    let d0 = null;
+    try { d0 = Object.getOwnPropertyDescriptor(ta, "0"); } catch(e){ d0 = { error: e && e.name ? e.name : "ERR" }; }
+    dp.desc = d0;
+
+    // Post-write
+    let afterWrite = null, dNow = null;
+    try { ta[0] = 0x33; afterWrite = ta[0]; } catch(e){ afterWrite = "THREW:"+(e&&e.name?e.name:"ERR"); }
+    try { dNow = Object.getOwnPropertyDescriptor(ta, "0"); } catch(e){ dNow = { error: e && e.name ? e.name : "ERR" }; }
+
+    // Delete should be false for typed array elements
+    let del1 = null;
+    try { del1 = delete ta[0]; } catch(e){ del1 = "THREW:"+(e&&e.name?e.name:"ERR"); }
+
+    // Flag only strong impossible: descriptor says configurable:true OR engine reports an own property descriptor with configurable:true.
+    if (typedArrayIndexDescImpossible(d0) || typedArrayIndexDescImpossible(dNow)){
+      alertVuln(id, "TypedArray index descriptor became configurable=true (impossible).", {
+        baselineOwnDesc: base,
+        beforeVal,
+        defineProperty: dp,
+        afterWrite,
+        afterDelete: del1,
+        descNow: dNow
+      });
+    } else {
+      info(id, "No impossible configurable=true observed on index descriptor.", {
+        beforeVal, definePropertyOk: dp.ok, definePropertyThrew: dp.threw, del1
+      });
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T4: Impact — descriptor-driven hardening bypass check
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T4/Impact.hardening";
+    const ta = makeTypedArrayForIndexTests();
+
+    // Try to "poison" index descriptor like in T3 (best-effort)
+    let poisonOk = null, poisonThrew = false, poisonErr = null;
+    try {
+      poisonOk = Reflect.defineProperty(ta, "0", { value: 9, writable:true, enumerable:true, configurable:true });
+    } catch(e){
+      poisonThrew = true;
+      poisonErr = e && e.name ? e.name : "ERR";
+    }
+
+    // A userland hardener that trusts descriptors
+    const pre = Object.getOwnPropertyDescriptor(ta, "0");
+    const hard = descriptorDrivenHarden(ta);
+    const post = Object.getOwnPropertyDescriptor(ta, "0");
+
+    // Demonstrate effect: if descriptors claim configurable=true, a hardener would attempt to lock it down.
+    // If after hardening, descriptor still lies or is inconsistent, we report impact.
+    const impact = {
+      poisonOk, poisonThrew, poisonErr,
+      preDesc: pre,
+      hardening: hard,
+      postDesc: post
+    };
+
+    // Alert if: hardener "changed" something but invariants remain contradictory OR descriptor still says configurable:true
+    // (meaning: userland security code is misled / cannot enforce intended policy).
+    const preImpossible = typedArrayIndexDescImpossible(pre);
+    const postImpossible = typedArrayIndexDescImpossible(post);
+
+    if (preImpossible || postImpossible){
+      // This is not memory corruption, but it's a real security-relevant impact: object-hardening cannot rely on descriptors.
+      alertVuln(id, "Descriptor-driven hardening becomes unreliable (integrity policy bypass / inconsistent enforcement).", impact);
+    } else {
+      info(id, "Hardening did not observe impossible descriptor states.", impact);
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T5: Proxy invariants enforcement — does engine throw when invariants are violated?
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T5/Impact.proxy.invariants";
+    const ta = makeTypedArrayForIndexTests();
+
+    // Proxy that tries to lie about descriptor (configurable=true)
+    const handler = {
+      getOwnPropertyDescriptor(target, prop){
+        if (prop === "0"){
+          return { value: 9, writable:true, enumerable:true, configurable:true }; // liar
         }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      }
+    };
+    const p = new Proxy(ta, handler);
 
-        // Função para induzir otimização JIT
-        function jitWriter(ta, value) {
-            // Tentativa de forçar escrita direta sem check de acessores
-            ta[0] = value;
+    let threw = false, err = null, d = null;
+    try { d = Object.getOwnPropertyDescriptor(p, "0"); }
+    catch(e){ threw = true; err = e && e.name ? e.name : "ERR"; }
+
+    // If the engine allows Proxy to violate invariants without TypeError, that's stronger impact.
+    // We alert when it does NOT throw and returns configurable:true.
+    if (!threw && d && d.configurable === true){
+      alertVuln(id, "Proxy invariant enforcement failed: got configurable:true descriptor for TA index via Proxy.", { desc: d });
+    } else {
+      info(id, "Proxy invariants appear enforced (or no impossible descriptor returned).", { threw, err, desc: d });
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T6: structuredClone(ArrayBuffer) — independence + victim checksum
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T6/Impact.structuredClone.independence";
+    if (typeof structuredClone !== "function"){
+      info(id, "structuredClone not available.");
+      return;
+    }
+    const victim = makeVictim(64*1024, 0xC0FFEE ^ cfg.runSeed);
+    const snap = snapshotVictim(victim.u8, 256);
+
+    // clone
+    let cloned = null, err = null;
+    try { cloned = structuredClone(victim.ab); }
+    catch(e){ err = e && e.name ? e.name : "ERR"; }
+
+    if (!cloned || err){
+      info(id, "Clone failed or unsupported path.", { err });
+      return;
+    }
+
+    // mutate clone and ensure original victim unchanged
+    const c8 = new Uint8Array(cloned);
+    c8[0] ^= 0xFF;
+    c8[123] ^= 0x7A;
+
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok){
+      alertVuln(id, "Clone mutation affected original victim (aliasing) — strong isolation break.", cmp);
+    } else {
+      info(id, "Clone independence OK.");
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T7: structuredClone transfer(ArrayBuffer) — detach invariants consistency (repeat)
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T7/Impact.transfer.detach.signature";
+    if (typeof structuredClone !== "function"){
+      info(id, "structuredClone not available.");
+      return;
+    }
+
+    // Repeat N times, signature must be consistent.
+    const sigs = [];
+    for (let i=0;i<cfg.N;i++){
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      u8[0] = 0xAA;
+
+      let out = { before: ab.byteLength, after:null, threw:false, err:null, recvLen:null, recv0:null };
+      try {
+        const recv = structuredClone(ab, { transfer:[ab] });
+        out.after = ab.byteLength;
+        try {
+          const r8 = new Uint8Array(recv);
+          out.recvLen = r8.length;
+          out.recv0 = r8[0];
+        } catch(e2){
+          out.recvLen = "THREW:"+(e2&&e2.name?e2.name:"ERR");
         }
+      } catch(e){
+        out.threw = true;
+        out.err = e && e.name ? e.name : "ERR";
+      }
+      sigs.push(JSON.stringify(out));
+    }
 
-        async function runSanityTest() {
-            $log.textContent = "";
-            print("--- INICIANDO TESTE DE SANIDADE ---");
+    const base = sigs[0];
+    for (let i=1;i<sigs.length;i++){
+      if (sigs[i] !== base){
+        alertVuln(id, "Detach/transfer signature inconsistent across repetitions (suspicious).", {
+          rep0: JSON.parse(base),
+          repN: JSON.parse(sigs[i])
+        });
+        return;
+      }
+    }
 
-            // 1. Setup do Alvo
-            const ab = new ArrayBuffer(0x100);
-            const ta = new Uint32Array(ab);
-            const MAGIC_VALUE = 0x41424344;
+    // Strong invariants: after transfer, byteLength should be 0; receiver should be readable and intact.
+    const last = JSON.parse(base);
+    if (!last.threw){
+      if (last.after !== 0){
+        alertVuln(id, "After transfer, sender byteLength != 0 (unexpected).", last);
+        return;
+      }
+      if (last.recvLen !== 4096 || last.recv0 !== 0xAA){
+        alertVuln(id, "Receiver not intact after transfer (unexpected).", last);
+        return;
+      }
+    } else {
+      info(id, "Transfer threw; treat as unsupported/blocked.", last);
+    }
+    info(id, "Transfer signature stable.");
+  });
 
-            // 2. Aquecimento JIT (Warm-up)
-            print("Fase 1: Aquecendo JIT...");
-            for(let i = 0; i < 50000; i++) {
-                jitWriter(ta, i);
-            }
+  // ------------------------------------------------------------
+  // T8: MessageChannel transfer — senderLen must be 0 or unchanged; receiver intact
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T8/Impact.MessageChannel.transfer";
+    if (typeof MessageChannel !== "function"){
+      info(id, "MessageChannel not available.");
+      return;
+    }
+    const ch = new MessageChannel();
+    const ab = new ArrayBuffer(4096);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0xAA;
 
-            // 3. Trigger do Bug de Invariante
-            print("Fase 2: Injetando Invariante Impossível...");
-            try {
-                Reflect.defineProperty(ta, "0", {
-                    configurable: true,
-                    writable: true
-                });
-                print("Invariante injetada!", "success");
-            } catch(e) {
-                print("Falha na definição: " + e.message, "warning");
-            }
+    let got = undefined;
+    ch.port2.onmessage = (ev) => { got = ev.data; };
 
-            // 4. Neutering (Detachment)
-            // No PS4, postMessage é a forma mais eficaz de 'matar' o buffer aqui.
-            print("Fase 3: Executando Neutering do ArrayBuffer...");
-            try {
-                window.postMessage(ab, "*", [ab]);
-                print("Buffer enviado para neutering.");
-            } catch(e) {
-                print("Erro no Neutering: " + e.message, "warning");
-            }
+    let postThrew = false, postErr=null;
+    try { ch.port1.postMessage(ab, [ab]); }
+    catch(e){ postThrew = true; postErr = e && e.name ? e.name : "ERR"; }
 
-            // 5. O Teste de Corrupção (Acesso Pós-Morte)
-            print("Fase 4: Tentando escrita via JIT no buffer morto...");
-            try {
-                jitWriter(ta, MAGIC_VALUE);
-                
-                // Sanidade Crítica: ta.length deve ser 0 se o motor estiver íntegro.
-                if (ta.length !== 0) {
-                    print("ALERTA: ta.length ainda é " + ta.length + " após o neutering!", "critical");
-                } else {
-                    print("Sanidade: ta.length é 0 (Comportamento esperado).");
-                }
-            } catch(e) {
-                print("Interrupção de segurança: " + e.message);
-            }
+    if (postThrew){
+      info(id, "postMessage(transfer) threw; treat as blocked.", { postErr });
+      return;
+    }
 
-            // 6. Varredura de Memória (Heap Spray leve)
-            // Se o JIT escreveu em memória morta, o valor pode ter caído em outro objeto.
-            print("Fase 5: Varrendo memória adjacente para MAGIC_VALUE...");
-            const candidates = [];
-            for (let i = 0; i < 2000; i++) {
-                // Alocamos novos buffers para ver se algum 'herdou' o MAGIC_VALUE
-                const leakCheck = new Uint32Array(new ArrayBuffer(0x100));
-                if (leakCheck[0] === MAGIC_VALUE) {
-                    print("!!! SUCESSO !!! MAGIC_VALUE encontrado na posição " + i, "critical");
-                    print("Isso confirma um Use-After-Free utilizável.", "critical");
-                    return;
-                }
-                candidates.push(leakCheck);
-            }
+    // wait a tick
+    await Promise.resolve();
+    await sleep(0);
 
-            print("Varredura concluída. Nenhum leak imediato detectado.");
-            print("Nota: Se houver um crash de sistema (CE-XXX), o bug é de kernel-level severity.", "warning");
+    const senderLen = ab.byteLength;
+    const tag = Object.prototype.toString.call(got);
+
+    // senderLen should be 0 (transfer) or 4096 (clone-ish)
+    if (senderLen !== 0 && senderLen !== 4096){
+      alertVuln(id, "sender ab.byteLength in impossible state.", { senderLen, tag });
+      return;
+    }
+
+    if (senderLen === 0){
+      if (!got){
+        alertVuln(id, "sender detached but receiver got nothing.", { tag, gotType: typeof got });
+        return;
+      }
+      let rLen=null, r0=null, readErr=null;
+      try {
+        const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+        const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
+        if (isAB){
+          const r8 = new Uint8Array(got);
+          rLen = r8.length; r0 = r8[0];
+        } else if (isView){
+          const r8 = (got instanceof Uint8Array) ? got : new Uint8Array(got.buffer);
+          rLen = r8.length; r0 = r8[0];
+        } else {
+          alertVuln(id, "receiver not ArrayBuffer nor view after detach.", { tag });
+          return;
         }
+      } catch(e){
+        readErr = e && e.name ? e.name : "ERR";
+      }
+      if (readErr){
+        alertVuln(id, "failed to read receiver after detach.", { tag, readErr });
+        return;
+      }
+      if (rLen !== 4096 || r0 !== 0xAA){
+        alertVuln(id, "receiver content/len unexpected after transfer.", { tag, rLen, r0 });
+        return;
+      }
+      info(id, "Transfer path OK.");
+    } else {
+      // Clone-ish: check independence (mutate sender must not reflect)
+      if (!got) { info(id, "Clone-ish but receiver missing; ignore."); return; }
+      let r8 = null;
+      try {
+        const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+        const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
+        if (!isAB && !isView){ info(id, "Clone-ish receiver not AB/view; ignore."); return; }
+        r8 = isAB ? new Uint8Array(got) : (got instanceof Uint8Array ? got : new Uint8Array(got.buffer));
+      } catch(_){ return; }
 
-        document.getElementById('runBtn').onclick = runSanityTest;
-    </script>
+      const before = r8[0];
+      u8[0] = 0xBB;
+      const after = r8[0];
+      if (before !== after){
+        alertVuln(id, "Clone path aliasing detected (receiver reflected sender mutation).", { before, after, tag });
+      } else {
+        info(id, "Clone path independence OK.");
+      }
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T9: Cross-realm check — does the impossible descriptor reproduce in iframe too?
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T9/CrossRealm.iframe.descriptor";
+    const f = makeIframe();
+    let w = null;
+    try { w = f.contentWindow; } catch(_){}
+    if (!w){
+      killIframe(f);
+      info(id, "iframe contentWindow unavailable.");
+      return;
+    }
+
+    // Evaluate in iframe realm
+    let res = null, err=null;
+    try {
+      res = w.eval(`
+        (function(){
+          const ta = new Uint8Array(8);
+          let ok = null, threw=false, err=null;
+          try { ok = Reflect.defineProperty(ta, "0", { value:9, writable:true, enumerable:true, configurable:true }); }
+          catch(e){ threw=true; err=e && e.name ? e.name : "ERR"; }
+          let d=null;
+          try { d = Object.getOwnPropertyDescriptor(ta, "0"); } catch(e){ d={error:(e&&e.name)||"ERR"}; }
+          return { ok, threw, err, desc:d, ta0: ta[0] };
+        })();
+      `);
+    } catch(e){
+      err = e && e.name ? e.name : "ERR";
+    } finally {
+      killIframe(f);
+    }
+
+    if (err){
+      info(id, "iframe eval failed.", { err });
+      return;
+    }
+    if (res && res.desc && res.desc.configurable === true){
+      alertVuln(id, "Impossible configurable=true reproduced in iframe realm.", res);
+    } else {
+      info(id, "No impossible descriptor in iframe realm (or not observable).", res);
+    }
+  });
+
+  // ------------------------------------------------------------
+  // T10: Victim integrity sweep — ensure no accidental cross-buffer mutation occurred
+  // ------------------------------------------------------------
+  tests.push(async (cfg) => {
+    const id = "T10/Victim.integrity.sweep";
+    const victim = makeVictim(128*1024, 0xBADC0DE ^ cfg.runSeed);
+    const snap = snapshotVictim(victim.u8, 256);
+
+    // Perform non-exploitative operations that are relevant to the bug surface:
+    // - defineProperty attempts on typed array index
+    // - descriptor reads
+    // - seal/freeze attempts on wrapper objects (not on TA itself)
+    const ta = new Uint8Array(64);
+    try { Reflect.defineProperty(ta, "0", { value:9, writable:true, enumerable:true, configurable:true }); } catch(_){}
+    try { Object.getOwnPropertyDescriptor(ta, "0"); } catch(_){}
+
+    const wrapper = { ta };
+    try { Object.seal(wrapper); } catch(_){}
+    try { Object.freeze(wrapper); } catch(_){}
+    try { Object.preventExtensions(wrapper); } catch(_){}
+
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok){
+      alertVuln(id, "Victim checksum changed during non-exploitative harness ops (unexpected).", cmp);
+    } else {
+      info(id, "Victim integrity OK.");
+    }
+  });
+
+  // ============================================================
+  // Main runAll
+  // ============================================================
+  async function runAll(){
+    STOP = false;
+    RUN_ID++;
+    const runId = RUN_ID;
+
+    const N = Math.max(1, parseInt(document.getElementById("repN").value || "20", 10));
+    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value || "50", 10));
+    const timeoutMs = Math.max(100, parseInt(document.getElementById("timeoutMs").value || "1500", 10));
+
+    const cfg = {
+      N,
+      delayMs,
+      timeoutMs,
+      runSeed: (Date.now() ^ (Math.random()*0xFFFFFFFF)) >>> 0
+    };
+
+    logLine("============================================================");
+    logLine("Run ALL :: Impact Harness (no exploitation)");
+    logLine("Config :: " + JSON.stringify(cfg));
+    logLine("============================================================");
+
+    for (let i=0;i<tests.length;i++){
+      if (STOP || runId !== RUN_ID) break;
+
+      const testName = `TEST ${i+1}/${tests.length}`;
+      logLine(`RUN :: ${testName}`);
+      try {
+        const p = Promise.resolve(tests[i](cfg));
+        await withTimeout(p, timeoutMs);
+      } catch(e){
+        // Exceptions alone are not proof; log softly.
+        logLine(`INFO ${testName}: exception (ignored) :: ${e && e.name ? e.name : "ERR"}`);
+      }
+      logLine(`DONE :: ${testName}`);
+      if (delayMs) await sleep(delayMs);
+    }
+
+    logLine("ALL DONE.");
+  }
+
+  // Wire UI
+  document.getElementById("btnReset").onclick = resetLog;
+  document.getElementById("btnStop").onclick = stopNow;
+  document.getElementById("btnRun").onclick = runAll;
+
+  resetLog();
+})();
+</script>
 </body>
 </html>
