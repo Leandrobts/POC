@@ -2,10 +2,10 @@
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
-  <title>PS4 Memory Corruption Tests (401-450) - Basic</title>
+  <title>PS4 Impossible Invariants Tests (401-450) - No CSS</title>
 </head>
 <body>
-  <h1>PS4 Memory Corruption Tests (401–450) — Basic (no CSS)</h1>
+  <h1>PS4 Impossible Invariants Tests (401–450) — No CSS</h1>
 
   <div>
     <button id="btnReset">Reset log</button>
@@ -55,7 +55,7 @@
   }
 
   // =========================
-  // Victim model (strong)
+  // Strong victim model (XOR blocks + spot samples)
   // =========================
   function xorshift32(seed) {
     let x = seed >>> 0;
@@ -136,7 +136,7 @@
   }
 
   // =========================
-  // Helpers / Amplifiers (bounded)
+  // Pressure helpers (bounded)
   // =========================
   function heapSpray(intensity) {
     const count = 24 * intensity;
@@ -186,6 +186,9 @@
     return keep;
   }
 
+  // =========================
+  // Detach helpers
+  // =========================
   function safeStructuredClone(obj, transferList) {
     if (typeof structuredClone !== "function") return { supported:false };
     try {
@@ -194,6 +197,39 @@
     } catch (e) {
       return { supported:true, error:(e && e.name) ? e.name : "ERR" };
     }
+  }
+
+  async function messageChannelTransferOnce(bytes, payload0, waitBudgetMs) {
+    if (typeof MessageChannel !== "function") return { supported:false };
+
+    const ch = new MessageChannel();
+    const ab = new ArrayBuffer(bytes);
+    const u8 = new Uint8Array(ab);
+    u8[0] = payload0;
+
+    let got = undefined;
+    let gotSet = false;
+    ch.port2.onmessage = (ev) => { got = ev.data; gotSet = true; };
+
+    let postThrew = false;
+    try { ch.port1.postMessage(ab, [ab]); } catch (_) { postThrew = true; }
+
+    if (postThrew) return { supported:true, postThrew:true };
+
+    // Espera por entrega até budget (evita falso "drop" por janela curta)
+    const start = Date.now();
+    while (!gotSet && (Date.now() - start) < waitBudgetMs) {
+      await sleep(0);
+    }
+
+    return {
+      supported:true,
+      postThrew:false,
+      senderLen: ab.byteLength,
+      gotSet,
+      got,
+      tag: Object.prototype.toString.call(got)
+    };
   }
 
   function expectedSubarrayRange(len, begin, end) {
@@ -206,7 +242,10 @@
     return { b, e, length: e - b };
   }
 
-  async function crossBufferIsolationTest(testNum, label, stressFn, intensity, mode) {
+  // =========================
+  // Cross-buffer victim harness
+  // =========================
+  async function crossBufferIsolation(testNum, label, stressFn, intensity, mode) {
     const victim = makeVictim(64 * 1024, (0xC0FFEE00 ^ testNum) >>> 0);
     const snap = snapshotVictim(victim.u8, 256);
 
@@ -222,100 +261,258 @@
   }
 
   // =========================
-  // Tests 401..450
+  // Tests 401..450 (impossible invariants focus)
   // =========================
   const tests = [];
   function addTest(num, name, fn) { tests.push({ num, name, fn }); }
 
-  // 401: structuredClone transfer repeat consistency (signature of detach results stable)
-  addTest(401, "structuredClone transfer repeat consistency", async () => {
-    if (typeof structuredClone !== "function") return;
+  // 401: TypedArray.length descriptor cannot be writable/configurable (impossible)
+  addTest(401, "TypedArray.length descriptor impossible", async () => {
+    const ta = new Uint8Array(10);
+    const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ta), "length")
+           || Object.getOwnPropertyDescriptor(ta, "length");
+    // Em engines normais, length é accessor no %TypedArray%.prototype (não writable)
+    // Se aparecer writable/configurable true, é fortíssimo (ou bug enorme).
+    if (d && (d.writable === true || d.configurable === true)) {
+      alertVuln(401, "TypedArray.length ficou writable/configurable (IMPOSSIBLE).", d);
+    }
+  });
+
+  // 402: TypedArray.byteLength/byteOffset cannot be writable/configurable (impossible)
+  addTest(402, "TypedArray.byteLength/byteOffset descriptor impossible", async () => {
+    const ta = new Uint8Array(10);
+    const proto = Object.getPrototypeOf(ta);
+    const dBL = Object.getOwnPropertyDescriptor(proto, "byteLength") || Object.getOwnPropertyDescriptor(ta, "byteLength");
+    const dBO = Object.getOwnPropertyDescriptor(proto, "byteOffset") || Object.getOwnPropertyDescriptor(ta, "byteOffset");
+    const bad = [];
+    if (dBL && (dBL.writable === true || dBL.configurable === true)) bad.push({ prop:"byteLength", desc:dBL });
+    if (dBO && (dBO.writable === true || dBO.configurable === true)) bad.push({ prop:"byteOffset", desc:dBO });
+    if (bad.length) alertVuln(402, "byteLength/byteOffset ficaram writable/configurable (IMPOSSIBLE).", bad);
+  });
+
+  // 403: ArrayBuffer.byteLength cannot be writable/configurable (impossible)
+  addTest(403, "ArrayBuffer.byteLength descriptor impossible", async () => {
+    const ab = new ArrayBuffer(16);
+    const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ab), "byteLength")
+           || Object.getOwnPropertyDescriptor(ab, "byteLength");
+    if (d && (d.writable === true || d.configurable === true)) {
+      alertVuln(403, "ArrayBuffer.byteLength writable/configurable (IMPOSSIBLE).", d);
+    }
+  });
+
+  // 404: DefineProperty should not make TA index configurable in a weird way (impossible-ish)
+  addTest(404, "DefineProperty on TA index invariants", async () => {
+    const ta = new Uint8Array(4);
+    ta[0] = 7;
+    let ok = true;
+    try {
+      Object.defineProperty(ta, "0", { configurable:true, writable:true, value: 9 });
+      ok = true;
+    } catch (_) {
+      ok = false; // normal: TypeError
+    }
+    // Se defineProperty "funcionar", descriptor NÃO pode virar configurable=true em typed arrays.
+    if (ok) {
+      const d = Object.getOwnPropertyDescriptor(ta, "0");
+      if (d && d.configurable === true) {
+        alertVuln(404, "TA index virou configurable=true via defineProperty (IMPOSSIBLE).", d);
+      }
+    }
+  });
+
+  // 405: Detach signature must be consistent across repetitions (same behavior)
+  addTest(405, "Detach signature repeat consistency", async (intensity, mode) => {
+    // Usa structuredClone transfer se existir; caso contrário tenta MessageChannel.
     const reps = 6;
     let sig0 = null;
+
     for (let i = 0; i < reps; i++) {
-      const ab = new ArrayBuffer(2048);
+      const ab = new ArrayBuffer(4096);
       const u8 = new Uint8Array(ab);
-      u8[0] = 0x5A;
+      const u32 = new Uint32Array(ab);
+      u8[0] = 0xAA;
 
-      const res = safeStructuredClone(ab, [ab]);
-      if (!res.supported || res.error) return;
+      let detached = false;
 
-      const senderLen = ab.byteLength;
-      const recvTag = Object.prototype.toString.call(res.value);
-      let recvLen = null, recv0 = null;
-      try {
-        const r8 = new Uint8Array(res.value);
-        recvLen = r8.length;
-        recv0 = r8[0];
-      } catch (_) { return; }
+      if (typeof structuredClone === "function") {
+        const r = safeStructuredClone(ab, [ab]);
+        if (!r.supported || r.error) return;
+        detached = true;
+      } else if (typeof MessageChannel === "function") {
+        const r = await messageChannelTransferOnce(4096, 0xAA, 50);
+        if (!r.supported || r.postThrew) return;
+        detached = (r.senderLen === 0);
+      } else {
+        return;
+      }
 
-      const sig = `senderLen=${senderLen}|recvTag=${recvTag}|recvLen=${recvLen}|recv0=${recv0}`;
+      // Observa comportamento das views após detach
+      const sample = [];
+      function readTA(name, obj) {
+        const s = { name };
+        try { s.length = obj.length; } catch (e) { s.length = "THREW:" + (e && e.name ? e.name : "ERR"); }
+        try { s.byteLength = obj.byteLength; } catch (e) { s.byteLength = "THREW:" + (e && e.name ? e.name : "ERR"); }
+        try { s.r0 = obj[0]; } catch (e) { s.r0 = "THREW:" + (e && e.name ? e.name : "ERR"); }
+        try { obj[0] = 0x7A; s.wrote = true; } catch (e) { s.wrote = "THREW:" + (e && e.name ? e.name : "ERR"); }
+        try { s.r0b = obj[0]; } catch (e) { s.r0b = "THREW:" + (e && e.name ? e.name : "ERR"); }
+        return s;
+      }
+
+      sample.push(readTA("Uint8Array", u8));
+      sample.push(readTA("Uint32Array", u32));
+
+      const sig = JSON.stringify({ abLen: ab.byteLength, detached, sample });
       if (sig0 === null) sig0 = sig;
       else if (sig !== sig0) {
-        alertVuln(401, "Transfer repeat inconsistente (assinatura mudou).", { base: sig0, got: sig });
+        alertVuln(405, "Comportamento pós-detach variou entre repetições (suspeito forte).", { base: sig0, got: sig });
         return;
       }
-      if (senderLen !== 0) {
-        alertVuln(401, "Transfer: senderLen != 0 após transfer.", { senderLen });
+
+      // Invariante forte: se detach ocorreu, ab.byteLength deve ser 0 (se suportado)
+      if (detached && ab.byteLength !== 0) {
+        alertVuln(405, "Detach ocorreu mas ab.byteLength != 0 (IMPOSSIBLE nesse caminho).", { abLen: ab.byteLength, sample });
         return;
       }
-      if (recvLen !== 2048 || recv0 !== 0x5A) {
-        alertVuln(401, "Transfer: receiver payload/len inesperado.", { recvLen, recv0, recvTag });
-        return;
-      }
+
+      void intensity; void mode;
     }
   });
 
-  // 402: typed array OOR read should be undefined (or stable) and must not mutate
-  addTest(402, "TypedArray OOR read invariants (no mutation)", async () => {
-    const ab = new ArrayBuffer(256);
-    const ta = new Uint8Array(ab);
+  // 406: MessageChannel transfer MUST either (a) detach sender or (b) throw. Sender in-between is impossible.
+  addTest(406, "MessageChannel transfer senderLen impossible states", async () => {
+    if (typeof MessageChannel !== "function") return;
+    const r = await messageChannelTransferOnce(4096, 0xAA, 200);
+    if (!r.supported) return;
+    if (r.postThrew) return;
+
+    // Estado impossível: senderLen não ser 0 nem original (4096)
+    if (r.senderLen !== 0 && r.senderLen !== 4096) {
+      alertVuln(406, "senderLen ficou em estado impossível após postMessage transfer.", { senderLen: r.senderLen, tag: r.tag });
+      return;
+    }
+  });
+
+  // 407: If sender detached, receiver must be readable and payload intact (with longer wait budget).
+  addTest(407, "MessageChannel detach => receiver must be readable+intact", async () => {
+    if (typeof MessageChannel !== "function") return;
+    const r = await messageChannelTransferOnce(4096, 0xAA, 800);
+
+    if (!r.supported || r.postThrew) return;
+    if (r.senderLen !== 0) return; // não detacheou → não é caminho
+
+    // Se detacheou, mas não chegou nada até budget: isso é anomalia de entrega.
+    // Não é corrupção automaticamente, mas é um “impossible-ish” forte se for determinístico.
+    if (!r.gotSet || !r.got) {
+      alertVuln(407, "Sender detacheou, mas receiver não recebeu payload dentro do budget (anomalia de entrega).", {
+        gotSet: r.gotSet, gotType: typeof r.got, tag: r.tag
+      });
+      return;
+    }
+
+    // Validar tipo+leitura
+    let rLen = null, r0 = null;
+    try {
+      const tag = r.tag;
+      const isAB = (tag === "[object ArrayBuffer]") || (r.got && typeof r.got.byteLength === "number" && typeof r.got.slice === "function");
+      const isView = (r.got && typeof r.got === "object" && typeof r.got.byteLength === "number" && typeof r.got.buffer === "object");
+
+      let r8;
+      if (isAB) r8 = new Uint8Array(r.got);
+      else if (isView) r8 = (r.got instanceof Uint8Array) ? r.got : new Uint8Array(r.got.buffer);
+      else {
+        alertVuln(407, "Receiver não é ArrayBuffer nem view após detach (IMPOSSIBLE).", { tag });
+        return;
+      }
+
+      rLen = r8.length;
+      r0 = r8[0];
+    } catch (e) {
+      alertVuln(407, "Falha ao ler receiver após detach (suspeito forte).", { err: e && e.name, tag: r.tag });
+      return;
+    }
+
+    if (rLen !== 4096 || r0 !== 0xAA) {
+      alertVuln(407, "Receiver payload/len inesperado após detach (suspeito forte).", { rLen, r0, tag: r.tag });
+    }
+  });
+
+  // 408: Subarray negative clamp fuzzer: must match expected range (many cases)
+  addTest(408, "Subarray negative clamp fuzzer (expected range)", async (intensity) => {
+    const ta = new Uint8Array(256);
     for (let i = 0; i < ta.length; i++) ta[i] = i & 0xFF;
-    const v = ta[999999];
-    // v typically undefined; regardless, buffer must stay unchanged
-    for (let i = 0; i < 16; i++) {
-      if (ta[i] !== (i & 0xFF)) {
-        alertVuln(402, "OOR read coincidiu com mutação (impossível).", { i, got: ta[i] });
+
+    const rounds = 50 * intensity;
+    for (let i = 0; i < rounds; i++) {
+      const begin = (Math.random() * 800 - 400) | 0;
+      const end = (Math.random() * 800 - 400) | 0;
+      const exp = expectedSubarrayRange(ta.length, begin, end);
+      const sub = ta.subarray(begin, end);
+
+      if (sub.length !== exp.length) {
+        alertVuln(408, "Clamp FAIL: sub.length != expected.", { begin, end, exp, gotLen: sub.length });
         return;
       }
+      // Conteúdo deve bater no mínimo para first/last
+      if (sub.length) {
+        if (sub[0] !== ta[exp.b] || sub[sub.length - 1] !== ta[exp.e - 1]) {
+          alertVuln(408, "Clamp FAIL: conteúdo não bate com expected.", {
+            begin, end, exp, gotFirst: sub[0], expFirst: ta[exp.b], gotLast: sub[sub.length-1], expLast: ta[exp.e-1]
+          });
+          return;
+        }
+      }
     }
-    void v;
   });
 
-  // 403: subarray clamp for extreme negatives (must equal full length)
-  addTest(403, "subarray extreme clamp", async () => {
-    const ta = new Uint8Array(100);
-    const sub = ta.subarray(-1000000, 1000000);
-    if (sub.length !== 100) alertVuln(403, "subarray clamp errado.", { gotLen: sub.length });
+  // 409: TypedArray OOR write must be no-op (checksum)
+  addTest(409, "TypedArray OOR write must be no-op (checksum)", async () => {
+    const victim = makeVictim(4096, 0x409 ^ 0xA11CE551);
+    const snap = snapshotVictim(victim.u8, 128);
+    const ta = new Uint32Array(victim.ab);
+
+    const idx = ta.length; // OOR
+    try { ta[idx] = 0xDEADBEEF; } catch (_) {}
+
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok) alertVuln(409, "OOR write alterou victim (IMPOSSIBLE).", cmp);
   });
 
-  // 404: DataView OOR must throw or be consistent; must not write (checksum)
-  addTest(404, "DataView OOR set checksum", async () => {
-    const victim = makeVictim(4096, 0x404 ^ 0xC0DE);
+  // 410: DataView OOR get must throw or be stable, but must not mutate (checksum)
+  addTest(410, "DataView OOR get/set must not mutate (checksum)", async () => {
+    const victim = makeVictim(4096, 0x410 ^ 0xC0DE);
     const snap = snapshotVictim(victim.u8, 128);
     const dv = new DataView(victim.ab);
+
+    try { dv.getUint32(0x7fffffff, true); } catch (_) {}
     try { dv.setUint32(0x7fffffff, 0x11223344, true); } catch (_) {}
+
     const cmp = compareSnapshot(victim.u8, snap);
-    if (!cmp.ok) alertVuln(404, "DataView OOR alterou victim.", cmp);
+    if (!cmp.ok) alertVuln(410, "DataView OOR causou mutação (IMPOSSIBLE).", cmp);
   });
 
-  // 405: TypedArray.set with huge source length (proxy) must not corrupt victim
-  addTest(405, "TypedArray.set with proxy huge length (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(405, "TA.set proxy huge length", async () => {
-      const dst = new Uint8Array(256);
-      const src = new Proxy({ length: 1 }, {
-        get(t, p) {
-          if (p === "length") return 1000000;
-          if (p === "0") return 7;
-          return t[p];
-        }
-      });
-      try { dst.set(src, 0); } catch (_) {}
-    }, intensity, mode);
+  // 411: Clone independence (structuredClone) must not alias (if supported)
+  addTest(411, "structuredClone(ArrayBuffer) must not alias", async () => {
+    if (typeof structuredClone !== "function") return;
+    const ab = new ArrayBuffer(512);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0x11;
+
+    const r = safeStructuredClone(ab);
+    if (!r.supported || r.error || !r.value) return;
+
+    const clone = r.value;
+    const r8 = new Uint8Array(clone);
+    const before = r8[0];
+    u8[0] = 0x22;
+    const after = r8[0];
+
+    if (before !== after) {
+      alertVuln(411, "Clone refletiu mutação do original (aliasing IMPOSSIBLE).", { before, after });
+    }
   });
 
-  // 406: ArrayBuffer slice must not alias (sanity)
-  addTest(406, "ArrayBuffer.slice independence", async () => {
+  // 412: ArrayBuffer.slice must not alias (same as before, but keep as "impossible")
+  addTest(412, "ArrayBuffer.slice must not alias", async () => {
     const ab = new ArrayBuffer(64);
     const u8 = new Uint8Array(ab);
     u8[0] = 0x11;
@@ -324,256 +521,135 @@
     const before = v2[0];
     u8[0] = 0x22;
     const after = v2[0];
-    if (before !== after) alertVuln(406, "ArrayBuffer.slice aliasing detectado.", { before, after });
+    if (before !== after) alertVuln(412, "ArrayBuffer.slice aliasing detectado (IMPOSSIBLE).", { before, after });
   });
 
-  // 407: copyWithin with crazy args must not corrupt victim (cross-buffer)
-  addTest(407, "copyWithin crazy args (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(407, "copyWithin crazy args", async () => {
-      const ta = new Uint8Array(1024);
-      ta.copyWithin(-99999, 0, 99999);
-      ta.copyWithin(0, -99999, -1);
-    }, intensity, mode);
-  });
-
-  // 408: fill with proxy valueOf + allocations (cross-buffer)
-  addTest(408, "Array.fill proxy valueOf (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(408, "fill proxy valueOf", async () => {
-      const a = new Array(2000);
-      const v = new Proxy({ n: 7 }, {
+  // 413: Proxy "length trap" on TypedArray.from must not corrupt cross-buffer victim
+  addTest(413, "TypedArray.from Proxy length trap (cross-buffer checksum)", async (intensity, mode) => {
+    await crossBufferIsolation(413, "TA.from Proxy length trap", async () => {
+      const src = new Proxy({ length: 1 }, {
         get(t, p) {
-          if (p === "valueOf") return function() { new Uint8Array(new ArrayBuffer(4096)); return 7; };
+          if (p === "length") return 1000000;
+          if (p === "0") return 7;
           return t[p];
         }
       });
-      a.fill(v);
-    }, intensity, mode);
-  });
-
-  // 409: Map/Set toStringTag side effects (cross-buffer)
-  addTest(409, "Symbol.toStringTag getter side effect (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(409, "toStringTag side effect", async () => {
-      const obj = {};
-      Object.defineProperty(obj, Symbol.toStringTag, { get() { new Uint8Array(new ArrayBuffer(4096)); return "X"; } });
-      Object.prototype.toString.call(obj);
-    }, intensity, mode);
-  });
-
-  // 410: DOMParser parse churn (if available) cross-buffer
-  addTest(410, "DOMParser parse churn (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(410, "DOMParser churn", async () => {
-      if (typeof DOMParser !== "function") return;
-      const p = new DOMParser();
-      for (let i = 0; i < 50 * intensity; i++) {
-        p.parseFromString("<div><span>aa</span></div>", "text/html");
-      }
-    }, intensity, mode);
-  });
-
-  // 411: URL + Blob churn (if available) cross-buffer
-  addTest(411, "Blob/URL churn (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(411, "Blob URL churn", async () => {
-      if (typeof Blob !== "function" || !URL || typeof URL.createObjectURL !== "function") return;
-      const urls = [];
-      for (let i = 0; i < 20 * intensity; i++) {
-        const b = new Blob([new Uint8Array(1024)]);
-        const u = URL.createObjectURL(b);
-        urls.push(u);
-      }
-      for (const u of urls) { try { URL.revokeObjectURL(u); } catch (_) {} }
-    }, intensity, mode);
-  });
-
-  // 412: Promise.race churn (cross-buffer)
-  addTest(412, "Promise.race churn (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(412, "Promise.race churn", async () => {
-      const n = 120 * intensity;
-      for (let i = 0; i < n; i++) {
-        await Promise.race([Promise.resolve(i), Promise.resolve(i+1)]);
-      }
-    }, intensity, mode);
-  });
-
-  // 413: TypedArray.prototype.reduce with side alloc (cross-buffer)
-  addTest(413, "TypedArray.reduce alloc side-effect (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(413, "TA.reduce alloc", async () => {
-      const ta = new Uint8Array(4096);
-      for (let i = 0; i < ta.length; i++) ta[i] = i & 0xFF;
-      ta.reduce((acc, v, i) => {
-        if ((i & 127) === 0) new Uint32Array(new ArrayBuffer(2048));
-        return acc + v;
-      }, 0);
-    }, intensity, mode);
-  });
-
-  // 414: TypedArray.prototype.forEach side alloc (cross-buffer)
-  addTest(414, "TypedArray.forEach alloc side-effect (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(414, "TA.forEach alloc", async () => {
-      const ta = new Uint8Array(4096);
-      ta.forEach((v, i) => { if ((i & 127) === 0) new Uint8Array(new ArrayBuffer(4096)); void v; });
-    }, intensity, mode);
-  });
-
-  // 415: TypedArray.prototype.reverse aliasing sanity (same buffer views)
-  addTest(415, "reverse aliasing sanity (same buffer views)", async () => {
-    const ab = new ArrayBuffer(64);
-    const a = new Uint8Array(ab);
-    const b = new Uint8Array(ab);
-    a[0] = 1; a[63] = 2;
-    a.reverse();
-    // Since b aliases, b should see changes deterministically
-    if (b[0] !== 2 || b[63] !== 1) alertVuln(415, "Aliasing reverse inconsistente (mesmo buffer).", { b0: b[0], b63: b[63] });
-  });
-
-  // 416: Subarray write must stay in bounds (marker guard)
-  addTest(416, "subarray write must not leak out-of-range", async () => {
-    const ta = new Uint8Array(128);
-    for (let i = 0; i < ta.length; i++) ta[i] = 0xAA;
-    const begin = -20, end = -10;
-    const exp = expectedSubarrayRange(ta.length, begin, end);
-    const sub = ta.subarray(begin, end);
-    if (sub.length !== exp.length) return;
-
-    const marker = 0xCC;
-    if (sub.length) sub[0] = marker;
-
-    if (ta[exp.b] !== marker) alertVuln(416, "subarray write não refletiu no clamp esperado.", { pos: exp.b });
-    if (exp.b > 0 && ta[exp.b - 1] === marker) alertVuln(416, "subarray write vazou para byte anterior.", { pos: exp.b - 1 });
-    if (exp.e < ta.length && ta[exp.e] === marker) alertVuln(416, "subarray write vazou para byte posterior.", { pos: exp.e });
-  });
-
-  // 417: Frozen array-like into TypedArray.from must not corrupt victim (cross-buffer)
-  addTest(417, "TypedArray.from frozen array-like (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(417, "TA.from frozen", async () => {
-      const src = { length: 32 };
-      for (let i = 0; i < 32; i++) src[i] = i;
-      try { Object.freeze(src); } catch (_) {}
       try { Uint8Array.from(src); } catch (_) {}
     }, intensity, mode);
   });
 
-  // 418: String.prototype.repeat huge-ish bounded (cross-buffer)
-  addTest(418, "String repeat bounded (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(418, "String repeat", async () => {
-      let s = "ab";
-      s = s.repeat(2000 * intensity);
-      s.indexOf("b");
-    }, intensity, mode);
-  });
+  // 414: Iterator concurrent modification - must not produce impossible index behavior (basic invariant)
+  addTest(414, "Array iterator concurrent modification sanity (no impossible)", async () => {
+    const a = new Array(100);
+    for (let i = 0; i < a.length; i++) a[i] = i;
 
-  // 419: RegExp replace with function side-effect (cross-buffer)
-  addTest(419, "RegExp replace callback side-effects (cross-buffer)", async (intensity, mode) => {
-    await crossBufferIsolationTest(419, "RegExp replace cb", async () => {
-      const re = /a/g;
-      const s = "a".repeat(2000 * intensity);
-      s.replace(re, () => { new Uint8Array(new ArrayBuffer(2048)); return "b"; });
-    }, intensity, mode);
-  });
-
-  // 420: DOM teardown of iframes (teardown)
-  addTest(420, "iframe create/remove churn (teardown)", async (intensity, mode) => {
-    await crossBufferIsolationTest(420, "iframe churn", async () => {
-      if (mode !== "teardown") return;
-      const arr = [];
-      for (let i = 0; i < 20 * intensity; i++) {
-        const f = document.createElement("iframe");
-        f.style.display = "none";
-        document.body.appendChild(f);
-        arr.push(f);
+    let seenBad = false;
+    let i = 0;
+    for (const v of a) {
+      if (i === 10) a.length = 5; // shrink
+      if (v !== undefined && typeof v !== "number") seenBad = true;
+      i++;
+      if (i > 200) { // impossível em array 100
+        alertVuln(414, "Iterator percorreu >200 passos (impossível).", { i });
+        return;
       }
-      for (const f of arr) { try { f.remove(); } catch (_) {} }
-    }, intensity, mode);
+    }
+    if (seenBad) alertVuln(414, "Iterator retornou tipo impossível (suspeito).", {});
   });
 
-  // 421: PostMessage clone (no transfer) must not alias (best-effort, no alert if not deliver)
-  addTest(421, "postMessage clone independence (best-effort)", async () => {
-    if (typeof postMessage !== "function") return;
-    const ab = new ArrayBuffer(512);
-    const u8 = new Uint8Array(ab);
-    u8[0] = 0x11;
-
-    let got;
-    function handler(ev) { got = ev.data; }
-    window.addEventListener("message", handler);
-
-    try { postMessage(ab, "*"); } catch (_) { window.removeEventListener("message", handler); return; }
-    await sleep(0);
-    window.removeEventListener("message", handler);
-
-    if (!got) return;
-    const tag = Object.prototype.toString.call(got);
-    if (tag !== "[object ArrayBuffer]") return;
-
-    const r8 = new Uint8Array(got);
-    const before = r8[0];
-    u8[0] = 0x22;
-    const after = r8[0];
-    if (before !== after) alertVuln(421, "postMessage clone refletiu mutação do sender (aliasing impossível).", { before, after });
-  });
-
-  // 422-449: compact batch — pure cross-buffer stress variants
-  // Each test differs in the kind of benign-but-stressful workload.
-  for (let k = 422; k <= 449; k++) {
-    addTest(k, "stress variant " + k + " (cross-buffer)", async (intensity, mode) => {
-      await crossBufferIsolationTest(k, "stress variant " + k, async () => {
-        const v = k % 7;
+  // 415..449: variants that try to break invariants through side effects + checksums
+  // (still “impossible” oriented: they only ALERT if checksum/descriptor invariants break)
+  for (let num = 415; num <= 449; num++) {
+    addTest(num, "Impossible-focused variant " + num, async (intensity, mode) => {
+      await crossBufferIsolation(num, "Impossible variant " + num, async () => {
+        const v = num % 7;
 
         if (v === 0) {
-          // alloc + microtasks
-          heapSpray(intensity);
-          await microtaskChurn(intensity);
+          // Many detach attempts but only validate "no corruption"
+          if (typeof structuredClone === "function") {
+            for (let i = 0; i < 5 * intensity; i++) {
+              const ab = new ArrayBuffer(1024);
+              safeStructuredClone(ab, [ab]);
+            }
+          } else if (typeof MessageChannel === "function") {
+            for (let i = 0; i < 5 * intensity; i++) {
+              await messageChannelTransferOnce(1024, 0x5A, 50);
+            }
+          }
         } else if (v === 1) {
-          // holes + churn
-          makeHoles(intensity);
-          await microtaskChurn(intensity);
+          // Subarray clamp storms
+          const ta = new Uint8Array(512);
+          for (let i = 0; i < 50 * intensity; i++) ta.subarray((-1000 + i) | 0, (1000 - i) | 0);
         } else if (v === 2) {
-          // object spray + stringify
-          const o = objectSpray(intensity);
-          try { JSON.stringify(o[0]); } catch (_) {}
-        } else if (v === 3) {
-          // typedarray map/filter/reduce chain
-          const ta = new Uint8Array(8192);
-          const m = ta.map((x, i) => (x ^ (i & 255)) & 255);
-          const f = m.filter((x, i) => ((x + i) & 7) === 0);
-          f.reduce((a, b) => a + b, 0);
-        } else if (v === 4) {
-          // dataview unaligned r/w
+          // DataView unaligned churn
           const ab = new ArrayBuffer(4096);
           const dv = new DataView(ab);
-          for (let off = 1; off < 64; off++) {
+          for (let off = 1; off < 128; off++) {
             dv.setUint32(off, (0x11223344 ^ off) >>> 0, true);
             dv.getUint32(off, true);
           }
+        } else if (v === 3) {
+          // TypedArray chain with side alloc
+          const ta = new Uint8Array(8192);
+          ta.map((x, i) => { if ((i & 255) === 0) new Uint8Array(new ArrayBuffer(2048)); return (x ^ (i & 255)) & 255; });
+          ta.filter((x, i) => { if ((i & 255) === 0) new Uint32Array(new ArrayBuffer(1024)); return ((x + i) & 7) === 0; });
+        } else if (v === 4) {
+          // JSON/toStringTag side effects
+          const obj = {};
+          Object.defineProperty(obj, Symbol.toStringTag, { get() { new Uint8Array(new ArrayBuffer(4096)); return "X"; } });
+          Object.prototype.toString.call(obj);
+          try { JSON.stringify({ obj }); } catch (_) {}
         } else if (v === 5) {
-          // regex + strings
-          const s = ("ab".repeat(2000 * intensity));
-          /b/g.test(s);
-          s.replace(/a/g, "c");
+          // DOM teardown (only when mode=teardown)
+          if (mode === "teardown") {
+            const arr = [];
+            for (let i = 0; i < 10 * intensity; i++) {
+              const f = document.createElement("iframe");
+              f.style.display = "none";
+              document.body.appendChild(f);
+              arr.push(f);
+            }
+            for (const f of arr) { try { f.remove(); } catch (_) {} }
+          }
         } else {
-          // teardown-ish in JS objects
-          const arr = [];
-          for (let i = 0; i < 2000 * intensity; i++) arr.push({ i, s: "x"+i });
-          arr.length = 0;
+          // Allocation patterns
+          heapSpray(intensity);
+          makeHoles(intensity);
+          objectSpray(intensity);
+          await microtaskChurn(intensity);
         }
       }, intensity, mode);
     });
   }
 
-  // 450: Comprehensive victim integrity sweep (bigger victim)
-  addTest(450, "Comprehensive victim integrity sweep (bigger)", async (intensity, mode) => {
+  // 450: Comprehensive invariant sweep (descriptors + victim checksum)
+  addTest(450, "Comprehensive sweep: descriptors + victim checksum", async (intensity, mode) => {
     const victim = makeVictim(128 * 1024, 0x450 ^ 0xC0FFEE);
     const snap = snapshotVictim(victim.u8, 256);
-
     const keep = maybePressure(mode, intensity);
-    await microtaskChurn(Math.min(5, intensity));
 
-    // benign churn
+    // Descriptor checks again (strong)
+    const ta = new Uint8Array(16);
+    const protoTA = Object.getPrototypeOf(ta);
+    const props = ["length", "byteLength", "byteOffset"];
+    const bad = [];
+    for (const p of props) {
+      const d = Object.getOwnPropertyDescriptor(protoTA, p) || Object.getOwnPropertyDescriptor(ta, p);
+      if (d && (d.writable === true || d.configurable === true)) bad.push({ prop: p, desc: d });
+    }
+    if (bad.length) {
+      alertVuln(450, "Descriptors impossíveis detectados.", bad);
+      return;
+    }
+
+    // Benign churn
     const tmp = [];
     for (let i = 0; i < 200 * intensity; i++) tmp.push(new Uint8Array(new ArrayBuffer(1024)));
     for (let i = 0; i < tmp.length; i += 3) tmp[i] = null;
+    await microtaskChurn(Math.min(5, intensity));
 
     const cmp = compareSnapshot(victim.u8, snap);
-    if (!cmp.ok) alertVuln(450, "Comprehensive: victim corrompido após churn benigno.", cmp);
+    if (!cmp.ok) alertVuln(450, "Victim corrompido após churn benigno (IMPOSSIBLE).", cmp);
 
     void keep;
   });
@@ -592,7 +668,7 @@
     const mode = document.getElementById("mode").value;
 
     logLine("============================================================");
-    logLine("Run ALL :: 50 tests (401..450)");
+    logLine("Run ALL :: 50 tests (401..450) [IMPOSSIBLE INVARIANTS]");
     logLine("Config :: mode=" + mode + " intensity=" + intensity + " timeout=" + timeoutMs + "ms delay=" + delayMs + "ms");
     logLine("============================================================");
 
@@ -606,6 +682,7 @@
         await withTimeout(p, timeoutMs);
         logLine("DONE :: TEST " + t.num);
       } catch (e) {
+        // Exceções sozinhas não são sinal de corrupção: não alertar.
         logLine("DONE :: TEST " + t.num + " (exception ignored: " + ((e && e.name) ? e.name : "ERR") + ")");
       }
 
