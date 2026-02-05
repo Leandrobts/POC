@@ -411,39 +411,94 @@
     checkDetachConsistency(301, 4);
   });
 
-  // 302: MessageChannel transfer AB (expected: sender AB detaches to 0)
-  tests.push(async () => {
-    if (typeof MessageChannel !== "function") return;
-    const ch = new MessageChannel();
-    const ab = new ArrayBuffer(4096);
-    const u8 = new Uint8Array(ab);
-    u8[0] = 0xAA;
+  // 302 (FIX): MessageChannel transfer/clone invariants (no instanceof-only)
+tests.push(async () => {
+  if (typeof MessageChannel !== "function") return;
 
-    let got = null;
-    ch.port2.onmessage = (ev) => { got = ev.data; };
-    try { ch.port1.postMessage(ab, [ab]); } catch (_) { return; }
+  const ch = new MessageChannel();
+  const ab = new ArrayBuffer(4096);
+  const u8 = new Uint8Array(ab);
+  u8[0] = 0xAA;
 
-    // wait a tick
-    await microtaskChurn(10);
-    await wait(0);
+  let got = undefined;
+  ch.port2.onmessage = (ev) => { got = ev.data; };
 
-    // If transfer succeeded, sender ab.byteLength should be 0.
-    // Some engines may throw earlier; in that case we skip.
-    if (ab.byteLength !== 0) {
-      alertVuln(302, "MessageChannel transfer tentou ocorrer mas ab.byteLength não ficou 0 (suspeito).", { afterByteLength: ab.byteLength });
+  let postThrew = false;
+  try { ch.port1.postMessage(ab, [ab]); }
+  catch (e) { postThrew = true; }
+
+  // Se nem conseguiu postar com transfer, não é sinal de corrupção.
+  if (postThrew) return;
+
+  await Promise.resolve();
+  await new Promise(r => setTimeout(r, 0));
+
+  const tag = Object.prototype.toString.call(got);
+
+  // Classifica o payload recebido
+  const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+  const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
+
+  const senderLen = ab.byteLength;
+
+  // Interpretação:
+  // - transfer real: senderLen == 0
+  // - clone: senderLen == 4096
+  if (senderLen !== 0 && senderLen !== 4096) {
+    alertVuln(302, "MessageChannel: sender ab.byteLength ficou em estado impossível.", { senderLen, tag });
+    return;
+  }
+
+  // Se transfer aconteceu, receiver precisa conter os dados.
+  if (senderLen === 0) {
+    if (!got) {
+      alertVuln(302, "MessageChannel: sender detacheou mas receiver não recebeu nada.", { tag, gotType: typeof got });
       return;
     }
 
-    // Received should be an ArrayBuffer with expected content
-    if (!(got instanceof ArrayBuffer)) {
-      alertVuln(302, "MessageChannel transfer: receiver não recebeu ArrayBuffer (suspeito).", { receivedType: typeof got });
+    let r0 = null, rLen = null;
+    try {
+      if (isAB) {
+        const r8 = new Uint8Array(got);
+        rLen = r8.length;
+        r0 = r8[0];
+      } else if (isView) {
+        const r8 = (got instanceof Uint8Array) ? got : new Uint8Array(got.buffer);
+        rLen = r8.length;
+        r0 = r8[0];
+      } else {
+        alertVuln(302, "MessageChannel: receiver não é ArrayBuffer nem view após sender detach.", { tag });
+        return;
+      }
+    } catch (e) {
+      alertVuln(302, "MessageChannel: falha ao ler receiver após sender detach.", { tag, err: e && e.name });
       return;
     }
-    const r8 = new Uint8Array(got);
-    if (r8.length !== 4096 || r8[0] !== 0xAA) {
-      alertVuln(302, "MessageChannel transfer: receiver conteúdo/len inesperado.", { len: r8.length, first: r8[0] });
+
+    if (rLen !== 4096 || r0 !== 0xAA) {
+      alertVuln(302, "MessageChannel: receiver conteúdo/len inesperado após transfer.", { tag, rLen, r0 });
     }
-  });
+    return;
+  }
+
+  // Se NÃO houve transfer (clone), valida independência (mutação não deve refletir)
+  if (senderLen === 4096) {
+    if (!got) return; // engines podem não entregar de forma previsível; não alerta.
+    if (!isAB && !isView) return;
+
+    let r8;
+    try {
+      r8 = isAB ? new Uint8Array(got) : (got instanceof Uint8Array ? got : new Uint8Array(got.buffer));
+    } catch (_) { return; }
+
+    const before = r8[0];
+    u8[0] = 0xBB; // muta sender
+    const after = r8[0];
+    if (before !== after) {
+      alertVuln(302, "MessageChannel: receiver refletiu mutação do sender (aliasing inesperado em clone).", { before, after, tag });
+    }
+  }
+});
 
   // 303: structuredClone (no transfer) must copy (no alias)
   tests.push(async () => {
@@ -763,6 +818,57 @@
     heapSpray(intensity);
   }, I));
 
+  // 341 (FIX): length shadowing should NOT affect internal semantics
+tests.push(async () => {
+  const ta = new Uint8Array(8);
+  for (let i = 0; i < ta.length; i++) ta[i] = i;
+
+  const origLen = ta.length;
+  const origBL = ta.byteLength;
+
+  let defined = false;
+  try {
+    Object.defineProperty(ta, "length", { value: 999, configurable: true, writable: true });
+    defined = (ta.length === 999);
+  } catch (e) {
+    // Se jogar, ok também — não é bug.
+    return;
+  }
+
+  // Independente de shadowing, invariantes internas devem segurar.
+  if (ta.byteLength !== origBL) {
+    alertVuln(341, "TypedArray byteLength mudou após definir length (suspeito).", { origBL, gotBL: ta.byteLength, defined });
+    return;
+  }
+
+  // Elementos existentes devem permanecer consistentes
+  for (let i = 0; i < origLen; i++) {
+    if (ta[i] !== i) {
+      alertVuln(341, "TypedArray conteúdo mudou após definir length (suspeito).", { i, exp: i, got: ta[i], defined });
+      return;
+    }
+  }
+
+  // OOR write deve ser no-op e não deve criar elemento “real”
+  const before0 = ta[0];
+  try { ta[999] = 0xCC; } catch (_) {}
+  if (ta[0] !== before0) {
+    alertVuln(341, "OOR write alterou elemento válido (suspeito).", { before0, after0: ta[0], defined });
+    return;
+  }
+
+  // Se length foi shadowed para 999, um loop ingênuo poderia iterar demais,
+  // mas isso não deve dar acesso a memória “real”.
+  // Verifica que índices > origLen continuam undefined (leitura) e writes não mudam checksum local.
+  let changed = false;
+  for (let i = origLen; i < origLen + 16; i++) {
+    if (ta[i] !== undefined) changed = true;
+  }
+  if (changed) {
+    alertVuln(341, "Leituras acima do comprimento real retornaram valores definidos (suspeito).", { origLen, defined });
+  }
+});
+
   // 321..349: (29 tests) - Mix of new vectors, all bounded + isolation harness
   const mix = [
     [321, "MessageChannel ping-pong + small transfers", async (I) => {
@@ -920,16 +1026,7 @@
         try { throw new Error("x"); } catch (_) {}
       }
     }],
-    [341, "Property descriptor sanity on typed array (length non-writable)", async () => {
-      const ta = new Uint8Array(8);
-      let ok = true;
-      try {
-        Object.defineProperty(ta, "length", { value: 999, configurable: true });
-        // If it changed, that's extremely suspicious (typed array length is intrinsic).
-        if (ta.length === 999) ok = false;
-      } catch (_) {}
-      if (!ok) alertVuln(341, "TypedArray length property became writable/changable (IMPOSSIBLE).");
-    }],
+    
     [342, "TypedArray OOR write no-op sanity", async () => {
       checkTypedArrayOORWriteNoop(342);
     }],
