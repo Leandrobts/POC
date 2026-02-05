@@ -1,282 +1,481 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="utf-8">
-  <title>PS4 302 Isolator - MessageChannel transfer drop</title>
+  <meta charset="UTF-8" />
+  <title>PS4 WebKit – 302 Isolator V2 (MessageChannel transfer/clone invariants)</title>
 </head>
 <body>
-  <h2>PS4 302 Isolator (MessageChannel transfer)</h2>
+  <h2>PS4 WebKit – 302 Isolator V2</h2>
 
-  <button id="reset">Reset log</button>
-  <button id="run">Run 302 (N)</button>
-  <button id="stop">Stop</button>
+  <div>
+    <button id="btnReset">Reset log</button>
+    <button id="btnRun">Run</button>
+    <button id="btnStop">Stop</button>
+  </div>
 
-  <div style="margin-top:8px;">
-    <label>N (iterações):
-      <input id="N" type="number" value="30" min="1" step="1">
-    </label>
-    <label style="margin-left:12px;">Timeout por iteração (ms):
-      <input id="TO" type="number" value="1200" min="50" step="50">
-    </label>
-    <label style="margin-left:12px;">Delay entre iterações (ms):
-      <input id="DELAY" type="number" value="50" min="0" step="10">
+  <div>
+    <label>Mode:
+      <select id="mode">
+        <option value="A">A (baseline: new channel, start ports, 1 transfer)</option>
+        <option value="B">B (no start: new channel, no start, 1 transfer)</option>
+        <option value="C">C (reuse channel: 1 channel for all iterations)</option>
+        <option value="D">D (burst in-flight: 16 transfers back-to-back)</option>
+        <option value="E">E (teardown: close ports immediately after post)</option>
+        <option value="F">F (pressure: alloc pressure around post)</option>
+        <option value="G">G (mixed: alternate transfer and clone)</option>
+      </select>
     </label>
   </div>
 
-  <pre id="log" style="white-space:pre-wrap;margin-top:10px;"></pre>
+  <div>
+    <label>N (iterations):
+      <input id="iters" type="number" min="1" value="30">
+    </label>
+    <label>Timeout (ms):
+      <input id="timeout" type="number" min="50" value="1200">
+    </label>
+    <label>Delay (ms):
+      <input id="delay" type="number" min="0" value="50">
+    </label>
+  </div>
+
+  <div>
+    <label>Payload size:
+      <select id="psize">
+        <option value="4096">4096</option>
+        <option value="16384">16384</option>
+        <option value="65536">65536</option>
+      </select>
+    </label>
+
+    <label>Burst count (Mode D):
+      <input id="burst" type="number" min="2" value="16">
+    </label>
+
+    <label>Pressure MB (Mode F):
+      <input id="pressureMB" type="number" min="0" value="16">
+    </label>
+  </div>
+
+  <pre id="log" style="white-space:pre-wrap;"></pre>
 
 <script>
-(function(){
-  const $log = document.getElementById('log');
-  const now = () => String(Date.now());
-  const log = (s) => { $log.textContent += `[${now()}] ${s}\n`; };
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
 
-  let STOP = false;
+  function now() { return Date.now(); }
+  function log(msg) { logEl.textContent += `[${now()}] ${msg}\n`; }
+  function clearLog() { logEl.textContent = ""; }
 
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  function waitFor(condFn, timeoutMs){
-    // polling leve (compatível com engines antigas)
-    const start = Date.now();
-    return new Promise(resolve => {
-      (function tick(){
-        if (condFn()) return resolve(true);
-        if ((Date.now() - start) >= timeoutMs) return resolve(false);
-        setTimeout(tick, 0);
-      })();
+  function withTimeout(promise, ms) {
+    let t;
+    const timeout = new Promise((_, rej) => {
+      t = setTimeout(() => rej(new Error("TIMEOUT")), ms);
     });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
   }
 
-  function classifyPayload(x){
-    const tag = Object.prototype.toString.call(x);
+  function tagOf(x) {
+    try { return Object.prototype.toString.call(x); }
+    catch (_) { return "[object ?]"; }
+  }
+
+  // Heurística “não instanceof-only”
+  function classifyPayload(got) {
+    const tag = tagOf(got);
+
     const isAB = (tag === "[object ArrayBuffer]") ||
-                 (x && typeof x === "object" && typeof x.byteLength === "number" && typeof x.slice === "function");
-    const isView = (x && typeof x === "object" && typeof x.byteLength === "number" && x.buffer && typeof x.buffer === "object");
-    return { tag, isAB, isView, type: typeof x };
+      (!!got && typeof got === "object" &&
+       typeof got.byteLength === "number" &&
+       typeof got.slice === "function" &&
+       typeof got.constructor === "function");
+
+    const isView = (!!got && typeof got === "object" &&
+      typeof got.byteLength === "number" &&
+      !!got.buffer && typeof got.buffer === "object");
+
+    return { tag, isAB, isView };
   }
 
-  function readFirstByte(payload){
-    // Retorna {ok, len, b0, err}
-    try {
-      let u8;
-      const cls = classifyPayload(payload);
-      if (cls.isAB) u8 = new Uint8Array(payload);
-      else if (cls.isView) {
-        if (payload instanceof Uint8Array) u8 = payload;
-        else u8 = new Uint8Array(payload.buffer);
-      } else {
-        return { ok:false, len:null, b0:null, err:"NOT_AB_OR_VIEW", cls };
+  function alertVuln(code, msg, details) {
+    const payload = details ? JSON.stringify(details) : "";
+    const full = `ALERTA ${code}: ${msg}${payload ? " :: " + payload : ""}`;
+    log(full);
+    try { alert(full); } catch (_) {}
+  }
+
+  function xorChecksumU8(u8) {
+    let x = 0;
+    for (let i = 0; i < u8.length; i++) x ^= u8[i];
+    return x & 0xFF;
+  }
+
+  function fillPattern(u8, seedByte) {
+    // padrão simples, determinístico e verificável
+    for (let i = 0; i < u8.length; i++) u8[i] = (seedByte + i) & 0xFF;
+  }
+
+  function snapshotChecksumBlocks(u8) {
+    // checksum por blocos (forte o suficiente pra detectar 1-byte flip)
+    const blk = 256;
+    const out = [];
+    for (let off = 0; off < u8.length; off += blk) {
+      let x = 0;
+      const end = Math.min(u8.length, off + blk);
+      for (let i = off; i < end; i++) x ^= u8[i];
+      out.push(x & 0xFF);
+    }
+    return out;
+  }
+
+  function compareFull(u8, expectedSeedByte) {
+    // valida 100% (sem “valor != sentinel”)
+    for (let i = 0; i < u8.length; i++) {
+      const exp = (expectedSeedByte + i) & 0xFF;
+      if (u8[i] !== exp) return { ok: false, idx: i, got: u8[i], exp };
+    }
+    return { ok: true };
+  }
+
+  function allocPressure(mb) {
+    // pressão leve/moderada (sem travar): buffers descartáveis
+    const bytes = mb * 1024 * 1024;
+    const chunk = 256 * 1024;
+    const n = Math.max(0, Math.floor(bytes / chunk));
+    const tmp = [];
+    for (let i = 0; i < n; i++) tmp.push(new Uint8Array(chunk));
+    // solta referência logo em seguida
+  }
+
+  // ----------------------------
+  // Runner
+  // ----------------------------
+  let stopFlag = false;
+
+  function makeStats() {
+    return {
+      ok_detach: 0,
+      ok_clone: 0,
+      transfer_throw: 0,
+      drop: 0,
+
+      senderlen_impossible: 0,
+      recv_missing: 0,
+      recv_tag_weird: 0,
+      recv_read_fail: 0,
+      recv_len_bad: 0,
+      recv_data_bad: 0,
+
+      aliasing_in_clone: 0,
+      inconsistent_detach_access: 0, // views vivas com comportamento inconsistente
+
+      other: 0
+    };
+  }
+
+  // “após detach: consistente” (não exigimos throw vs 0, exigimos consistência)
+  function checkDetachedViewConsistency(u8, tries = 8) {
+    const results = [];
+    for (let i = 0; i < tries; i++) {
+      try {
+        // pode retornar 0/undefined, ou lançar; o importante é ser consistente
+        results.push({ kind: "read", v: u8[0] });
+      } catch (e) {
+        results.push({ kind: "throw", name: e && e.name });
       }
-      return { ok:true, len:u8.length, b0:u8[0], err:null, cls };
-    } catch (e) {
-      return { ok:false, len:null, b0:null, err:(e && e.name) || "ERR", cls: classifyPayload(payload) };
     }
+    const first = JSON.stringify(results[0]);
+    for (let i = 1; i < results.length; i++) {
+      if (JSON.stringify(results[i]) !== first) {
+        return { ok: false, results };
+      }
+    }
+    return { ok: true, results };
   }
 
-  async function runOne(iter, timeoutMs){
-    if (typeof MessageChannel !== "function") {
-      return { iter, status:"SKIP_NO_MESSAGECHANNEL" };
-    }
+  // Reuso opcional do channel (Mode C)
+  let sharedCh = null;
 
-    const ch = new MessageChannel();
+  function createChannel(mode) {
+    const ch = (mode === "C" && sharedCh) ? sharedCh : new MessageChannel();
+    if (mode === "C" && !sharedCh) sharedCh = ch;
+    return ch;
+  }
 
-    // IMPORTANT: alguns engines antigos requerem start()
-    try { ch.port1.start && ch.port1.start(); } catch(_){}
-    try { ch.port2.start && ch.port2.start(); } catch(_){}
+  function startPortsIfWanted(ch, mode) {
+    if (mode === "B") return; // "no start"
+    try { ch.port1.start && ch.port1.start(); } catch (_) {}
+    try { ch.port2.start && ch.port2.start(); } catch (_) {}
+  }
 
-    let gotPing = false;
-    let got = undefined;
+  async function waitDeliveryTick() {
+    // microtask + macrotask (boa compatibilidade)
+    await Promise.resolve();
+    await sleep(0);
+  }
+
+  async function runOne(mode, timeoutMs, payloadSize, burstCount, pressureMB, stats) {
+    if (typeof MessageChannel !== "function") return;
+
+    const ch = createChannel(mode);
+    startPortsIfWanted(ch, mode);
+
+    let gotList = [];
+    let gotCount = 0;
+
+    const wantBurst = (mode === "D");
+    const wantTeardown = (mode === "E");
+    const wantPressure = (mode === "F");
+    const wantMixed = (mode === "G");
+
+    let gotResolve;
+    const gotPromise = new Promise((res) => { gotResolve = res; });
 
     ch.port2.onmessage = (ev) => {
-      // Primeiro evento pode ser o ping, segundo o payload
-      if (ev && ev.data === 123) gotPing = true;
-      else got = ev ? ev.data : ev;
+      gotCount++;
+      gotList.push(ev.data);
+      // resolve no 1º evento (baseline), ou quando burst atingir count
+      if (!wantBurst) gotResolve(true);
+      else if (gotCount >= burstCount) gotResolve(true);
     };
 
-    // Invariante A: canal vivo (ping sem transfer)
-    let pingPostThrew = false;
-    try { ch.port1.postMessage(123); } catch (e) { pingPostThrew = true; }
+    // decide caminho: transfer vs clone (Mode G alterna)
+    const doTransfer = !wantMixed ? true : ((stats.ok_detach + stats.ok_clone) % 2 === 0);
 
-    if (pingPostThrew) {
-      // Se nem ping funciona, não dá pra afirmar nada sobre transfer
-      return { iter, status:"PING_POST_THREW" };
+    // prepara payload(s)
+    const seedBase = 0xA0; // só pra diferenciar do 0xAA literal
+    let abs = [];  // arraybuffers
+    let u8s = [];  // views sender
+
+    const msgN = wantBurst ? burstCount : 1;
+    for (let i = 0; i < msgN; i++) {
+      const ab = new ArrayBuffer(payloadSize);
+      const u8 = new Uint8Array(ab);
+      const seed = (seedBase + i) & 0xFF;
+      fillPattern(u8, seed);
+      abs.push(ab);
+      u8s.push(u8);
     }
 
-    const pingOk = await waitFor(() => gotPing === true, timeoutMs);
-    if (!pingOk) {
-      return { iter, status:"PING_TIMEOUT" };
-    }
+    // checksums dos senders (100% por bloco)
+    const senderBlocks = u8s.map(u8 => snapshotChecksumBlocks(u8));
 
-    // Invariante B: transfer real (detach)
-    const ab = new ArrayBuffer(4096);
-    const u8 = new Uint8Array(ab);
-    u8[0] = 0xAA;
+    let postThrew = false;
+    try {
+      if (wantPressure) allocPressure(pressureMB);
 
-    let transferPostThrew = false;
-    try { ch.port1.postMessage(ab, [ab]); } catch(e) { transferPostThrew = true; }
-
-    if (transferPostThrew) {
-      return { iter, status:"TRANSFER_POST_THREW" };
-    }
-
-    const senderLen = ab.byteLength; // 0 => detach real, 4096 => clone
-    if (senderLen !== 0 && senderLen !== 4096) {
-      return { iter, status:"SENDERLEN_IMPOSSIBLE", senderLen };
-    }
-
-    // Invariante C: se detach real, receiver deve receber payload íntegro
-    // (se clone, a entrega pode variar; não usamos para sinal forte)
-    if (senderLen === 0) {
-      const gotOk = await waitFor(() => got !== undefined, timeoutMs);
-
-      if (!gotOk) {
-        return { iter, status:"DROP_DETACH_NO_MESSAGE", senderLen, gotType: typeof got, tag: classifyPayload(got).tag };
-      }
-      if (!got) {
-        // null / 0 / false etc — aqui esperamos objeto
-        return { iter, status:"DROP_DETACH_GOT_FALSY", senderLen, gotType: typeof got, tag: classifyPayload(got).tag };
+      if (wantBurst) {
+        for (let i = 0; i < msgN; i++) {
+          if (doTransfer) ch.port1.postMessage(abs[i], [abs[i]]);
+          else ch.port1.postMessage(abs[i]); // clone path
+        }
+      } else {
+        if (doTransfer) ch.port1.postMessage(abs[0], [abs[0]]);
+        else ch.port1.postMessage(abs[0]); // clone
       }
 
-      const r = readFirstByte(got);
-      if (!r.ok) {
-        return {
-          iter,
-          status:"DETACH_GOT_UNREADABLE",
-          senderLen,
-          gotType: typeof got,
-          tag: r.cls && r.cls.tag,
-          err: r.err
-        };
+      if (wantTeardown) {
+        try { ch.port1.close && ch.port1.close(); } catch (_) {}
+        try { ch.port2.close && ch.port2.close(); } catch (_) {}
       }
 
-      if (r.len !== 4096 || r.b0 !== 0xAA) {
-        return {
-          iter,
-          status:"DETACH_BAD_CONTENT",
-          senderLen,
-          tag: r.cls.tag,
-          rLen: r.len,
-          r0: r.b0
-        };
+      if (wantPressure) allocPressure(pressureMB);
+    } catch (e) {
+      postThrew = true;
+      stats.transfer_throw++;
+      return;
+    }
+
+    // Aguarda entrega (ou drop)
+    let delivered = false;
+    try {
+      delivered = await withTimeout(gotPromise, timeoutMs);
+    } catch (e) {
+      // drop: nada recebido no timeout
+      stats.drop++;
+      return;
+    }
+
+    // aguarda mais um tick p/ estabilizar estado
+    await waitDeliveryTick();
+
+    // validações por mensagem
+    const checkMsg = (idx, got) => {
+      const { tag, isAB, isView } = classifyPayload(got);
+
+      const senderLen = abs[idx].byteLength; // 0 se transfer, payloadSize se clone
+
+      // Estado permitido: 0 (transfer) ou payloadSize (clone). Qualquer outro = impossível.
+      if (senderLen !== 0 && senderLen !== payloadSize) {
+        stats.senderlen_impossible++;
+        alertVuln(302, "sender ab.byteLength em estado impossível", { mode, idx, senderLen, payloadSize, tag });
+        return;
       }
 
-      return { iter, status:"OK_DETACH", senderLen };
+      // Se transfer: receiver tem que existir e bater conteúdo 100%
+      if (senderLen === 0) {
+        if (!got) {
+          stats.recv_missing++;
+          alertVuln(302, "sender detacheou mas receiver não recebeu nada", { mode, idx, tag, gotType: typeof got });
+          return;
+        }
+
+        let r8 = null;
+        try {
+          if (isAB) r8 = new Uint8Array(got);
+          else if (isView) {
+            // tenta view direta; fallback para buffer
+            if (tag === "[object Uint8Array]") r8 = got;
+            else r8 = new Uint8Array(got.buffer);
+          } else {
+            stats.recv_tag_weird++;
+            alertVuln(302, "receiver não é ArrayBuffer nem view após detach", { mode, idx, tag });
+            return;
+          }
+        } catch (e) {
+          stats.recv_read_fail++;
+          alertVuln(302, "falha ao ler receiver após detach", { mode, idx, tag, err: e && e.name });
+          return;
+        }
+
+        if (r8.length !== payloadSize) {
+          stats.recv_len_bad++;
+          alertVuln(302, "receiver length inesperado após transfer", { mode, idx, tag, rLen: r8.length, payloadSize });
+          return;
+        }
+
+        // valida 100% bytes
+        const seed = (seedBase + idx) & 0xFF;
+        const v = compareFull(r8, seed);
+        if (!v.ok) {
+          stats.recv_data_bad++;
+          alertVuln(302, "receiver conteúdo divergente após transfer (validação 100%)", { mode, idx, tag, firstBad: v });
+          return;
+        }
+
+        // Invariante forte extra: view do sender (u8s[idx]) está detached: comportamento consistente
+        const cons = checkDetachedViewConsistency(u8s[idx], 8);
+        if (!cons.ok) {
+          stats.inconsistent_detach_access++;
+          alertVuln(302, "após detach, acesso à view do sender ficou inconsistente", { mode, idx, sample: cons.results.slice(0, 4) });
+          return;
+        }
+
+        stats.ok_detach++;
+        return;
+      }
+
+      // Se clone: receiver pode ou não chegar (alguns ambientes), mas se chegar e for AB/view,
+      // deve ser independente (mutação no sender não reflete no receiver).
+      if (senderLen === payloadSize) {
+        if (!got) { stats.ok_clone++; return; }
+        if (!isAB && !isView) { stats.ok_clone++; return; }
+
+        let r8;
+        try {
+          r8 = isAB ? new Uint8Array(got) : (tag === "[object Uint8Array]" ? got : new Uint8Array(got.buffer));
+        } catch (_) { stats.ok_clone++; return; }
+
+        // guarda checksums do receiver antes
+        const beforeBlk = snapshotChecksumBlocks(r8);
+
+        // muta sender de forma clara
+        u8s[idx][0] ^= 0xFF;
+        u8s[idx][payloadSize - 1] ^= 0x7F;
+
+        // receiver NÃO pode mudar
+        const afterBlk = snapshotChecksumBlocks(r8);
+
+        if (JSON.stringify(beforeBlk) !== JSON.stringify(afterBlk)) {
+          stats.aliasing_in_clone++;
+          alertVuln(302, "clone com aliasing: receiver refletiu mutação do sender", {
+            mode, idx, tag,
+            before0: beforeBlk[0], after0: afterBlk[0]
+          });
+          return;
+        }
+
+        stats.ok_clone++;
+      }
+    };
+
+    if (!delivered) { stats.drop++; return; }
+
+    if (wantBurst) {
+      // se não recebeu todos (pode ocorrer), considera drop parcial como anomalia leve (log sem ALERTA)
+      if (gotList.length !== burstCount) {
+        // não ALERTA por default; pode ser limitação/ordem
+        log(`NOTE: burst recebeu ${gotList.length}/${burstCount} (mode=${mode})`);
+      }
+      const n = Math.min(gotList.length, msgN);
+      for (let i = 0; i < n; i++) checkMsg(i, gotList[i]);
+    } else {
+      checkMsg(0, gotList[0]);
     }
-
-    // clone path (senderLen === 4096): não tratamos como bug se não entregar,
-    // mas se entregar e refletir mutação (aliasing), isso é interessante.
-    const gotMaybe = await waitFor(() => got !== undefined, Math.min(200, timeoutMs));
-    if (!gotMaybe) return { iter, status:"OK_CLONE_NO_DELIVERY", senderLen };
-
-    const cls = classifyPayload(got);
-    if (!cls.isAB && !cls.isView) return { iter, status:"OK_CLONE_NONBUFFER", senderLen, tag: cls.tag };
-
-    const r = readFirstByte(got);
-    if (!r.ok) return { iter, status:"OK_CLONE_UNREADABLE", senderLen, tag: cls.tag };
-
-    const before = r.b0;
-    u8[0] = 0xBB;
-    const afterRead = readFirstByte(got);
-    if (afterRead.ok && afterRead.b0 !== before) {
-      return { iter, status:"ALIASING_IN_CLONE_UNEXPECTED", senderLen, tag: cls.tag, before, after: afterRead.b0 };
-    }
-
-    return { iter, status:"OK_CLONE", senderLen };
   }
 
-  async function runAll(){
-    STOP = false;
-    const N = Math.max(1, parseInt(document.getElementById('N').value, 10) || 30);
-    const TO = Math.max(50, parseInt(document.getElementById('TO').value, 10) || 1200);
-    const DELAY = Math.max(0, parseInt(document.getElementById('DELAY').value, 10) || 50);
+  async function runAll() {
+    stopFlag = false;
 
+    const mode = $("mode").value;
+    const N = Math.max(1, +$("iters").value || 30);
+    const timeoutMs = Math.max(50, +$("timeout").value || 1200);
+    const delayMs = Math.max(0, +$("delay").value || 0);
+    const payloadSize = Math.max(64, +$("psize").value || 4096);
+    const burstCount = Math.max(2, +$("burst").value || 16);
+    const pressureMB = Math.max(0, +$("pressureMB").value || 0);
+
+    const stats = makeStats();
+
+    log("Pronto. Dica: se no PS4 der drop, aumente Timeout e reduza Delay para achar janela de falha.");
     log("============================================================");
-    log(`Run 302 isolator :: N=${N} timeout=${TO}ms delay=${DELAY}ms`);
+    log(`Run 302 isolator V2 :: mode=${mode} N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms size=${payloadSize} burst=${burstCount} pressureMB=${pressureMB}`);
     log("============================================================");
 
-    const stats = {
-      ok_detach:0,
-      ok_clone:0,
-      ping_fail:0,
-      transfer_throw:0,
-      drops:0,
-      senderlen_impossible:0,
-      aliasing_in_clone:0,
-      other:0
-    };
+    // Reset shared channel on each run unless Mode C (reuse) is chosen
+    sharedCh = null;
 
-    const dropSamples = [];
-
-    for (let i = 1; i <= N; i++){
-      if (STOP) break;
-
-      const r = await runOne(i, TO);
-
-      // Contabiliza
-      switch (r.status) {
-        case "OK_DETACH": stats.ok_detach++; break;
-        case "OK_CLONE":
-        case "OK_CLONE_NO_DELIVERY":
-        case "OK_CLONE_NONBUFFER":
-        case "OK_CLONE_UNREADABLE":
-          stats.ok_clone++; break;
-        case "PING_POST_THREW":
-        case "PING_TIMEOUT":
-          stats.ping_fail++; break;
-        case "TRANSFER_POST_THREW":
-          stats.transfer_throw++; break;
-        case "SENDERLEN_IMPOSSIBLE":
-          stats.senderlen_impossible++; break;
-        case "ALIASING_IN_CLONE_UNEXPECTED":
-          stats.aliasing_in_clone++;
-          // isso é raro; amostra
-          if (dropSamples.length < 3) dropSamples.push(r);
-          break;
-        case "DROP_DETACH_NO_MESSAGE":
-        case "DROP_DETACH_GOT_FALSY":
-        case "DETACH_GOT_UNREADABLE":
-        case "DETACH_BAD_CONTENT":
-          stats.drops++;
-          if (dropSamples.length < 5) dropSamples.push(r);
-          break;
-        default:
-          if (r.status && r.status.startsWith("SKIP")) stats.other++;
-          else stats.other++;
+    for (let i = 0; i < N; i++) {
+      if (stopFlag) break;
+      try {
+        await runOne(mode, timeoutMs, payloadSize, burstCount, pressureMB, stats);
+      } catch (e) {
+        stats.other++;
+        log(`ERR: exception inesperada: ${e && e.name ? e.name : e}`);
       }
-
-      // Log mínimo (sem spam)
-      if (r.status !== "OK_DETACH" && r.status !== "OK_CLONE" && r.status !== "OK_CLONE_NO_DELIVERY") {
-        log(`iter ${i}: ${r.status}` + (r.senderLen !== undefined ? ` (senderLen=${r.senderLen})` : ""));
-      }
-
-      if (DELAY) await sleep(DELAY);
+      if (delayMs) await sleep(delayMs);
     }
 
     log("------------------------------------------------------------");
-    log(`RESULTADOS: ok_detach=${stats.ok_detach} ok_clone=${stats.ok_clone} ping_fail=${stats.ping_fail} transfer_throw=${stats.transfer_throw}`);
-    log(`          drops(detach path)=${stats.drops} senderlen_impossible=${stats.senderlen_impossible} aliasing_in_clone=${stats.aliasing_in_clone} other=${stats.other}`);
+    log(`RESULTADOS: ok_detach=${stats.ok_detach} ok_clone=${stats.ok_clone} transfer_throw=${stats.transfer_throw} drop=${stats.drop}`);
+    log(`          senderlen_impossible=${stats.senderlen_impossible} recv_missing=${stats.recv_missing} recv_tag_weird=${stats.recv_tag_weird}`);
+    log(`          recv_read_fail=${stats.recv_read_fail} recv_len_bad=${stats.recv_len_bad} recv_data_bad=${stats.recv_data_bad}`);
+    log(`          aliasing_in_clone=${stats.aliasing_in_clone} inconsistent_detach_access=${stats.inconsistent_detach_access} other=${stats.other}`);
 
-    if (dropSamples.length) {
-      log("AMOSTRAS:");
-      for (const s of dropSamples) log("  " + JSON.stringify(s));
-    }
-
-    // ALERTA FINAL: somente se for algo defensável
-    // - drop no caminho detach (canal vivo + detach real) OU senderLen impossível OU aliasing inesperado
-    if (stats.drops > 0 || stats.senderlen_impossible > 0 || stats.aliasing_in_clone > 0) {
-      alert("302 ISOLATOR ALERTA: achou inconsistência.\n" +
-            `drops(detach)=${stats.drops} senderLenImpossible=${stats.senderlen_impossible} aliasingInClone=${stats.aliasing_in_clone}\n` +
-            "Veja o log (amostras em JSON).");
-    } else {
+    if (!stopFlag &&
+        stats.senderlen_impossible === 0 &&
+        stats.recv_missing === 0 &&
+        stats.recv_tag_weird === 0 &&
+        stats.recv_read_fail === 0 &&
+        stats.recv_len_bad === 0 &&
+        stats.recv_data_bad === 0 &&
+        stats.aliasing_in_clone === 0 &&
+        stats.inconsistent_detach_access === 0) {
       log("OK: nenhuma inconsistência detectada nas condições atuais.");
+    } else {
+      log("ATENÇÃO: houve anomalias. Veja ALERTAs acima (se existirem) e os contadores.");
     }
   }
 
-  document.getElementById('reset').onclick = () => { $log.textContent = ""; log("Reset."); };
-  document.getElementById('run').onclick = runAll;
-  document.getElementById('stop').onclick = () => { STOP = true; log("Stop requested."); };
+  $("btnReset").onclick = () => { stopFlag = true; clearLog(); log("Reset."); };
+  $("btnStop").onclick  = () => { stopFlag = true; log("Stop solicitado."); };
+  $("btnRun").onclick   = () => { runAll(); };
 
-  log("Pronto. Dica: se no PS4 der drop, aumente Timeout e reduza Delay para achar janela de falha.");
+  // Auto-start message
+  log("Pronto. Selecione um Mode e clique Run.");
 })();
 </script>
 </body>
