@@ -1,343 +1,575 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="pt-BR">
 <head>
-  <meta charset="utf-8">
-  <title>PS4 POC Pack — TA/AB Impossible Invariants + MessageChannel Drop</title>
+  <meta charset="UTF-8" />
+  <title>PS4 Stability Triage (01..50) - No-DoS</title>
 </head>
 <body>
-  <h2>PS4 POC Pack — TypedArray/ArrayBuffer Invariants (no exploitation)</h2>
+  <h2>PS4 Browser – Stability Triage (01..50)</h2>
 
   <button id="btnReset">Reset log</button>
-  <button id="btnAB">T1 :: AB.byteLength descriptor audit</button>
-  <button id="btnA">A :: Object.defineProperty on ta[0]</button>
-  <button id="btnB">B :: Reflect.defineProperty on ta[0]</button>
-  <button id="btnC">C :: Proxy wrapper invariants</button>
-  <button id="btnD">D :: Cross-realm iframe reproduce</button>
-  <button id="btnT8">T8 :: MessageChannel transfer DROP detector (handshake)</button>
+  <button id="btnRun">Run ALL (01..50)</button>
+  <button id="btnStop">Stop</button>
 
-  <div style="margin-top:10px;">
-    N (T8 reps): <input id="N" type="number" value="30" min="1" step="1">
-    Delay (ms): <input id="delayMs" type="number" value="50" min="0" step="10">
-    Timeout (ms): <input id="timeoutMs" type="number" value="1200" min="100" step="50">
+  <div>
+    Delay (ms): <input id="delayMs" type="number" value="60" min="0" step="10">
+    Timeout por teste (ms): <input id="timeoutMs" type="number" value="1200" min="200" step="50">
+    Repetições (N): <input id="reps" type="number" value="1" min="1" max="50" step="1">
   </div>
 
-  <pre id="log" style="white-space:pre-wrap; margin-top:10px;"></pre>
+  <pre id="log"></pre>
 
 <script>
 (() => {
   "use strict";
 
   const $log = document.getElementById("log");
+  const $delay = document.getElementById("delayMs");
+  const $timeout = document.getElementById("timeoutMs");
+  const $reps = document.getElementById("reps");
 
-  function ts(){ return Date.now(); }
-  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
-  function resetLog(){ $log.textContent = ""; logLine("Reset."); }
+  let STOP = false;
+  let RUN_ID = 0;
 
-  function j(x){
-    try { return JSON.stringify(x, null, 2); }
-    catch(e){ return String(x); }
-  }
+  function ts() { return Date.now(); }
+  function logLine(s) { $log.textContent += `[${ts()}] ${s}\n`; }
+  function resetLog() { $log.textContent = ""; logLine("Reset."); }
+  function stopNow() { STOP = true; logLine("STOP requested."); }
 
-  function alertBox(tag, msg, extra){
-    const blob = extra ? ("\n" + j(extra)) : "";
-    const full = `${tag}: ${msg}${blob}`;
-    logLine(full);
-    alert(full);
-  }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  // -------------------------
-  // Helpers
-  // -------------------------
-  function auditDesc(obj, prop){
-    let d = null, threw = false, err = null;
-    try { d = Object.getOwnPropertyDescriptor(obj, prop); }
-    catch(e){ threw = true; err = e && e.name; }
-    return { threw, err, desc: d };
-  }
-
-  // IMPORTANT:
-  // Não assumimos "configurable deve ser false/true" (porque isso varia por spec/engine/historic).
-  // O que medimos é CONSISTÊNCIA:
-  //  - se desc diz configurable:true, delete não deveria lançar TypeError (comportamento típico de non-configurable).
-  //  - se delete falha/lança, mas desc diz configurable:true => inconsistente.
-  function taIndexConsistencyReport(label, defineFn){
-    const ab = new ArrayBuffer(16);
-    const ta = new Uint8Array(ab);
-    ta[0] = 7;
-
-    const baselineOwnDesc = auditDesc(ta, "0").desc;
-    logLine(`${label} Initial ta[0]=${ta[0]} baselineOwnDesc=${j(baselineOwnDesc)}`);
-
-    const defineRes = { ok: null, threw: false, err: null, desc: null };
-    try {
-      defineRes.ok = defineFn(ta);
-    } catch (e) {
-      defineRes.threw = true;
-      defineRes.err = e && e.name;
-    }
-    defineRes.desc = auditDesc(ta, "0").desc;
-
-    logLine(`${label} defineProperty result = ${j(defineRes)}`);
-    logLine(`${label} After defineProperty ta[0] = ${ta[0]}`);
-
-    // write afterwards
-    ta[0] = 0x33;
-
-    // delete paths
-    let del1 = null, del2 = null, del1Threw = false, del1Err = null;
-    try { del1 = delete ta[0]; }
-    catch(e){ del1Threw = true; del1Err = e && e.name; del1 = `THREW:${del1Err || "ERR"}`; }
-
-    try { del2 = Reflect.deleteProperty(ta, "0"); }
-    catch(e){ del2 = `THREW:${(e && e.name) || "ERR"}`; }
-
-    const descNow = auditDesc(ta, "0").desc;
-    const keys = (() => { try { return Reflect.ownKeys(ta); } catch(_) { return []; } })();
-
-    const report = {
-      baselineOwnDesc,
-      defineRes,
-      afterWrite: ta[0],
-      delete1: del1,
-      delete2: del2,
-      descNow,
-      ownKeys: keys
-    };
-
-    logLine(`${label} After ta[0]=0x33 / deletes / keys => ${j(report)}`);
-
-    // Consistency check:
-    // If descriptor claims configurable:true but delete behaves like non-configurable (throws TypeError / false),
-    // that is an invariant inconsistency worth reporting.
-    const cfg = descNow && typeof descNow.configurable === "boolean" ? descNow.configurable : null;
-
-    const deleteLooksNonConfig =
-      (del1Threw && del1Err === "TypeError") ||
-      (del2 === false) ||
-      (typeof del2 === "string" && del2.indexOf("THREW:TypeError") === 0);
-
-    if (cfg === true && deleteLooksNonConfig) {
-      alertBox("ALERTA", "TA index: descriptor diz configurable:true, mas delete falha/lança como se fosse non-configurable (inconsistência de invariantes).", report);
-      return;
-    }
-
-    logLine(`${label} OK: sem inconsistência forte detectada (neste run).`);
-  }
-
-  // Detach helper
-  function detachAttempt(ab){
-    if (typeof structuredClone === "function") {
-      try { structuredClone(ab, { transfer: [ab] }); return { attempted:true, ok:true, via:"structuredClone" }; }
-      catch(e){ return { attempted:true, ok:false, via:"structuredClone", err:(e&&e.name)||"ERR" }; }
-    }
-    if (typeof postMessage === "function") {
-      try { postMessage("x", "*", [ab]); return { attempted:true, ok:true, via:"postMessage" }; }
-      catch(e){ return { attempted:true, ok:false, via:"postMessage", err:(e&&e.name)||"ERR" }; }
-    }
-    return { attempted:false, ok:false, via:"none" };
-  }
-
-  async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  async function waitMessageOnce(port, timeoutMs){
-    return new Promise((resolve) => {
-      let done = false;
-      const t = setTimeout(() => {
-        if (done) return;
-        done = true;
-        cleanup();
-        resolve({ ok:false, reason:"timeout", data:undefined });
-      }, timeoutMs);
-
-      function onMsg(ev){
-        if (done) return;
-        done = true;
-        cleanup();
-        resolve({ ok:true, data: ev.data });
-      }
-
-      function cleanup(){
-        clearTimeout(t);
-        try { port.onmessage = null; } catch(_) {}
-      }
-
-      try { port.onmessage = onMsg; } catch(_) {}
-      try { port.start && port.start(); } catch(_) {}
+  function withTimeout(promise, ms) {
+    let t;
+    const timeout = new Promise((_, rej) => {
+      t = setTimeout(() => rej(new Error("TIMEOUT")), ms);
     });
+    return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
   }
 
-  // -------------------------
-  // Buttons
-  // -------------------------
-  document.getElementById("btnReset").onclick = resetLog;
-
-  // T1: AB descriptor audit (não chama de "impossible" por si só)
-  document.getElementById("btnAB").onclick = async () => {
-    logLine("============================================================");
-    logLine("POC: ArrayBuffer.prototype.byteLength descriptor audit");
-    logLine("============================================================");
-
-    const d = auditDesc(ArrayBuffer.prototype, "byteLength").desc;
-    logLine(`Descriptor(ArrayBuffer.prototype.byteLength) = ${j(d)}`);
-
-    // Quick detach sample
-    const ab = new ArrayBuffer(16);
-    const beforeLen = ab.byteLength;
-    const det = detachAttempt(ab);
-    const afterLen = ab.byteLength;
-
-    logLine(`Sample: beforeLen=${beforeLen} afterLen=${afterLen} detachAttempted=${det.attempted} via=${det.via} ok=${det.ok}`);
-
-    // Aqui o "impacto" que vale reportar é: descriptor configurável pode quebrar hardening baseado em descriptor.
-    // Não é "corrupção", é "policy/integrity hazard".
-    if (d && d.configurable === true) {
-      alertBox("INFO", "AB.byteLength aparece configurable:true. Isso por si só não prova corrupção; mas pode afetar hardening baseado em descriptors (impacto comportamental).", { desc:d, detachSample:{beforeLen, afterLen, det} });
+  // Helpers (bounded, no-DoS)
+  function makeSmallTree(nodes) {
+    const root = document.createElement("div");
+    let cur = root;
+    for (let i = 0; i < nodes; i++) {
+      const d = document.createElement("div");
+      d.textContent = "n" + i;
+      cur.appendChild(d);
+      cur = d;
     }
-  };
+    return root;
+  }
 
-  // A
-  document.getElementById("btnA").onclick = async () => {
-    logLine("============================================================");
-    logLine("POC A: Object.defineProperty em ta[0]");
-    logLine("============================================================");
-    taIndexConsistencyReport("A", (ta) => Object.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
-  };
-
-  // B
-  document.getElementById("btnB").onclick = async () => {
-    logLine("============================================================");
-    logLine("POC B: Reflect.defineProperty em ta[0]");
-    logLine("============================================================");
-    taIndexConsistencyReport("B", (ta) => Reflect.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
-  };
-
-  // C
-  document.getElementById("btnC").onclick = async () => {
-    logLine("============================================================");
-    logLine("POC C: Proxy invariants (defineProperty via Proxy wrapper)");
-    logLine("============================================================");
-    taIndexConsistencyReport("C", (ta) => {
-      const p = new Proxy(ta, {});
-      return Reflect.defineProperty(p, "0", { value: 9, writable: true, enumerable: true, configurable: true });
-    });
-  };
-
-  // D
-  document.getElementById("btnD").onclick = async () => {
-    logLine("============================================================");
-    logLine("POC D: Cross-realm iframe reproduce");
-    logLine("============================================================");
-
+  function makeIframeHidden() {
     const f = document.createElement("iframe");
-    f.style.display = "none";
+    f.width = "1";
+    f.height = "1";
+    f.setAttribute("sandbox", "allow-scripts allow-same-origin");
     document.body.appendChild(f);
+    return f;
+  }
 
-    let res = null;
+  function safeDetachAB(ab) {
+    // Best-effort: structuredClone transfer if available.
+    if (typeof structuredClone === "function") {
+      try { structuredClone(ab, { transfer: [ab] }); return true; } catch (_) {}
+    }
+    return false;
+  }
+
+  function safeClone(obj) {
+    if (typeof structuredClone === "function") {
+      try { return structuredClone(obj); } catch (_) { return null; }
+    }
+    // fallback: JSON clone for plain objects only
+    try { return JSON.parse(JSON.stringify(obj)); } catch (_) { return null; }
+  }
+
+  // =========================
+  // Tests (01..50) - bounded stability triage (não DoS)
+  // Log APENAS start/end; qualquer crash/CE “grava” o último start.
+  // =========================
+  const tests = [];
+
+  // 01: Basic TypedArray create/read/write (small)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(256);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0x11;
+    u8[255] = 0x22;
+    void u8[0]; void u8[255];
+  });
+
+  // 02: DataView unaligned get/set (small)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(64);
+    const dv = new DataView(ab);
+    dv.setUint32(1, 0x12345678, true);
+    dv.getUint32(1, true);
+  });
+
+  // 03: subarray clamp sanity
+  tests.push(async () => {
+    const u8 = new Uint8Array(64);
+    for (let i = 0; i < u8.length; i++) u8[i] = i;
+    const s = u8.subarray(-10, 1000);
+    if (s.length) s[0] = 0xAA;
+  });
+
+  // 04: copyWithin overlap (small)
+  tests.push(async () => {
+    const u8 = new Uint8Array(64);
+    u8.fill(0x41);
+    u8.copyWithin(1, 0, 32);
+  });
+
+  // 05: set overlap (same buffer)
+  tests.push(async () => {
+    const u8 = new Uint8Array(64);
+    for (let i = 0; i < 64; i++) u8[i] = i;
+    u8.set(u8.subarray(0, 16), 8);
+  });
+
+  // 06: ArrayBuffer.slice independence
+  tests.push(async () => {
+    const ab = new ArrayBuffer(128);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0xAB;
+    const ab2 = ab.slice(0);
+    const u82 = new Uint8Array(ab2);
+    u8[0] = 0xCD;
+    void u82[0];
+  });
+
+  // 07: structuredClone plain object
+  tests.push(async () => {
+    const o = { a: 1, b: { c: 2 }, d: [1,2,3] };
+    safeClone(o);
+  });
+
+  // 08: structuredClone(ArrayBuffer) clone path
+  tests.push(async () => {
+    if (typeof structuredClone !== "function") return;
+    const ab = new ArrayBuffer(256);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0x5A;
+    const ab2 = structuredClone(ab);
+    void new Uint8Array(ab2)[0];
+  });
+
+  // 09: structuredClone transfer detach (best-effort)
+  tests.push(async () => {
+    if (typeof structuredClone !== "function") return;
+    const ab = new ArrayBuffer(256);
+    safeDetachAB(ab);
+    void ab.byteLength;
+  });
+
+  // 10: MessageChannel basic send/recv (no transfer)
+  tests.push(async () => {
+    if (typeof MessageChannel !== "function") return;
+    const ch = new MessageChannel();
+    let got = 0;
+    ch.port2.onmessage = (ev) => { got = ev.data | 0; };
+    ch.port1.postMessage(123);
+    await sleep(0);
+    void got;
+    ch.port1.close(); ch.port2.close();
+  });
+
+  // 11: MessageChannel transfer AB (small) best-effort
+  tests.push(async () => {
+    if (typeof MessageChannel !== "function") return;
+    const ch = new MessageChannel();
+    const ab = new ArrayBuffer(256);
+    const u8 = new Uint8Array(ab); u8[0] = 0xAA;
+    let got;
+    ch.port2.onmessage = (ev) => { got = ev.data; };
+    try { ch.port1.postMessage(ab, [ab]); } catch (_) { /* ignore */ }
+    await sleep(0);
+    void ab.byteLength;
+    void got;
+    ch.port1.close(); ch.port2.close();
+  });
+
+  // 12: history.pushState with small object
+  tests.push(async () => {
+    if (!history || !history.pushState) return;
+    history.pushState({ x: 1, y: "a" }, "", "#t12_" + Math.random().toString(16).slice(2));
+  });
+
+  // 13: history.replaceState small object
+  tests.push(async () => {
+    if (!history || !history.replaceState) return;
+    history.replaceState({ k: "v", n: 2 }, "", "#t13_" + Math.random().toString(16).slice(2));
+  });
+
+  // 14: popstate handler attach/detach
+  tests.push(async () => {
+    const fn = () => {};
+    window.addEventListener("popstate", fn);
+    window.removeEventListener("popstate", fn);
+  });
+
+  // 15: DOM small tree create/remove
+  tests.push(async () => {
+    const t = makeSmallTree(40);
+    document.body.appendChild(t);
+    t.remove();
+  });
+
+  // 16: DOMParser parse small HTML
+  tests.push(async () => {
+    if (typeof DOMParser !== "function") return;
+    const p = new DOMParser();
+    p.parseFromString("<div><span>ok</span></div>", "text/html");
+  });
+
+  // 17: Range operations (small)
+  tests.push(async () => {
+    const d = document.createElement("div");
+    d.textContent = "abcdef";
+    document.body.appendChild(d);
+    const r = document.createRange();
+    r.selectNodeContents(d);
+    r.setStart(d.firstChild, 1);
+    r.setEnd(d.firstChild, 4);
+    d.remove();
+  });
+
+  // 18: Selection API (best-effort)
+  tests.push(async () => {
+    const sel = window.getSelection && window.getSelection();
+    if (!sel) return;
+    sel.removeAllRanges();
+  });
+
+  // 19: create/remove iframe (teardown light)
+  tests.push(async () => {
+    const f = makeIframeHidden();
+    f.remove();
+  });
+
+  // 20: iframe write simple doc then remove
+  tests.push(async () => {
+    const f = makeIframeHidden();
     try {
       const w = f.contentWindow;
-      const ta = new w.Uint8Array(new w.ArrayBuffer(16));
-      ta[0] = 7;
-
-      let ok = null, threw=false, err=null;
-      try {
-        ok = w.Reflect.defineProperty(ta, "0", { value: 9, writable:true, enumerable:true, configurable:true });
-      } catch(e){ threw=true; err=(e&&e.name)||"ERR"; }
-
-      const desc = w.Object.getOwnPropertyDescriptor(ta, "0");
-      res = { ok, threw, err, desc, ta0: ta[0] };
-
-      logLine(`iframe result => ${j(res)}`);
-
-      // Mesma regra: se desc diz configurable:true e delete falha => inconsistente
-      let del2 = null;
-      try { del2 = w.Reflect.deleteProperty(ta, "0"); } catch(e){ del2 = `THREW:${(e&&e.name)||"ERR"}`; }
-
-      if (desc && desc.configurable === true && del2 === false) {
-        alertBox("ALERTA", "Cross-realm: descriptor configurable:true mas Reflect.deleteProperty=false (inconsistência).", { res, del2 });
-      } else {
-        logLine("D OK: sem inconsistencia forte detectada (neste run).");
+      const d = f.contentDocument;
+      if (w && d) {
+        d.open();
+        d.write("<!doctype html><meta charset=utf-8><title>x</title><p>ok</p>");
+        d.close();
       }
-    } finally {
-      try { f.remove(); } catch(_) {}
+    } catch (_) {}
+    f.remove();
+  });
+
+  // 21: URL + Blob create/revoke (small)
+  tests.push(async () => {
+    if (typeof Blob !== "function" || !URL || !URL.createObjectURL) return;
+    const b = new Blob(["hello"], { type: "text/plain" });
+    const u = URL.createObjectURL(b);
+    URL.revokeObjectURL(u);
+  });
+
+  // 22: TextEncoder/TextDecoder roundtrip
+  tests.push(async () => {
+    if (typeof TextEncoder !== "function" || typeof TextDecoder !== "function") return;
+    const enc = new TextEncoder();
+    const dec = new TextDecoder("utf-8");
+    const buf = enc.encode("abc");
+    dec.decode(buf);
+  });
+
+  // 23: Promise microtask chain small
+  tests.push(async () => {
+    let p = Promise.resolve();
+    for (let i = 0; i < 50; i++) p = p.then(() => {});
+    await p;
+  });
+
+  // 24: setTimeout(0) scheduling
+  tests.push(async () => {
+    await new Promise(r => setTimeout(r, 0));
+  });
+
+  // 25: requestAnimationFrame one frame (if available)
+  tests.push(async () => {
+    if (typeof requestAnimationFrame !== "function") return;
+    await new Promise(r => requestAnimationFrame(() => r()));
+  });
+
+  // 26: EventTarget add/remove listeners on element
+  tests.push(async () => {
+    const b = document.createElement("button");
+    const fn = () => {};
+    b.addEventListener("click", fn);
+    b.removeEventListener("click", fn);
+  });
+
+  // 27: MutationObserver attach/disconnect
+  tests.push(async () => {
+    if (typeof MutationObserver !== "function") return;
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    const mo = new MutationObserver(() => {});
+    mo.observe(div, { childList: true, subtree: true });
+    div.appendChild(document.createElement("span"));
+    mo.disconnect();
+    div.remove();
+  });
+
+  // 28: DOMTokenList classList churn small
+  tests.push(async () => {
+    const d = document.createElement("div");
+    d.classList.add("a");
+    d.classList.toggle("b");
+    d.classList.remove("a");
+  });
+
+  // 29: dataset set/get
+  tests.push(async () => {
+    const d = document.createElement("div");
+    d.dataset.x = "1";
+    void d.dataset.x;
+  });
+
+  // 30: small canvas create/destroy (no heavy draw)
+  tests.push(async () => {
+    const c = document.createElement("canvas");
+    c.width = 64; c.height = 64;
+    const ctx = c.getContext && c.getContext("2d");
+    if (ctx) ctx.fillRect(1,1,2,2);
+  });
+
+  // 31: Audio element create/load (no autoplay)
+  tests.push(async () => {
+    const a = document.createElement("audio");
+    a.src = "";
+    a.load();
+  });
+
+  // 32: Video element create/load (no autoplay)
+  tests.push(async () => {
+    const v = document.createElement("video");
+    v.src = "";
+    v.load();
+  });
+
+  // 33: form named item add/remove
+  tests.push(async () => {
+    const form = document.createElement("form");
+    const input = document.createElement("input");
+    input.name = "boom";
+    form.appendChild(input);
+    document.body.appendChild(form);
+    void form.boom;
+    input.remove();
+    void form.boom;
+    form.remove();
+  });
+
+  // 34: NodeIterator traversal small
+  tests.push(async () => {
+    if (!document.createNodeIterator) return;
+    const root = document.createElement("div");
+    root.innerHTML = "<p>a<b>b</b></p><p>c</p>";
+    document.body.appendChild(root);
+    const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+    while (it.nextNode()) {}
+    root.remove();
+  });
+
+  // 35: TreeWalker traversal small
+  tests.push(async () => {
+    if (!document.createTreeWalker) return;
+    const root = document.createElement("div");
+    root.innerHTML = "<p>a<b>b</b></p><p>c</p>";
+    document.body.appendChild(root);
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    while (tw.nextNode()) {}
+    root.remove();
+  });
+
+  // 36: JSON stringify/parse moderate object
+  tests.push(async () => {
+    const o = { a: [1,2,3], b: { c: "x" }, d: true };
+    const s = JSON.stringify(o);
+    JSON.parse(s);
+  });
+
+  // 37: RegExp exec loop bounded
+  tests.push(async () => {
+    const re = /a/g;
+    const s = "aaaaa";
+    for (let i = 0; i < 10; i++) re.exec(s);
+  });
+
+  // 38: String ops bounded
+  tests.push(async () => {
+    const s = "abcd".repeat(50);
+    s.substring(10, 100);
+  });
+
+  // 39: Map/Set churn small
+  tests.push(async () => {
+    const m = new Map();
+    for (let i = 0; i < 50; i++) m.set(i, i*i);
+    m.delete(10);
+    void m.get(20);
+    const s = new Set();
+    for (let i = 0; i < 50; i++) s.add(i);
+    s.has(33);
+  });
+
+  // 40: WeakMap churn small (if available)
+  tests.push(async () => {
+    if (typeof WeakMap !== "function") return;
+    const wm = new WeakMap();
+    const k = {};
+    wm.set(k, 1);
+    wm.get(k);
+  });
+
+  // 41: TypedArray.from with getter side-effect (bounded)
+  tests.push(async () => {
+    const arrLike = {
+      length: 8,
+      get 0() { return 1; },
+      get 1() { return 2; },
+      get 2() { return 3; },
+      get 3() { return 4; },
+      get 4() { return 5; },
+      get 5() { return 6; },
+      get 6() { return 7; },
+      get 7() { return 8; },
+    };
+    Uint8Array.from(arrLike);
+  });
+
+  // 42: Proxy length trap (bounded)
+  tests.push(async () => {
+    const base = [1,2,3,4];
+    const p = new Proxy(base, {
+      get(t, prop, r) {
+        if (prop === "length") return 4;
+        return Reflect.get(t, prop, r);
+      }
+    });
+    Uint8Array.from(p);
+  });
+
+  // 43: Object.defineProperty on normal array index (control)
+  tests.push(async () => {
+    const a = [1,2,3];
+    Object.defineProperty(a, "0", { value: 9, writable: true, configurable: true });
+    delete a[0];
+  });
+
+  // 44: DOM teardown + microtasks (bounded)
+  tests.push(async () => {
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    div.remove();
+    await Promise.resolve();
+  });
+
+  // 45: create/remove multiple small nodes (bounded)
+  tests.push(async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    for (let i = 0; i < 50; i++) {
+      const s = document.createElement("span");
+      s.textContent = "x";
+      host.appendChild(s);
     }
-  };
+    host.remove();
+  });
 
-  // T8
-  document.getElementById("btnT8").onclick = async () => {
-    const N = Math.max(1, parseInt(document.getElementById("N").value || "30", 10));
-    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value || "50", 10));
-    const timeoutMs = Math.max(100, parseInt(document.getElementById("timeoutMs").value || "1200", 10));
+  // 46: Image element create/load empty
+  tests.push(async () => {
+    const img = document.createElement("img");
+    img.src = "";
+    void img.complete;
+  });
+
+  // 47: Fetch API presence check (no network)
+  tests.push(async () => {
+    void (typeof fetch);
+  });
+
+  // 48: requestIdleCallback (if available)
+  tests.push(async () => {
+    if (typeof requestIdleCallback !== "function") return;
+    await new Promise(r => requestIdleCallback(() => r()));
+  });
+
+  // 49: Small structuredClone transfer loop (very bounded)
+  tests.push(async () => {
+    if (typeof structuredClone !== "function") return;
+    for (let i = 0; i < 3; i++) {
+      const ab = new ArrayBuffer(128);
+      safeDetachAB(ab);
+      void ab.byteLength;
+    }
+  });
+
+  // 50: Final tiny mixed sequence (bounded)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(256);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0xAA;
+    const sub = u8.subarray(0, 8);
+    sub[0] = 0xBB;
+    await sleep(0);
+  });
+
+  // =========================
+  // Runner
+  // =========================
+  async function runAll() {
+    STOP = false;
+    RUN_ID++;
+    const runId = RUN_ID;
+
+    const delayMs = Math.max(0, parseInt($delay.value || "0", 10));
+    const timeoutMs = Math.max(200, parseInt($timeout.value || "1200", 10));
+    const reps = Math.min(50, Math.max(1, parseInt($reps.value || "1", 10)));
 
     logLine("============================================================");
-    logLine("POC T8: MessageChannel transfer drop detector (handshake)");
+    logLine("Run ALL :: 50 tests (01..50)");
+    logLine("Config :: " + JSON.stringify({ reps, delayMs, timeoutMs }));
     logLine("============================================================");
-    logLine(`Config :: N=${N} delayMs=${delayMs} timeoutMs=${timeoutMs}`);
 
-    let ok_detach = 0, ok_clone = 0, transfer_throw = 0;
-    let drops_detach_path = 0, sender_impossible = 0, other = 0;
+    for (let r = 0; r < reps; r++) {
+      if (STOP || runId !== RUN_ID) break;
 
-    for (let i = 0; i < N; i++) {
-      const ch = new MessageChannel();
-      const ab = new ArrayBuffer(4096);
-      const u8 = new Uint8Array(ab);
-      u8[0] = 0xAA;
+      for (let i = 0; i < tests.length; i++) {
+        if (STOP || runId !== RUN_ID) break;
 
-      // Arm message waiter BEFORE posting
-      const waiter = waitMessageOnce(ch.port2, timeoutMs);
+        const tn = String(i + 1).padStart(2, "0");
+        logLine("RUN :: TEST " + tn);
 
-      let threw = false;
-      try { ch.port1.postMessage(ab, [ab]); }
-      catch(e){ threw = true; }
-
-      if (threw) {
-        transfer_throw++;
-        if (delayMs) await sleep(delayMs);
-        continue;
-      }
-
-      const senderLen = ab.byteLength;
-      if (senderLen !== 0 && senderLen !== 4096) {
-        sender_impossible++;
-        if (delayMs) await sleep(delayMs);
-        continue;
-      }
-
-      const msg = await waiter;
-
-      if (senderLen === 0) {
-        // Transfer path: receiver SHOULD arrive eventually. If timeout => treat as "drop under timeout".
-        if (!msg.ok || msg.data === undefined) {
-          drops_detach_path++;
-        } else {
-          try {
-            const r8 = (Object.prototype.toString.call(msg.data) === "[object ArrayBuffer]")
-              ? new Uint8Array(msg.data)
-              : (msg.data && msg.data.buffer ? new Uint8Array(msg.data.buffer) : null);
-
-            if (r8 && r8.length === 4096 && r8[0] === 0xAA) ok_detach++;
-            else other++;
-          } catch(_) { other++; }
+        try {
+          await withTimeout(Promise.resolve(tests[i]()), timeoutMs);
+        } catch (_) {
+          // Sem log de erro por design: seu objetivo é achar crash/CE pelo último RUN.
+          // Se quiser, posso incluir contagem de exceptions separada.
         }
-      } else {
-        // Clone path: detach didn't happen
-        ok_clone++;
+
+        logLine("DONE :: TEST " + tn);
+
+        if (delayMs) await sleep(delayMs);
       }
-
-      if (delayMs) await sleep(delayMs);
     }
 
-    const summary = { ok_detach, ok_clone, transfer_throw, drops_detach_path, sender_impossible, other };
-    logLine(`RESULTADOS: ${j(summary)}`);
+    logLine("ALL DONE.");
+  }
 
-    // Só alerta se tiver drop relevante em detach path.
-    if (drops_detach_path > 0) {
-      alertBox("ALERTA", "MessageChannel: detach confirmado (senderLen==0) mas receiver não chegou dentro do timeout (DROP/atraso severo). Isso é inconsistência observável (pode ser bug de entrega, não necessariamente corrupção).", summary);
-    } else {
-      logLine("OK: nenhum drop detectado nas condições atuais.");
-    }
-  };
+  document.getElementById("btnReset").onclick = resetLog;
+  document.getElementById("btnStop").onclick = stopNow;
+  document.getElementById("btnRun").onclick = runAll;
 
-  // init
   resetLog();
 })();
 </script>
