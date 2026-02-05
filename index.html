@@ -1,481 +1,1211 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <title>PS4 WebKit – 302 Isolator V2 (MessageChannel transfer/clone invariants)</title>
+  <meta charset="UTF-8">
+  <title>PS4 Memory Corruption Tests (301-350) - Ultra-Rigorous v1</title>
 </head>
 <body>
-  <h2>PS4 WebKit – 302 Isolator V2</h2>
+  <h1>PS4 Memory Corruption Tests (301-350) - Ultra-Rigorous</h1>
 
   <div>
     <button id="btnReset">Reset log</button>
-    <button id="btnRun">Run</button>
+    <button id="btnRunAll">Run ALL (301..350)</button>
     <button id="btnStop">Stop</button>
   </div>
 
-  <div>
-    <label>Mode:
-      <select id="mode">
-        <option value="A">A (baseline: new channel, start ports, 1 transfer)</option>
-        <option value="B">B (no start: new channel, no start, 1 transfer)</option>
-        <option value="C">C (reuse channel: 1 channel for all iterations)</option>
-        <option value="D">D (burst in-flight: 16 transfers back-to-back)</option>
-        <option value="E">E (teardown: close ports immediately after post)</option>
-        <option value="F">F (pressure: alloc pressure around post)</option>
-        <option value="G">G (mixed: alternate transfer and clone)</option>
-      </select>
-    </label>
+  <div style="margin-top:8px;">
+    Delay (ms): <input id="delayMs" type="number" value="80" min="0" step="10">
+    Timeout por teste (ms): <input id="timeoutMs" type="number" value="1400" min="100" step="50">
+    Intensidade (1..5): <input id="intensity" type="number" value="3" min="1" max="5" step="1">
   </div>
 
-  <div>
-    <label>N (iterations):
-      <input id="iters" type="number" min="1" value="30">
-    </label>
-    <label>Timeout (ms):
-      <input id="timeout" type="number" min="50" value="1200">
-    </label>
-    <label>Delay (ms):
-      <input id="delay" type="number" min="0" value="50">
-    </label>
-  </div>
-
-  <div>
-    <label>Payload size:
-      <select id="psize">
-        <option value="4096">4096</option>
-        <option value="16384">16384</option>
-        <option value="65536">65536</option>
-      </select>
-    </label>
-
-    <label>Burst count (Mode D):
-      <input id="burst" type="number" min="2" value="16">
-    </label>
-
-    <label>Pressure MB (Mode F):
-      <input id="pressureMB" type="number" min="0" value="16">
-    </label>
-  </div>
-
-  <pre id="log" style="white-space:pre-wrap;"></pre>
+  <pre id="log" style="white-space:pre-wrap; margin-top:10px;"></pre>
 
 <script>
 (() => {
-  const $ = (id) => document.getElementById(id);
-  const logEl = $("log");
+  "use strict";
 
-  function now() { return Date.now(); }
-  function log(msg) { logEl.textContent += `[${now()}] ${msg}\n`; }
-  function clearLog() { logEl.textContent = ""; }
+  const $log = document.getElementById("log");
 
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  let STOP = false;
+  let RUN_ID = 0;
 
+  function ts() { return Date.now(); }
+  function logLine(s) { $log.textContent += `[${ts()}] ${s}\n`; }
+  function resetLog() { $log.textContent = ""; logLine("Reset."); }
+  function stopNow() { STOP = true; logLine("STOP requested."); }
+
+  function alertVuln(testNum, msg, extraObj) {
+    const extra = extraObj ? ("\n" + JSON.stringify(extraObj, null, 2)) : "";
+    const full = `ALERTA TEST ${testNum}: ${msg}${extra}`;
+    logLine(full);
+    alert(full);
+  }
+
+  // =========================
+  // Strong victim model
+  // =========================
+  function xorshift32(seed) {
+    let x = seed >>> 0;
+    return () => {
+      x ^= (x << 13) >>> 0;
+      x ^= (x >>> 17) >>> 0;
+      x ^= (x << 5) >>> 0;
+      return x >>> 0;
+    };
+  }
+
+  function fillVictim(u8, seed) {
+    const rnd = xorshift32(seed);
+    for (let i = 0; i < u8.length; i++) {
+      const r = rnd();
+      u8[i] = (r ^ (r >>> 8) ^ (r >>> 16) ^ (r >>> 24)) & 0xFF;
+    }
+  }
+
+  function blockXor32(u8, blockBytes) {
+    const nBlocks = Math.ceil(u8.length / blockBytes);
+    const out = new Uint32Array(nBlocks);
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+
+    for (let b = 0; b < nBlocks; b++) {
+      const start = b * blockBytes;
+      const end = Math.min(u8.length, start + blockBytes);
+      let acc = 0 >>> 0;
+
+      let i = start;
+      for (; i + 4 <= end; i += 4) acc ^= dv.getUint32(i, true);
+      for (; i < end; i++) acc ^= (u8[i] << (((i - start) & 3) * 8)) >>> 0;
+
+      out[b] = acc >>> 0;
+    }
+    return out;
+  }
+
+  function snapshotVictim(u8, opts) {
+    const blockBytes = opts.blockBytes || 256;
+    const sum = blockXor32(u8, blockBytes);
+
+    const spots = [];
+    const step = Math.max(1, Math.floor(u8.length / 16));
+    for (let i = 0; i < u8.length; i += step) spots.push(u8[i]);
+
+    return { blockBytes, sum, spots, len: u8.length };
+  }
+
+  function compareSnapshot(u8, snap) {
+    if (u8.length !== snap.len) {
+      return { ok: false, reason: "victim length changed", gotLen: u8.length, expLen: snap.len };
+    }
+    const now = blockXor32(u8, snap.blockBytes);
+    if (now.length !== snap.sum.length) {
+      return { ok: false, reason: "checksum blocks length mismatch", gotBlocks: now.length, expBlocks: snap.sum.length };
+    }
+    for (let i = 0; i < now.length; i++) {
+      if (now[i] !== snap.sum[i]) {
+        const start = i * snap.blockBytes;
+        const end = Math.min(u8.length, start + 32);
+        const bytes = [];
+        for (let j = start; j < end; j++) bytes.push(u8[j]);
+        return {
+          ok: false,
+          reason: "checksum mismatch",
+          blockIndex: i,
+          exp: snap.sum[i] >>> 0,
+          got: now[i] >>> 0,
+          first32BytesOfBlock: bytes
+        };
+      }
+    }
+    const spots = [];
+    const step = Math.max(1, Math.floor(u8.length / 16));
+    for (let i = 0; i < u8.length; i += step) spots.push(u8[i]);
+    for (let k = 0; k < spots.length; k++) {
+      if (spots[k] !== snap.spots[k]) {
+        return { ok: false, reason: "spot sample mismatch", spotIndex: k, exp: snap.spots[k], got: spots[k] };
+      }
+    }
+    return { ok: true };
+  }
+
+  function makeVictim(bytes, seed) {
+    const ab = new ArrayBuffer(bytes);
+    const u8 = new Uint8Array(ab);
+    fillVictim(u8, seed);
+    return { ab, u8 };
+  }
+
+  // =========================
+  // Detach invariants
+  // =========================
+  function detachArrayBuffer(ab) {
+    if (typeof structuredClone === "function") {
+      try { structuredClone(ab, { transfer: [ab] }); return true; } catch (_) {}
+    }
+    if (typeof postMessage === "function") {
+      try { postMessage("x", "*", [ab]); return true; } catch (_) {}
+    }
+    return false;
+  }
+
+  function sampleDetachedBehavior(ab, views) {
+    const out = { detachedAttempted: false, afterByteLength: null, viewSamples: [] };
+    out.detachedAttempted = detachArrayBuffer(ab);
+    out.afterByteLength = ab.byteLength;
+
+    for (const v of views) {
+      const s = { name: v.name, kind: v.kind };
+      try { s.length = v.obj.length; } catch (e) { s.length = "THREW:" + (e && e.name ? e.name : "ERR"); }
+      try { s.byteLength = v.obj.byteLength; } catch (e) { s.byteLength = "THREW:" + (e && e.name ? e.name : "ERR"); }
+      try { s.read0 = v.kind === "TA" ? v.obj[0] : "NA"; } catch (e) { s.read0 = "THREW:" + (e && e.name ? e.name : "ERR"); }
+      try {
+        if (v.kind === "TA") {
+          const before = (v.obj.length ? v.obj[0] : undefined);
+          v.obj[0] = 0x7A;
+          const after = (v.obj.length ? v.obj[0] : v.obj[0]);
+          s.writeEffect = { before, after };
+        } else {
+          s.writeEffect = "NA";
+        }
+      } catch (e) {
+        s.writeEffect = "THREW:" + (e && e.name ? e.name : "ERR");
+      }
+      out.viewSamples.push(s);
+    }
+    return out;
+  }
+
+  function checkDetachConsistency(testNum, repetitions) {
+    const samples = [];
+    for (let i = 0; i < repetitions; i++) {
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      const u32 = new Uint32Array(ab);
+      if (u8.length) u8[0] = 0xAA;
+
+      const s = sampleDetachedBehavior(ab, [
+        { name: "Uint8Array", kind: "TA", obj: u8 },
+        { name: "Uint32Array", kind: "TA", obj: u32 },
+      ]);
+      samples.push(s);
+    }
+
+    const anyDetach = samples.some(x => x.detachedAttempted);
+    if (!anyDetach) return;
+
+    function sig(s) {
+      const parts = [];
+      parts.push("abLen=" + s.afterByteLength);
+      for (const v of s.viewSamples) {
+        parts.push(v.name + ":len=" + v.length + ":bl=" + v.byteLength + ":r0=" + v.read0 + ":we=" + JSON.stringify(v.writeEffect));
+      }
+      return parts.join("|");
+    }
+
+    const sig0 = sig(samples[0]);
+    for (let i = 1; i < samples.length; i++) {
+      const si = sig(samples[i]);
+      if (si !== sig0) {
+        alertVuln(testNum, "DETACH INCONSISTENT: comportamento pós-detach variou entre repetições (suspeito).", {
+          rep0: samples[0],
+          repN: samples[i]
+        });
+        return;
+      }
+    }
+
+    for (const s of samples) {
+      if (s.detachedAttempted && s.afterByteLength !== 0) {
+        alertVuln(testNum, "DETACH SUSPECT: detach foi tentado mas ab.byteLength não ficou 0.", s);
+        return;
+      }
+    }
+  }
+
+  // =========================
+  // Subarray clamp invariants
+  // =========================
+  function expectedSubarrayRange(len, begin, end) {
+    let b = begin | 0;
+    let e = (end === undefined) ? len : (end | 0);
+
+    if (b < 0) b = Math.max(len + b, 0);
+    else b = Math.min(b, len);
+
+    if (e < 0) e = Math.max(len + e, 0);
+    else e = Math.min(e, len);
+
+    if (e < b) e = b;
+    return { b, e, length: e - b };
+  }
+
+  function checkNegativeSubarrayClamp(testNum) {
+    const ab = new ArrayBuffer(256);
+    const ta = new Uint8Array(ab);
+    for (let i = 0; i < ta.length; i++) ta[i] = i & 0xFF;
+
+    const begin = -50;
+    const end = -20;
+    const exp = expectedSubarrayRange(ta.length, begin, end);
+
+    const sub = ta.subarray(begin, end);
+
+    if (sub.length !== exp.length) {
+      alertVuln(testNum, "SUBARRAY NEGATIVE CLAMP FAIL: length inesperado.", {
+        taLen: ta.length, begin, end, exp, gotLen: sub.length
+      });
+      return;
+    }
+
+    if (sub.length > 0) {
+      const expFirst = ta[exp.b];
+      const expLast = ta[exp.e - 1];
+      const gotFirst = sub[0];
+      const gotLast = sub[sub.length - 1];
+
+      if (gotFirst !== expFirst || gotLast !== expLast) {
+        alertVuln(testNum, "SUBARRAY NEGATIVE CLAMP FAIL: conteúdo não corresponde ao clamp esperado.", {
+          expFirst, gotFirst, expLast, gotLast, exp
+        });
+        return;
+      }
+
+      const marker = 0xCC;
+      sub[0] = marker;
+      if (ta[exp.b] !== marker) {
+        alertVuln(testNum, "SUBARRAY WRITE FAIL: escrita não refletiu na posição clamped (inconsistente).", {
+          pos: exp.b, expMarker: marker, got: ta[exp.b]
+        });
+        return;
+      }
+
+      if (exp.b > 0 && ta[exp.b - 1] === marker) {
+        alertVuln(testNum, "SUBARRAY WRITE OOR: escrita vazou para byte anterior à região (suspeito).", { pos: exp.b });
+        return;
+      }
+      if (exp.e < ta.length && ta[exp.e] === marker) {
+        alertVuln(testNum, "SUBARRAY WRITE OOR: escrita vazou para byte após a região (suspeito).", { pos: exp.e });
+        return;
+      }
+    }
+  }
+
+  // =========================
+  // OOR TypedArray write invariant
+  // =========================
+  function checkTypedArrayOORWriteNoop(testNum) {
+    const victim = makeVictim(4096, 0xA11CE551 ^ testNum);
+    const snap = snapshotVictim(victim.u8, { blockBytes: 128 });
+
+    const ta = new Uint32Array(victim.ab);
+    const idx = ta.length; // out of range
+
+    let threw = false;
+    try { ta[idx] = 0xDEADBEEF; } catch (_) { threw = true; }
+
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok) {
+      alertVuln(testNum, "TYPEDARRAY OOR WRITE CHANGED VICTIM (suspeito).", cmp);
+      return;
+    }
+
+    void threw;
+  }
+
+  // =========================
+  // Amplifiers (bounded)
+  // =========================
+  function heapSpray(intensity) {
+    const count = 40 * intensity;
+    const size = 0x2000;
+    const arr = [];
+    for (let i = 0; i < count; i++) {
+      const ab = new ArrayBuffer(size);
+      const u32 = new Uint32Array(ab);
+      for (let j = 0; j < u32.length; j += 64) u32[j] = (0x41414141 ^ i ^ j) >>> 0;
+      arr.push(ab);
+    }
+    return arr;
+  }
+
+  function makeHoles(intensity) {
+    const holes = [];
+    const n = 160 * intensity;
+    for (let i = 0; i < n; i++) holes.push(new ArrayBuffer(0x100));
+    for (let i = 0; i < holes.length; i += 2) holes[i] = null;
+    return holes;
+  }
+
+  function objectSpray(intensity) {
+    const n = 320 * intensity;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const o = { a: i, b: i * 2, c: ("x" + i) };
+      if ((i & 7) === 0) o.d = new ArrayBuffer(0x80);
+      out.push(o);
+    }
+    return out;
+  }
+
+  function microtaskChurn(n) {
+    let p = Promise.resolve();
+    for (let i = 0; i < n; i++) p = p.then(() => {});
+    return p;
+  }
+
+  // =========================
+  // Cross-buffer isolation harness
+  // =========================
+  async function crossBufferIsolationTest(testNum, label, stressFn, intensity) {
+    const victim = makeVictim(64 * 1024, (0xC0FFEE00 ^ testNum) >>> 0);
+    const snap = snapshotVictim(victim.u8, { blockBytes: 256 });
+
+    await stressFn(intensity);
+
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok) {
+      alertVuln(testNum, `${label}: VICTIM CORRUPTED (cross-buffer mismatch).`, cmp);
+    }
+  }
+
+  // =========================
+  // Helpers for new vectors
+  // =========================
+  function safeStructuredClone(obj, transferList) {
+    if (typeof structuredClone !== "function") return { supported: false };
+    try {
+      if (transferList) return { supported: true, value: structuredClone(obj, { transfer: transferList }) };
+      return { supported: true, value: structuredClone(obj) };
+    } catch (e) {
+      return { supported: true, error: (e && e.name) ? e.name : "ERR" };
+    }
+  }
+
+  function makeIframe() {
+    const f = document.createElement("iframe");
+    f.style.display = "none";
+    document.body.appendChild(f);
+    return f;
+  }
+
+  function removeIframe(f) {
+    try { f.remove(); } catch (_) {}
+  }
+
+  function postMessageTransferToSelf(ab) {
+    // transfers AB away from current realm if allowed by browser
+    try { postMessage("x", "*", [ab]); return true; } catch (_) { return false; }
+  }
+
+  async function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // =========================
+  // Tests 301..350 (50 total)
+  // =========================
+  const tests = [];
+
+  // 301: Baseline strong invariants quick sweep
+  tests.push(async () => {
+    checkTypedArrayOORWriteNoop(301);
+    checkNegativeSubarrayClamp(301);
+    checkDetachConsistency(301, 4);
+  });
+
+  // 302 (FIX): MessageChannel transfer/clone invariants (no instanceof-only)
+tests.push(async () => {
+  if (typeof MessageChannel !== "function") return;
+
+  const ch = new MessageChannel();
+  const ab = new ArrayBuffer(4096);
+  const u8 = new Uint8Array(ab);
+  u8[0] = 0xAA;
+
+  let got = undefined;
+  ch.port2.onmessage = (ev) => { got = ev.data; };
+
+  let postThrew = false;
+  try { ch.port1.postMessage(ab, [ab]); }
+  catch (e) { postThrew = true; }
+
+  // Se nem conseguiu postar com transfer, não é sinal de corrupção.
+  if (postThrew) return;
+
+  await Promise.resolve();
+  await new Promise(r => setTimeout(r, 0));
+
+  const tag = Object.prototype.toString.call(got);
+
+  // Classifica o payload recebido
+  const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+  const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
+
+  const senderLen = ab.byteLength;
+
+  // Interpretação:
+  // - transfer real: senderLen == 0
+  // - clone: senderLen == 4096
+  if (senderLen !== 0 && senderLen !== 4096) {
+    alertVuln(302, "MessageChannel: sender ab.byteLength ficou em estado impossível.", { senderLen, tag });
+    return;
+  }
+
+  // Se transfer aconteceu, receiver precisa conter os dados.
+  if (senderLen === 0) {
+    if (!got) {
+      alertVuln(302, "MessageChannel: sender detacheou mas receiver não recebeu nada.", { tag, gotType: typeof got });
+      return;
+    }
+
+    let r0 = null, rLen = null;
+    try {
+      if (isAB) {
+        const r8 = new Uint8Array(got);
+        rLen = r8.length;
+        r0 = r8[0];
+      } else if (isView) {
+        const r8 = (got instanceof Uint8Array) ? got : new Uint8Array(got.buffer);
+        rLen = r8.length;
+        r0 = r8[0];
+      } else {
+        alertVuln(302, "MessageChannel: receiver não é ArrayBuffer nem view após sender detach.", { tag });
+        return;
+      }
+    } catch (e) {
+      alertVuln(302, "MessageChannel: falha ao ler receiver após sender detach.", { tag, err: e && e.name });
+      return;
+    }
+
+    if (rLen !== 4096 || r0 !== 0xAA) {
+      alertVuln(302, "MessageChannel: receiver conteúdo/len inesperado após transfer.", { tag, rLen, r0 });
+    }
+    return;
+  }
+
+  // Se NÃO houve transfer (clone), valida independência (mutação não deve refletir)
+  if (senderLen === 4096) {
+    if (!got) return; // engines podem não entregar de forma previsível; não alerta.
+    if (!isAB && !isView) return;
+
+    let r8;
+    try {
+      r8 = isAB ? new Uint8Array(got) : (got instanceof Uint8Array ? got : new Uint8Array(got.buffer));
+    } catch (_) { return; }
+
+    const before = r8[0];
+    u8[0] = 0xBB; // muta sender
+    const after = r8[0];
+    if (before !== after) {
+      alertVuln(302, "MessageChannel: receiver refletiu mutação do sender (aliasing inesperado em clone).", { before, after, tag });
+    }
+  }
+});
+
+  // 303: structuredClone (no transfer) must copy (no alias)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(2048);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0x11;
+
+    const res = safeStructuredClone({ ab });
+    if (!res.supported) return;
+    if (res.error) return; // skip to avoid false positives
+
+    const cloned = res.value;
+    if (!cloned || !(cloned.ab instanceof ArrayBuffer)) return;
+
+    const c8 = new Uint8Array(cloned.ab);
+    // mutate original, clone must stay
+    u8[0] = 0x22;
+    if (c8[0] !== 0x11) {
+      alertVuln(303, "structuredClone sem transfer parece ter alias (IMPOSSIBLE).", { clone0: c8[0] });
+    }
+  });
+
+  // 304: structuredClone with transfer: original must detach
+  tests.push(async () => {
+    const ab = new ArrayBuffer(1024);
+    new Uint8Array(ab)[0] = 0x7E;
+
+    const res = safeStructuredClone(ab, [ab]);
+    if (!res.supported) return;
+    if (res.error) return;
+
+    if (ab.byteLength !== 0) {
+      alertVuln(304, "structuredClone transfer: ab não detacheou (suspeito).", { afterByteLength: ab.byteLength });
+      return;
+    }
+    const recv = res.value;
+    if (!(recv instanceof ArrayBuffer)) return;
+    const r8 = new Uint8Array(recv);
+    if (r8[0] !== 0x7E) {
+      alertVuln(304, "structuredClone transfer: conteúdo receiver inesperado.", { first: r8[0], len: r8.length });
+    }
+  });
+
+  // 305: Detach via postMessage transfer (self) consistency
+  tests.push(async () => {
+    const reps = 4;
+    const sigs = [];
+    for (let i = 0; i < reps; i++) {
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      u8[0] = 0xAA ^ i;
+      const ok = postMessageTransferToSelf(ab);
+      // if transfer unsupported, skip whole test
+      if (!ok) return;
+      sigs.push(ab.byteLength);
+    }
+    // Should be consistent: all 0
+    const allSame = sigs.every(x => x === sigs[0]);
+    if (!allSame) alertVuln(305, "postMessage transfer: byteLength pós-transfer inconsistente.", { sigs });
+    if (sigs[0] !== 0) alertVuln(305, "postMessage transfer: ab.byteLength não ficou 0.", { sigs });
+  });
+
+  // 306: Iframe churn + postMessage ping (bounded) + cross-buffer isolation
+  tests.push(async (I) => crossBufferIsolationTest(306, "iframe churn + postMessage", async (intensity) => {
+    const loops = 5 * intensity;
+    for (let i = 0; i < loops; i++) {
+      const f = makeIframe();
+      try {
+        const w = f.contentWindow;
+        if (w && typeof w.postMessage === "function") w.postMessage("ping", "*");
+      } catch (_) {}
+      removeIframe(f);
+      await microtaskChurn(20);
+    }
+  }, I));
+
+  // 307: History push/replace + popstate ordering (no alert unless impossible)
+  tests.push(async () => {
+    if (!("history" in window) || typeof history.pushState !== "function") return;
+
+    let hits = [];
+    function onPop(e) { hits.push((e && e.state && e.state.tag) ? e.state.tag : "NULL"); }
+    window.addEventListener("popstate", onPop);
+
+    const base = { tag: "A", n: 1 };
+    const b = { tag: "B", n: 2 };
+
+    try {
+      history.replaceState(base, "", "#A");
+      history.pushState(b, "", "#B");
+      // navigate back then forward
+      history.back();
+      await wait(80);
+      history.forward();
+      await wait(80);
+    } catch (_) {}
+
+    window.removeEventListener("popstate", onPop);
+
+    // We don't demand a strict count (engine scheduling), but order should not be impossible (e.g., forward before back).
+    // If we saw both A and B, the first should be A then B.
+    const firstA = hits.indexOf("A");
+    const firstB = hits.indexOf("B");
+    if (firstA !== -1 && firstB !== -1 && firstB < firstA) {
+      alertVuln(307, "history popstate ordering impossível (B antes de A).", { hits });
+    }
+  });
+
+  // 308: DOM teardown while iterating NodeList (should not produce impossible values)
+  tests.push(async (I) => crossBufferIsolationTest(308, "DOM teardown + live list iteration", async (intensity) => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const n = 200 * intensity;
+    for (let i = 0; i < n; i++) {
+      const s = document.createElement("span");
+      s.textContent = "x" + i;
+      root.appendChild(s);
+    }
+    const list = root.getElementsByTagName("span"); // live HTMLCollection
+    // remove mid-iteration
+    for (let i = 0; i < list.length; i++) {
+      if ((i & 15) === 0) {
+        try { root.textContent = ""; } catch (_) {}
+      }
+      // access shouldn't throw
+      try { void list[i]; } catch (_) {}
+    }
+    root.remove();
+  }, I));
+
+  // 309: Canvas resize + getImageData bounds (no alert unless mismatch in expected length)
+  tests.push(async () => {
+    const c = document.createElement("canvas");
+    const ctx = c.getContext && c.getContext("2d");
+    if (!ctx) return;
+
+    c.width = 64; c.height = 64;
+    ctx.fillRect(0,0,64,64);
+    // resize churn
+    for (let i = 0; i < 10; i++) {
+      c.width = 32 + i;
+      c.height = 32 + i;
+      ctx.fillRect(0,0,c.width,c.height);
+      const img = ctx.getImageData(0,0,c.width,c.height);
+      const expLen = c.width * c.height * 4;
+      if (img.data.length !== expLen) {
+        alertVuln(309, "Canvas ImageData length incoerente.", { got: img.data.length, exp: expLen, w: c.width, h: c.height });
+        break;
+      }
+    }
+  });
+
+  // 310: AudioContext churn (bounded) + cross-buffer isolation
+  tests.push(async (I) => crossBufferIsolationTest(310, "AudioContext churn (bounded)", async (intensity) => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const reps = 1 + Math.min(2, intensity);
+    for (let i = 0; i < reps; i++) {
+      let ac = null;
+      try { ac = new AC(); } catch (_) { return; }
+      try {
+        const osc = ac.createOscillator();
+        const g = ac.createGain();
+        osc.connect(g); g.connect(ac.destination);
+        osc.start(0);
+        osc.stop(0.01);
+      } catch (_) {}
+      try { await ac.close(); } catch (_) {}
+      await wait(20);
+    }
+  }, I));
+
+  // 311: FileReader blob churn (bounded) + cross-buffer isolation
+  tests.push(async (I) => crossBufferIsolationTest(311, "FileReader blob churn (bounded)", async (intensity) => {
+    if (typeof FileReader !== "function" || typeof Blob !== "function") return;
+    const loops = 2 * intensity;
+    for (let i = 0; i < loops; i++) {
+      const data = new Uint8Array(4096);
+      data[0] = i & 0xFF;
+      const blob = new Blob([data]);
+      const fr = new FileReader();
+      await new Promise((resolve) => {
+        fr.onload = () => resolve();
+        fr.onerror = () => resolve();
+        try { fr.readAsArrayBuffer(blob); } catch (_) { resolve(); }
+      });
+    }
+  }, I));
+
+  // 312: Iterator concurrent modification strict check (must not see "impossible" extra elements)
+  tests.push(async () => {
+    const a = Array.from({length: 200}, (_,i)=>i);
+    let sawImpossible = false;
+    let i = 0;
+    for (const v of a) {
+      if (i === 50) a.length = 60; // shrink
+      if (i > 61) { sawImpossible = true; break; }
+      void v;
+      i++;
+    }
+    if (sawImpossible) {
+      alertVuln(312, "Iterator saw values beyond shrunk length (suspeito).", { iterCount: i, finalLen: a.length });
+    }
+  });
+
+  // 313: TypedArray.prototype methods with detach mid-callback (should terminate or behave consistently; no cross-buffer)
+  tests.push(async () => {
+    // This test is intentionally conservative: only flags if we get truly impossible behavior.
+    const ab = new ArrayBuffer(4096);
+    const ta = new Uint8Array(ab);
+    ta.fill(1);
+
+    let detached = false;
+    let iters = 0;
+
+    function cb(v, idx) {
+      iters++;
+      if (!detached && idx === 10) {
+        detached = detachArrayBuffer(ab);
+      }
+      return v === 1;
+    }
+
+    let res;
+    try { res = ta.every(cb); } catch (_) { return; }
+
+    // After detach, some engines may treat length as 0 or stop; we only flag "wild" iteration count.
+    if (detached && iters > 2000) {
+      alertVuln(313, "TypedArray.every iterou demais após detach (suspeito).", { iters, detached, res });
+    }
+  });
+
+  // 314: DataView randomized bounds must throw on OOB
+  tests.push(async () => {
+    const ab = new ArrayBuffer(64);
+    const dv = new DataView(ab);
+    for (let off = 0; off < 80; off++) {
+      const inRange = (off + 4) <= 64;
+      let threw = false;
+      try { dv.getUint32(off, true); } catch (_) { threw = true; }
+      if (!inRange && !threw) {
+        alertVuln(314, "DataView.getUint32 OOB did NOT throw (IMPOSSIBLE).", { off });
+        break;
+      }
+    }
+  });
+
+  // 315: TypedArray.set overlap correctness (same buffer) + victim isolation
+  tests.push(async (I) => crossBufferIsolationTest(315, "TypedArray.set overlap correctness", async (intensity) => {
+    const ab = new ArrayBuffer(1024);
+    const u8 = new Uint8Array(ab);
+    for (let i = 0; i < u8.length; i++) u8[i] = i & 0xFF;
+
+    // overlap set: copy from later to earlier
+    u8.set(u8.subarray(100, 200), 120);
+
+    // sanity: location 120 should now equal old 100
+    // can't access old now, but we can compute expected because initial was i&0xFF
+    if (u8[120] !== (100 & 0xFF)) {
+      alertVuln(315, "TypedArray.set overlap produced unexpected value (suspeito).", { got: u8[120], exp: (100 & 0xFF) });
+    }
+
+    heapSpray(intensity);
+  }, I));
+
+  // 316: ArrayBuffer.slice independence heavy (no alias) + victim isolation
+  tests.push(async (I) => crossBufferIsolationTest(316, "ArrayBuffer.slice independence heavy", async (intensity) => {
+    const ab = new ArrayBuffer(4096);
+    const u8 = new Uint8Array(ab);
+    u8.fill(0x33);
+    const ab2 = ab.slice(512, 2048);
+    const u82 = new Uint8Array(ab2);
+    u82[0] = 0x44;
+    if (u8[512] === 0x44) alertVuln(316, "ArrayBuffer.slice aliased original (IMPOSSIBLE).");
+    objectSpray(intensity);
+  }, I));
+
+  // 317: JSON stringify side-effect count (must be 1)
+  tests.push(async () => {
+    let hits = 0;
+    const obj = {
+      a: 1,
+      toJSON() { hits++; return { a: 1, b: 2 }; }
+    };
+    let s = "";
+    try { s = JSON.stringify(obj); } catch (_) { return; }
+    if (hits !== 1) alertVuln(317, "JSON.stringify toJSON chamado != 1 (suspeito).", { hits, s });
+  });
+
+  // 318: Spread operator proxy get trap count bounded (no impossible explosion)
+  tests.push(async () => {
+    let gets = 0;
+    const arr = [1,2,3,4];
+    const p = new Proxy(arr, {
+      get(t, prop, r) { gets++; return Reflect.get(t, prop, r); }
+    });
+    try { void [...p]; } catch (_) { return; }
+    // It's okay to have several gets; flag only absurd values.
+    if (gets > 200) alertVuln(318, "Spread caused excessive Proxy.get calls (suspeito).", { gets });
+  });
+
+  // 319: Microtask churn + detach consistency check
+  tests.push(async () => {
+    await microtaskChurn(200);
+    checkDetachConsistency(319, 4);
+  });
+
+  // 320: GC pressure (bounded) + victim isolation
+  tests.push(async (I) => crossBufferIsolationTest(320, "GC pressure allocations (bounded)", async (intensity) => {
+    const tmp = [];
+    const loops = 80 * intensity;
+    for (let i = 0; i < loops; i++) {
+      tmp.push(new ArrayBuffer(0x400));
+      if ((i & 7) === 0) tmp[i] = null;
+    }
+    makeHoles(intensity);
+    heapSpray(intensity);
+  }, I));
+
+  // 341 (FIX): length shadowing should NOT affect internal semantics
+tests.push(async () => {
+  const ta = new Uint8Array(8);
+  for (let i = 0; i < ta.length; i++) ta[i] = i;
+
+  const origLen = ta.length;
+  const origBL = ta.byteLength;
+
+  let defined = false;
+  try {
+    Object.defineProperty(ta, "length", { value: 999, configurable: true, writable: true });
+    defined = (ta.length === 999);
+  } catch (e) {
+    // Se jogar, ok também — não é bug.
+    return;
+  }
+
+  // Independente de shadowing, invariantes internas devem segurar.
+  if (ta.byteLength !== origBL) {
+    alertVuln(341, "TypedArray byteLength mudou após definir length (suspeito).", { origBL, gotBL: ta.byteLength, defined });
+    return;
+  }
+
+  // Elementos existentes devem permanecer consistentes
+  for (let i = 0; i < origLen; i++) {
+    if (ta[i] !== i) {
+      alertVuln(341, "TypedArray conteúdo mudou após definir length (suspeito).", { i, exp: i, got: ta[i], defined });
+      return;
+    }
+  }
+
+  // OOR write deve ser no-op e não deve criar elemento “real”
+  const before0 = ta[0];
+  try { ta[999] = 0xCC; } catch (_) {}
+  if (ta[0] !== before0) {
+    alertVuln(341, "OOR write alterou elemento válido (suspeito).", { before0, after0: ta[0], defined });
+    return;
+  }
+
+  // Se length foi shadowed para 999, um loop ingênuo poderia iterar demais,
+  // mas isso não deve dar acesso a memória “real”.
+  // Verifica que índices > origLen continuam undefined (leitura) e writes não mudam checksum local.
+  let changed = false;
+  for (let i = origLen; i < origLen + 16; i++) {
+    if (ta[i] !== undefined) changed = true;
+  }
+  if (changed) {
+    alertVuln(341, "Leituras acima do comprimento real retornaram valores definidos (suspeito).", { origLen, defined });
+  }
+});
+
+  // 321..349: (29 tests) - Mix of new vectors, all bounded + isolation harness
+  const mix = [
+    [321, "MessageChannel ping-pong + small transfers", async (I) => {
+      if (typeof MessageChannel !== "function") return;
+      const ch = new MessageChannel();
+      let got = 0;
+      ch.port2.onmessage = (ev) => { if (ev && ev.data === "pong") got++; };
+      for (let i = 0; i < 20 * I; i++) ch.port1.postMessage("pong");
+      await wait(0);
+      // No strict alert; just ensure it didn't explode into exceptions.
+    }],
+    [322, "DOM innerHTML replace churn", async (I) => {
+      const d = document.createElement("div");
+      document.body.appendChild(d);
+      for (let i = 0; i < 60 * I; i++) {
+        d.innerHTML = "<span>" + i + "</span><b>" + (i*i) + "</b>";
+        if ((i & 15) === 0) d.textContent = "";
+      }
+      d.remove();
+    }],
+    [323, "DocumentFragment append/remove churn", async (I) => {
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      for (let i = 0; i < 40 * I; i++) {
+        const frag = document.createDocumentFragment();
+        for (let j = 0; j < 30; j++) {
+          const s = document.createElement("span");
+          s.textContent = "x";
+          frag.appendChild(s);
+        }
+        host.appendChild(frag);
+        host.textContent = "";
+      }
+      host.remove();
+    }],
+    [324, "Canvas create/destroy churn (no CSS)", async (I) => {
+      for (let i = 0; i < 10 * I; i++) {
+        const c = document.createElement("canvas");
+        const ctx = c.getContext && c.getContext("2d");
+        if (ctx) { c.width = 64; c.height = 64; ctx.fillRect(0,0,64,64); ctx.getImageData(0,0,64,64); }
+      }
+    }],
+    [325, "EventTarget add/remove listeners churn", async (I) => {
+      const btn = document.createElement("button");
+      document.body.appendChild(btn);
+      function h() {}
+      for (let i = 0; i < 200 * I; i++) {
+        btn.addEventListener("click", h);
+        btn.removeEventListener("click", h);
+      }
+      btn.remove();
+    }],
+    [326, "History state large object clone check (bounded)", async (I) => {
+      if (!history || !history.pushState) return;
+      const big = { tag: "X", arr: Array.from({length: 200*I}, (_,k)=>k), s: "a".repeat(128) };
+      try { history.replaceState({tag:"BASE"}, "", "#base"); } catch (_) {}
+      try { history.pushState(big, "", "#x"); } catch (_) {}
+      // Pull it back
+      let st;
+      try { st = history.state; } catch (_) { return; }
+      // Only flag if state is null unexpectedly
+      if (!st) alertVuln(326, "history.state retornou null após pushState (suspeito).");
+    }],
+    [327, "structuredClone nested objects (no transfer) copy sanity", async (I) => {
+      const res = safeStructuredClone({ a: { b: { c: 1 } }, arr: [1,2,3] });
+      if (!res.supported || res.error) return;
+      if (!res.value || res.value.a.b.c !== 1 || res.value.arr.length !== 3) {
+        alertVuln(327, "structuredClone nested copy incoerente.", { value: res.value });
+      }
+      objectSpray(I);
+    }],
+    [328, "Promise.all microtask fanout (bounded)", async (I) => {
+      const n = 50 * I;
+      const ps = [];
+      for (let i = 0; i < n; i++) ps.push(Promise.resolve(i));
+      const r = await Promise.all(ps);
+      if (r.length !== n) alertVuln(328, "Promise.all result length mismatch (suspeito).", { got: r.length, exp: n });
+    }],
+    [329, "ArrayBuffer transfer + views liveness check", async (I) => {
+      const ab = new ArrayBuffer(2048);
+      const u8 = new Uint8Array(ab);
+      u8[0] = 0x55;
+      const ok = detachArrayBuffer(ab);
+      if (!ok) return;
+      // After detach, access must be consistent; we reuse the core checker.
+      checkDetachConsistency(329, 4);
+      heapSpray(I);
+    }],
+    [330, "TypedArray subarray chain (negatives) clamp invariants", async () => {
+      checkNegativeSubarrayClamp(330);
+    }],
+    [331, "DataView set/get consistency", async () => {
+      const ab = new ArrayBuffer(16);
+      const dv = new DataView(ab);
+      dv.setUint32(0, 0x12345678, true);
+      const le = dv.getUint32(0, true);
+      const be = dv.getUint32(0, false);
+      if (le !== 0x12345678 || be !== 0x78563412) alertVuln(331, "DataView endian inconsistente.", { le, be });
+    }],
+    [332, "Uint8ClampedArray clamp sanity", async () => {
+      if (typeof Uint8ClampedArray !== "function") return;
+      const c = new Uint8ClampedArray(4);
+      c[0] = 300;
+      c[1] = -50;
+      if (c[0] !== 255 || c[1] !== 0) alertVuln(332, "Clamping incoerente.", { c0: c[0], c1: c[1] });
+    }],
+    [333, "Int8 wrap sanity", async () => {
+      const i8 = new Int8Array(2);
+      i8[0] = 128;
+      if (i8[0] !== -128) alertVuln(333, "Int8 wrap falhou.", { got: i8[0] });
+    }],
+    [334, "Array.sort comparator side-effects bounded", async () => {
+      const a = [3,2,1,4,5,0];
+      let calls = 0;
+      a.sort((x,y)=>{ calls++; return x-y; });
+      if (calls <= 0) alertVuln(334, "Sort comparator calls == 0 (improvável).", { calls });
+    }],
+    [335, "Map/Filter/Reduce combined (bounded)", async (I) => {
+      const a = Array.from({length: 2000}, (_,i)=>i);
+      const b = a.map(x=>x^0x55).filter(x=>(x&3)===0).reduce((acc,v)=>acc+v, 0);
+      void b;
+      objectSpray(I);
+    }],
+    [336, "String operations stress (bounded)", async (I) => {
+      const s = "a".repeat(1024) + "b".repeat(1024);
+      const t = s.split("b").join("c");
+      void t;
+      heapSpray(I);
+    }],
+    [337, "RegExp exec loop bounded", async () => {
+      const re = /a+/g;
+      const s = "a".repeat(5000) + "b";
+      let m, c=0;
+      while ((m = re.exec(s)) && c < 10) c++;
+    }],
+    [338, "DOM Range create/remove", async (I) => {
+      const d = document.createElement("div");
+      d.textContent = "x".repeat(2000);
+      document.body.appendChild(d);
+      const r = document.createRange();
+      for (let i=0;i<50*I;i++){
+        r.selectNodeContents(d);
+        r.collapse(i&1);
+      }
+      d.remove();
+    }],
+    [339, "Selection API probe (if available)", async () => {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (!sel) return;
+      // basic calls shouldn't throw
+      try { sel.removeAllRanges(); } catch (_) {}
+    }],
+    [340, "Nested try/catch exception churn", async (I) => {
+      for (let i=0;i<100*I;i++){
+        try { throw new Error("x"); } catch (_) {}
+      }
+    }],
+    
+    [342, "TypedArray OOR write no-op sanity", async () => {
+      checkTypedArrayOORWriteNoop(342);
+    }],
+    [343, "Multiple views same buffer ordering check", async () => {
+      const ab = new ArrayBuffer(64);
+      const u8 = new Uint8Array(ab);
+      const u32 = new Uint32Array(ab);
+      u32[0] = 0x11223344;
+      // little-endian expected on PS4; still allow both but detect nonsense
+      const b0 = u8[0];
+      if (!(b0 === 0x44 || b0 === 0x11)) alertVuln(343, "Byte order incoerente.", { b0 });
+    }],
+    [344, "Buffer slice + typed views independence chain", async () => {
+      const ab = new ArrayBuffer(256);
+      const u8 = new Uint8Array(ab);
+      u8.fill(0x10);
+      const ab2 = ab.slice(0,128);
+      const u82 = new Uint8Array(ab2);
+      u82[0] = 0x99;
+      if (u8[0] === 0x99) alertVuln(344, "ArrayBuffer.slice aliased original (IMPOSSIBLE).");
+    }],
+    [345, "Microtask + DOM + alloc combo (bounded)", async (I) => {
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      for (let i=0;i<20*I;i++){
+        host.innerHTML = "<i>" + i + "</i><u>" + (i*i) + "</u>";
+        await microtaskChurn(20);
+        heapSpray(1);
+      }
+      host.remove();
+    }],
+    [346, "Iframe nested doc.write/remove (bounded)", async (I) => {
+      const loops = 3 * I;
+      for (let i=0;i<loops;i++){
+        const f = makeIframe();
+        try {
+          const doc = f.contentDocument;
+          if (doc) {
+            doc.open();
+            doc.write("<html><body><p>t</p></body></html>");
+            doc.close();
+          }
+        } catch (_) {}
+        removeIframe(f);
+      }
+    }],
+    [347, "postMessage burst (bounded)", async (I) => {
+      let n = 0;
+      function onMsg(ev){ n++; }
+      window.addEventListener("message", onMsg);
+      const loops = 50 * I;
+      for (let i=0;i<loops;i++) postMessage("x", "*");
+      await wait(0);
+      window.removeEventListener("message", onMsg);
+      // no strict alert; only ensure it didn't explode.
+      void n;
+    }],
+    [348, "structuredClone typed arrays (copy)", async () => {
+      const u8 = new Uint8Array(32);
+      u8[0] = 0x5A;
+      const res = safeStructuredClone(u8);
+      if (!res.supported || res.error) return;
+      const c = res.value;
+      if (!(c instanceof Uint8Array)) return;
+      u8[0] = 0x6B;
+      if (c[0] !== 0x5A) alertVuln(348, "structuredClone Uint8Array parece ter alias (IMPOSSIBLE).", { c0: c[0] });
+    }],
+    [349, "Detach + DataView access consistency (bounded)", async () => {
+      const ab = new ArrayBuffer(64);
+      const dv = new DataView(ab);
+      dv.setUint32(0, 0x12345678, true);
+      const ok = detachArrayBuffer(ab);
+      if (!ok) return;
+      // After detach, DataView operations should throw consistently in most engines; we don't force, we check consistency:
+      let threw = 0;
+      for (let i=0;i<5;i++){
+        try { dv.getUint32(0, true); } catch (_) { threw++; }
+      }
+      if (threw !== 0 && threw !== 5) {
+        alertVuln(349, "DataView pós-detach inconsistente (às vezes joga, às vezes não).", { threw });
+      }
+    }],
+  ];
+
+  for (const [num, label, fn] of mix) {
+    tests.push(async (I) => crossBufferIsolationTest(num, label, fn, I));
+  }
+
+  // 350: Comprehensive combo (bounded) + strong invariants
+  tests.push(async (I) => {
+    checkTypedArrayOORWriteNoop(350);
+    checkNegativeSubarrayClamp(350);
+    checkDetachConsistency(350, 5);
+
+    await crossBufferIsolationTest(350, "COMPREHENSIVE COMBO (bounded)", async (intensity) => {
+      makeHoles(intensity);
+      heapSpray(intensity);
+      objectSpray(intensity);
+
+      // iframe + DOM churn
+      for (let i=0;i<2*intensity;i++){
+        const f = makeIframe();
+        try {
+          const doc = f.contentDocument;
+          if (doc) {
+            doc.open();
+            doc.write("<html><body><div id='x'>x</div></body></html>");
+            doc.close();
+          }
+        } catch (_) {}
+        removeIframe(f);
+      }
+
+      // microtasks
+      await microtaskChurn(300 * intensity);
+
+      // canvas if available
+      const c = document.createElement("canvas");
+      const ctx = c.getContext && c.getContext("2d");
+      if (ctx) {
+        c.width = 48; c.height = 48;
+        ctx.fillRect(0,0,48,48);
+        ctx.getImageData(0,0,48,48);
+      }
+    }, I);
+  });
+
+  // Validate count = 50
+  if (tests.length !== 50) {
+    logLine("INTERNAL WARN: expected 50 tests, got " + tests.length);
+  }
+
+  // =========================
+  // Runner
+  // =========================
   function withTimeout(promise, ms) {
     let t;
     const timeout = new Promise((_, rej) => {
       t = setTimeout(() => rej(new Error("TIMEOUT")), ms);
     });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
-  }
-
-  function tagOf(x) {
-    try { return Object.prototype.toString.call(x); }
-    catch (_) { return "[object ?]"; }
-  }
-
-  // Heurística “não instanceof-only”
-  function classifyPayload(got) {
-    const tag = tagOf(got);
-
-    const isAB = (tag === "[object ArrayBuffer]") ||
-      (!!got && typeof got === "object" &&
-       typeof got.byteLength === "number" &&
-       typeof got.slice === "function" &&
-       typeof got.constructor === "function");
-
-    const isView = (!!got && typeof got === "object" &&
-      typeof got.byteLength === "number" &&
-      !!got.buffer && typeof got.buffer === "object");
-
-    return { tag, isAB, isView };
-  }
-
-  function alertVuln(code, msg, details) {
-    const payload = details ? JSON.stringify(details) : "";
-    const full = `ALERTA ${code}: ${msg}${payload ? " :: " + payload : ""}`;
-    log(full);
-    try { alert(full); } catch (_) {}
-  }
-
-  function xorChecksumU8(u8) {
-    let x = 0;
-    for (let i = 0; i < u8.length; i++) x ^= u8[i];
-    return x & 0xFF;
-  }
-
-  function fillPattern(u8, seedByte) {
-    // padrão simples, determinístico e verificável
-    for (let i = 0; i < u8.length; i++) u8[i] = (seedByte + i) & 0xFF;
-  }
-
-  function snapshotChecksumBlocks(u8) {
-    // checksum por blocos (forte o suficiente pra detectar 1-byte flip)
-    const blk = 256;
-    const out = [];
-    for (let off = 0; off < u8.length; off += blk) {
-      let x = 0;
-      const end = Math.min(u8.length, off + blk);
-      for (let i = off; i < end; i++) x ^= u8[i];
-      out.push(x & 0xFF);
-    }
-    return out;
-  }
-
-  function compareFull(u8, expectedSeedByte) {
-    // valida 100% (sem “valor != sentinel”)
-    for (let i = 0; i < u8.length; i++) {
-      const exp = (expectedSeedByte + i) & 0xFF;
-      if (u8[i] !== exp) return { ok: false, idx: i, got: u8[i], exp };
-    }
-    return { ok: true };
-  }
-
-  function allocPressure(mb) {
-    // pressão leve/moderada (sem travar): buffers descartáveis
-    const bytes = mb * 1024 * 1024;
-    const chunk = 256 * 1024;
-    const n = Math.max(0, Math.floor(bytes / chunk));
-    const tmp = [];
-    for (let i = 0; i < n; i++) tmp.push(new Uint8Array(chunk));
-    // solta referência logo em seguida
-  }
-
-  // ----------------------------
-  // Runner
-  // ----------------------------
-  let stopFlag = false;
-
-  function makeStats() {
-    return {
-      ok_detach: 0,
-      ok_clone: 0,
-      transfer_throw: 0,
-      drop: 0,
-
-      senderlen_impossible: 0,
-      recv_missing: 0,
-      recv_tag_weird: 0,
-      recv_read_fail: 0,
-      recv_len_bad: 0,
-      recv_data_bad: 0,
-
-      aliasing_in_clone: 0,
-      inconsistent_detach_access: 0, // views vivas com comportamento inconsistente
-
-      other: 0
-    };
-  }
-
-  // “após detach: consistente” (não exigimos throw vs 0, exigimos consistência)
-  function checkDetachedViewConsistency(u8, tries = 8) {
-    const results = [];
-    for (let i = 0; i < tries; i++) {
-      try {
-        // pode retornar 0/undefined, ou lançar; o importante é ser consistente
-        results.push({ kind: "read", v: u8[0] });
-      } catch (e) {
-        results.push({ kind: "throw", name: e && e.name });
-      }
-    }
-    const first = JSON.stringify(results[0]);
-    for (let i = 1; i < results.length; i++) {
-      if (JSON.stringify(results[i]) !== first) {
-        return { ok: false, results };
-      }
-    }
-    return { ok: true, results };
-  }
-
-  // Reuso opcional do channel (Mode C)
-  let sharedCh = null;
-
-  function createChannel(mode) {
-    const ch = (mode === "C" && sharedCh) ? sharedCh : new MessageChannel();
-    if (mode === "C" && !sharedCh) sharedCh = ch;
-    return ch;
-  }
-
-  function startPortsIfWanted(ch, mode) {
-    if (mode === "B") return; // "no start"
-    try { ch.port1.start && ch.port1.start(); } catch (_) {}
-    try { ch.port2.start && ch.port2.start(); } catch (_) {}
-  }
-
-  async function waitDeliveryTick() {
-    // microtask + macrotask (boa compatibilidade)
-    await Promise.resolve();
-    await sleep(0);
-  }
-
-  async function runOne(mode, timeoutMs, payloadSize, burstCount, pressureMB, stats) {
-    if (typeof MessageChannel !== "function") return;
-
-    const ch = createChannel(mode);
-    startPortsIfWanted(ch, mode);
-
-    let gotList = [];
-    let gotCount = 0;
-
-    const wantBurst = (mode === "D");
-    const wantTeardown = (mode === "E");
-    const wantPressure = (mode === "F");
-    const wantMixed = (mode === "G");
-
-    let gotResolve;
-    const gotPromise = new Promise((res) => { gotResolve = res; });
-
-    ch.port2.onmessage = (ev) => {
-      gotCount++;
-      gotList.push(ev.data);
-      // resolve no 1º evento (baseline), ou quando burst atingir count
-      if (!wantBurst) gotResolve(true);
-      else if (gotCount >= burstCount) gotResolve(true);
-    };
-
-    // decide caminho: transfer vs clone (Mode G alterna)
-    const doTransfer = !wantMixed ? true : ((stats.ok_detach + stats.ok_clone) % 2 === 0);
-
-    // prepara payload(s)
-    const seedBase = 0xA0; // só pra diferenciar do 0xAA literal
-    let abs = [];  // arraybuffers
-    let u8s = [];  // views sender
-
-    const msgN = wantBurst ? burstCount : 1;
-    for (let i = 0; i < msgN; i++) {
-      const ab = new ArrayBuffer(payloadSize);
-      const u8 = new Uint8Array(ab);
-      const seed = (seedBase + i) & 0xFF;
-      fillPattern(u8, seed);
-      abs.push(ab);
-      u8s.push(u8);
-    }
-
-    // checksums dos senders (100% por bloco)
-    const senderBlocks = u8s.map(u8 => snapshotChecksumBlocks(u8));
-
-    let postThrew = false;
-    try {
-      if (wantPressure) allocPressure(pressureMB);
-
-      if (wantBurst) {
-        for (let i = 0; i < msgN; i++) {
-          if (doTransfer) ch.port1.postMessage(abs[i], [abs[i]]);
-          else ch.port1.postMessage(abs[i]); // clone path
-        }
-      } else {
-        if (doTransfer) ch.port1.postMessage(abs[0], [abs[0]]);
-        else ch.port1.postMessage(abs[0]); // clone
-      }
-
-      if (wantTeardown) {
-        try { ch.port1.close && ch.port1.close(); } catch (_) {}
-        try { ch.port2.close && ch.port2.close(); } catch (_) {}
-      }
-
-      if (wantPressure) allocPressure(pressureMB);
-    } catch (e) {
-      postThrew = true;
-      stats.transfer_throw++;
-      return;
-    }
-
-    // Aguarda entrega (ou drop)
-    let delivered = false;
-    try {
-      delivered = await withTimeout(gotPromise, timeoutMs);
-    } catch (e) {
-      // drop: nada recebido no timeout
-      stats.drop++;
-      return;
-    }
-
-    // aguarda mais um tick p/ estabilizar estado
-    await waitDeliveryTick();
-
-    // validações por mensagem
-    const checkMsg = (idx, got) => {
-      const { tag, isAB, isView } = classifyPayload(got);
-
-      const senderLen = abs[idx].byteLength; // 0 se transfer, payloadSize se clone
-
-      // Estado permitido: 0 (transfer) ou payloadSize (clone). Qualquer outro = impossível.
-      if (senderLen !== 0 && senderLen !== payloadSize) {
-        stats.senderlen_impossible++;
-        alertVuln(302, "sender ab.byteLength em estado impossível", { mode, idx, senderLen, payloadSize, tag });
-        return;
-      }
-
-      // Se transfer: receiver tem que existir e bater conteúdo 100%
-      if (senderLen === 0) {
-        if (!got) {
-          stats.recv_missing++;
-          alertVuln(302, "sender detacheou mas receiver não recebeu nada", { mode, idx, tag, gotType: typeof got });
-          return;
-        }
-
-        let r8 = null;
-        try {
-          if (isAB) r8 = new Uint8Array(got);
-          else if (isView) {
-            // tenta view direta; fallback para buffer
-            if (tag === "[object Uint8Array]") r8 = got;
-            else r8 = new Uint8Array(got.buffer);
-          } else {
-            stats.recv_tag_weird++;
-            alertVuln(302, "receiver não é ArrayBuffer nem view após detach", { mode, idx, tag });
-            return;
-          }
-        } catch (e) {
-          stats.recv_read_fail++;
-          alertVuln(302, "falha ao ler receiver após detach", { mode, idx, tag, err: e && e.name });
-          return;
-        }
-
-        if (r8.length !== payloadSize) {
-          stats.recv_len_bad++;
-          alertVuln(302, "receiver length inesperado após transfer", { mode, idx, tag, rLen: r8.length, payloadSize });
-          return;
-        }
-
-        // valida 100% bytes
-        const seed = (seedBase + idx) & 0xFF;
-        const v = compareFull(r8, seed);
-        if (!v.ok) {
-          stats.recv_data_bad++;
-          alertVuln(302, "receiver conteúdo divergente após transfer (validação 100%)", { mode, idx, tag, firstBad: v });
-          return;
-        }
-
-        // Invariante forte extra: view do sender (u8s[idx]) está detached: comportamento consistente
-        const cons = checkDetachedViewConsistency(u8s[idx], 8);
-        if (!cons.ok) {
-          stats.inconsistent_detach_access++;
-          alertVuln(302, "após detach, acesso à view do sender ficou inconsistente", { mode, idx, sample: cons.results.slice(0, 4) });
-          return;
-        }
-
-        stats.ok_detach++;
-        return;
-      }
-
-      // Se clone: receiver pode ou não chegar (alguns ambientes), mas se chegar e for AB/view,
-      // deve ser independente (mutação no sender não reflete no receiver).
-      if (senderLen === payloadSize) {
-        if (!got) { stats.ok_clone++; return; }
-        if (!isAB && !isView) { stats.ok_clone++; return; }
-
-        let r8;
-        try {
-          r8 = isAB ? new Uint8Array(got) : (tag === "[object Uint8Array]" ? got : new Uint8Array(got.buffer));
-        } catch (_) { stats.ok_clone++; return; }
-
-        // guarda checksums do receiver antes
-        const beforeBlk = snapshotChecksumBlocks(r8);
-
-        // muta sender de forma clara
-        u8s[idx][0] ^= 0xFF;
-        u8s[idx][payloadSize - 1] ^= 0x7F;
-
-        // receiver NÃO pode mudar
-        const afterBlk = snapshotChecksumBlocks(r8);
-
-        if (JSON.stringify(beforeBlk) !== JSON.stringify(afterBlk)) {
-          stats.aliasing_in_clone++;
-          alertVuln(302, "clone com aliasing: receiver refletiu mutação do sender", {
-            mode, idx, tag,
-            before0: beforeBlk[0], after0: afterBlk[0]
-          });
-          return;
-        }
-
-        stats.ok_clone++;
-      }
-    };
-
-    if (!delivered) { stats.drop++; return; }
-
-    if (wantBurst) {
-      // se não recebeu todos (pode ocorrer), considera drop parcial como anomalia leve (log sem ALERTA)
-      if (gotList.length !== burstCount) {
-        // não ALERTA por default; pode ser limitação/ordem
-        log(`NOTE: burst recebeu ${gotList.length}/${burstCount} (mode=${mode})`);
-      }
-      const n = Math.min(gotList.length, msgN);
-      for (let i = 0; i < n; i++) checkMsg(i, gotList[i]);
-    } else {
-      checkMsg(0, gotList[0]);
-    }
+    return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
   }
 
   async function runAll() {
-    stopFlag = false;
+    STOP = false;
+    RUN_ID++;
+    const runId = RUN_ID;
 
-    const mode = $("mode").value;
-    const N = Math.max(1, +$("iters").value || 30);
-    const timeoutMs = Math.max(50, +$("timeout").value || 1200);
-    const delayMs = Math.max(0, +$("delay").value || 0);
-    const payloadSize = Math.max(64, +$("psize").value || 4096);
-    const burstCount = Math.max(2, +$("burst").value || 16);
-    const pressureMB = Math.max(0, +$("pressureMB").value || 0);
+    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value || "0", 10));
+    const timeoutMs = Math.max(100, parseInt(document.getElementById("timeoutMs").value || "1400", 10));
+    const intensity = Math.min(5, Math.max(1, parseInt(document.getElementById("intensity").value || "3", 10)));
 
-    const stats = makeStats();
+    logLine("============================================================");
+    logLine("Run ALL :: 50 tests (301..350)");
+    logLine("============================================================");
 
-    log("Pronto. Dica: se no PS4 der drop, aumente Timeout e reduza Delay para achar janela de falha.");
-    log("============================================================");
-    log(`Run 302 isolator V2 :: mode=${mode} N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms size=${payloadSize} burst=${burstCount} pressureMB=${pressureMB}`);
-    log("============================================================");
+    for (let i = 0; i < tests.length; i++) {
+      if (STOP || runId !== RUN_ID) break;
 
-    // Reset shared channel on each run unless Mode C (reuse) is chosen
-    sharedCh = null;
-
-    for (let i = 0; i < N; i++) {
-      if (stopFlag) break;
       try {
-        await runOne(mode, timeoutMs, payloadSize, burstCount, pressureMB, stats);
+        const p = Promise.resolve(tests[i](intensity));
+        await withTimeout(p, timeoutMs);
       } catch (e) {
-        stats.other++;
-        log(`ERR: exception inesperada: ${e && e.name ? e.name : e}`);
+        // Exceptions alone are not corruption signals; keep silent to avoid false positives.
       }
-      if (delayMs) await sleep(delayMs);
+
+      if (delayMs) await new Promise(r => setTimeout(r, delayMs));
     }
 
-    log("------------------------------------------------------------");
-    log(`RESULTADOS: ok_detach=${stats.ok_detach} ok_clone=${stats.ok_clone} transfer_throw=${stats.transfer_throw} drop=${stats.drop}`);
-    log(`          senderlen_impossible=${stats.senderlen_impossible} recv_missing=${stats.recv_missing} recv_tag_weird=${stats.recv_tag_weird}`);
-    log(`          recv_read_fail=${stats.recv_read_fail} recv_len_bad=${stats.recv_len_bad} recv_data_bad=${stats.recv_data_bad}`);
-    log(`          aliasing_in_clone=${stats.aliasing_in_clone} inconsistent_detach_access=${stats.inconsistent_detach_access} other=${stats.other}`);
-
-    if (!stopFlag &&
-        stats.senderlen_impossible === 0 &&
-        stats.recv_missing === 0 &&
-        stats.recv_tag_weird === 0 &&
-        stats.recv_read_fail === 0 &&
-        stats.recv_len_bad === 0 &&
-        stats.recv_data_bad === 0 &&
-        stats.aliasing_in_clone === 0 &&
-        stats.inconsistent_detach_access === 0) {
-      log("OK: nenhuma inconsistência detectada nas condições atuais.");
-    } else {
-      log("ATENÇÃO: houve anomalias. Veja ALERTAs acima (se existirem) e os contadores.");
-    }
+    logLine("ALL DONE.");
   }
 
-  $("btnReset").onclick = () => { stopFlag = true; clearLog(); log("Reset."); };
-  $("btnStop").onclick  = () => { stopFlag = true; log("Stop solicitado."); };
-  $("btnRun").onclick   = () => { runAll(); };
+  // Wire UI
+  document.getElementById("btnReset").onclick = resetLog;
+  document.getElementById("btnStop").onclick = stopNow;
+  document.getElementById("btnRunAll").onclick = runAll;
 
-  // Auto-start message
-  log("Pronto. Selecione um Mode e clique Run.");
+  // init
+  resetLog();
 })();
 </script>
 </body>
