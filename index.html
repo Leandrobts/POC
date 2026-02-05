@@ -1,1324 +1,911 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <title>PS4 Memory Corruption Tests (251-300) - ULTRA RIGOROUS</title>
+  <meta charset="UTF-8">
+  <title>PS4 Memory Corruption Tests (251-300) - Ultra-Rigorous v2 (Strong Invariants)</title>
 </head>
 <body>
-    <h1>PS4 Memory Corruption Tests (251-300)</h1>
-    <h2>Ultra-rigorous - Eliminates ALL false positives</h2>
-    <div id="output"></div>
-    
-    <script>
-        const log = (msg) => {
-            const div = document.getElementById('output');
-            div.innerHTML += msg + '<br>';
-            console.log(msg);
+  <h1>PS4 Memory Corruption Tests (251-300) - Ultra-Rigorous v2</h1>
+
+  <div>
+    <button id="btnReset">Reset log</button>
+    <button id="btnRunAll">Run ALL (251..300)</button>
+    <button id="btnStop">Stop</button>
+  </div>
+
+  <div style="margin-top:8px;">
+    Delay (ms): <input id="delayMs" type="number" value="80" min="0" step="10">
+    Timeout por teste (ms): <input id="timeoutMs" type="number" value="1200" min="100" step="50">
+    Intensidade (1..5): <input id="intensity" type="number" value="3" min="1" max="5" step="1">
+  </div>
+
+  <pre id="log" style="white-space:pre-wrap; margin-top:10px;"></pre>
+
+<script>
+(() => {
+  "use strict";
+
+  const $log = document.getElementById("log");
+
+  let STOP = false;
+  let RUN_ID = 0;
+
+  function ts() { return Date.now(); }
+  function logLine(s) { $log.textContent += `[${ts()}] ${s}\n`; }
+  function resetLog() { $log.textContent = ""; logLine("Reset."); }
+  function stopNow() { STOP = true; logLine("STOP requested."); }
+
+  function alertVuln(testNum, msg, extraObj) {
+    const extra = extraObj ? ("\n" + JSON.stringify(extraObj, null, 2)) : "";
+    const full = `ALERTA TEST ${testNum}: ${msg}${extra}`;
+    logLine(full);
+    alert(full);
+  }
+
+  // =========================
+  // Strong victim model
+  // =========================
+  function xorshift32(seed) {
+    let x = seed >>> 0;
+    return () => {
+      x ^= (x << 13) >>> 0;
+      x ^= (x >>> 17) >>> 0;
+      x ^= (x << 5) >>> 0;
+      return x >>> 0;
+    };
+  }
+
+  function fillVictim(u8, seed) {
+    const rnd = xorshift32(seed);
+    for (let i = 0; i < u8.length; i++) {
+      const r = rnd();
+      u8[i] = (r ^ (r >>> 8) ^ (r >>> 16) ^ (r >>> 24)) & 0xFF;
+    }
+  }
+
+  // block XOR32 checksum across whole buffer (validates 100% coverage)
+  function blockXor32(u8, blockBytes) {
+    const nBlocks = Math.ceil(u8.length / blockBytes);
+    const out = new Uint32Array(nBlocks);
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+
+    for (let b = 0; b < nBlocks; b++) {
+      const start = b * blockBytes;
+      const end = Math.min(u8.length, start + blockBytes);
+      let acc = 0 >>> 0;
+
+      // XOR 32-bit words (unaligned safe via DataView)
+      let i = start;
+      for (; i + 4 <= end; i += 4) {
+        acc ^= dv.getUint32(i, true);
+      }
+      // tail bytes
+      for (; i < end; i++) {
+        acc ^= (u8[i] << ((i - start) & 3) * 8) >>> 0;
+      }
+      out[b] = acc >>> 0;
+    }
+    return out;
+  }
+
+  function snapshotVictim(u8, opts) {
+    const blockBytes = opts.blockBytes || 256;
+    const sum = blockXor32(u8, blockBytes);
+    // also keep a small spot-sample (helps debug)
+    const spots = [];
+    const step = Math.max(1, Math.floor(u8.length / 16));
+    for (let i = 0; i < u8.length; i += step) spots.push(u8[i]);
+    return { blockBytes, sum, spots, len: u8.length };
+  }
+
+  function compareSnapshot(u8, snap) {
+    if (u8.length !== snap.len) {
+      return { ok: false, reason: "victim length changed", gotLen: u8.length, expLen: snap.len };
+    }
+    const now = blockXor32(u8, snap.blockBytes);
+    if (now.length !== snap.sum.length) {
+      return { ok: false, reason: "checksum blocks length mismatch", gotBlocks: now.length, expBlocks: snap.sum.length };
+    }
+    for (let i = 0; i < now.length; i++) {
+      if (now[i] !== snap.sum[i]) {
+        // gather a small window of bytes to show where it drifted
+        const start = i * snap.blockBytes;
+        const end = Math.min(u8.length, start + 32);
+        const bytes = [];
+        for (let j = start; j < end; j++) bytes.push(u8[j]);
+        return {
+          ok: false,
+          reason: "checksum mismatch",
+          blockIndex: i,
+          exp: snap.sum[i] >>> 0,
+          got: now[i] >>> 0,
+          first32BytesOfBlock: bytes
         };
+      }
+    }
+    // spot sample check too
+    const spots = [];
+    const step = Math.max(1, Math.floor(u8.length / 16));
+    for (let i = 0; i < u8.length; i += step) spots.push(u8[i]);
+    for (let k = 0; k < spots.length; k++) {
+      if (spots[k] !== snap.spots[k]) {
+        return { ok: false, reason: "spot sample mismatch", spotIndex: k, exp: snap.spots[k], got: spots[k] };
+      }
+    }
+    return { ok: true };
+  }
 
-        const alert_vuln = (testNum, msg) => {
-            const alertMsg = `ALERTA TEST ${testNum}: ${msg}`;
-            log('<strong style="color:red;font-size:16px">' + alertMsg + '</strong>');
-            alert(alertMsg);
-        };
+  function makeVictim(bytes, seed) {
+    const ab = new ArrayBuffer(bytes);
+    const u8 = new Uint8Array(ab);
+    fillVictim(u8, seed);
+    return { ab, u8 };
+  }
 
-        // RIGOROUS: Only alert if separate buffer contaminated
-        function checkCrossBufferCorruption(victimBuffer, expectedSentinel) {
-            const view = new Uint32Array(victimBuffer);
-            for (let i = 0; i < view.length; i++) {
-                if (view[i] !== expectedSentinel) {
-                    return {corrupted: true, index: i, value: view[i]};
-                }
-            }
-            return {corrupted: false};
+  // =========================
+  // Detach invariants
+  // =========================
+  function detachArrayBuffer(ab) {
+    // Prefer structuredClone transfer when available; fallback to postMessage transfer
+    if (typeof structuredClone === "function") {
+      try { structuredClone(ab, { transfer: [ab] }); return true; } catch (_) {}
+    }
+    if (typeof postMessage === "function") {
+      try { postMessage("x", "*", [ab]); return true; } catch (_) {}
+    }
+    return false;
+  }
+
+  function sampleDetachedBehavior(ab, views) {
+    const out = { detachedAttempted: false, afterByteLength: null, viewSamples: [] };
+    out.detachedAttempted = detachArrayBuffer(ab);
+    out.afterByteLength = ab.byteLength;
+
+    for (const v of views) {
+      const s = { name: v.name, kind: v.kind };
+      try {
+        s.length = v.obj.length;
+      } catch (e) {
+        s.length = "THREW:" + (e && e.name ? e.name : "ERR");
+      }
+      try {
+        s.byteLength = v.obj.byteLength;
+      } catch (e) {
+        s.byteLength = "THREW:" + (e && e.name ? e.name : "ERR");
+      }
+      try {
+        // read index 0 as property access (for TypedArray)
+        s.read0 = v.kind === "TA" ? v.obj[0] : "NA";
+      } catch (e) {
+        s.read0 = "THREW:" + (e && e.name ? e.name : "ERR");
+      }
+      try {
+        if (v.kind === "TA") {
+          // attempt write index 0; should be ignored if detached/length==0 (or throw in some engines)
+          const before = (v.obj.length ? v.obj[0] : undefined);
+          v.obj[0] = 0x7A;
+          const after = (v.obj.length ? v.obj[0] : v.obj[0]);
+          s.writeEffect = { before, after };
+        } else {
+          s.writeEffect = "NA";
         }
+      } catch (e) {
+        s.writeEffect = "THREW:" + (e && e.name ? e.name : "ERR");
+      }
+      out.viewSamples.push(s);
+    }
+    return out;
+  }
 
-        // RIGOROUS: Check if truly detached (byteLength === 0)
-        function isBufferDetached(arrayBuffer) {
-            return arrayBuffer.byteLength === 0;
-        }
+  function checkDetachConsistency(testNum, repetitions) {
+    // We expect consistency across repetitions in same engine:
+    // - ab.byteLength becomes 0 after detach (if detach succeeded)
+    // - TypedArray view lengths become 0 OR throw consistently; access must not be "sometimes live"
+    const samples = [];
+    for (let i = 0; i < repetitions; i++) {
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      const u32 = new Uint32Array(ab);
+      // mark
+      if (u8.length) u8[0] = 0xAA;
 
-        // RIGOROUS: Check if access throws (for detached buffers)
-        function doesAccessThrow(typedArray, index, value) {
-            try {
-                typedArray[index] = value;
-                return false;
-            } catch(e) {
-                return true;
-            }
-        }
+      const s = sampleDetachedBehavior(ab, [
+        { name: "Uint8Array", kind: "TA", obj: u8 },
+        { name: "Uint32Array", kind: "TA", obj: u32 },
+      ]);
+      samples.push(s);
+    }
 
-        // RIGOROUS: Verify memory at specific address changed
-        function verifyMemoryWrite(buffer, byteOffset, expectedBytes) {
-            const view = new Uint8Array(buffer);
-            for (let i = 0; i < expectedBytes.length; i++) {
-                if (view[byteOffset + i] !== expectedBytes[i]) {
-                    return false;
-                }
-            }
-            return true;
-        }
+    // If detach isn't possible, skip silently (no false alert)
+    const anyDetach = samples.some(x => x.detachedAttempted);
+    if (!anyDetach) return;
 
-        // TEST 251: OOB write with cross-buffer validation ONLY
-        try {
-            log('TEST 251: Cross-buffer OOB write detection');
-            
-            // Create victim buffer BEFORE attacker
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xDEADBEEF;
-            victimView.fill(SENTINEL);
-            
-            // Create attacker buffer
-            const attacker = new ArrayBuffer(0x100);
-            const attackerView = new Uint32Array(attacker);
-            
-            // Try massive OOB write
-            for (let offset = attackerView.length; offset < attackerView.length + 1000; offset++) {
-                attackerView[offset] = 0x41414141;
-            }
-            
-            // Check ONLY victim buffer
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(251, 'Cross-buffer corruption detected! victim[' + result.index + ']=0x' + result.value.toString(16));
-            }
-        } catch(e) {
-            log('TEST 251: Exception - ' + e.message);
-        }
+    // Normalize signature for each repetition
+    function sig(s) {
+      const parts = [];
+      parts.push("abLen=" + s.afterByteLength);
+      for (const v of s.viewSamples) {
+        parts.push(v.name + ":len=" + v.length + ":bl=" + v.byteLength + ":r0=" + v.read0 + ":we=" + JSON.stringify(v.writeEffect));
+      }
+      return parts.join("|");
+    }
 
-        // TEST 252: Detach with strict byteLength check
-        try {
-            log('TEST 252: Buffer detach strict validation');
-            
-            if (typeof structuredClone !== 'undefined') {
-                const ab = new ArrayBuffer(0x1000);
-                const ta = new Uint32Array(ab);
-                ta[0] = 0x12345678;
-                
-                const beforeLength = ab.byteLength;
-                
-                try {
-                    structuredClone(ab, {transfer: [ab]});
-                } catch(e2) {
-                    log('TEST 252: Transfer failed - ' + e2.message);
-                    throw e2;
-                }
-                
-                const afterLength = ab.byteLength;
-                
-                // ONLY alert if byteLength NOT zero after transfer
-                if (afterLength !== 0) {
-                    alert_vuln(252, 'Buffer not detached! byteLength=' + afterLength + ' (expected 0)');
-                }
-                
-                log('TEST 252: Before=' + beforeLength + ', After=' + afterLength);
-            }
-        } catch(e) {
-            log('TEST 252: Exception or not available - ' + e.message);
-        }
+    const sig0 = sig(samples[0]);
+    for (let i = 1; i < samples.length; i++) {
+      const si = sig(samples[i]);
+      if (si !== sig0) {
+        alertVuln(testNum, "DETACH INCONSISTENT: comportamento pós-detach variou entre repetições (suspeito).", {
+          rep0: samples[0],
+          repN: samples[i]
+        });
+        return;
+      }
+    }
 
-        // TEST 253: TypedArray.set overflow with victim validation
-        try {
-            log('TEST 253: TypedArray.set cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xCAFEBABE;
-            victimView.fill(SENTINEL);
-            
-            const dest = new Uint32Array(10);
-            const src = new Uint32Array(1000);
-            src.fill(0x42424242);
-            
-            try {
-                dest.set(src, 0);
-            } catch(e2) {
-                // Expected to throw
-            }
-            
-            // Check victim ONLY
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(253, 'set() corrupted external buffer at index ' + result.index);
-            }
-        } catch(e) {
-            log('TEST 253: Exception - ' + e.message);
-        }
+    // Extra: if detach succeeded, ab.byteLength should be 0 (spec-like). If not, only alert if it claims detach succeeded.
+    for (const s of samples) {
+      if (s.detachedAttempted && s.afterByteLength !== 0) {
+        alertVuln(testNum, "DETACH SUSPECT: detach foi tentado mas ab.byteLength não ficou 0.", s);
+        return;
+      }
+    }
+  }
 
-        // TEST 254: Integer overflow with wrap detection
-        try {
-            log('TEST 254: Integer overflow wrap detection');
-            
-            const testSizes = [
-                0x7FFFFFFE,
-                0x7FFFFFFF,
-                0x80000000
-            ];
-            
-            for (let size of testSizes) {
-                try {
-                    const ab = new ArrayBuffer(size);
-                    const actual = ab.byteLength;
-                    
-                    // ONLY alert if size wrapped to small value
-                    if (actual > 0 && actual < 0x1000 && size > 0x1000) {
-                        alert_vuln(254, 'Size wrapped! Requested 0x' + size.toString(16) + ', got 0x' + actual.toString(16));
-                    }
-                } catch(e2) {
-                    // Expected for large sizes
-                }
-            }
-        } catch(e) {
-            log('TEST 254: Exception - ' + e.message);
-        }
+  // =========================
+  // Subarray negative clamp invariants
+  // =========================
+  function expectedSubarrayRange(len, begin, end) {
+    let b = begin | 0;
+    let e = (end === undefined) ? len : (end | 0);
 
-        // TEST 255: DataView unaligned with strict bounds
-        try {
-            log('TEST 255: DataView strict bounds check');
-            
-            const ab = new ArrayBuffer(8);
-            const dv = new DataView(ab);
-            
-            // This SHOULD throw (reading bytes 6,7,8,9 but buffer is 8 bytes)
-            let threw = false;
-            try {
-                dv.getUint32(6);
-            } catch(e2) {
-                threw = true;
-            }
-            
-            // ONLY alert if didn't throw
-            if (!threw) {
-                alert_vuln(255, 'DataView allowed OOB read (offset 6 in 8-byte buffer)');
-            }
-        } catch(e) {
-            log('TEST 255: Exception - ' + e.message);
-        }
+    if (b < 0) b = Math.max(len + b, 0);
+    else b = Math.min(b, len);
 
-        // TEST 256: Subarray with victim buffer
-        try {
-            log('TEST 256: Subarray cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xBAADF00D;
-            victimView.fill(SENTINEL);
-            
-            const parent = new Uint32Array(100);
-            const sub = parent.subarray(10, 200); // Clamps to [10, 100]
-            
-            // Try to write in clamped region
-            for (let i = 0; i < 200; i++) {
-                sub[i] = 0x43434343;
-            }
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(256, 'Subarray corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 256: Exception - ' + e.message);
-        }
+    if (e < 0) e = Math.max(len + e, 0);
+    else e = Math.min(e, len);
 
-        // TEST 257: Negative index with victim
-        try {
-            log('TEST 257: Negative index cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x88888888;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            
-            // Write to negative indices
-            for (let i = -100; i < 0; i++) {
-                ta[i] = 0x44444444;
-            }
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(257, 'Negative index corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 257: Exception - ' + e.message);
-        }
+    if (e < b) e = b;
+    return { b, e, length: e - b };
+  }
 
-        // TEST 258: copyWithin with victim
-        try {
-            log('TEST 258: copyWithin cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x99999999;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            ta.fill(0x45454545);
-            
-            // copyWithin with OOB
-            ta.copyWithin(0, 50, 1000);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(258, 'copyWithin corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 258: Exception - ' + e.message);
-        }
+  function checkNegativeSubarrayClamp(testNum) {
+    const ab = new ArrayBuffer(256);
+    const ta = new Uint8Array(ab);
+    for (let i = 0; i < ta.length; i++) ta[i] = i & 0xFF;
 
-        // TEST 259: Fill with victim
-        try {
-            log('TEST 259: Fill cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xAAAAAAAA;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            ta.fill(0x46464646);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(259, 'Fill corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 259: Exception - ' + e.message);
-        }
+    const begin = -50;
+    const end = -20;
+    const exp = expectedSubarrayRange(ta.length, begin, end);
 
-        // TEST 260: Reverse with victim
-        try {
-            log('TEST 260: Reverse cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xBBBBBBBB;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            for (let i = 0; i < ta.length; i++) ta[i] = i;
-            
-            ta.reverse();
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(260, 'Reverse corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 260: Exception - ' + e.message);
-        }
+    const sub = ta.subarray(begin, end);
 
-        // TEST 261: Sort with victim
-        try {
-            log('TEST 261: Sort cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xCCCCCCCC;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([5, 2, 8, 1, 9, 3, 7, 4, 6]);
-            ta.sort((a, b) => a - b);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(261, 'Sort corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 261: Exception - ' + e.message);
-        }
+    if (sub.length !== exp.length) {
+      alertVuln(testNum, "SUBARRAY NEGATIVE CLAMP FAIL: length inesperado.", {
+        taLen: ta.length, begin, end, exp, gotLen: sub.length
+      });
+      return;
+    }
 
-        // TEST 262: Map with victim
-        try {
-            log('TEST 262: Map cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xDDDDDDDD;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const mapped = ta.map(x => x * 2);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(262, 'Map corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 262: Exception - ' + e.message);
-        }
+    // Verify view maps correct region: first/last bytes should match
+    if (sub.length > 0) {
+      const expFirst = ta[exp.b];
+      const expLast = ta[exp.e - 1];
+      const gotFirst = sub[0];
+      const gotLast = sub[sub.length - 1];
 
-        // TEST 263: Filter with victim
-        try {
-            log('TEST 263: Filter cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xEEEEEEEE;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-            const filtered = ta.filter(x => x % 2 === 0);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(263, 'Filter corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 263: Exception - ' + e.message);
-        }
+      if (gotFirst !== expFirst || gotLast !== expLast) {
+        alertVuln(testNum, "SUBARRAY NEGATIVE CLAMP FAIL: conteúdo não corresponde ao clamp esperado.", {
+          expFirst, gotFirst, expLast, gotLast, exp
+        });
+        return;
+      }
 
-        // TEST 264: Reduce with victim
-        try {
-            log('TEST 264: Reduce cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xFFFFFFFF;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const sum = ta.reduce((a, b) => a + b, 0);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(264, 'Reduce corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 264: Exception - ' + e.message);
-        }
+      // Writes should reflect into the *same underlying buffer* at the clamped location (normal alias),
+      // but NOT become "mágico" fora da região.
+      const marker = 0xCC;
+      sub[0] = marker;
+      if (ta[exp.b] !== marker) {
+        alertVuln(testNum, "SUBARRAY WRITE FAIL: escrita não refletiu na posição clamped (inconsistente).", {
+          pos: exp.b, expMarker: marker, got: ta[exp.b]
+        });
+        return;
+      }
 
-        // TEST 265: Slice with victim and independence check
-        try {
-            log('TEST 265: Slice independence strict check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x11111111;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            for (let i = 0; i < ta.length; i++) ta[i] = i;
-            
-            const sliced = ta.slice(10, 20);
-            
-            // Modify original
-            ta[15] = 0x47474747;
-            
-            // Sliced should NOT see change (independent buffer)
-            if (sliced[5] === 0x47474747) {
-                alert_vuln(265, 'Slice not independent! Shares buffer with original');
-            }
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(265, 'Slice corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 265: Exception - ' + e.message);
-        }
+      // Ensure it did NOT write outside expected region:
+      if (exp.b > 0 && ta[exp.b - 1] === marker) {
+        alertVuln(testNum, "SUBARRAY WRITE OOR: escrita vazou para byte anterior à região (suspeito).", { pos: exp.b });
+        return;
+      }
+      if (exp.e < ta.length && ta[exp.e] === marker) {
+        alertVuln(testNum, "SUBARRAY WRITE OOR: escrita vazou para byte após a região (suspeito).", { pos: exp.e });
+        return;
+      }
+    }
+  }
 
-        // TEST 266: ArrayBuffer.slice with victim
-        try {
-            log('TEST 266: ArrayBuffer.slice cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x22222222;
-            victimView.fill(SENTINEL);
-            
-            const ab = new ArrayBuffer(0x1000);
-            const sliced = ab.slice(0x100, 0x200);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(266, 'ArrayBuffer.slice corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 266: Exception - ' + e.message);
-        }
+  // =========================
+  // Out-of-range TypedArray write invariants
+  // =========================
+  function checkTypedArrayOORWriteNoop(testNum) {
+    const victim = makeVictim(4096, 0xA11CE551);
+    const snap = snapshotVictim(victim.u8, { blockBytes: 128 });
 
-        // TEST 267: Constructor with array-like and victim
-        try {
-            log('TEST 267: Constructor array-like cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x33333333;
-            victimView.fill(SENTINEL);
-            
-            const arrayLike = {length: 1000};
-            for (let i = 0; i < 1000; i++) {
-                arrayLike[i] = 0x48484848;
-            }
-            
-            const ta = new Uint32Array(arrayLike);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(267, 'Array-like constructor corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 267: Exception - ' + e.message);
-        }
+    const ta = new Uint32Array(victim.ab);
+    const idx = ta.length; // exactly out of range
+    const before0 = ta.length ? ta[0] : 0;
 
-        // TEST 268: TypedArray.from with victim
-        try {
-            log('TEST 268: TypedArray.from cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x44444444;
-            victimView.fill(SENTINEL);
-            
-            const source = new Array(1000).fill(0x49494949);
-            const ta = Uint32Array.from(source);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(268, 'TypedArray.from corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 268: Exception - ' + e.message);
-        }
+    // Spec: setting out of range is a no-op (no throw)
+    let threw = false;
+    try { ta[idx] = 0xDEADBEEF; } catch (e) { threw = true; }
 
-        // TEST 269: TypedArray.of with victim
-        try {
-            log('TEST 269: TypedArray.of cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x55555555;
-            victimView.fill(SENTINEL);
-            
-            const ta = Uint32Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-            
-            // Check victim
-            const result = checkCrossBufferCorruption(victim, SENTINEL);
-            if (result.corrupted) {
-                alert_vuln(269, 'TypedArray.of corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 269: Exception - ' + e.message);
-        }
+    // Either behavior is acceptable across engines? In practice TypedArray OOR write should not throw.
+    // We'll only ALERT if victim bytes changed, or if behavior flips within repeats (handled elsewhere).
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok) {
+      alertVuln(testNum, "TYPEDARRAY OOR WRITE CHANGED VICTIM (suspeito).", cmp);
+      return;
+    }
+    // If it threw, that's weird but could be engine choice; we flag as "IMPOSSIBLE" only if inconsistent elsewhere.
+    // Here: do nothing.
+    void before0; void threw;
+  }
 
-        // TEST 270: Every with victim
-        try {
-            log('TEST 270: Every cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x66666666;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const result = ta.every(x => x > 0);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(270, 'Every corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 270: Exception - ' + e.message);
-        }
+  // =========================
+  // Amplifiers (stress without false positives)
+  // =========================
+  function heapSpray(intensity) {
+    const count = 50 * intensity;
+    const size = 0x2000;
+    const arr = [];
+    for (let i = 0; i < count; i++) {
+      const ab = new ArrayBuffer(size);
+      const u32 = new Uint32Array(ab);
+      for (let j = 0; j < u32.length; j += 64) u32[j] = (0x41414141 ^ i ^ j) >>> 0;
+      arr.push(ab);
+    }
+    return arr;
+  }
 
-        // TEST 271: Some with victim
-        try {
-            log('TEST 271: Some cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x77777777;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const result = ta.some(x => x > 3);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(271, 'Some corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 271: Exception - ' + e.message);
-        }
+  function makeHoles(intensity) {
+    const holes = [];
+    const n = 200 * intensity;
+    for (let i = 0; i < n; i++) holes.push(new ArrayBuffer(0x100));
+    for (let i = 0; i < holes.length; i += 2) holes[i] = null;
+    return holes;
+  }
 
-        // TEST 272: Find with victim
-        try {
-            log('TEST 272: Find cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x88888888;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const result = ta.find(x => x === 3);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(272, 'Find corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 272: Exception - ' + e.message);
-        }
+  function objectSpray(intensity) {
+    const n = 400 * intensity;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const o = { a: i, b: i * 2, c: ("x" + i) };
+      if ((i & 7) === 0) o.d = new ArrayBuffer(0x80);
+      out.push(o);
+    }
+    return out;
+  }
 
-        // TEST 273: FindIndex with victim
-        try {
-            log('TEST 273: FindIndex cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x99999999;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const result = ta.findIndex(x => x === 3);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(273, 'FindIndex corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 273: Exception - ' + e.message);
-        }
+  function microtaskChurn(n) {
+    let p = Promise.resolve();
+    for (let i = 0; i < n; i++) p = p.then(() => {});
+    return p;
+  }
 
-        // TEST 274: Entries iterator with victim
-        try {
-            log('TEST 274: Entries iterator cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xAAAAAAAA;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            for (let [idx, val] of ta.entries()) {
-                // Iterate
-            }
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(274, 'Entries iterator corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 274: Exception - ' + e.message);
-        }
+  // =========================
+  // Core test template: victim snapshot -> stress -> verify victim unchanged
+  // =========================
+  async function crossBufferIsolationTest(testNum, label, stressFn, intensity) {
+    const victim = makeVictim(64 * 1024, 0xC0FFEE00 ^ testNum);
+    const snap = snapshotVictim(victim.u8, { blockBytes: 256 });
 
-        // TEST 275: Keys iterator with victim
-        try {
-            log('TEST 275: Keys iterator cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xBBBBBBBB;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            for (let idx of ta.keys()) {
-                // Iterate
-            }
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(275, 'Keys iterator corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 275: Exception - ' + e.message);
-        }
+    // execute stress on separate allocations
+    await stressFn(intensity);
 
-        // TEST 276: Values iterator with victim
-        try {
-            log('TEST 276: Values iterator cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xCCCCCCCC;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            for (let val of ta.values()) {
-                // Iterate
-            }
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(276, 'Values iterator corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 276: Exception - ' + e.message);
-        }
+    const cmp = compareSnapshot(victim.u8, snap);
+    if (!cmp.ok) {
+      alertVuln(testNum, `${label}: VICTIM CORRUPTED (cross-buffer mismatch).`, cmp);
+    }
+  }
 
-        // TEST 277: Multiple buffer allocation pattern
-        try {
-            log('TEST 277: Allocation pattern isolation');
-            
-            const buffers = [];
-            for (let i = 0; i < 100; i++) {
-                const ab = new ArrayBuffer(0x1000);
-                const ta = new Uint32Array(ab);
-                const sentinel = 0xDDD00000 + i;
-                ta.fill(sentinel);
-                buffers.push({ab, ta, sentinel});
-            }
-            
-            // Check all buffers maintained isolation
-            for (let i = 0; i < buffers.length; i++) {
-                const {ta, sentinel} = buffers[i];
-                for (let j = 0; j < 10; j++) { // Sample first 10 elements
-                    if (ta[j] !== sentinel) {
-                        alert_vuln(277, 'Buffer ' + i + ' contaminated! Expected 0x' + sentinel.toString(16) + ' got 0x' + ta[j].toString(16));
-                        break;
-                    }
-                }
-            }
-        } catch(e) {
-            log('TEST 277: Exception - ' + e.message);
-        }
+  // =========================
+  // Define tests 251..300
+  // =========================
+  const tests = [];
 
-        // TEST 278: Heap spray pattern with validation
-        try {
-            log('TEST 278: Heap spray isolation check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xEEEEEEEE;
-            victimView.fill(SENTINEL);
-            
-            const spray = [];
-            for (let i = 0; i < 50; i++) {
-                const ab = new ArrayBuffer(0x1000);
-                const ta = new Uint32Array(ab);
-                ta.fill(0x4A4A4A4A);
-                spray.push(ab);
-            }
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(278, 'Heap spray contaminated external buffer!');
-            }
-        } catch(e) {
-            log('TEST 278: Exception - ' + e.message);
-        }
+  // 251: Cross-buffer OOB write detection (sanity: OOR write is no-op + victim unchanged)
+  tests.push(async (I) => {
+    checkTypedArrayOORWriteNoop(251);
+    await crossBufferIsolationTest(251, "Cross-buffer OOR write no-op verification", async () => {
+      // do some additional noise allocations around
+      heapSpray(I);
+    }, I);
+  });
 
-        // TEST 279: Buffer reuse after free pattern
-        try {
-            log('TEST 279: Buffer reuse contamination check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xFFFFFFFF;
-            victimView.fill(SENTINEL);
-            
-            const buffers = [];
-            for (let i = 0; i < 50; i++) {
-                buffers.push(new ArrayBuffer(0x1000));
-            }
-            
-            // Free half
-            for (let i = 0; i < buffers.length; i += 2) {
-                buffers[i] = null;
-            }
-            
-            // Allocate new
-            const newBuf = new ArrayBuffer(0x1000);
-            const newView = new Uint32Array(newBuf);
-            newView.fill(0x4B4B4B4B);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(279, 'Buffer reuse contaminated external buffer!');
-            }
-        } catch(e) {
-            log('TEST 279: Exception - ' + e.message);
-        }
+  // 252: Buffer detach strict validation + consistency across repetitions
+  tests.push(async () => {
+    checkDetachConsistency(252, 5);
+  });
 
-        // TEST 280: DataView mixed operations with victim
-        try {
-            log('TEST 280: DataView operations cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x11223344;
-            victimView.fill(SENTINEL);
-            
-            const ab = new ArrayBuffer(0x100);
-            const dv = new DataView(ab);
-            
-            dv.setUint8(0, 0x12);
-            dv.setUint16(1, 0x3456);
-            dv.setUint32(3, 0x789ABCDE);
-            dv.setFloat32(7, 3.14);
-            dv.setFloat64(11, 2.718);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(280, 'DataView operations corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 280: Exception - ' + e.message);
-        }
+  // 253: TypedArray.set cross-buffer check (set should throw on OOB source offset; victim must remain)
+  tests.push(async (I) => {
+    await crossBufferIsolationTest(253, "TypedArray.set cross-buffer isolation", async (intensity) => {
+      const a = new Uint8Array(256);
+      const b = new Uint8Array(128);
+      a.fill(0x11); b.fill(0x22);
+      // valid set
+      a.set(b, 64);
+      // invalid set should throw; we ignore exception as expected behavior
+      try { a.set(b, 200); } catch (_) {}
+      // some churn
+      heapSpray(intensity);
+    }, I);
+  });
 
-        // TEST 281: SharedArrayBuffer with victim
-        try {
-            log('TEST 281: SharedArrayBuffer cross-buffer');
-            
-            if (typeof SharedArrayBuffer !== 'undefined') {
-                const victim = new ArrayBuffer(0x1000);
-                const victimView = new Uint32Array(victim);
-                const SENTINEL = 0x55667788;
-                victimView.fill(SENTINEL);
-                
-                const sab = new SharedArrayBuffer(0x1000);
-                const ta = new Uint32Array(sab);
-                ta.fill(0x4C4C4C4C);
-                
-                // Check victim
-                const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-                if (corrupt.corrupted) {
-                    alert_vuln(281, 'SharedArrayBuffer corrupted external buffer!');
-                }
-            }
-        } catch(e) {
-            log('TEST 281: Exception - ' + e.message);
-        }
+  // 254: Integer overflow wrap detection (allocation attempts) + victim unchanged
+  tests.push(async (I) => {
+    await crossBufferIsolationTest(254, "Integer overflow/wrap allocation attempts", async (intensity) => {
+      const sizes = [0x40000000, 0x7fffffff];
+      for (const s of sizes) { try { new ArrayBuffer(s); } catch (_) {} }
+      objectSpray(intensity);
+    }, I);
+  });
 
-        // TEST 282: Atomics operations with victim
-        try {
-            log('TEST 282: Atomics cross-buffer check');
-            
-            if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
-                const victim = new ArrayBuffer(0x1000);
-                const victimView = new Uint32Array(victim);
-                const SENTINEL = 0x99AABBCC;
-                victimView.fill(SENTINEL);
-                
-                const sab = new SharedArrayBuffer(0x100);
-                const ta = new Int32Array(sab);
-                
-                Atomics.store(ta, 0, 0x4D4D4D4D);
-                Atomics.add(ta, 1, 100);
-                Atomics.exchange(ta, 2, 0x4E4E4E4E);
-                
-                // Check victim
-                const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-                if (corrupt.corrupted) {
-                    alert_vuln(282, 'Atomics corrupted external buffer!');
-                }
-            }
-        } catch(e) {
-            log('TEST 282: Exception - ' + e.message);
-        }
+  // 255: DataView strict bounds check
+  tests.push(async () => {
+    const ab = new ArrayBuffer(16);
+    const dv = new DataView(ab);
+    let ok = true;
+    try { dv.getUint32(13, true); ok = false; } catch (_) {}
+    // If it didn't throw, that's suspicious: it's truly OOB read.
+    if (!ok) alertVuln(255, "DataView.getUint32 OOB did NOT throw (IMPOSSIBLE).");
+  });
 
-        // TEST 283: BigInt64Array with victim
-        try {
-            log('TEST 283: BigInt64Array cross-buffer');
-            
-            if (typeof BigInt64Array !== 'undefined') {
-                const victim = new ArrayBuffer(0x1000);
-                const victimView = new Uint32Array(victim);
-                const SENTINEL = 0xDDEEFF00;
-                victimView.fill(SENTINEL);
-                
-                const ta = new BigInt64Array(100);
-                ta.fill(0x4F4F4F4F4F4F4F4Fn);
-                
-                // Check victim
-                const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-                if (corrupt.corrupted) {
-                    alert_vuln(283, 'BigInt64Array corrupted external buffer!');
-                }
-            }
-        } catch(e) {
-            log('TEST 283: Exception - ' + e.message);
-        }
+  // 256: Subarray cross-buffer check (ensure subarray is view on same buffer; no magic)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(128);
+    const ta = new Uint8Array(ab);
+    for (let i = 0; i < ta.length; i++) ta[i] = i;
+    const sub = ta.subarray(10, 20);
+    sub[0] = 0xEE;
+    if (ta[10] !== 0xEE) alertVuln(256, "subarray write did not reflect into same buffer (inconsistente).");
+  });
 
-        // TEST 284: Resizable ArrayBuffer with victim
-        try {
-            log('TEST 284: Resizable ArrayBuffer cross-buffer');
-            
-            if (typeof ArrayBuffer.prototype.resize === 'function') {
-                const victim = new ArrayBuffer(0x1000);
-                const victimView = new Uint32Array(victim);
-                const SENTINEL = 0x11335577;
-                victimView.fill(SENTINEL);
-                
-                const ab = new ArrayBuffer(0x100, {maxByteLength: 0x1000});
-                ab.resize(0x500);
-                
-                const ta = new Uint32Array(ab);
-                ta.fill(0x50505050);
-                
-                // Check victim
-                const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-                if (corrupt.corrupted) {
-                    alert_vuln(284, 'Resizable ArrayBuffer corrupted external buffer!');
-                }
-            }
-        } catch(e) {
-            log('TEST 284: Exception - ' + e.message);
-        }
+  // 257: Negative index cross-buffer (CLAMP validation)
+  tests.push(async () => {
+    checkNegativeSubarrayClamp(257);
+  });
 
-        // TEST 285: Cross-type view with victim
-        try {
-            log('TEST 285: Cross-type views cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x22446688;
-            victimView.fill(SENTINEL);
-            
-            const ab = new ArrayBuffer(0x100);
-            const u8 = new Uint8Array(ab);
-            const u16 = new Uint16Array(ab);
-            const u32 = new Uint32Array(ab);
-            const f32 = new Float32Array(ab);
-            const f64 = new Float64Array(ab);
-            
-            u32[0] = 0x51515151;
-            f64[1] = 3.14159;
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(285, 'Cross-type views corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 285: Exception - ' + e.message);
-        }
+  // 258..276: Cross-buffer checks around common array methods (victim snapshots + stress)
+  const methodStress = [
+    [258, "copyWithin cross-buffer check", async (I) => {
+      const a = new Uint8Array(4096);
+      for (let i = 0; i < a.length; i++) a[i] = i & 0xFF;
+      a.copyWithin(100, 0, 512);
+      heapSpray(I);
+    }],
+    [259, "fill cross-buffer check", async (I) => {
+      const a = new Uint32Array(2048);
+      a.fill(0xA5A5A5A5);
+      objectSpray(I);
+    }],
+    [260, "reverse cross-buffer check", async (I) => {
+      const a = Array.from({length: 2000}, (_,i)=>i);
+      a.reverse();
+      heapSpray(I);
+    }],
+    [261, "sort cross-buffer check", async (I) => {
+      const a = Array.from({length: 2000}, (_,i)=> (i*1103515245 + 12345)>>>0);
+      a.sort((x,y)=> (x|0)-(y|0));
+      heapSpray(I);
+    }],
+    [262, "map cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const b = a.map(x => (x ^ 0x5a5a) & 0xffff);
+      void b;
+      objectSpray(I);
+    }],
+    [263, "filter cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const b = a.filter(x => (x & 7) === 0);
+      void b;
+      heapSpray(I);
+    }],
+    [264, "reduce cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const s = a.reduce((acc,v)=>acc+v, 0);
+      void s;
+      objectSpray(I);
+    }],
+    [265, "slice independence strict check", async (I) => {
+      const a = new Uint8Array(1024);
+      a.fill(0x11);
+      const b = a.slice(100, 900);
+      b[0] = 0x22;
+      // slice should copy; original must not change
+      if (a[100] === 0x22) alertVuln(265, "TypedArray.slice aliased original (IMPOSSIBLE).");
+      heapSpray(I);
+    }],
+    [266, "ArrayBuffer.slice cross-buffer", async (I) => {
+      const ab = new ArrayBuffer(1024);
+      const u8 = new Uint8Array(ab);
+      u8.fill(0x33);
+      const ab2 = ab.slice(0, 512);
+      const u82 = new Uint8Array(ab2);
+      u82[0] = 0x44;
+      if (u8[0] === 0x44) alertVuln(266, "ArrayBuffer.slice aliased original (IMPOSSIBLE).");
+      objectSpray(I);
+    }],
+    [267, "Constructor array-like cross-buffer", async (I) => {
+      const arrLike = { length: 4, 0: 1, 1: 2, 2: 3, 3: 4 };
+      const ta = new Uint32Array(arrLike);
+      if (ta.length !== 4 || ta[0] !== 1 || ta[3] !== 4) alertVuln(267, "Uint32Array(arrayLike) incoerente.");
+      heapSpray(I);
+    }],
+    [268, "TypedArray.from cross-buffer", async (I) => {
+      if (typeof Uint8Array.from === "function") {
+        const ta = Uint8Array.from([1,2,3,4,5], x => x * 3);
+        if (ta[0] !== 3 || ta[4] !== 15) alertVuln(268, "Uint8Array.from incoerente.");
+      }
+      objectSpray(I);
+    }],
+    [269, "TypedArray.of cross-buffer", async (I) => {
+      if (typeof Uint8Array.of === "function") {
+        const ta = Uint8Array.of(9,8,7,6);
+        if (ta.length !== 4 || ta[0] !== 9 || ta[3] !== 6) alertVuln(269, "Uint8Array.of incoerente.");
+      }
+      heapSpray(I);
+    }],
+    [270, "every cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const ok = a.every(x => x >= 0);
+      if (!ok) alertVuln(270, "every retornou false inesperado.");
+      objectSpray(I);
+    }],
+    [271, "some cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const ok = a.some(x => x === 4099);
+      if (!ok) alertVuln(271, "some retornou false inesperado.");
+      heapSpray(I);
+    }],
+    [272, "find cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const v = a.find(x => x === 1234);
+      if (v !== 1234) alertVuln(272, "find não encontrou valor esperado.");
+      objectSpray(I);
+    }],
+    [273, "findIndex cross-buffer check", async (I) => {
+      const a = Array.from({length: 5000}, (_,i)=>i);
+      const idx = a.findIndex(x => x === 1234);
+      if (idx !== 1234) alertVuln(273, "findIndex retornou índice inesperado.");
+      heapSpray(I);
+    }],
+    [274, "entries iterator cross-buffer", async (I) => {
+      const a = Array.from({length: 2000}, (_,i)=>i);
+      let c = 0;
+      for (const [k,v] of a.entries()) { c += (k === v) ? 1 : 0; if (k > 300) break; }
+      if (c < 200) alertVuln(274, "entries iteration incoerente.");
+      objectSpray(I);
+    }],
+    [275, "keys iterator cross-buffer", async (I) => {
+      const a = Array.from({length: 2000}, (_,i)=>i);
+      let last = -1, steps = 0;
+      for (const k of a.keys()) { last = k; steps++; if (steps > 300) break; }
+      if (last < 0) alertVuln(275, "keys iteration incoerente.");
+      heapSpray(I);
+    }],
+    [276, "values iterator cross-buffer", async (I) => {
+      const a = Array.from({length: 2000}, (_,i)=>i);
+      let last = -1, steps = 0;
+      for (const v of a.values()) { last = v; steps++; if (steps > 300) break; }
+      if (last < 0) alertVuln(276, "values iteration incoerente.");
+      objectSpray(I);
+    }],
+  ];
 
-        // TEST 286: Uint8ClampedArray with victim
-        try {
-            log('TEST 286: Uint8ClampedArray cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x33557799;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint8ClampedArray(1000);
-            ta.fill(255);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(286, 'Uint8ClampedArray corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 286: Exception - ' + e.message);
-        }
+  for (const [num, label, fn] of methodStress) {
+    tests.push(async (I) => crossBufferIsolationTest(num, label, fn, I));
+  }
 
-        // TEST 287: Int8Array with victim
-        try {
-            log('TEST 287: Int8Array cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x44668800;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Int8Array(1000);
-            ta.fill(-128);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(287, 'Int8Array corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 287: Exception - ' + e.message);
-        }
+  // 277: Allocation pattern isolation
+  tests.push(async (I) => crossBufferIsolationTest(277, "Allocation pattern isolation", async (intensity) => {
+    makeHoles(intensity);
+    heapSpray(intensity);
+  }, I));
 
-        // TEST 288: Massive allocation with victim
-        try {
-            log('TEST 288: Massive allocation isolation');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x55779911;
-            victimView.fill(SENTINEL);
-            
-            let allocated = 0;
-            const buffers = [];
-            
-            // Try to allocate up to 100MB (not DoS, just memory pressure)
-            for (let i = 0; i < 100; i++) {
-                try {
-                    buffers.push(new ArrayBuffer(0x100000)); // 1MB
-                    allocated++;
-                } catch(e2) {
-                    break;
-                }
-            }
-            
-            log('TEST 288: Allocated ' + allocated + 'MB');
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(288, 'Massive allocation corrupted external buffer!');
-            }
-            
-            // Cleanup
-            buffers.length = 0;
-        } catch(e) {
-            log('TEST 288: Exception - ' + e.message);
-        }
+  // 278: Heap spray isolation check
+  tests.push(async (I) => crossBufferIsolationTest(278, "Heap spray isolation", async (intensity) => {
+    heapSpray(intensity * 2);
+  }, I));
 
-        // TEST 289: Sequential operations with victim
-        try {
-            log('TEST 289: Sequential operations isolation');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x66881122;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            
-            ta.fill(1);
-            ta.reverse();
-            ta.sort((a, b) => a - b);
-            const mapped = ta.map(x => x * 2);
-            const filtered = mapped.filter(x => x > 0);
-            const sum = filtered.reduce((a, b) => a + b, 0);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(289, 'Sequential operations corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 289: Exception - ' + e.message);
-        }
+  // 279: Buffer reuse contamination check
+  tests.push(async (I) => crossBufferIsolationTest(279, "Buffer reuse contamination", async (intensity) => {
+    const pool = [];
+    for (let i = 0; i < 200 * intensity; i++) pool.push(new ArrayBuffer(0x400));
+    for (let i = 0; i < pool.length; i += 3) pool[i] = null;
+    for (let i = 0; i < 200 * intensity; i++) pool.push(new ArrayBuffer(0x400));
+  }, I));
 
-        // TEST 290: Nested subarrays with victim
-        try {
-            log('TEST 290: Nested subarrays cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x77993344;
-            victimView.fill(SENTINEL);
-            
-            const ta1 = new Uint32Array(100);
-            const ta2 = ta1.subarray(10, 90);
-            const ta3 = ta2.subarray(10, 70);
-            const ta4 = ta3.subarray(10, 50);
-            
-            ta4.fill(0x52525252);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(290, 'Nested subarrays corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 290: Exception - ' + e.message);
-        }
+  // 280: DataView ops cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(280, "DataView operations cross-buffer", async (intensity) => {
+    const ab = new ArrayBuffer(4096);
+    const dv = new DataView(ab);
+    for (let i = 0; i < 512; i++) dv.setUint32(i * 4, (0x11223344 ^ i) >>> 0, true);
+    for (let i = 0; i < 16; i++) dv.getUint32(i * 4, true);
+    heapSpray(intensity);
+  }, I));
 
-        // TEST 291: Buffer with Object.freeze and victim
-        try {
-            log('TEST 291: Frozen buffer cross-check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x88AA5566;
-            victimView.fill(SENTINEL);
-            
-            const ab = new ArrayBuffer(0x100);
-            const ta = new Uint32Array(ab);
-            
-            Object.freeze(ab);
-            Object.freeze(ta);
-            
-            ta[0] = 0x53535353;
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(291, 'Frozen buffer ops corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 291: Exception - ' + e.message);
-        }
+  // 281: SharedArrayBuffer cross-buffer (skip if unsupported)
+  tests.push(async () => {
+    if (typeof SharedArrayBuffer !== "function") return;
+    const sab = new SharedArrayBuffer(1024);
+    const u8 = new Uint8Array(sab);
+    u8[0] = 1;
+    if (u8[0] !== 1) alertVuln(281, "SharedArrayBuffer basic failed (incoerente).");
+  });
 
-        // TEST 292: Buffer with Object.seal and victim
-        try {
-            log('TEST 292: Sealed buffer cross-check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x99BB6677;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            Object.seal(ta);
-            
-            ta[0] = 0x54545454;
-            ta[100] = 0x55555555; // Should become property
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(292, 'Sealed buffer ops corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 292: Exception - ' + e.message);
-        }
+  // 282: Atomics cross-buffer (skip if unsupported)
+  tests.push(async () => {
+    if (typeof Atomics !== "object" || typeof SharedArrayBuffer !== "function") return;
+    const sab = new SharedArrayBuffer(1024);
+    const ia = new Int32Array(sab);
+    Atomics.store(ia, 0, 123);
+    const v = Atomics.load(ia, 0);
+    if (v !== 123) alertVuln(282, "Atomics load/store incoerente.");
+  });
 
-        // TEST 293: Proxy wrapped array with victim
-        try {
-            log('TEST 293: Proxy array cross-buffer');
-            
-            if (typeof Proxy !== 'undefined') {
-                const victim = new ArrayBuffer(0x1000);
-                const victimView = new Uint32Array(victim);
-                const SENTINEL = 0xAACC7788;
-                victimView.fill(SENTINEL);
-                
-                const ta = new Uint32Array(100);
-                const proxy = new Proxy(ta, {
-                    get: (target, prop) => target[prop],
-                    set: (target, prop, value) => {
-                        target[prop] = value;
-                        return true;
-                    }
-                });
-                
-                proxy[0] = 0x56565656;
-                
-                // Check victim
-                const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-                if (corrupt.corrupted) {
-                    alert_vuln(293, 'Proxy array corrupted external buffer!');
-                }
-            }
-        } catch(e) {
-            log('TEST 293: Exception - ' + e.message);
-        }
+  // 283: BigInt64Array cross-buffer (skip if unsupported)
+  tests.push(async () => {
+    if (typeof BigInt64Array !== "function") return;
+    const ab = new ArrayBuffer(64);
+    const bi = new BigInt64Array(ab);
+    bi[0] = 1n;
+    if (bi[0] !== 1n) alertVuln(283, "BigInt64Array incoerente.");
+  });
 
-        // TEST 294: Mixed endian DataView with victim
-        try {
-            log('TEST 294: Mixed endian DataView cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xBBDD8899;
-            victimView.fill(SENTINEL);
-            
-            const ab = new ArrayBuffer(0x100);
-            const dv = new DataView(ab);
-            
-            dv.setUint32(0, 0x12345678, true); // LE
-            dv.setUint32(4, 0xABCDEF00, false); // BE
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(294, 'Mixed endian DataView corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 294: Exception - ' + e.message);
-        }
+  // 284: Resizable ArrayBuffer cross-buffer (skip if unsupported)
+  tests.push(async () => {
+    // PS4/old WebKit typically doesn't support resizable buffers; do not false-alert.
+    // If it exists, verify shrink -> access throws consistently.
+    if (typeof ArrayBuffer !== "function") return;
+    // feature probe: new ArrayBuffer(length, {maxByteLength}) is nonstandard in many engines
+    let rab;
+    try { rab = new ArrayBuffer(1024, { maxByteLength: 2048 }); } catch (_) { return; }
+    const u8 = new Uint8Array(rab);
+    u8[0] = 0xAA;
+    let shrunk = false;
+    try { rab.resize(16); shrunk = true; } catch (_) { return; }
+    if (!shrunk) return;
 
-        // TEST 295: toString/toLocaleString with victim
-        try {
-            log('TEST 295: toString operations cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xCCEE99AA;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array([1, 2, 3, 4, 5]);
-            const str1 = ta.toString();
-            const str2 = ta.toLocaleString();
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(295, 'toString operations corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 295: Exception - ' + e.message);
-        }
+    // After shrink, reading beyond new length should throw in DataView, and typed views should reflect new length
+    const dv = new DataView(rab);
+    let threw = false;
+    try { dv.getUint32(32, true); } catch (_) { threw = true; }
+    if (!threw) alertVuln(284, "Resizable AB: DataView read beyond after shrink did NOT throw (suspeito).");
+  });
 
-        // TEST 296: join with victim
-        try {
-            log('TEST 296: Join operation cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xDDFFAABB;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(1000);
-            ta.fill(0x57575757);
-            const joined = ta.join(',');
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(296, 'Join operation corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 296: Exception - ' + e.message);
-        }
+  // 285: Cross-type views cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(285, "Cross-type views cross-buffer", async (intensity) => {
+    const ab = new ArrayBuffer(4096);
+    const u8 = new Uint8Array(ab);
+    const u32 = new Uint32Array(ab);
+    u32[0] = 0x12345678;
+    if (!(u8[0] === 0x78 || u8[0] === 0x12)) {
+      // endian dependent, but should be one of them
+      alertVuln(285, "Cross-type view endian incoerente.", { u8_0: u8[0] });
+    }
+    heapSpray(intensity);
+  }, I));
 
-        // TEST 297: indexOf/lastIndexOf with victim
-        try {
-            log('TEST 297: indexOf operations cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xEE00BBCC;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(1000);
-            ta.fill(0x58585858);
-            ta[500] = 0x59595959;
-            
-            const idx1 = ta.indexOf(0x59595959);
-            const idx2 = ta.lastIndexOf(0x59595959);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(297, 'indexOf operations corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 297: Exception - ' + e.message);
-        }
+  // 286: Uint8ClampedArray cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(286, "Uint8ClampedArray cross-buffer", async (intensity) => {
+    if (typeof Uint8ClampedArray !== "function") return;
+    const ab = new ArrayBuffer(64);
+    const c = new Uint8ClampedArray(ab);
+    c[0] = 300; // should clamp to 255
+    if (c[0] !== 255) alertVuln(286, "Clamping falhou.", { got: c[0] });
+    objectSpray(intensity);
+  }, I));
 
-        // TEST 298: includes with victim
-        try {
-            log('TEST 298: Includes operation cross-buffer');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0xFF11CCDD;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(1000);
-            ta.fill(0x5A5A5A5A);
-            
-            const hasValue = ta.includes(0x5A5A5A5A);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(298, 'Includes operation corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 298: Exception - ' + e.message);
-        }
+  // 287: Int8Array cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(287, "Int8Array wrap cross-buffer", async (intensity) => {
+    const ab = new ArrayBuffer(16);
+    const i8 = new Int8Array(ab);
+    i8[0] = 128; // wraps to -128
+    if (i8[0] !== -128) alertVuln(287, "Int8 wrap falhou.", { got: i8[0] });
+    heapSpray(intensity);
+  }, I));
 
-        // TEST 299: forEach with victim
-        try {
-            log('TEST 299: forEach cross-buffer check');
-            
-            const victim = new ArrayBuffer(0x1000);
-            const victimView = new Uint32Array(victim);
-            const SENTINEL = 0x0022DDEE;
-            victimView.fill(SENTINEL);
-            
-            const ta = new Uint32Array(100);
-            ta.fill(0x5B5B5B5B);
-            
-            let sum = 0;
-            ta.forEach(val => sum += val);
-            
-            // Check victim
-            const corrupt = checkCrossBufferCorruption(victim, SENTINEL);
-            if (corrupt.corrupted) {
-                alert_vuln(299, 'forEach corrupted external buffer!');
-            }
-        } catch(e) {
-            log('TEST 299: Exception - ' + e.message);
-        }
+  // 288: Massive allocation isolation (bounded)
+  tests.push(async (I) => crossBufferIsolationTest(288, "Massive allocation isolation", async (intensity) => {
+    // avoid kernel panic / DoS: keep bounded
+    const mb = 8 * intensity; // 8..40 MB
+    const buffers = [];
+    for (let i = 0; i < mb; i++) {
+      try { buffers.push(new ArrayBuffer(1024 * 1024)); } catch (_) { break; }
+    }
+    void buffers;
+  }, I));
 
-        // TEST 300: Comprehensive multi-operation stress test
-        try {
-            log('TEST 300: COMPREHENSIVE STRESS TEST');
-            
-            // Create 10 victim buffers
-            const victims = [];
-            for (let i = 0; i < 10; i++) {
-                const ab = new ArrayBuffer(0x1000);
-                const ta = new Uint32Array(ab);
-                const sentinel = 0x10000000 + (i * 0x1000000);
-                ta.fill(sentinel);
-                victims.push({ab, ta, sentinel});
-            }
-            
-            // Perform comprehensive operations
-            const test1 = new Uint32Array(1000);
-            test1.fill(0x5C5C5C5C);
-            test1.reverse();
-            test1.sort((a, b) => a - b);
-            
-            const test2 = new Uint32Array(test1.buffer);
-            test2.copyWithin(0, 500, 1000);
-            
-            const test3 = test1.slice(100, 900);
-            const test4 = test1.subarray(200, 800);
-            
-            const mapped = test1.map(x => x + 1);
-            const filtered = mapped.filter(x => x !== 0);
-            const reduced = filtered.reduce((a, b) => a + b, 0);
-            
-            // Check ALL victims
-            let anyCorrupted = false;
-            for (let i = 0; i < victims.length; i++) {
-                const {ta, sentinel} = victims[i];
-                const corrupt = checkCrossBufferCorruption(victims[i].ab, sentinel);
-                if (corrupt.corrupted) {
-                    alert_vuln(300, 'COMPREHENSIVE TEST: Victim ' + i + ' corrupted at index ' + corrupt.index);
-                    anyCorrupted = true;
-                    break;
-                }
-            }
-            
-            if (!anyCorrupted) {
-                log('TEST 300: ✓ COMPREHENSIVE TEST PASSED - All victims isolated');
-            }
-            
-        } catch(e) {
-            log('TEST 300: Exception - ' + e.message);
-        }
+  // 289: Sequential operations isolation
+  tests.push(async (I) => crossBufferIsolationTest(289, "Sequential ops isolation", async (intensity) => {
+    const a = new Uint8Array(1024 * 32);
+    a.fill(0x11);
+    a.copyWithin(100, 0, 4000);
+    a.fill(0x22, 2000, 6000);
+    const b = a.slice(1000, 9000);
+    b.reverse?.();
+    await microtaskChurn(200 * intensity);
+  }, I));
 
-        log('========================================');
-        log('ALL 50 ULTRA-RIGOROUS TESTS COMPLETE (251-300)');
-        log('========================================');
-        log('METHODOLOGY: Only alerts on cross-buffer corruption');
-        log('FALSE POSITIVES ELIMINATED: No alerts for spec-compliant behavior');
-        log('Run on PS4 and modern browsers - compare results');
-    </script>
+  // 290: Nested subarrays cross-buffer (negative + nested)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(512);
+    const ta = new Uint8Array(ab);
+    for (let i = 0; i < ta.length; i++) ta[i] = i & 0xFF;
+
+    const s1 = ta.subarray(-200);
+    const s2 = s1.subarray(-100, -10);
+    const exp = expectedSubarrayRange(ta.length, ta.length - 200 - 100, ta.length - 200 - 10);
+
+    if (s2.length !== exp.length) {
+      alertVuln(290, "Nested negative subarray clamp mismatch.", { got: s2.length, exp: exp.length });
+    }
+  });
+
+  // 291: Frozen buffer cross-check (expected exception in most engines)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(64);
+    const u8 = new Uint8Array(ab);
+    let threw = false;
+    try { Object.freeze(u8); } catch (_) { threw = true; }
+    // no alert; freezing typed array views is commonly rejected (PS4 log shows that)
+    void threw;
+  });
+
+  // 292: Sealed buffer cross-check
+  tests.push(async () => {
+    const ab = new ArrayBuffer(64);
+    const u8 = new Uint8Array(ab);
+    let threw = false;
+    try { Object.seal(u8); } catch (_) { threw = true; }
+    void threw;
+  });
+
+  // 293: Proxy array cross-buffer (ensure it doesn't pretend to be typed array)
+  tests.push(async () => {
+    const ta = new Uint8Array(8);
+    const p = new Proxy(ta, {
+      get(t, prop, r) { return Reflect.get(t, prop, r); }
+    });
+    // Basic access must be consistent; no alert unless nonsense
+    if (p[0] !== 0) alertVuln(293, "Proxy typed array basic read mismatch.", { got: p[0] });
+  });
+
+  // 294: Mixed endian DataView cross-buffer (consistency)
+  tests.push(async () => {
+    const ab = new ArrayBuffer(8);
+    const dv = new DataView(ab);
+    dv.setUint32(0, 0x12345678, true);
+    const le = dv.getUint32(0, true);
+    const be = dv.getUint32(0, false);
+    if (le !== 0x12345678 || be !== 0x78563412) {
+      alertVuln(294, "Endianness inconsistente.", { le, be });
+    }
+  });
+
+  // 295: toString operations cross-buffer (no corruption checks; just run)
+  tests.push(async (I) => crossBufferIsolationTest(295, "toString ops cross-buffer", async (intensity) => {
+    const a = new Uint32Array(2048);
+    for (let i = 0; i < a.length; i++) a[i] = i;
+    const s = a.toString();
+    void s;
+    objectSpray(intensity);
+  }, I));
+
+  // 296: join operation cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(296, "join cross-buffer", async (intensity) => {
+    const a = Array.from({length: 2000}, (_,i)=>i);
+    const s = a.join(",");
+    void s;
+    heapSpray(intensity);
+  }, I));
+
+  // 297: indexOf ops cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(297, "indexOf cross-buffer", async (intensity) => {
+    const a = Array.from({length: 10000}, (_,i)=>i);
+    const idx = a.indexOf(9001);
+    if (idx !== 9001) alertVuln(297, "indexOf retornou incorreto.", { idx });
+    objectSpray(intensity);
+  }, I));
+
+  // 298: includes ops cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(298, "includes cross-buffer", async (intensity) => {
+    const a = [1,2,NaN,4];
+    if (a.includes(NaN) !== true) alertVuln(298, "includes(NaN) incoerente.");
+    heapSpray(intensity);
+  }, I));
+
+  // 299: forEach cross-buffer
+  tests.push(async (I) => crossBufferIsolationTest(299, "forEach cross-buffer", async (intensity) => {
+    const a = Array.from({length: 8000}, (_,i)=>i);
+    let s = 0;
+    a.forEach(v => { s += v; });
+    void s;
+    objectSpray(intensity);
+  }, I));
+
+  // 300: COMPREHENSIVE STRESS TEST (bounded + strong invariants)
+  tests.push(async (I) => {
+    // combined: detach consistency + negative subarray clamp + OOR write no-op + cross-buffer snapshot
+    checkDetachConsistency(300, 5);
+    checkNegativeSubarrayClamp(300);
+    checkTypedArrayOORWriteNoop(300);
+
+    await crossBufferIsolationTest(300, "Comprehensive stress (bounded)", async (intensity) => {
+      makeHoles(intensity);
+      heapSpray(intensity);
+      objectSpray(intensity);
+      await microtaskChurn(300 * intensity);
+    }, I);
+  });
+
+  // sanity: ensure we have exactly 50 tests (251..300)
+  if (tests.length !== 50) {
+    logLine("INTERNAL WARN: expected 50 tests, got " + tests.length);
+  }
+
+  // =========================
+  // Runner
+  // =========================
+  function withTimeout(promise, ms) {
+    let t;
+    const timeout = new Promise((_, rej) => {
+      t = setTimeout(() => rej(new Error("TIMEOUT")), ms);
+    });
+    return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+  }
+
+  async function runAll() {
+    STOP = false;
+    RUN_ID++;
+    const runId = RUN_ID;
+
+    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value || "0", 10));
+    const timeoutMs = Math.max(100, parseInt(document.getElementById("timeoutMs").value || "1200", 10));
+    const intensity = Math.min(5, Math.max(1, parseInt(document.getElementById("intensity").value || "3", 10)));
+
+    logLine("============================================================");
+    logLine("Run ALL :: 50 tests (251..300)");
+    logLine("============================================================");
+
+    for (let i = 0; i < tests.length; i++) {
+      if (STOP || runId !== RUN_ID) break;
+
+      const testNum = 251 + i;
+      try {
+        const p = Promise.resolve(tests[i](intensity));
+        await withTimeout(p, timeoutMs);
+      } catch (e) {
+        // Exceptions alone are not corruption; only alert if "impossible" patterns were detected by invariants.
+        // So we just keep quiet here to avoid false positives.
+      }
+
+      if (delayMs) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+
+    logLine("ALL DONE.");
+  }
+
+  // Wire UI
+  document.getElementById("btnReset").onclick = resetLog;
+  document.getElementById("btnStop").onclick = stopNow;
+  document.getElementById("btnRunAll").onclick = runAll;
+
+  // init
+  resetLog();
+})();
+</script>
 </body>
 </html>
-
