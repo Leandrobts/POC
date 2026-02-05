@@ -1,468 +1,343 @@
-
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-  <meta charset="UTF-8">
-  <title>PS4 PoCs — TypedArray Index Invariant + MessageChannel Drop</title>
+  <meta charset="utf-8">
+  <title>PS4 POC Pack — TA/AB Impossible Invariants + MessageChannel Drop</title>
 </head>
 <body>
-  <h2>PS4 PoCs (no exploitation) — cada botão roda um cenário</h2>
+  <h2>PS4 POC Pack — TypedArray/ArrayBuffer Invariants (no exploitation)</h2>
 
-  <div>
-    <button id="btnReset">Reset log</button>
+  <button id="btnReset">Reset log</button>
+  <button id="btnAB">T1 :: AB.byteLength descriptor audit</button>
+  <button id="btnA">A :: Object.defineProperty on ta[0]</button>
+  <button id="btnB">B :: Reflect.defineProperty on ta[0]</button>
+  <button id="btnC">C :: Proxy wrapper invariants</button>
+  <button id="btnD">D :: Cross-realm iframe reproduce</button>
+  <button id="btnT8">T8 :: MessageChannel transfer DROP detector (handshake)</button>
+
+  <div style="margin-top:10px;">
+    N (T8 reps): <input id="N" type="number" value="30" min="1" step="1">
+    Delay (ms): <input id="delayMs" type="number" value="50" min="0" step="10">
+    Timeout (ms): <input id="timeoutMs" type="number" value="1200" min="100" step="50">
   </div>
 
-  <hr>
-
-  <h3>AB descriptor audit (não é “bug” por default)</h3>
-  <button id="btnABDesc">POC: ArrayBuffer.prototype.byteLength descriptor audit</button>
-
-  <hr>
-
-  <h3>TypedArray index “configurable:true” (A/B/C/D)</h3>
-  <button id="btnTA_A">POC A: Object.defineProperty em ta[0]</button>
-  <button id="btnTA_B">POC B: Reflect.defineProperty em ta[0]</button>
-  <button id="btnTA_C">POC C: Proxy invariants (defineProperty/getOwnPropertyDescriptor)</button>
-  <button id="btnTA_D">POC D: Cross-realm (iframe) reproduce</button>
-
-  <hr>
-
-  <h3>MessageChannel transfer drop (T8)</h3>
-  <div>
-    N: <input id="mcN" type="number" value="30" min="1" step="1">
-    Delay(ms): <input id="mcDelay" type="number" value="50" min="0" step="10">
-    Timeout(ms): <input id="mcTimeout" type="number" value="1200" min="100" step="50">
-  </div>
-  <button id="btnMC">POC: MessageChannel transfer drop detector</button>
-
-  <hr>
-
-  <pre id="log" style="white-space:pre-wrap;"></pre>
+  <pre id="log" style="white-space:pre-wrap; margin-top:10px;"></pre>
 
 <script>
-(function(){
+(() => {
   "use strict";
 
-  var $log = document.getElementById("log");
+  const $log = document.getElementById("log");
 
   function ts(){ return Date.now(); }
-  function logLine(s){ $log.textContent += "["+ts()+"] " + s + "\n"; }
+  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
   function resetLog(){ $log.textContent = ""; logLine("Reset."); }
 
-  function safeJson(x){
+  function j(x){
     try { return JSON.stringify(x, null, 2); }
     catch(e){ return String(x); }
   }
 
-  function banner(title){
-    logLine("============================================================");
-    logLine(title);
-    logLine("============================================================");
-  }
-
-  function alertBox(title, obj){
-    var msg = title + "\n" + safeJson(obj);
-    logLine("ALERTA: " + title + " " + safeJson(obj));
-    try { alert(msg); } catch(_){}
-  }
-
-  // -------------------------
-  // Victim checksum (cross-buffer corruption evidence)
-  // -------------------------
-  function xorshift32(seed){
-    var x = seed >>> 0;
-    return function(){
-      x ^= (x << 13) >>> 0;
-      x ^= (x >>> 17) >>> 0;
-      x ^= (x << 5) >>> 0;
-      return x >>> 0;
-    };
-  }
-
-  function fillVictim(u8, seed){
-    var rnd = xorshift32(seed);
-    for (var i=0;i<u8.length;i++){
-      var r = rnd();
-      u8[i] = (r ^ (r>>>8) ^ (r>>>16) ^ (r>>>24)) & 0xFF;
-    }
-  }
-
-  function blockXor32(u8, blockBytes){
-    var nBlocks = Math.ceil(u8.length / blockBytes);
-    var out = new Uint32Array(nBlocks);
-    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-
-    for (var b=0;b<nBlocks;b++){
-      var start = b*blockBytes;
-      var end = Math.min(u8.length, start + blockBytes);
-      var acc = 0 >>> 0;
-
-      var i = start;
-      for (; i + 4 <= end; i += 4) acc ^= dv.getUint32(i, true);
-      for (; i < end; i++) acc ^= (u8[i] << (((i - start) & 3) * 8)) >>> 0;
-
-      out[b] = acc >>> 0;
-    }
-    return out;
-  }
-
-  function snapshotVictim(u8, blockBytes){
-    return {
-      len: u8.length,
-      blockBytes: blockBytes,
-      sum: blockXor32(u8, blockBytes)
-    };
-  }
-
-  function compareSnapshot(u8, snap){
-    if (u8.length !== snap.len) return { ok:false, reason:"len changed", gotLen:u8.length, expLen:snap.len };
-    var now = blockXor32(u8, snap.blockBytes);
-    if (now.length !== snap.sum.length) return { ok:false, reason:"blocks len mismatch" };
-    for (var i=0;i<now.length;i++){
-      if (now[i] !== snap.sum[i]){
-        return { ok:false, reason:"checksum mismatch", blockIndex:i, exp:(snap.sum[i]>>>0), got:(now[i]>>>0) };
-      }
-    }
-    return { ok:true };
-  }
-
-  function withVictim(runFn, label){
-    // 64KB victim, isolate from PoC allocations as much as possible
-    var victimAB = new ArrayBuffer(64*1024);
-    var victimU8 = new Uint8Array(victimAB);
-    fillVictim(victimU8, (0xC0FFEE00 ^ (Date.now() & 0xffffffff)) >>> 0);
-    var snap = snapshotVictim(victimU8, 256);
-
-    var out = null;
-    try { out = runFn(); }
-    catch(e){ out = { threw:true, err:(e && e.name) ? e.name : "ERR" }; }
-
-    var cmp = compareSnapshot(victimU8, snap);
-    if (!cmp.ok){
-      alertBox("EVIDÊNCIA DE CORRUPÇÃO (victim cross-buffer mudou): " + label, { cmp: cmp, result: out });
-    } else {
-      logLine("Victim integrity OK: " + label);
-    }
-    return out;
+  function alertBox(tag, msg, extra){
+    const blob = extra ? ("\n" + j(extra)) : "";
+    const full = `${tag}: ${msg}${blob}`;
+    logLine(full);
+    alert(full);
   }
 
   // -------------------------
   // Helpers
   // -------------------------
-  function getDesc(obj, prop){
-    try { return Object.getOwnPropertyDescriptor(obj, prop); }
-    catch(e){ return "THREW:" + ((e && e.name) ? e.name : "ERR"); }
+  function auditDesc(obj, prop){
+    let d = null, threw = false, err = null;
+    try { d = Object.getOwnPropertyDescriptor(obj, prop); }
+    catch(e){ threw = true; err = e && e.name; }
+    return { threw, err, desc: d };
   }
 
-  function getProtoDesc(proto, prop){
-    try { return Object.getOwnPropertyDescriptor(proto, prop); }
-    catch(e){ return "THREW:" + ((e && e.name) ? e.name : "ERR"); }
-  }
-
-  function makeIframe(){
-    var f = document.createElement("iframe");
-    f.style.display = "none";
-    document.body.appendChild(f);
-    return f;
-  }
-  function removeIframe(f){
-    try { f.parentNode.removeChild(f); } catch(_){}
-  }
-
-  // -------------------------
-  // POC: ArrayBuffer.prototype.byteLength audit
-  // -------------------------
-  function pocABDesc(){
-    banner("POC: ArrayBuffer.prototype.byteLength descriptor audit");
-
-    var desc = getProtoDesc(ArrayBuffer.prototype, "byteLength");
-    logLine("Descriptor(ArrayBuffer.prototype.byteLength) = " + safeJson(desc));
-
-    // Não chamar de bug só por configurable=true.
-    // O spec define como accessor e detached => +0.
-    var ab = new ArrayBuffer(16);
-    var before = ab.byteLength;
-
-    // Best-effort detach: MessageChannel/structuredClone/postMessage variam por engine.
-    var detachedAttempted = false;
-    try {
-      if (typeof MessageChannel === "function"){
-        var ch = new MessageChannel();
-        ch.port1.postMessage(ab, [ab]);
-        detachedAttempted = true;
-      }
-    } catch(_){}
-    var after = ab.byteLength;
-
-    logLine("Sample: beforeLen=" + before + " afterLen=" + after + " detachedAttempted=" + detachedAttempted);
-    if (detachedAttempted && after !== 0 && after !== before){
-      alertBox("AB.byteLength em estado estranho (nem 0 nem original)", { before: before, after: after });
-    }
-  }
-
-  // -------------------------
-  // TypedArray index invariant PoCs (A/B/C/D)
-  // -------------------------
-  function coreTAExperiment(mode){
-    var ta = new Uint8Array(4);
+  // IMPORTANT:
+  // Não assumimos "configurable deve ser false/true" (porque isso varia por spec/engine/historic).
+  // O que medimos é CONSISTÊNCIA:
+  //  - se desc diz configurable:true, delete não deveria lançar TypeError (comportamento típico de non-configurable).
+  //  - se delete falha/lança, mas desc diz configurable:true => inconsistente.
+  function taIndexConsistencyReport(label, defineFn){
+    const ab = new ArrayBuffer(16);
+    const ta = new Uint8Array(ab);
     ta[0] = 7;
 
-    var baseline = getDesc(ta, "0");
-    logLine("Initial ta[0]=" + ta[0] + " baselineOwnDesc=" + safeJson(baseline));
+    const baselineOwnDesc = auditDesc(ta, "0").desc;
+    logLine(`${label} Initial ta[0]=${ta[0]} baselineOwnDesc=${j(baselineOwnDesc)}`);
 
-    var defineRes = { ok:null, threw:false, err:null, desc:null };
-
+    const defineRes = { ok: null, threw: false, err: null, desc: null };
     try {
-      var d = { value: 9, writable: true, enumerable: true, configurable: true };
-      if (mode === "A"){
-        Object.defineProperty(ta, "0", d);
-        defineRes.ok = true;
-      } else if (mode === "B"){
-        defineRes.ok = Reflect.defineProperty(ta, "0", d);
-      } else if (mode === "C"){
-        // via Proxy wrapper to stress invariant enforcement
-        var p = new Proxy(ta, {});
-        defineRes.ok = Reflect.defineProperty(p, "0", d);
-      } else {
-        // mode D handled elsewhere
-      }
-    } catch(e){
+      defineRes.ok = defineFn(ta);
+    } catch (e) {
       defineRes.threw = true;
-      defineRes.err = (e && e.name) ? e.name : "ERR";
+      defineRes.err = e && e.name;
     }
+    defineRes.desc = auditDesc(ta, "0").desc;
 
-    defineRes.desc = getDesc(ta, "0");
-    logLine("defineProperty result = " + safeJson(defineRes));
-    logLine("After defineProperty ta[0] = " + ta[0]);
+    logLine(`${label} defineProperty result = ${j(defineRes)}`);
+    logLine(`${label} After defineProperty ta[0] = ${ta[0]}`);
 
-    // Try write & delete behaviors
-    var afterWrite = null, del1 = null, del2 = null, descNow = null;
-    try { ta[0] = 0x33; afterWrite = ta[0]; } catch(e){ afterWrite = "THREW:" + ((e && e.name) ? e.name : "ERR"); }
-    try { del1 = delete ta[0]; } catch(e){ del1 = "THREW:" + ((e && e.name) ? e.name : "ERR"); }
-    try { del2 = Reflect.deleteProperty(ta, "0"); } catch(e){ del2 = "THREW:" + ((e && e.name) ? e.name : "ERR"); }
-    descNow = getDesc(ta, "0");
+    // write afterwards
+    ta[0] = 0x33;
 
-    var keys = null;
-    try { keys = Reflect.ownKeys(ta); } catch(e){ keys = "THREW:" + ((e && e.name) ? e.name : "ERR"); }
+    // delete paths
+    let del1 = null, del2 = null, del1Threw = false, del1Err = null;
+    try { del1 = delete ta[0]; }
+    catch(e){ del1Threw = true; del1Err = e && e.name; del1 = `THREW:${del1Err || "ERR"}`; }
 
-    var out = {
-      baselineOwnDesc: baseline,
-      defineRes: defineRes,
-      afterWrite: afterWrite,
+    try { del2 = Reflect.deleteProperty(ta, "0"); }
+    catch(e){ del2 = `THREW:${(e && e.name) || "ERR"}`; }
+
+    const descNow = auditDesc(ta, "0").desc;
+    const keys = (() => { try { return Reflect.ownKeys(ta); } catch(_) { return []; } })();
+
+    const report = {
+      baselineOwnDesc,
+      defineRes,
+      afterWrite: ta[0],
       delete1: del1,
       delete2: del2,
-      descNow: descNow,
+      descNow,
       ownKeys: keys
     };
 
-    logLine("After ta[0]=0x33 / deletes / keys => " + safeJson(out));
+    logLine(`${label} After ta[0]=0x33 / deletes / keys => ${j(report)}`);
 
-    // "Impossible" condition we care about:
-    // - configurable:true on an integer index descriptor (very suspicious per spec rules).
-    var cfg = null;
-    try { cfg = !!(descNow && descNow.configurable); } catch(_){ cfg = null; }
-    if (cfg === true){
-      alertBox("TA index descriptor ficou configurable:true (suspeito / spec-violation)", out);
-    }
-    return out;
-  }
+    // Consistency check:
+    // If descriptor claims configurable:true but delete behaves like non-configurable (throws TypeError / false),
+    // that is an invariant inconsistency worth reporting.
+    const cfg = descNow && typeof descNow.configurable === "boolean" ? descNow.configurable : null;
 
-  function pocTA_A(){
-    banner("POC A: Object.defineProperty em ta[0]");
-    withVictim(function(){ return coreTAExperiment("A"); }, "TA_A");
-  }
+    const deleteLooksNonConfig =
+      (del1Threw && del1Err === "TypeError") ||
+      (del2 === false) ||
+      (typeof del2 === "string" && del2.indexOf("THREW:TypeError") === 0);
 
-  function pocTA_B(){
-    banner("POC B: Reflect.defineProperty em ta[0]");
-    withVictim(function(){ return coreTAExperiment("B"); }, "TA_B");
-  }
-
-  function pocTA_C(){
-    banner("POC C: Proxy invariants (defineProperty via Proxy wrapper)");
-    withVictim(function(){ return coreTAExperiment("C"); }, "TA_C");
-  }
-
-  function pocTA_D(){
-    banner("POC D: Cross-realm iframe reproduce");
-    withVictim(function(){
-      var f = makeIframe();
-      var w = f.contentWindow;
-      var out = { ok:false, threw:false, err:null, desc:null, ta0:null };
-
-      try {
-        var TA = w.Uint8Array;
-        var ta = new TA(4);
-        ta[0] = 7;
-        out.ok = Reflect.defineProperty(ta, "0", { value: 9, writable:true, enumerable:true, configurable:true });
-        out.desc = w.Object.getOwnPropertyDescriptor(ta, "0");
-        out.ta0 = ta[0];
-      } catch(e){
-        out.threw = true;
-        out.err = (e && e.name) ? e.name : "ERR";
-      }
-
-      removeIframe(f);
-      logLine("iframe result => " + safeJson(out));
-
-      if (out.desc && out.desc.configurable === true){
-        alertBox("Cross-realm: TA index configurable:true reproduzido", out);
-      }
-      return out;
-    }, "TA_D");
-  }
-
-  // -------------------------
-  // POC: MessageChannel transfer drop (T8)
-  // -------------------------
-  function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
-
-  function withTimeout(p, ms){
-    return new Promise(function(resolve, reject){
-      var t = setTimeout(function(){ reject(new Error("TIMEOUT")); }, ms);
-      p.then(function(v){ clearTimeout(t); resolve(v); }, function(e){ clearTimeout(t); reject(e); });
-    });
-  }
-
-  function pocMC(){
-    banner("POC: MessageChannel transfer drop detector (T8)");
-
-    if (typeof MessageChannel !== "function"){
-      logLine("MessageChannel não disponível.");
+    if (cfg === true && deleteLooksNonConfig) {
+      alertBox("ALERTA", "TA index: descriptor diz configurable:true, mas delete falha/lança como se fosse non-configurable (inconsistência de invariantes).", report);
       return;
     }
 
-    var N = Math.max(1, parseInt(document.getElementById("mcN").value || "30", 10));
-    var delayMs = Math.max(0, parseInt(document.getElementById("mcDelay").value || "50", 10));
-    var timeoutMs = Math.max(100, parseInt(document.getElementById("mcTimeout").value || "1200", 10));
+    logLine(`${label} OK: sem inconsistência forte detectada (neste run).`);
+  }
 
-    logLine("Config :: N=" + N + " delayMs=" + delayMs + " timeoutMs=" + timeoutMs);
+  // Detach helper
+  function detachAttempt(ab){
+    if (typeof structuredClone === "function") {
+      try { structuredClone(ab, { transfer: [ab] }); return { attempted:true, ok:true, via:"structuredClone" }; }
+      catch(e){ return { attempted:true, ok:false, via:"structuredClone", err:(e&&e.name)||"ERR" }; }
+    }
+    if (typeof postMessage === "function") {
+      try { postMessage("x", "*", [ab]); return { attempted:true, ok:true, via:"postMessage" }; }
+      catch(e){ return { attempted:true, ok:false, via:"postMessage", err:(e&&e.name)||"ERR" }; }
+    }
+    return { attempted:false, ok:false, via:"none" };
+  }
 
-    withVictim(function(){
-      var state = {
-        ok_detach: 0,
-        ok_clone: 0,
-        transfer_throw: 0,
-        drops_detach_path: 0,
-        senderlen_impossible: 0,
-        other: 0
-      };
+  async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-      var i = 0;
+  async function waitMessageOnce(port, timeoutMs){
+    return new Promise((resolve) => {
+      let done = false;
+      const t = setTimeout(() => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve({ ok:false, reason:"timeout", data:undefined });
+      }, timeoutMs);
 
-      function one(){
-        return new Promise(function(resolve){
-          var ch = new MessageChannel();
-          var ab = new ArrayBuffer(4096);
-          var u8 = new Uint8Array(ab);
-          u8[0] = 0xAA;
-
-          var got = undefined;
-          ch.port2.onmessage = function(ev){ got = ev.data; };
-
-          var threw = false;
-          try { ch.port1.postMessage(ab, [ab]); }
-          catch(e){ threw = true; }
-
-          if (threw){
-            state.transfer_throw++;
-            return resolve();
-          }
-
-          // give event loop a chance
-          setTimeout(function(){
-            var senderLen = ab.byteLength;
-
-            if (senderLen !== 0 && senderLen !== 4096){
-              state.senderlen_impossible++;
-              return resolve();
-            }
-
-            if (senderLen === 0){
-              // detach path: receiver must exist and be readable
-              if (!got){
-                state.drops_detach_path++;
-                return resolve();
-              }
-              try {
-                var r8 = (Object.prototype.toString.call(got) === "[object ArrayBuffer]") ? new Uint8Array(got) :
-                         (got && got.buffer ? new Uint8Array(got.buffer) : null);
-                if (!r8 || r8.length !== 4096 || r8[0] !== 0xAA){
-                  state.other++;
-                } else {
-                  state.ok_detach++;
-                }
-              } catch(_){
-                state.other++;
-              }
-              return resolve();
-            }
-
-            if (senderLen === 4096){
-              // clone path (best-effort): if got exists, must not alias.
-              if (!got){
-                state.ok_clone++;
-                return resolve();
-              }
-              try {
-                var r8c = (Object.prototype.toString.call(got) === "[object ArrayBuffer]") ? new Uint8Array(got) :
-                          (got && got.buffer ? new Uint8Array(got.buffer) : null);
-                if (!r8c){ state.ok_clone++; return resolve(); }
-                var before = r8c[0];
-                u8[0] = 0xBB;
-                var after = r8c[0];
-                if (before !== after){
-                  state.other++;
-                } else {
-                  state.ok_clone++;
-                }
-              } catch(_){
-                state.ok_clone++;
-              }
-              return resolve();
-            }
-
-            resolve();
-          }, 0);
-        });
+      function onMsg(ev){
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve({ ok:true, data: ev.data });
       }
 
-      function loop(){
-        if (i >= N) return Promise.resolve();
-        i++;
-        var p = one();
-        return withTimeout(p, timeoutMs).catch(function(){ state.other++; }).then(function(){
-          if (!delayMs) return loop();
-          return wait(delayMs).then(loop);
-        });
+      function cleanup(){
+        clearTimeout(t);
+        try { port.onmessage = null; } catch(_) {}
       }
 
-      return loop().then(function(){
-        logLine("RESULTADOS: " + safeJson(state));
-        if (state.drops_detach_path > 0){
-          alertBox("MessageChannel: sender detached mas receiver veio undefined (DROP) — evidência de inconsistência", state);
-        }
-        return state;
-      });
-    }, "MC_T8");
+      try { port.onmessage = onMsg; } catch(_) {}
+      try { port.start && port.start(); } catch(_) {}
+    });
   }
 
   // -------------------------
-  // Wire UI
+  // Buttons
   // -------------------------
   document.getElementById("btnReset").onclick = resetLog;
 
-  document.getElementById("btnABDesc").onclick = function(){
-    banner("RUN :: AB descriptor audit");
-    withVictim(function(){ return pocABDesc(); }, "ABDesc");
+  // T1: AB descriptor audit (não chama de "impossible" por si só)
+  document.getElementById("btnAB").onclick = async () => {
+    logLine("============================================================");
+    logLine("POC: ArrayBuffer.prototype.byteLength descriptor audit");
+    logLine("============================================================");
+
+    const d = auditDesc(ArrayBuffer.prototype, "byteLength").desc;
+    logLine(`Descriptor(ArrayBuffer.prototype.byteLength) = ${j(d)}`);
+
+    // Quick detach sample
+    const ab = new ArrayBuffer(16);
+    const beforeLen = ab.byteLength;
+    const det = detachAttempt(ab);
+    const afterLen = ab.byteLength;
+
+    logLine(`Sample: beforeLen=${beforeLen} afterLen=${afterLen} detachAttempted=${det.attempted} via=${det.via} ok=${det.ok}`);
+
+    // Aqui o "impacto" que vale reportar é: descriptor configurável pode quebrar hardening baseado em descriptor.
+    // Não é "corrupção", é "policy/integrity hazard".
+    if (d && d.configurable === true) {
+      alertBox("INFO", "AB.byteLength aparece configurable:true. Isso por si só não prova corrupção; mas pode afetar hardening baseado em descriptors (impacto comportamental).", { desc:d, detachSample:{beforeLen, afterLen, det} });
+    }
   };
 
-  document.getElementById("btnTA_A").onclick = pocTA_A;
-  document.getElementById("btnTA_B").onclick = pocTA_B;
-  document.getElementById("btnTA_C").onclick = pocTA_C;
-  document.getElementById("btnTA_D").onclick = pocTA_D;
+  // A
+  document.getElementById("btnA").onclick = async () => {
+    logLine("============================================================");
+    logLine("POC A: Object.defineProperty em ta[0]");
+    logLine("============================================================");
+    taIndexConsistencyReport("A", (ta) => Object.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
+  };
 
-  document.getElementById("btnMC").onclick = pocMC;
+  // B
+  document.getElementById("btnB").onclick = async () => {
+    logLine("============================================================");
+    logLine("POC B: Reflect.defineProperty em ta[0]");
+    logLine("============================================================");
+    taIndexConsistencyReport("B", (ta) => Reflect.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
+  };
 
+  // C
+  document.getElementById("btnC").onclick = async () => {
+    logLine("============================================================");
+    logLine("POC C: Proxy invariants (defineProperty via Proxy wrapper)");
+    logLine("============================================================");
+    taIndexConsistencyReport("C", (ta) => {
+      const p = new Proxy(ta, {});
+      return Reflect.defineProperty(p, "0", { value: 9, writable: true, enumerable: true, configurable: true });
+    });
+  };
+
+  // D
+  document.getElementById("btnD").onclick = async () => {
+    logLine("============================================================");
+    logLine("POC D: Cross-realm iframe reproduce");
+    logLine("============================================================");
+
+    const f = document.createElement("iframe");
+    f.style.display = "none";
+    document.body.appendChild(f);
+
+    let res = null;
+    try {
+      const w = f.contentWindow;
+      const ta = new w.Uint8Array(new w.ArrayBuffer(16));
+      ta[0] = 7;
+
+      let ok = null, threw=false, err=null;
+      try {
+        ok = w.Reflect.defineProperty(ta, "0", { value: 9, writable:true, enumerable:true, configurable:true });
+      } catch(e){ threw=true; err=(e&&e.name)||"ERR"; }
+
+      const desc = w.Object.getOwnPropertyDescriptor(ta, "0");
+      res = { ok, threw, err, desc, ta0: ta[0] };
+
+      logLine(`iframe result => ${j(res)}`);
+
+      // Mesma regra: se desc diz configurable:true e delete falha => inconsistente
+      let del2 = null;
+      try { del2 = w.Reflect.deleteProperty(ta, "0"); } catch(e){ del2 = `THREW:${(e&&e.name)||"ERR"}`; }
+
+      if (desc && desc.configurable === true && del2 === false) {
+        alertBox("ALERTA", "Cross-realm: descriptor configurable:true mas Reflect.deleteProperty=false (inconsistência).", { res, del2 });
+      } else {
+        logLine("D OK: sem inconsistencia forte detectada (neste run).");
+      }
+    } finally {
+      try { f.remove(); } catch(_) {}
+    }
+  };
+
+  // T8
+  document.getElementById("btnT8").onclick = async () => {
+    const N = Math.max(1, parseInt(document.getElementById("N").value || "30", 10));
+    const delayMs = Math.max(0, parseInt(document.getElementById("delayMs").value || "50", 10));
+    const timeoutMs = Math.max(100, parseInt(document.getElementById("timeoutMs").value || "1200", 10));
+
+    logLine("============================================================");
+    logLine("POC T8: MessageChannel transfer drop detector (handshake)");
+    logLine("============================================================");
+    logLine(`Config :: N=${N} delayMs=${delayMs} timeoutMs=${timeoutMs}`);
+
+    let ok_detach = 0, ok_clone = 0, transfer_throw = 0;
+    let drops_detach_path = 0, sender_impossible = 0, other = 0;
+
+    for (let i = 0; i < N; i++) {
+      const ch = new MessageChannel();
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      u8[0] = 0xAA;
+
+      // Arm message waiter BEFORE posting
+      const waiter = waitMessageOnce(ch.port2, timeoutMs);
+
+      let threw = false;
+      try { ch.port1.postMessage(ab, [ab]); }
+      catch(e){ threw = true; }
+
+      if (threw) {
+        transfer_throw++;
+        if (delayMs) await sleep(delayMs);
+        continue;
+      }
+
+      const senderLen = ab.byteLength;
+      if (senderLen !== 0 && senderLen !== 4096) {
+        sender_impossible++;
+        if (delayMs) await sleep(delayMs);
+        continue;
+      }
+
+      const msg = await waiter;
+
+      if (senderLen === 0) {
+        // Transfer path: receiver SHOULD arrive eventually. If timeout => treat as "drop under timeout".
+        if (!msg.ok || msg.data === undefined) {
+          drops_detach_path++;
+        } else {
+          try {
+            const r8 = (Object.prototype.toString.call(msg.data) === "[object ArrayBuffer]")
+              ? new Uint8Array(msg.data)
+              : (msg.data && msg.data.buffer ? new Uint8Array(msg.data.buffer) : null);
+
+            if (r8 && r8.length === 4096 && r8[0] === 0xAA) ok_detach++;
+            else other++;
+          } catch(_) { other++; }
+        }
+      } else {
+        // Clone path: detach didn't happen
+        ok_clone++;
+      }
+
+      if (delayMs) await sleep(delayMs);
+    }
+
+    const summary = { ok_detach, ok_clone, transfer_throw, drops_detach_path, sender_impossible, other };
+    logLine(`RESULTADOS: ${j(summary)}`);
+
+    // Só alerta se tiver drop relevante em detach path.
+    if (drops_detach_path > 0) {
+      alertBox("ALERTA", "MessageChannel: detach confirmado (senderLen==0) mas receiver não chegou dentro do timeout (DROP/atraso severo). Isso é inconsistência observável (pode ser bug de entrega, não necessariamente corrupção).", summary);
+    } else {
+      logLine("OK: nenhum drop detectado nas condições atuais.");
+    }
+  };
+
+  // init
   resetLog();
 })();
 </script>
