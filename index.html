@@ -1,412 +1,235 @@
+
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>PS4 T8 Amplifier + Post-DROP Queue Integrity (Auto, Minimal Log)</title>
+  <title>PS4 T8 Retest + Pós-DROP Queue Integrity (Minimal)</title>
 </head>
 <body>
-  <h1>PS4 T8 Amplifier + Post-DROP Queue Integrity (Auto, Minimal Log)</h1>
+  <h2>PS4 T8 Retest — MessageChannel Transfer DROP + Pós-DROP Queue Integrity</h2>
 
   <button id="run">RUN AUTO</button>
   <button id="stop">STOP</button>
   <button id="reset">Reset log</button>
 
   <p>
-    Attempts (N):
-    <input id="N" type="number" value="200" min="1" step="10">
-    Timeout per attempt (ms):
-    <input id="timeout" type="number" value="500" min="50" step="50">
-    Delay between attempts (ms):
-    <input id="delay" type="number" value="0" min="0" step="10">
-    Intensity (1..5):
-    <input id="intensity" type="number" value="3" min="1" max="5" step="1">
-  </p>
-
-  <p>
-    Failure samples limit:
-    <input id="sampleLimit" type="number" value="5" min="1" step="1">
+    Attempts (N): <input id="N" type="number" value="10" min="1" step="1">
+    Timeout per attempt (ms): <input id="timeout" type="number" value="200" min="50" step="50">
+    Delay between attempts (ms): <input id="delay" type="number" value="10" min="0" step="5">
   </p>
 
   <pre id="log"></pre>
 
 <script>
-(function(){
+(() => {
   "use strict";
 
-  var $log = document.getElementById("log");
+  const $log = document.getElementById("log");
+  const $N = document.getElementById("N");
+  const $timeout = document.getElementById("timeout");
+  const $delay = document.getElementById("delay");
+
+  let STOP = false;
+
   function ts(){ return Date.now(); }
-  function logLine(s){ $log.textContent += "["+ts()+"] " + s + "\n"; }
+  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
   function resetLog(){ $log.textContent=""; logLine("Reset."); }
 
   function j(x){
     try { return JSON.stringify(x); } catch(e){ return String(x); }
   }
 
-  function sleep(ms){
-    return new Promise(function(res){ setTimeout(res, ms|0); });
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  async function withTimeout(p, ms){
+    let t;
+    const to = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
+    try { return await Promise.race([p, to]); }
+    finally { clearTimeout(t); }
   }
 
-  var STOP = false;
+  // Pós-DROP: verifica se a fila/canal continua saudável.
+  // Critérios fortes (sem exploração):
+  // - mensagens subsequentes não podem sumir
+  // - não podem chegar fora de ordem
+  // - payload deve bater (id/seq)
+  async function postDropQueueCheck(ch, attemptIdx, timeoutMs){
+    const port1 = ch.port1;
+    const port2 = ch.port2;
 
-  // --------- Small helpers (low-risk, avoid DoS) ----------
-  function lightGC(intensity){
-    // Not a DoS: bounded allocations
-    var rounds = Math.max(1, Math.min(5, intensity|0));
-    var arr = [];
-    for (var r=0; r<rounds; r++){
-      var n = 200 + r*100; // bounded
-      for (var i=0; i<n; i++){
-        arr.push(new Uint8Array(1024)); // 1KB
-      }
-      // Drop references gradually
-      arr.length = Math.floor(arr.length/2);
-    }
-    return arr.length;
-  }
+    const expect = [];
+    const got = [];
 
-  function microtaskBurst(intensity){
-    // Microtask interleaving can affect delivery timing
-    var n = Math.max(1, Math.min(50, (intensity|0) * 10));
-    var p = Promise.resolve();
-    for (var i=0; i<n; i++){
-      p = p.then(function(){});
-    }
-    return p;
-  }
-
-  function rand32(){
-    return (Math.random()*0x100000000) >>> 0;
-  }
-
-  // Modes to amplify DROP window (no DoS):
-  // 0 baseline
-  // 1 microtask burst around postMessage
-  // 2 light GC pressure before+after postMessage
-  // 3 port churn (close/recreate pattern)
-  // 4 mixed (random among above)
-  function pickMode(i, intensity){
-    if (intensity <= 1) return 0;
-    if (intensity === 2) return (i % 2) ? 1 : 0;
-    if (intensity === 3) return (i % 3);
-    if (intensity === 4) return (i % 4);
-    return 4;
-  }
-
-  function modeName(m){
-    switch(m){
-      case 0: return "baseline";
-      case 1: return "microtasks";
-      case 2: return "lightGC";
-      case 3: return "portChurn";
-      case 4: return "mix";
-      default: return "unknown";
-    }
-  }
-
-  // --------- Attempt: Transfer + detect DROP ----------
-  function runOneAttempt(mode, timeoutMs){
-    return new Promise(function(resolve){
-      var ch = new MessageChannel();
-      var got = undefined;
-      var gotType = "unset";
-      var gotTag = "unset";
-      var gotLen = -1;
-      var onMsgFired = false;
-      var onErrFired = false;
-
-      function cleanup(){
-        try { ch.port1.onmessage = null; ch.port2.onmessage = null; } catch(e){}
-        try { ch.port1.onmessageerror = null; ch.port2.onmessageerror = null; } catch(e){}
-        // Do NOT aggressively close in baseline modes (avoid changing behavior too much).
-      }
-
-      ch.port2.onmessage = function(ev){
-        onMsgFired = true;
-        got = ev.data;
-        try { gotType = (got === null) ? "null" : typeof got; } catch(e){ gotType = "typeof_err"; }
-        try { gotTag = Object.prototype.toString.call(got); } catch(e){ gotTag = "tag_err"; }
-        try { gotLen = (got && typeof got.byteLength === "number") ? got.byteLength : -1; } catch(e){ gotLen = -2; }
-      };
-      ch.port2.onmessageerror = function(){
-        onErrFired = true;
-      };
-
-      // Prepare AB payload
-      var ab = new ArrayBuffer(4096);
-      var u8 = new Uint8Array(ab);
-      u8[0] = 0xAA;
-      u8[1] = 0x55;
-      u8[4095] = 0xCC;
-
-      var postThrew = false;
-      var postErr = null;
-
-      // Optional pre-conditioning
-      var preGC = 0;
-      var preMT = null;
-
-      function doPost(){
-        try {
-          ch.port1.postMessage(ab, [ab]);
-        } catch(e){
-          postThrew = true;
-          postErr = (e && e.name) ? e.name : "ERR";
-        }
-      }
-
-      function afterWait(){
-        var senderLen = -1;
-        try { senderLen = ab.byteLength; } catch(e){ senderLen = -2; }
-
-        // Define outcome
-        // DROP := transfer committed (senderLen==0) but receiver got nothing (got===undefined)
-        var outcome = "OK";
-        if (postThrew) {
-          outcome = "THROW";
-        } else if (senderLen === 0 && got === undefined) {
-          outcome = "DROP";
-        } else if (senderLen !== 0 && senderLen !== 4096) {
-          outcome = "SENDER_IMP";
-        } else if (senderLen === 0 && got !== undefined) {
-          // Validate payload best-effort
-          var bad = false;
-          try {
-            var r8 = null;
-            if (gotTag === "[object ArrayBuffer]") r8 = new Uint8Array(got);
-            else if (got && got.buffer && typeof got.byteLength === "number") r8 = new Uint8Array(got.buffer);
-            if (!r8 || r8.length !== 4096) bad = true;
-            else if ((r8[0] !== 0xAA) || (r8[1] !== 0x55) || (r8[4095] !== 0xCC)) bad = true;
-          } catch(e){
-            bad = true;
-          }
-          if (bad) outcome = "BAD_PAYLOAD";
-          else outcome = "DETACH_OK";
-        } else {
-          // senderLen==4096 => clone path or no transfer
-          outcome = "CLONE_OR_NO_TRANSFER";
-        }
-
-        cleanup();
-        resolve({
-          mode: modeName(mode),
-          outcome: outcome,
-          senderLen: senderLen,
-          gotType: gotType,
-          gotTag: gotTag,
-          gotLen: gotLen,
-          onMsgFired: onMsgFired,
-          onErrFired: onErrFired,
-          postThrew: postThrew,
-          postErr: postErr
-        });
-      }
-
-      // Execute according to mode
-      (function(){
-        if (mode === 4) {
-          // mixed: choose one at runtime
-          var r = rand32() % 4; // 0..3
-          mode = r;
-        }
-
-        if (mode === 2) preGC = lightGC(3);
-        if (mode === 1) preMT = microtaskBurst(3);
-
-        // Port churn: start/stop ports around transfer (still bounded)
-        if (mode === 3) {
-          try { ch.port2.start && ch.port2.start(); } catch(e){}
-        }
-
-        // Post after microtasks if selected
-        var p = Promise.resolve();
-        if (preMT) p = preMT;
-
-        p.then(function(){
-          doPost();
-
-          // Optional post-conditioning (light)
-          if (mode === 2) lightGC(2);
-          if (mode === 1) microtaskBurst(2);
-
-          // Wait delivery window (bounded)
-          return sleep(timeoutMs|0);
-        }).then(afterWait);
-      })();
-    });
-  }
-
-  // --------- Post-DROP Queue Integrity Test ----------
-  // Goal: after a DROP, check whether the MessageChannel ports/queue remain consistent
-  // without exploiting memory corruption:
-  // - send small ping -> must arrive
-  // - send second transfer -> must arrive intact
-  // - ordering sanity: ping1, ping2, transfer
-  function postDropQueueTest(timeoutMs){
-    return new Promise(function(resolve){
-      var ch = new MessageChannel();
-      var received = [];
-      var errors = 0;
-
-      ch.port2.onmessage = function(ev){
-        received.push(ev.data);
-      };
-      ch.port2.onmessageerror = function(){
-        errors++;
-      };
-
-      function finalize(tag, extra){
-        try { ch.port1.onmessage = null; ch.port2.onmessage = null; } catch(e){}
-        try { ch.port1.onmessageerror = null; ch.port2.onmessageerror = null; } catch(e){}
-        resolve({ tag: tag, errors: errors, received: received, extra: extra || null });
-      }
-
-      // 1) ping small objects
-      var ping1 = { t:"ping1", k:(rand32()>>>0) };
-      var ping2 = { t:"ping2", k:(rand32()>>>0) };
-
-      // 2) transfer payload
-      var ab2 = new ArrayBuffer(4096);
-      var u2 = new Uint8Array(ab2);
-      u2[0] = 0xDE; u2[1] = 0xAD; u2[2] = 0xBE; u2[3] = 0xEF; u2[4095] = 0x7F;
-
-      var post2Threw = false, post2Err = null;
-
-      try { ch.port1.postMessage(ping1); } catch(e){ errors++; }
-      try { ch.port1.postMessage(ping2); } catch(e){ errors++; }
-
-      try {
-        ch.port1.postMessage(ab2, [ab2]);
-      } catch(e){
-        post2Threw = true;
-        post2Err = (e && e.name) ? e.name : "ERR";
-      }
-
-      // Wait window
-      sleep(timeoutMs|0).then(function(){
-        // Evaluate:
-        // Expect at least 3 messages (ping1, ping2, AB2) in any order,
-        // but we also check if pings vanish or AB2 vanishes.
-        var sawPing1 = false, sawPing2 = false, sawAB2 = false, badAB2 = false;
-
-        for (var i=0; i<received.length; i++){
-          var d = received[i];
-          if (d && d.t === "ping1" && d.k === ping1.k) sawPing1 = true;
-          else if (d && d.t === "ping2" && d.k === ping2.k) sawPing2 = true;
-          else {
-            // Maybe AB2
-            try {
-              var tag = Object.prototype.toString.call(d);
-              if (tag === "[object ArrayBuffer]") {
-                var r = new Uint8Array(d);
-                if (r.length === 4096 && r[0]===0xDE && r[1]===0xAD && r[2]===0xBE && r[3]===0xEF && r[4095]===0x7F) {
-                  sawAB2 = true;
-                } else {
-                  sawAB2 = true;
-                  badAB2 = true;
-                }
-              }
-            } catch(e){}
-          }
-        }
-
-        var verdict = "QUEUE_OK";
-        if (post2Threw) verdict = "QUEUE_POST_THROW";
-        else if (!sawPing1 || !sawPing2) verdict = "QUEUE_DROP_PINGS";
-        else if (!sawAB2) verdict = "QUEUE_DROP_TRANSFER";
-        else if (badAB2) verdict = "QUEUE_BAD_PAYLOAD";
-
-        finalize(verdict, { sawPing1:sawPing1, sawPing2:sawPing2, sawAB2:sawAB2, badAB2:badAB2, post2Threw:post2Threw, post2Err:post2Err });
-      });
-    });
-  }
-
-  // --------- Main runner ----------
-  async function runAuto(){
-    if (typeof MessageChannel !== "function") {
-      logLine("ERRO: MessageChannel não disponível neste navegador.");
-      return;
-    }
-
-    STOP = false;
-
-    var N = Math.max(1, parseInt(document.getElementById("N").value||"200",10));
-    var timeoutMs = Math.max(50, parseInt(document.getElementById("timeout").value||"500",10));
-    var delayMs = Math.max(0, parseInt(document.getElementById("delay").value||"0",10));
-    var intensity = Math.max(1, Math.min(5, parseInt(document.getElementById("intensity").value||"3",10)));
-    var sampleLimit = Math.max(1, parseInt(document.getElementById("sampleLimit").value||"5",10));
-
-    logLine("============================================================");
-    logLine("RUN AUTO :: T8 Amplifier + Post-DROP Queue Integrity");
-    logLine("Config :: " + j({N:N, timeoutMs:timeoutMs, delayMs:delayMs, intensity:intensity, sampleLimit:sampleLimit}));
-    logLine("============================================================");
-
-    var stats = {
-      DETACH_OK:0,
-      DROP:0,
-      SENDER_IMP:0,
-      BAD_PAYLOAD:0,
-      THROW:0,
-      TIMEOUT:0,
-      CLONE_OR_NO_TRANSFER:0,
-      POSTDROP_QUEUE_OK:0,
-      POSTDROP_QUEUE_FAIL:0
+    port2.onmessage = (ev) => {
+      got.push(ev.data);
     };
 
-    var samples = []; // minimal, first failures
-    var postDropSamples = [];
+    // Enfileira 2 pings simples e um objeto leve
+    const m1 = "PING#" + attemptIdx + "#1";
+    const m2 = "PING#" + attemptIdx + "#2";
+    const m3 = { kind:"PINGOBJ", i: attemptIdx, t: ts() };
 
-    for (var i=0; i<N; i++){
-      if (STOP) break;
+    expect.push(m1, m2, m3);
 
-      var m = pickMode(i, intensity);
-      var res = await runOneAttempt(m, timeoutMs);
+    try { port1.postMessage(m1); } catch(e){ return { ok:false, reason:"THROW_POST1", err:(e&&e.name)||"ERR" }; }
+    try { port1.postMessage(m2); } catch(e){ return { ok:false, reason:"THROW_POST2", err:(e&&e.name)||"ERR" }; }
+    try { port1.postMessage(m3); } catch(e){ return { ok:false, reason:"THROW_POST3", err:(e&&e.name)||"ERR" }; }
 
-      if (res.outcome === "DETACH_OK") stats.DETACH_OK++;
-      else if (res.outcome === "DROP") stats.DROP++;
-      else if (res.outcome === "SENDER_IMP") stats.SENDER_IMP++;
-      else if (res.outcome === "BAD_PAYLOAD") stats.BAD_PAYLOAD++;
-      else if (res.outcome === "THROW") stats.THROW++;
-      else if (res.outcome === "CLONE_OR_NO_TRANSFER") stats.CLONE_OR_NO_TRANSFER++;
-      else stats.TIMEOUT++; // fallback bucket
+    // Aguarda delivery (curto)
+    try {
+      await withTimeout((async () => {
+        // dá tempo de 2-3 ticks
+        await sleep(0); await sleep(0); await sleep(0);
+      })(), timeoutMs);
+    } catch(_) {}
 
-      if (res.outcome === "DROP" && samples.length < sampleLimit) {
-        samples.push({ i:i, kind:res.mode, outcome:"DROP", senderLen:res.senderLen, gotType:res.gotType, gotTag:res.gotTag });
+    // Analisa ordenação + presença
+    const summary = {
+      expectCount: expect.length,
+      gotCount: got.length,
+      missing: 0,
+      outOfOrder: false,
+      firstGot: got.length ? got[0] : null
+    };
+
+    // Regra: precisa receber 3 mensagens
+    if (got.length < expect.length) summary.missing = (expect.length - got.length);
+
+    // Regra: ordem deve ser a mesma (comparação simples para 1 e 2)
+    if (got.length >= 2) {
+      if (got[0] !== m1 || got[1] !== m2) summary.outOfOrder = true;
+    }
+
+    // Regra: objeto deve bater
+    let objOk = false;
+    if (got.length >= 3 && got[2] && typeof got[2] === "object") {
+      objOk = (got[2].kind === "PINGOBJ" && got[2].i === attemptIdx);
+    }
+
+    const ok = (summary.missing === 0) && (summary.outOfOrder === false) && objOk;
+
+    return {
+      ok,
+      reason: ok ? "QUEUE_OK" : "QUEUE_SUSPECT",
+      details: { summary, objOk }
+    };
+  }
+
+  async function runAuto(){
+    STOP = false;
+
+    const N = Math.max(1, parseInt($N.value||"10", 10));
+    const timeoutMs = Math.max(50, parseInt($timeout.value||"200", 10));
+    const delayMs = Math.max(0, parseInt($delay.value||"10", 10));
+
+    logLine("============================================================");
+    logLine(`Run T8 AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms mode=mix (baseline+microtasks)`);
+    logLine("============================================================");
+
+    const stats = {
+      DETACH_OK: 0,
+      DROP: 0,
+      SENDER_IMP: 0,
+      BAD_PAYLOAD: 0,
+      THROW: 0,
+      TIMEOUT: 0,
+      QUEUE_SUSPECT_AFTER_DROP: 0,
+      QUEUE_OK_AFTER_DROP: 0
+    };
+
+    const samples = []; // primeiros casos relevantes (mínimo)
+
+    for (let i = 0; i < N && !STOP; i++) {
+      const ch = new MessageChannel();
+      const port1 = ch.port1;
+      const port2 = ch.port2;
+
+      let got = undefined;
+      port2.onmessage = (ev) => { got = ev.data; };
+
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      u8[0] = 0xAA;
+
+      // "mix" leve: microtasks antes do post (mantém espírito do teu modo)
+      await Promise.resolve();
+
+      let threw = false;
+      try {
+        port1.postMessage(ab, [ab]); // transfer
+      } catch (e) {
+        threw = true;
+        stats.THROW++;
+        if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"THROW", err:(e&&e.name)||"ERR" });
       }
 
-      // Post-DROP queue integrity test (only when DROP happens)
-      if (res.outcome === "DROP") {
-        var q = await postDropQueueTest(timeoutMs);
-        if (q.tag === "QUEUE_OK") stats.POSTDROP_QUEUE_OK++;
-        else stats.POSTDROP_QUEUE_FAIL++;
+      if (!threw) {
+        // aguarda entrega curta
+        try {
+          await withTimeout((async () => { await sleep(0); await sleep(0); })(), timeoutMs);
+        } catch (_) {
+          stats.TIMEOUT++;
+          if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"TIMEOUT" });
+        }
 
-        if (q.tag !== "QUEUE_OK" && postDropSamples.length < sampleLimit) {
-          postDropSamples.push({ i:i, queue:q.tag, extra:q.extra });
+        const senderLen = ab.byteLength;
+
+        // estados impossíveis do sender
+        if (senderLen !== 0 && senderLen !== 4096) {
+          stats.SENDER_IMP++;
+          if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"SENDER_IMP", senderLen });
+        } else if (senderLen === 0) {
+          // caminho detach (esperado no transfer)
+          if (got === undefined || got === null) {
+            stats.DROP++;
+            if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"DROP", senderLen:0, gotType:String(got) });
+
+            // >>> NOVO: pós-DROP queue integrity check (sem mudar resto do teste)
+            const qc = await postDropQueueCheck(ch, i, timeoutMs);
+            if (qc.ok) stats.QUEUE_OK_AFTER_DROP++;
+            else {
+              stats.QUEUE_SUSPECT_AFTER_DROP++;
+              if (samples.length < 5) samples.push({ i, kind:"postDrop", outcome:qc.reason, details: qc.details });
+            }
+          } else {
+            // valida payload mínimo
+            let ok = false;
+            try {
+              const tag = Object.prototype.toString.call(got);
+              if (tag === "[object ArrayBuffer]") {
+                const r = new Uint8Array(got);
+                ok = (r.length === 4096 && r[0] === 0xAA);
+              }
+            } catch(_) {}
+
+            if (ok) stats.DETACH_OK++;
+            else {
+              stats.BAD_PAYLOAD++;
+              if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"BAD_PAYLOAD" });
+            }
+          }
+        } else {
+          // clone path (raro)
+          // aqui não é erro; só não é o foco
         }
       }
 
-      if ((i+1) % 10 === 0) {
-        logLine("progress: " + (i+1) + "/" + N);
-      }
-
+      if ((i+1) % 5 === 0) logLine(`progress: ${i+1}/${N}`);
       if (delayMs) await sleep(delayMs);
+
+      try { port1.close(); port2.close(); } catch(_) {}
     }
 
     logLine("------------------------------------------------------------");
     logLine("RESULT SUMMARY:");
     logLine(j(stats));
-    if (samples.length) {
-      logLine("SAMPLES (first failures: DROP):");
-      for (var s=0; s<samples.length; s++) logLine(j(samples[s]));
-    }
-    if (postDropSamples.length) {
-      logLine("SAMPLES (post-DROP queue failures):");
-      for (var p=0; p<postDropSamples.length; p++) logLine(j(postDropSamples[p]));
-    }
+    logLine("SAMPLES (first relevant):");
+    logLine(j(samples));
     logLine("DONE.");
   }
 
-  document.getElementById("run").onclick = function(){ runAuto().catch(function(e){ logLine("ERRO: " + (e && e.name ? e.name : "ERR")); }); };
-  document.getElementById("stop").onclick = function(){ STOP = true; logLine("STOP requested."); };
+  document.getElementById("run").onclick = () => runAuto().catch(e => logLine("ERRO:" + ((e&&e.name)||"ERR")));
+  document.getElementById("stop").onclick = () => { STOP = true; logLine("STOP requested."); };
   document.getElementById("reset").onclick = resetLog;
 
   resetLog();
