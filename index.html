@@ -1,11 +1,12 @@
+
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>PS4 UaD Probe (T8 base) — Stale / Pressure-change / Bounded Timing Loop</title>
+  <title>PS4 UaD Impact Probe (T8 Base) — Minimal Log</title>
 </head>
 <body>
-  <h2>PS4 UaD Probe (T8 base) — Auto (minimal log)</h2>
+  <h2>PS4 UaD Impact Probe (T8 base) — Minimal Log</h2>
 
   <button id="run">RUN AUTO</button>
   <button id="stop">STOP</button>
@@ -13,9 +14,10 @@
 
   <div>
     Attempts (N): <input id="N" type="number" value="30" min="1" step="1">
-    Timeout per attempt (ms): <input id="timeout" type="number" value="200" min="10" step="10">
+    Timeout per attempt (ms): <input id="to" type="number" value="200" min="50" step="50">
     Delay between attempts (ms): <input id="delay" type="number" value="10" min="0" step="5">
     LateCheck (ms): <input id="late" type="number" value="800" min="0" step="50">
+    Pressure (1..5): <input id="p" type="number" value="3" min="1" max="5" step="1">
   </div>
 
   <pre id="log"></pre>
@@ -26,294 +28,283 @@
 
   const $log = document.getElementById("log");
   const $N = document.getElementById("N");
-  const $timeout = document.getElementById("timeout");
+  const $to = document.getElementById("to");
   const $delay = document.getElementById("delay");
   const $late = document.getElementById("late");
+  const $p = document.getElementById("p");
 
   let STOP = false;
 
   function ts(){ return Date.now(); }
   function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
-  function resetLog(){ $log.textContent=""; logLine("Reset."); }
+  function reset(){ $log.textContent = ""; logLine("Reset."); }
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  async function withTimeout(promise, ms){
+  async function withTimeout(p, ms){
     let t;
-    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
-    try { return await Promise.race([promise, timeout]); }
+    const timeout = new Promise((_, rej) => t = setTimeout(() => rej(new Error("TIMEOUT")), ms));
+    try { return await Promise.race([p, timeout]); }
     finally { clearTimeout(t); }
   }
 
-  // Bounded pressure (não é "spray" agressivo; é pressão limitada)
-  function boundedPressure() {
-    // Ajuste conservador: 128 * 16KB = ~2MB por rodada
-    // (e a gente solta logo em seguida)
-    const arr = [];
-    for (let i = 0; i < 128; i++) {
-      const u = new Uint8Array(16 * 1024);
-      u[0] = (i & 0xFF);
-      arr.push(u);
+  function j(x){
+    try { return JSON.stringify(x); } catch(e){ return String(x); }
+  }
+
+  // Pressure: mantém leve/moderado pra não virar DoS
+  function heapPressure(level){
+    const bufs = [];
+    // level: 1..5 => volume crescente, mas controlado
+    const chunks = [24, 48, 72, 96, 120][Math.max(0, Math.min(4, level-1))];
+    const size   = [0x4000, 0x6000, 0x8000, 0xA000, 0xC000][Math.max(0, Math.min(4, level-1))];
+
+    for (let i = 0; i < chunks; i++) {
+      const ab = new ArrayBuffer(size);
+      const u8 = new Uint8Array(ab);
+      // toque mínimo pra materializar
+      u8[0] = (i & 0xFF);
+      u8[u8.length - 1] = ((i * 13) & 0xFF);
+      bufs.push(u8);
     }
-    // toca um pouco pra evitar lazy
+    return bufs;
+  }
+
+  // A/B/C: tenta obter um "concreto"
+  function readU8(u8){
+    try { return { ok:true, v:u8[0] }; }
+    catch(e){ return { ok:false, err:(e && e.name) ? e.name : "ERR" }; }
+  }
+
+  function readDV(dv){
+    try { return { ok:true, v:dv.getUint8(0) }; }
+    catch(e){ return { ok:false, err:(e && e.name) ? e.name : "ERR" }; }
+  }
+
+  // Probe C: loop curto com yields (não DoS) procurando crash/instabilidade/timing
+  async function timingProbe(u8, budgetReads){
+    const t0 = ts();
     let sum = 0;
-    for (let i = 0; i < arr.length; i += 16) sum ^= arr[i][0];
-    return sum; // só pra usar algo
-  }
-
-  function mkAttemptPayload() {
-    const ab = new ArrayBuffer(4096);
-    const u8 = new Uint8Array(ab);
-    u8[0] = 0xAA;
-    u8[1] = 0x55;
-    return { ab, u8 };
-  }
-
-  function safeReadU8(u8) {
-    // retorna {ok:boolean, v:number|null, err:string|null}
-    try {
-      const v = u8[0];
-      // Em detached correto, isso costuma lançar; se não lançar, v pode ser 0/undefined/AA etc.
-      // v pode virar undefined em alguns engines; normalizamos:
-      if (typeof v !== "number") return { ok: true, v: NaN, err: null };
-      return { ok: true, v: v, err: null };
-    } catch (e) {
-      return { ok: false, v: null, err: (e && e.name) ? e.name : "ERR" };
+    for (let i = 0; i < budgetReads; i++) {
+      // leitura rápida
+      try { sum ^= (u8[0] | 0); } catch(_) { /* se throw, ok */ break; }
+      // yield periódico
+      if ((i & 4095) === 0) await Promise.resolve();
+      if (STOP) break;
     }
+    return { dt: ts() - t0, sum: (sum|0) };
   }
 
-  async function runOnceAttempt(cfg) {
-    const { timeoutMs, lateMs } = cfg;
-
+  async function runOnce(i, cfg, stats, samples){
     const ch = new MessageChannel();
-    const { ab, u8 } = mkAttemptPayload();
-
     let got = undefined;
+
     ch.port2.onmessage = (ev) => { got = ev.data; };
 
-    let postThrew = false;
+    // Buffer “vítima”
+    const ab = new ArrayBuffer(4096);
+    const u8 = new Uint8Array(ab);
+    const dv = new DataView(ab);
+    u8[0] = 0xAA;
+
+    // Transfer
+    let threw = false;
     try { ch.port1.postMessage(ab, [ab]); }
-    catch (e) { postThrew = true; }
+    catch(e){ threw = true; }
 
-    // Se lançou, acabou
-    if (postThrew) {
-      return { kind:"throw", senderLen:null, gotType:null };
+    if (threw) {
+      stats.throw++;
+      return;
     }
 
-    // microtask + curto yield
-    await sleep(0);
+    // aguarda entrega (rápido)
+    try { await withTimeout(Promise.resolve().then(() => sleep(0)), cfg.timeoutMs); }
+    catch(_) { stats.timeout++; return; }
 
-    const senderLen_t0 = ab.byteLength;
-
-    // leitura imediata pós-transfer (B)
-    const r0 = safeReadU8(u8);
-
-    // microtask check
-    await Promise.resolve();
-    const senderLen_mt = ab.byteLength;
-    const r1 = safeReadU8(u8);
-
-    // timeout curto (seu padrão)
-    try { await withTimeout(sleep(0), timeoutMs); } catch(_) {}
-    const senderLen_t = ab.byteLength;
-    const r2 = safeReadU8(u8);
-
-    // late check (opcional)
-    if (lateMs > 0) await sleep(lateMs);
-    const senderLen_late = ab.byteLength;
-    const r3 = safeReadU8(u8);
-
-    const gotType = (got === undefined) ? "undefined" :
-      Object.prototype.toString.call(got);
-
-    // classifica drop vs ok_detach
-    let outcome = "other";
-    if (senderLen_t === 0) {
-      // detach path confirmado (pelo menos no t)
-      if (got === undefined || got === null) outcome = "drop";
-      else outcome = "detach_ok";
-    } else if (senderLen_t === 4096) {
-      outcome = "clone_or_no_detach";
-    } else {
-      outcome = "sender_impossible";
+    const senderLen = ab.byteLength;
+    if (senderLen !== 0 && senderLen !== 4096) {
+      stats.sender_impossible++;
+      if (samples.sender_impossible.length < 2) {
+        samples.sender_impossible.push({ i, senderLen });
+      }
+      return;
     }
 
-    // A: after pressure, tentar ver se muda
-    let changedAfterPressure = 0;
-    let staleAA = 0;
-
-    // stale check: se detached e readOk e v==0xAA em algum momento
-    if (senderLen_t === 0) {
-      const reads = [r0, r1, r2, r3];
-      for (const rr of reads) {
-        if (rr.ok && rr.v === 0xAA) { staleAA = 1; break; }
+    // DROP detection
+    if (senderLen === 0 && (got === undefined || got === null)) {
+      stats.drop++;
+      if (samples.drop.length < 2) {
+        samples.drop.push({ i, senderLen, gotType: (got === null ? "null" : "undefined") });
       }
 
-      // pressão limitada + re-leitura
-      const before = safeReadU8(u8);
-      const pressureSig = boundedPressure();
-      // solta rápido (escopo)
-      const after = safeReadU8(u8);
+      // Pós-DROP queue integrity: manda 3 mensagens e espera 4? (detecta out-of-order/missing)
+      // (mantém mínimo: só marca “suspect” se inconsistência clara)
+      let q = [];
+      ch.port2.onmessage = (ev) => { q.push(ev.data); };
 
-      if (before.ok && after.ok) {
-        // mudou entre duas leituras pós-detach após pressão
-        // (se ambos são number, compara; se NaN, trata)
-        const bv = before.v, av = after.v;
-        const bothNum = (typeof bv === "number" && typeof av === "number");
-        if (bothNum) {
-          if ((bv === bv) && (av === av) && bv !== av) changedAfterPressure = 1; // ambos não-NaN e diferentes
-          if ((bv !== bv) !== (av !== av)) changedAfterPressure = 1; // um NaN e outro não
+      try { ch.port1.postMessage({k:1}); ch.port1.postMessage({k:2}); ch.port1.postMessage({k:3}); }
+      catch(_) {}
+
+      await sleep(cfg.lateCheckMs);
+
+      // Esperado: 3 itens, ordem 1,2,3
+      let ok = (q.length === 3 && q[0] && q[1] && q[2] && q[0].k===1 && q[1].k===2 && q[2].k===3);
+      if (!ok) {
+        stats.queue_suspect_after_drop++;
+        if (samples.queue_suspect.length < 2) {
+          samples.queue_suspect.push({ i, expectCount:3, gotCount:q.length, outOfOrder: !(q[0]&&q[0].k===1) });
         }
+      } else {
+        stats.queue_ok_after_drop++;
       }
-      void pressureSig;
+      return;
     }
 
-    // C: timing loop limitado (curto) só quando detached
-    let timingSuspect = 0;
-    if (senderLen_t === 0) {
-      const tStart = performance.now();
-      let spins = 0;
-      // limite curto (ex: 2000 leituras com yields) — não é infinito
-      while (spins < 2000) {
-        if (STOP) break;
-        // leitura
-        safeReadU8(u8);
-        spins++;
+    // senderLen==0 e got veio — detach_ok
+    stats.detach_ok++;
 
-        // coopera com event loop a cada 200 iterações
-        if ((spins % 200) === 0) await sleep(0);
-      }
-      const dt = performance.now() - tStart;
-      // se ficou "tempo demais" para algo trivial, marca suspeito
-      if (dt > 50) timingSuspect = 1;
+    // A/B: read after detach (u8/dv) — isso é o “UaD window”
+    const rU0 = readU8(u8);
+    const rD0 = readDV(dv);
+
+    // se ambos deram throw, não há janela observável (ok)
+    if (!rU0.ok && !rD0.ok) {
+      stats.no_read_after_detach++;
+      return;
     }
 
-    return {
-      kind:"baseline",
-      outcome,
-      gotType,
-      senderLen_mt,
-      senderLen_t0,
-      senderLen: senderLen_t,
-      senderLen_late,
-      // resumo de leituras
-      reads: {
-        r0, r1, r2, r3
-      },
-      staleAA,
-      changedAfterPressure,
-      timingSuspect
-    };
+    stats.read_ok_when_detached++;
+
+    // B) stale == 0xAA
+    let staleAA = false;
+    if (rU0.ok && (rU0.v === 0xAA)) staleAA = true;
+    if (rD0.ok && (rD0.v === 0xAA)) staleAA = true;
+
+    if (staleAA) {
+      stats.staleAA++;
+      if (samples.stale.length < 2) {
+        samples.stale.push({ i, u8: rU0, dv: rD0 });
+      }
+      // stale é “concreto” — não precisa pressionar muito
+      return;
+    }
+
+    // A) pressure → valor muda pra algo “não-trivial”
+    // Só tenta se pelo menos um read está funcionando (ok==true)
+    const keep = heapPressure(cfg.pressure);
+    // forçar algum churn leve
+    await Promise.resolve();
+
+    const rU1 = readU8(u8);
+    const rD1 = readDV(dv);
+
+    // “changed” = leitura ainda funciona e valor mudou para != 0xAA e != 0
+    let changed = false;
+    function isChanged(r0, r1){
+      if (!r0.ok || !r1.ok) return false;
+      if (r0.v === r1.v) return false;
+      if (r1.v === 0xAA) return false;
+      return true;
+    }
+    if (isChanged(rU0, rU1) || isChanged(rD0, rD1)) changed = true;
+
+    if (changed) {
+      stats.changed_after_pressure++;
+      if (samples.changed.length < 2) {
+        samples.changed.push({ i, before:{u8:rU0,dv:rD0}, after:{u8:rU1,dv:rD1} });
+      }
+      return;
+    }
+
+    // C) timing probe (budget curto; não DoS)
+    const budgetReads = 80000; // ~80k com yields (controlado)
+    const tp = await timingProbe(u8, budgetReads);
+    if (tp.dt > 250) { // heurística: “suspeito” para PS4
+      stats.timing_suspect++;
+      if (samples.timing.length < 2) {
+        samples.timing.push({ i, dt: tp.dt, note:"slow read loop post-detach" });
+      }
+    }
+
+    // manter referência p/ evitar otimizações
+    if (keep && keep.length) keep[0][0] ^= 0;
   }
 
-  async function runAuto() {
+  async function runAuto(){
     STOP = false;
 
     const cfg = {
-      N: Math.max(1, parseInt($N.value || "30", 10)),
-      timeoutMs: Math.max(10, parseInt($timeout.value || "200", 10)),
-      delayMs: Math.max(0, parseInt($delay.value || "10", 10)),
-      lateMs: Math.max(0, parseInt($late.value || "800", 10))
+      N: Math.max(1, parseInt($N.value||"30",10)),
+      timeoutMs: Math.max(50, parseInt($to.value||"200",10)),
+      delayMs: Math.max(0, parseInt($delay.value||"10",10)),
+      lateCheckMs: Math.max(0, parseInt($late.value||"800",10)),
+      pressure: Math.max(1, Math.min(5, parseInt($p.value||"3",10)))
     };
 
-    logLine("============================================================");
-    logLine(`RUN AUTO :: N=${cfg.N} timeout=${cfg.timeoutMs}ms delay=${cfg.delayMs}ms lateCheck=${cfg.lateMs}ms`);
-    logLine("============================================================");
+    // log mínimo
+    logLine(`RUN AUTO :: N=${cfg.N} timeout=${cfg.timeoutMs}ms delay=${cfg.delayMs}ms lateCheck=${cfg.lateCheckMs}ms pressure=${cfg.pressure}`);
 
     const stats = {
       detach_ok: 0,
       drop: 0,
       throw: 0,
-      clone_or_no_detach: 0,
+      timeout: 0,
       sender_impossible: 0,
       other: 0,
 
-      // nossos 3 alvos
-      staleAA: 0,                 // B
-      changed_after_pressure: 0,   // A
-      timing_suspect: 0,           // C (limitado)
-
-      // “uaD window”: leu sem throw quando senderLen==0
       read_ok_when_detached: 0,
+      no_read_after_detach: 0,
 
-      // samples (primeiros N casos interessantes)
-      samples: []
+      staleAA: 0,
+      changed_after_pressure: 0,
+      timing_suspect: 0,
+
+      queue_suspect_after_drop: 0,
+      queue_ok_after_drop: 0
+    };
+
+    const samples = {
+      drop: [],
+      queue_suspect: [],
+      sender_impossible: [],
+      stale: [],
+      changed: [],
+      timing: []
     };
 
     for (let i = 0; i < cfg.N; i++) {
       if (STOP) break;
+      await runOnce(i, cfg, stats, samples);
 
-      const res = await runOnceAttempt(cfg);
-
-      if (res.kind === "throw") {
-        stats.throw++;
-      } else {
-        stats[res.outcome] = (stats[res.outcome] || 0) + 1;
-
-        // conta read_ok_when_detached:
-        // se senderLen==0 e pelo menos 1 read ok (sem exception)
-        if (res.senderLen === 0) {
-          const rr = res.reads;
-          const anyOk = rr.r0.ok || rr.r1.ok || rr.r2.ok || rr.r3.ok;
-          if (anyOk) stats.read_ok_when_detached++;
-        }
-
-        if (res.staleAA) stats.staleAA++;
-        if (res.changedAfterPressure) stats.changed_after_pressure++;
-        if (res.timingSuspect) stats.timing_suspect++;
-
-        const interesting =
-          (res.outcome === "drop") ||
-          (res.senderLen === 0 && (res.staleAA || res.changedAfterPressure || res.timingSuspect || (res.reads.r0.ok || res.reads.r1.ok || res.reads.r2.ok || res.reads.r3.ok)));
-
-        if (interesting && stats.samples.length < 5) {
-          // sample mínimo
-          stats.samples.push({
-            i,
-            kind: "baseline",
-            outcome: res.outcome,
-            senderLen: res.senderLen,
-            gotType: res.gotType,
-            staleAA: res.staleAA,
-            changedAfterPressure: res.changedAfterPressure,
-            timingSuspect: res.timingSuspect,
-            // primeira leitura só (pra não explodir log)
-            r0: res.reads.r0.ok ? res.reads.r0.v : ("THREW:" + res.reads.r0.err)
-          });
-        }
-      }
-
-      if (((i + 1) % 10) === 0) logLine(`progress: ${i+1}/${cfg.N}`);
+      if ((i+1) % 10 === 0) logLine(`progress: ${i+1}/${cfg.N}`);
       if (cfg.delayMs) await sleep(cfg.delayMs);
     }
 
-    logLine("------------------------------------------------------------");
+    // SUMÁRIO bem curto + 2 amostras no máximo
     logLine("RESULT SUMMARY:");
-    logLine(JSON.stringify({
-      detach_ok: stats.detach_ok,
-      drop: stats.drop,
-      throw: stats.throw,
-      clone_or_no_detach: stats.clone_or_no_detach,
-      sender_impossible: stats.sender_impossible,
-      other: stats.other,
+    logLine(j(stats));
 
-      // alvos
-      read_ok_when_detached: stats.read_ok_when_detached,
-      staleAA: stats.staleAA,
-      changed_after_pressure: stats.changed_after_pressure,
-      timing_suspect: stats.timing_suspect
-    }));
-    if (stats.samples.length) {
-      logLine("SAMPLES (first relevant):");
-      logLine(JSON.stringify(stats.samples));
+    // Só imprime amostras “contundentes”
+    const hot = [];
+    if (samples.stale.length) hot.push({ kind:"staleAA", samples: samples.stale });
+    if (samples.changed.length) hot.push({ kind:"changed_after_pressure", samples: samples.changed });
+    if (samples.drop.length) hot.push({ kind:"drop", samples: samples.drop });
+    if (samples.queue_suspect.length) hot.push({ kind:"queue_suspect_after_drop", samples: samples.queue_suspect });
+    if (samples.timing.length) hot.push({ kind:"timing_suspect", samples: samples.timing });
+
+    if (hot.length) {
+      logLine("SAMPLES (hot):");
+      // imprime compacto
+      logLine(j(hot));
     }
+
     logLine("DONE.");
   }
 
-  document.getElementById("run").onclick = () => runAuto().catch(e => logLine("ERRO: " + (e && e.name ? e.name : "ERR")));
+  document.getElementById("run").onclick = () => runAuto().catch(e => logLine("ERR: " + (e && e.name ? e.name : String(e))));
   document.getElementById("stop").onclick = () => { STOP = true; logLine("STOP requested."); };
-  document.getElementById("reset").onclick = resetLog;
+  document.getElementById("reset").onclick = reset;
 
-  resetLog();
+  reset();
 })();
 </script>
 </body>
