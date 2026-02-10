@@ -1,170 +1,320 @@
-
 <!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"><title>PS4 DROP + UaD Timing + Queue Integrity</title></head>
+<head>
+  <meta charset="UTF-8">
+  <title>PS4 UaD Probe (T8 base) — Stale / Pressure-change / Bounded Timing Loop</title>
+</head>
 <body>
-<h2>PS4 MessageChannel: DROP + UaD Timing + Pós-DROP Queue Integrity</h2>
+  <h2>PS4 UaD Probe (T8 base) — Auto (minimal log)</h2>
 
-<button onclick="run()">RUN AUTO</button>
-<button onclick="stop()">STOP</button>
-<button onclick="resetLog()">Reset log</button>
+  <button id="run">RUN AUTO</button>
+  <button id="stop">STOP</button>
+  <button id="reset">Reset log</button>
 
-<p>
-Attempts: <input id="n" type="number" value="30">
-Delay(ms): <input id="delay" type="number" value="30">
-Timeout(ms): <input id="timeout" type="number" value="200">
-LateCheck(ms): <input id="late" type="number" value="800">
-</p>
+  <div>
+    Attempts (N): <input id="N" type="number" value="30" min="1" step="1">
+    Timeout per attempt (ms): <input id="timeout" type="number" value="200" min="10" step="10">
+    Delay between attempts (ms): <input id="delay" type="number" value="10" min="0" step="5">
+    LateCheck (ms): <input id="late" type="number" value="800" min="0" step="50">
+  </div>
 
-<pre id="log"></pre>
+  <pre id="log"></pre>
 
 <script>
-let RUN = false;
+(() => {
+  "use strict";
 
-function log(s){ document.getElementById("log").textContent += `[${Date.now()}] ${s}\n`; }
-function resetLog(){ document.getElementById("log").textContent=""; log("Reset."); }
-function stop(){ RUN = false; }
-function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-function microtask(){ return Promise.resolve(); }
+  const $log = document.getElementById("log");
+  const $N = document.getElementById("N");
+  const $timeout = document.getElementById("timeout");
+  const $delay = document.getElementById("delay");
+  const $late = document.getElementById("late");
 
-async function run(){
-  RUN = true;
-  const N = +n.value|0;
-  const delayMs = +delay.value|0;
-  const timeoutMs = +timeout.value|0;
-  const lateMs = +late.value|0;
+  let STOP = false;
 
-  log("============================================================");
-  log(`RUN AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms lateCheck=${lateMs}ms`);
-  log("============================================================");
+  function ts(){ return Date.now(); }
+  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
+  function resetLog(){ $log.textContent=""; logLine("Reset."); }
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  const stats = {
-    detach_ok:0,
-    drop_fast:0,
-    drop_confirmed:0,
-    late_delivery:0,
+  async function withTimeout(promise, ms){
+    let t;
+    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
+    try { return await Promise.race([promise, timeout]); }
+    finally { clearTimeout(t); }
+  }
 
-    // UaD-timing probes (mais sensíveis)
-    uad_index_no_throw:0,   // se NÃO lançar ao ler u8[0] após detach → suspeito
-    uad_dataview_no_throw:0,
+  // Bounded pressure (não é "spray" agressivo; é pressão limitada)
+  function boundedPressure() {
+    // Ajuste conservador: 128 * 16KB = ~2MB por rodada
+    // (e a gente solta logo em seguida)
+    const arr = [];
+    for (let i = 0; i < 128; i++) {
+      const u = new Uint8Array(16 * 1024);
+      u[0] = (i & 0xFF);
+      arr.push(u);
+    }
+    // toca um pouco pra evitar lazy
+    let sum = 0;
+    for (let i = 0; i < arr.length; i += 16) sum ^= arr[i][0];
+    return sum; // só pra usar algo
+  }
 
-    // Pós-DROP Queue Integrity
-    queue_suspect_after_drop:0,
-    queue_ok_after_drop:0
-  };
-
-  let samples = [];
-
-  for (let i=0; i<N && RUN; i++){
-    const ch = new MessageChannel();
-
-    // payload
+  function mkAttemptPayload() {
     const ab = new ArrayBuffer(4096);
     const u8 = new Uint8Array(ab);
     u8[0] = 0xAA;
+    u8[1] = 0x55;
+    return { ab, u8 };
+  }
+
+  function safeReadU8(u8) {
+    // retorna {ok:boolean, v:number|null, err:string|null}
+    try {
+      const v = u8[0];
+      // Em detached correto, isso costuma lançar; se não lançar, v pode ser 0/undefined/AA etc.
+      // v pode virar undefined em alguns engines; normalizamos:
+      if (typeof v !== "number") return { ok: true, v: NaN, err: null };
+      return { ok: true, v: v, err: null };
+    } catch (e) {
+      return { ok: false, v: null, err: (e && e.name) ? e.name : "ERR" };
+    }
+  }
+
+  async function runOnceAttempt(cfg) {
+    const { timeoutMs, lateMs } = cfg;
+
+    const ch = new MessageChannel();
+    const { ab, u8 } = mkAttemptPayload();
 
     let got = undefined;
-    let gotAt = -1;
+    ch.port2.onmessage = (ev) => { got = ev.data; };
 
-    ch.port2.onmessage = (ev) => { got = ev.data; gotAt = Date.now(); };
-
-    // transfer
-    let threw = false;
+    let postThrew = false;
     try { ch.port1.postMessage(ab, [ab]); }
-    catch(e){ threw = true; }
+    catch (e) { postThrew = true; }
 
-    if (threw){ await sleep(delayMs); continue; }
+    // Se lançou, acabou
+    if (postThrew) {
+      return { kind:"throw", senderLen:null, gotType:null };
+    }
 
-    // Observação rápida (fast path)
-    await microtask();       // microtask timing
-    const senderLen_mt = ab.byteLength;
+    // microtask + curto yield
+    await sleep(0);
 
-    await sleep(0);          // task timing
     const senderLen_t0 = ab.byteLength;
 
-    await sleep(delayMs);    // estabiliza
-    const senderLen = ab.byteLength;
+    // leitura imediata pós-transfer (B)
+    const r0 = safeReadU8(u8);
 
-    const detached = (senderLen === 0);
-    if (detached) stats.detach_ok++;
+    // microtask check
+    await Promise.resolve();
+    const senderLen_mt = ab.byteLength;
+    const r1 = safeReadU8(u8);
 
-    // classifica DROP rápido (fast)
-    const isFastDrop = detached && (got === undefined);
-    if (isFastDrop) stats.drop_fast++;
+    // timeout curto (seu padrão)
+    try { await withTimeout(sleep(0), timeoutMs); } catch(_) {}
+    const senderLen_t = ab.byteLength;
+    const r2 = safeReadU8(u8);
 
-    // UaD timing probes: após DETACH, ler índice e DataView DEVEM falhar (normalmente TypeError).
-    // Se NÃO falhar, é uma janela “concreta” (não prova exploração, mas prova uso pós-detach).
-    if (detached){
-      // Probe 1: u8[0] deve lançar em buffer detached (se não lançar -> suspeito)
-      try {
-        void u8[0];
-        // se chegou aqui, não lançou
-        stats.uad_index_no_throw++;
-        if (samples.length < 3) samples.push({i, kind:"uad_index_no_throw", senderLen_mt, senderLen_t0, senderLen});
-      } catch(e){}
+    // late check (opcional)
+    if (lateMs > 0) await sleep(lateMs);
+    const senderLen_late = ab.byteLength;
+    const r3 = safeReadU8(u8);
 
-      // Probe 2: DataView em detached deve lançar ao construir ou ao ler
-      try {
-        const dv = new DataView(ab);
-        void dv.getUint8(0);
-        stats.uad_dataview_no_throw++;
-        if (samples.length < 3) samples.push({i, kind:"uad_dataview_no_throw", senderLen_mt, senderLen_t0, senderLen});
-      } catch(e){}
+    const gotType = (got === undefined) ? "undefined" :
+      Object.prototype.toString.call(got);
+
+    // classifica drop vs ok_detach
+    let outcome = "other";
+    if (senderLen_t === 0) {
+      // detach path confirmado (pelo menos no t)
+      if (got === undefined || got === null) outcome = "drop";
+      else outcome = "detach_ok";
+    } else if (senderLen_t === 4096) {
+      outcome = "clone_or_no_detach";
+    } else {
+      outcome = "sender_impossible";
     }
 
-    // Confirma se é DROP real ou “late delivery”
-    if (isFastDrop){
-      await sleep(lateMs);
-      if (got !== undefined){
-        stats.late_delivery++;
-        if (samples.length < 3) samples.push({i, kind:"late_delivery", gotType: typeof got, gotAt});
+    // A: after pressure, tentar ver se muda
+    let changedAfterPressure = 0;
+    let staleAA = 0;
+
+    // stale check: se detached e readOk e v==0xAA em algum momento
+    if (senderLen_t === 0) {
+      const reads = [r0, r1, r2, r3];
+      for (const rr of reads) {
+        if (rr.ok && rr.v === 0xAA) { staleAA = 1; break; }
+      }
+
+      // pressão limitada + re-leitura
+      const before = safeReadU8(u8);
+      const pressureSig = boundedPressure();
+      // solta rápido (escopo)
+      const after = safeReadU8(u8);
+
+      if (before.ok && after.ok) {
+        // mudou entre duas leituras pós-detach após pressão
+        // (se ambos são number, compara; se NaN, trata)
+        const bv = before.v, av = after.v;
+        const bothNum = (typeof bv === "number" && typeof av === "number");
+        if (bothNum) {
+          if ((bv === bv) && (av === av) && bv !== av) changedAfterPressure = 1; // ambos não-NaN e diferentes
+          if ((bv !== bv) !== (av !== av)) changedAfterPressure = 1; // um NaN e outro não
+        }
+      }
+      void pressureSig;
+    }
+
+    // C: timing loop limitado (curto) só quando detached
+    let timingSuspect = 0;
+    if (senderLen_t === 0) {
+      const tStart = performance.now();
+      let spins = 0;
+      // limite curto (ex: 2000 leituras com yields) — não é infinito
+      while (spins < 2000) {
+        if (STOP) break;
+        // leitura
+        safeReadU8(u8);
+        spins++;
+
+        // coopera com event loop a cada 200 iterações
+        if ((spins % 200) === 0) await sleep(0);
+      }
+      const dt = performance.now() - tStart;
+      // se ficou "tempo demais" para algo trivial, marca suspeito
+      if (dt > 50) timingSuspect = 1;
+    }
+
+    return {
+      kind:"baseline",
+      outcome,
+      gotType,
+      senderLen_mt,
+      senderLen_t0,
+      senderLen: senderLen_t,
+      senderLen_late,
+      // resumo de leituras
+      reads: {
+        r0, r1, r2, r3
+      },
+      staleAA,
+      changedAfterPressure,
+      timingSuspect
+    };
+  }
+
+  async function runAuto() {
+    STOP = false;
+
+    const cfg = {
+      N: Math.max(1, parseInt($N.value || "30", 10)),
+      timeoutMs: Math.max(10, parseInt($timeout.value || "200", 10)),
+      delayMs: Math.max(0, parseInt($delay.value || "10", 10)),
+      lateMs: Math.max(0, parseInt($late.value || "800", 10))
+    };
+
+    logLine("============================================================");
+    logLine(`RUN AUTO :: N=${cfg.N} timeout=${cfg.timeoutMs}ms delay=${cfg.delayMs}ms lateCheck=${cfg.lateMs}ms`);
+    logLine("============================================================");
+
+    const stats = {
+      detach_ok: 0,
+      drop: 0,
+      throw: 0,
+      clone_or_no_detach: 0,
+      sender_impossible: 0,
+      other: 0,
+
+      // nossos 3 alvos
+      staleAA: 0,                 // B
+      changed_after_pressure: 0,   // A
+      timing_suspect: 0,           // C (limitado)
+
+      // “uaD window”: leu sem throw quando senderLen==0
+      read_ok_when_detached: 0,
+
+      // samples (primeiros N casos interessantes)
+      samples: []
+    };
+
+    for (let i = 0; i < cfg.N; i++) {
+      if (STOP) break;
+
+      const res = await runOnceAttempt(cfg);
+
+      if (res.kind === "throw") {
+        stats.throw++;
       } else {
-        stats.drop_confirmed++;
-        // Pós-DROP Queue Integrity: manda sequência curta e valida ordem.
-        // Se a fila estiver corrompida, você vê missing/outOfOrder.
-        const tokens = ["A","B","C"];
-        const recv = [];
-        const chq = new MessageChannel();
-        chq.port2.onmessage = (ev)=> recv.push(ev.data);
+        stats[res.outcome] = (stats[res.outcome] || 0) + 1;
 
-        // “toca” a fila: 3 mensagens pequenas
-        chq.port1.postMessage(tokens[0]);
-        chq.port1.postMessage(tokens[1]);
-        chq.port1.postMessage(tokens[2]);
-
-        await sleep(timeoutMs);
-
-        const okCount = (recv.length === 3);
-        const okOrder = okCount && (recv[0]==="A" && recv[1]==="B" && recv[2]==="C");
-
-        if (okOrder){
-          stats.queue_ok_after_drop++;
-        } else {
-          stats.queue_suspect_after_drop++;
-          if (samples.length < 3) samples.push({i, kind:"queue_suspect_after_drop", recv});
+        // conta read_ok_when_detached:
+        // se senderLen==0 e pelo menos 1 read ok (sem exception)
+        if (res.senderLen === 0) {
+          const rr = res.reads;
+          const anyOk = rr.r0.ok || rr.r1.ok || rr.r2.ok || rr.r3.ok;
+          if (anyOk) stats.read_ok_when_detached++;
         }
 
-        try { chq.port1.close(); chq.port2.close(); } catch(e){}
+        if (res.staleAA) stats.staleAA++;
+        if (res.changedAfterPressure) stats.changed_after_pressure++;
+        if (res.timingSuspect) stats.timing_suspect++;
+
+        const interesting =
+          (res.outcome === "drop") ||
+          (res.senderLen === 0 && (res.staleAA || res.changedAfterPressure || res.timingSuspect || (res.reads.r0.ok || res.reads.r1.ok || res.reads.r2.ok || res.reads.r3.ok)));
+
+        if (interesting && stats.samples.length < 5) {
+          // sample mínimo
+          stats.samples.push({
+            i,
+            kind: "baseline",
+            outcome: res.outcome,
+            senderLen: res.senderLen,
+            gotType: res.gotType,
+            staleAA: res.staleAA,
+            changedAfterPressure: res.changedAfterPressure,
+            timingSuspect: res.timingSuspect,
+            // primeira leitura só (pra não explodir log)
+            r0: res.reads.r0.ok ? res.reads.r0.v : ("THREW:" + res.reads.r0.err)
+          });
+        }
       }
+
+      if (((i + 1) % 10) === 0) logLine(`progress: ${i+1}/${cfg.N}`);
+      if (cfg.delayMs) await sleep(cfg.delayMs);
     }
 
-    // progresso mínimo
-    if ((i+1) % 10 === 0) log(`progress: ${i+1}/${N}`);
-    await sleep(delayMs);
+    logLine("------------------------------------------------------------");
+    logLine("RESULT SUMMARY:");
+    logLine(JSON.stringify({
+      detach_ok: stats.detach_ok,
+      drop: stats.drop,
+      throw: stats.throw,
+      clone_or_no_detach: stats.clone_or_no_detach,
+      sender_impossible: stats.sender_impossible,
+      other: stats.other,
 
-    try { ch.port1.close(); ch.port2.close(); } catch(e){}
+      // alvos
+      read_ok_when_detached: stats.read_ok_when_detached,
+      staleAA: stats.staleAA,
+      changed_after_pressure: stats.changed_after_pressure,
+      timing_suspect: stats.timing_suspect
+    }));
+    if (stats.samples.length) {
+      logLine("SAMPLES (first relevant):");
+      logLine(JSON.stringify(stats.samples));
+    }
+    logLine("DONE.");
   }
 
-  log("------------------------------------------------------------");
-  log("RESULT SUMMARY:");
-  log(JSON.stringify(stats));
-  if (samples.length){
-    log("SAMPLES:");
-    log(JSON.stringify(samples));
-  }
-  log("DONE.");
-}
-resetLog();
+  document.getElementById("run").onclick = () => runAuto().catch(e => logLine("ERRO: " + (e && e.name ? e.name : "ERR")));
+  document.getElementById("stop").onclick = () => { STOP = true; logLine("STOP requested."); };
+  document.getElementById("reset").onclick = resetLog;
+
+  resetLog();
+})();
 </script>
 </body>
 </html>
