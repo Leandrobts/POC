@@ -2,126 +2,130 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PS4 UaF Window Harness — Post-Detach</title>
+<title>PS4 UaD Window Probe — MessageChannel</title>
 </head>
 <body>
 
-<h3>Potential Use-After-Detach Window — Auto Harness</h3>
+<h2>PS4 Potential Use-After-Detach Window</h2>
 
-<button id="run">RUN AUTO</button>
+<button onclick="run()">RUN UaD AUTO</button>
+<button onclick="stop()">STOP</button>
+<button onclick="resetLog()">Reset log</button>
+
+<p>
+Attempts: <input id="n" type="number" value="20">
+Delay(ms): <input id="delay" type="number" value="30">
+Timeout(ms): <input id="timeout" type="number" value="1200">
+</p>
+
 <pre id="log"></pre>
 
 <script>
-(() => {
-"use strict";
+let running = false;
 
-const logEl = document.getElementById("log");
-function log(s){ logEl.textContent += s + "\n"; }
-
-function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-function gcPressure(){
-  const arr = [];
-  for (let i=0;i<200;i++){
-    arr.push(new ArrayBuffer(1024*1024));
-  }
-  return arr;
+function log(s){
+  document.getElementById("log").textContent +=
+    "["+Date.now()+"] "+s+"\n";
 }
 
-async function attempt(iter){
-
-  const ch = new MessageChannel();
-
-  const ab = new ArrayBuffer(4096);
-  const view = new Uint8Array(ab);
-  view[0] = 0xAA;
-
-  let got;
-  ch.port2.onmessage = e => { got = e.data; };
-
-  try{
-    ch.port1.postMessage(ab, [ab]);
-  }catch{
-    return { kind:"THROW" };
-  }
-
-  const detached = (ab.byteLength === 0);
-
-  // 1️⃣ immediate read
-  let imm;
-  try { imm = view[0]; }
-  catch(e){ imm = "THREW"; }
-
-  // 2️⃣ microtask read
-  await Promise.resolve();
-  let micro;
-  try { micro = view[0]; }
-  catch(e){ micro = "THREW"; }
-
-  // 3️⃣ GC pressure
-  gcPressure();
-  let afterGC;
-  try { afterGC = view[0]; }
-  catch(e){ afterGC = "THREW"; }
-
-  // 4️⃣ queue activity
-  ch.port1.postMessage("ping");
-  await delay(0);
-
-  let afterQueue;
-  try { afterQueue = view[0]; }
-  catch(e){ afterQueue = "THREW"; }
-
-  return {
-    detached,
-    gotType: typeof got,
-    imm,
-    micro,
-    afterGC,
-    afterQueue
-  };
+function resetLog(){
+  document.getElementById("log").textContent="";
+  log("Reset.");
 }
+
+function stop(){ running=false; }
+
+function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 async function run(){
 
-  log("RUN :: UaF Window Auto");
-  log("================================");
+  running=true;
 
-  const N = 40;
+  const N = +n.value;
+  const delayMs = +delay.value;
+  const timeoutMs = +timeout.value;
 
-  let uafHits = 0;
-  let drops = 0;
+  log("============================================================");
+  log("RUN UaD Window Probe");
+  log("============================================================");
 
-  for (let i=0;i<N;i++){
+  let stats = {
+    drops:0,
+    uadReadable:0,
+    uadCloneable:0,
+    uadRetransfer:0,
+    uadDataView:0
+  };
 
-    const r = await attempt(i);
+  for(let i=0;i<N && running;i++){
 
-    if (!r.detached) continue;
+    const ch = new MessageChannel();
 
-    if (r.gotType === "undefined") drops++;
+    const ab = new ArrayBuffer(4096);
+    const u8 = new Uint8Array(ab);
+    u8[0]=0xAA;
 
-    const reads = [r.imm, r.micro, r.afterGC, r.afterQueue];
+    let got;
+    ch.port2.onmessage = e=>got=e.data;
 
-    const hasLiveRead =
-      reads.some(v => typeof v === "number" && v === 0xAA);
-
-    if (hasLiveRead){
-      uafHits++;
-      log("UAF_WINDOW :: " + JSON.stringify(r));
+    try{
+      ch.port1.postMessage(ab,[ab]);
+    }catch(e){
+      continue;
     }
+
+    await delay(0);
+    await delay(delayMs);
+
+    const detached = (ab.byteLength===0);
+
+    if(detached && got===undefined){
+
+      stats.drops++;
+      log("DROP detected → probing UaD window");
+
+      // Probe 1 — Old view read
+      try{
+        let v = u8[0];
+        if(v!==undefined){
+          stats.uadReadable++;
+          log("UaD: old view readable="+v);
+        }
+      }catch(e){}
+
+      // Probe 2 — DataView
+      try{
+        const dv = new DataView(ab);
+        let v = dv.getUint8(0);
+        stats.uadDataView++;
+        log("UaD: DataView readable="+v);
+      }catch(e){}
+
+      // Probe 3 — structuredClone
+      try{
+        structuredClone(ab);
+        stats.uadCloneable++;
+        log("UaD: structuredClone worked");
+      }catch(e){}
+
+      // Probe 4 — retransfer
+      try{
+        const ch2=new MessageChannel();
+        ch2.port1.postMessage(ab,[ab]);
+        stats.uadRetransfer++;
+        log("UaD: retransfer worked");
+      }catch(e){}
+
+    }
+
+    if(delayMs) await delay(delayMs);
   }
 
-  log("================================");
-  log("SUMMARY");
-  log(JSON.stringify({ drops, uafHits }, null, 2));
+  log("------------------------------------------------------------");
+  log("SUMMARY:");
+  log(JSON.stringify(stats,null,2));
+  log("DONE.");
 }
-
-document.getElementById("run").onclick = () => {
-  run().catch(()=>log("ERROR"));
-};
-
-})();
 </script>
-
 </body>
 </html>
