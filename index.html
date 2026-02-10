@@ -1,131 +1,170 @@
+
 <!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>PS4 UaD Window Probe — MessageChannel</title>
-</head>
+<head><meta charset="UTF-8"><title>PS4 DROP + UaD Timing + Queue Integrity</title></head>
 <body>
+<h2>PS4 MessageChannel: DROP + UaD Timing + Pós-DROP Queue Integrity</h2>
 
-<h2>PS4 Potential Use-After-Detach Window</h2>
-
-<button onclick="run()">RUN UaD AUTO</button>
+<button onclick="run()">RUN AUTO</button>
 <button onclick="stop()">STOP</button>
 <button onclick="resetLog()">Reset log</button>
 
 <p>
-Attempts: <input id="n" type="number" value="20">
+Attempts: <input id="n" type="number" value="30">
 Delay(ms): <input id="delay" type="number" value="30">
-Timeout(ms): <input id="timeout" type="number" value="1200">
+Timeout(ms): <input id="timeout" type="number" value="200">
+LateCheck(ms): <input id="late" type="number" value="800">
 </p>
 
 <pre id="log"></pre>
 
 <script>
-let running = false;
+let RUN = false;
 
-function log(s){
-  document.getElementById("log").textContent +=
-    "["+Date.now()+"] "+s+"\n";
-}
-
-function resetLog(){
-  document.getElementById("log").textContent="";
-  log("Reset.");
-}
-
-function stop(){ running=false; }
-
-function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function log(s){ document.getElementById("log").textContent += `[${Date.now()}] ${s}\n`; }
+function resetLog(){ document.getElementById("log").textContent=""; log("Reset."); }
+function stop(){ RUN = false; }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function microtask(){ return Promise.resolve(); }
 
 async function run(){
-
-  running=true;
-
-  const N = +n.value;
-  const delayMs = +delay.value;
-  const timeoutMs = +timeout.value;
+  RUN = true;
+  const N = +n.value|0;
+  const delayMs = +delay.value|0;
+  const timeoutMs = +timeout.value|0;
+  const lateMs = +late.value|0;
 
   log("============================================================");
-  log("RUN UaD Window Probe");
+  log(`RUN AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms lateCheck=${lateMs}ms`);
   log("============================================================");
 
-  let stats = {
-    drops:0,
-    uadReadable:0,
-    uadCloneable:0,
-    uadRetransfer:0,
-    uadDataView:0
+  const stats = {
+    detach_ok:0,
+    drop_fast:0,
+    drop_confirmed:0,
+    late_delivery:0,
+
+    // UaD-timing probes (mais sensíveis)
+    uad_index_no_throw:0,   // se NÃO lançar ao ler u8[0] após detach → suspeito
+    uad_dataview_no_throw:0,
+
+    // Pós-DROP Queue Integrity
+    queue_suspect_after_drop:0,
+    queue_ok_after_drop:0
   };
 
-  for(let i=0;i<N && running;i++){
+  let samples = [];
 
+  for (let i=0; i<N && RUN; i++){
     const ch = new MessageChannel();
 
+    // payload
     const ab = new ArrayBuffer(4096);
     const u8 = new Uint8Array(ab);
-    u8[0]=0xAA;
+    u8[0] = 0xAA;
 
-    let got;
-    ch.port2.onmessage = e=>got=e.data;
+    let got = undefined;
+    let gotAt = -1;
 
-    try{
-      ch.port1.postMessage(ab,[ab]);
-    }catch(e){
-      continue;
-    }
+    ch.port2.onmessage = (ev) => { got = ev.data; gotAt = Date.now(); };
 
-    await delay(0);
-    await delay(delayMs);
+    // transfer
+    let threw = false;
+    try { ch.port1.postMessage(ab, [ab]); }
+    catch(e){ threw = true; }
 
-    const detached = (ab.byteLength===0);
+    if (threw){ await sleep(delayMs); continue; }
 
-    if(detached && got===undefined){
+    // Observação rápida (fast path)
+    await microtask();       // microtask timing
+    const senderLen_mt = ab.byteLength;
 
-      stats.drops++;
-      log("DROP detected → probing UaD window");
+    await sleep(0);          // task timing
+    const senderLen_t0 = ab.byteLength;
 
-      // Probe 1 — Old view read
-      try{
-        let v = u8[0];
-        if(v!==undefined){
-          stats.uadReadable++;
-          log("UaD: old view readable="+v);
-        }
-      }catch(e){}
+    await sleep(delayMs);    // estabiliza
+    const senderLen = ab.byteLength;
 
-      // Probe 2 — DataView
-      try{
+    const detached = (senderLen === 0);
+    if (detached) stats.detach_ok++;
+
+    // classifica DROP rápido (fast)
+    const isFastDrop = detached && (got === undefined);
+    if (isFastDrop) stats.drop_fast++;
+
+    // UaD timing probes: após DETACH, ler índice e DataView DEVEM falhar (normalmente TypeError).
+    // Se NÃO falhar, é uma janela “concreta” (não prova exploração, mas prova uso pós-detach).
+    if (detached){
+      // Probe 1: u8[0] deve lançar em buffer detached (se não lançar -> suspeito)
+      try {
+        void u8[0];
+        // se chegou aqui, não lançou
+        stats.uad_index_no_throw++;
+        if (samples.length < 3) samples.push({i, kind:"uad_index_no_throw", senderLen_mt, senderLen_t0, senderLen});
+      } catch(e){}
+
+      // Probe 2: DataView em detached deve lançar ao construir ou ao ler
+      try {
         const dv = new DataView(ab);
-        let v = dv.getUint8(0);
-        stats.uadDataView++;
-        log("UaD: DataView readable="+v);
-      }catch(e){}
-
-      // Probe 3 — structuredClone
-      try{
-        structuredClone(ab);
-        stats.uadCloneable++;
-        log("UaD: structuredClone worked");
-      }catch(e){}
-
-      // Probe 4 — retransfer
-      try{
-        const ch2=new MessageChannel();
-        ch2.port1.postMessage(ab,[ab]);
-        stats.uadRetransfer++;
-        log("UaD: retransfer worked");
-      }catch(e){}
-
+        void dv.getUint8(0);
+        stats.uad_dataview_no_throw++;
+        if (samples.length < 3) samples.push({i, kind:"uad_dataview_no_throw", senderLen_mt, senderLen_t0, senderLen});
+      } catch(e){}
     }
 
-    if(delayMs) await delay(delayMs);
+    // Confirma se é DROP real ou “late delivery”
+    if (isFastDrop){
+      await sleep(lateMs);
+      if (got !== undefined){
+        stats.late_delivery++;
+        if (samples.length < 3) samples.push({i, kind:"late_delivery", gotType: typeof got, gotAt});
+      } else {
+        stats.drop_confirmed++;
+        // Pós-DROP Queue Integrity: manda sequência curta e valida ordem.
+        // Se a fila estiver corrompida, você vê missing/outOfOrder.
+        const tokens = ["A","B","C"];
+        const recv = [];
+        const chq = new MessageChannel();
+        chq.port2.onmessage = (ev)=> recv.push(ev.data);
+
+        // “toca” a fila: 3 mensagens pequenas
+        chq.port1.postMessage(tokens[0]);
+        chq.port1.postMessage(tokens[1]);
+        chq.port1.postMessage(tokens[2]);
+
+        await sleep(timeoutMs);
+
+        const okCount = (recv.length === 3);
+        const okOrder = okCount && (recv[0]==="A" && recv[1]==="B" && recv[2]==="C");
+
+        if (okOrder){
+          stats.queue_ok_after_drop++;
+        } else {
+          stats.queue_suspect_after_drop++;
+          if (samples.length < 3) samples.push({i, kind:"queue_suspect_after_drop", recv});
+        }
+
+        try { chq.port1.close(); chq.port2.close(); } catch(e){}
+      }
+    }
+
+    // progresso mínimo
+    if ((i+1) % 10 === 0) log(`progress: ${i+1}/${N}`);
+    await sleep(delayMs);
+
+    try { ch.port1.close(); ch.port2.close(); } catch(e){}
   }
 
   log("------------------------------------------------------------");
-  log("SUMMARY:");
-  log(JSON.stringify(stats,null,2));
+  log("RESULT SUMMARY:");
+  log(JSON.stringify(stats));
+  if (samples.length){
+    log("SAMPLES:");
+    log(JSON.stringify(samples));
+  }
   log("DONE.");
 }
+resetLog();
 </script>
 </body>
 </html>
