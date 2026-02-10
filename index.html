@@ -1,27 +1,38 @@
-<!doctype html>
+
+<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>PS4 T8 Retest — MessageChannel Transfer DROP (Minimal Log)</title>
+  <meta charset="UTF-8">
+  <title>PS4 T8 DROP + Queue/GC Impact Harness (Auto, Minimal Log)</title>
 </head>
 <body>
-  <h1>PS4 T8 Retest — MessageChannel Transfer DROP (Auto, Minimal Log)</h1>
+  <h1>PS4 T8 DROP + Queue/GC Impact Harness (Auto, Minimal Log)</h1>
 
-  <button id="run">RUN T8 AUTO</button>
-  <button id="stop">STOP</button>
-  <button id="reset">Reset log</button>
+  <button id="btnRunAll">RUN ALL (Auto)</button>
+  <button id="btnRunPoc">RUN PoC (HackerOne minimal)</button>
+  <button id="btnStop">STOP</button>
+  <button id="btnReset">Reset log</button>
 
   <p>
-    Attempts (N): <input id="N" type="number" value="60" min="10" step="10">
-    Timeout per attempt (ms): <input id="timeout" type="number" value="1200" min="200" step="100">
-    Delay between attempts (ms): <input id="delay" type="number" value="30" min="0" step="10">
-    Mode:
-    <select id="mode">
-      <option value="baseline">baseline</option>
-      <option value="pressure">pressure</option>
-      <option value="teardown">teardown</option>
-      <option value="mix" selected>mix</option>
-    </select>
+    Attempts (N): <input id="inN" type="number" value="200" min="1" step="10">
+    Timeout per attempt (ms): <input id="inTimeout" type="number" value="500" min="50" step="50">
+    Delay between attempts (ms): <input id="inDelay" type="number" value="0" min="0" step="10">
+  </p>
+
+  <p>
+    Post-DROP followups:
+    Queue test pings: <input id="inPings" type="number" value="6" min="1" step="1">
+    GC probe allocations: <input id="inGcAllocs" type="number" value="80" min="0" step="10">
+    GC probe buf size (bytes): <input id="inGcSize" type="number" value="65536" min="1024" step="1024">
+  </p>
+
+  <p>
+    Strategies (amplify):
+    <label><input id="stBaseline" type="checkbox" checked> baseline</label>
+    <label><input id="stMicrotask" type="checkbox" checked> microtasks</label>
+    <label><input id="stPortClose" type="checkbox" checked> close race</label>
+    <label><input id="stDomChurn" type="checkbox" checked> DOM churn</label>
+    <label><input id="stGcPressure" type="checkbox" checked> GC pressure</label>
   </p>
 
   <pre id="log"></pre>
@@ -31,238 +42,426 @@
   "use strict";
 
   const $log = document.getElementById("log");
-  const $run = document.getElementById("run");
-  const $stop = document.getElementById("stop");
-  const $reset = document.getElementById("reset");
+  const $ = (id) => document.getElementById(id);
 
   let STOP = false;
-  let RUN_ID = 0;
 
   function ts(){ return Date.now(); }
   function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
-  function resetLog(){ $log.textContent=""; logLine("Reset."); }
+  function resetLog(){ $log.textContent = ""; logLine("Reset."); }
+
+  function j(x){
+    try { return JSON.stringify(x); } catch(e){ return String(x); }
+  }
+
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  async function withTimeout(promise, ms){
-    let t;
-    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
-    try { return await Promise.race([promise, timeout]); }
-    finally { clearTimeout(t); }
-  }
-
-  // --- light, bounded "pressure" (no DoS)
-  function lightPressure(){
-    // Small churn: allocate a few medium buffers + touch them
-    const arr = [];
-    for (let i = 0; i < 24; i++){
-      const ab = new ArrayBuffer(0x4000); // 16KB
-      const u32 = new Uint32Array(ab);
-      u32[0] = 0x41414141 ^ i;
-      u32[u32.length-1] = 0x42424242 ^ i;
-      arr.push(ab);
+  async function waitFor(condFn, ms){
+    const t0 = Date.now();
+    while ((Date.now() - t0) < ms) {
+      if (condFn()) return true;
+      // yield microtask + task
+      await Promise.resolve();
+      await sleep(0);
     }
-    return arr;
+    return false;
   }
 
-  function lightTeardown(){
-    // Create/remove iframe + small microtask chain
-    const f = document.createElement("iframe");
-    document.body.appendChild(f);
-    try { f.contentWindow && f.contentWindow.location; } catch(_){}
-    try { f.remove(); } catch(_){}
-    // microtask churn (bounded)
+  function mkMarker(){
+    // marker 4 bytes
+    const m = (Math.random() * 0xFFFFFFFF) >>> 0;
+    return m;
+  }
+
+  function writeMarker(u8, m){
+    u8[0] = (m       ) & 0xFF;
+    u8[1] = (m >>>  8) & 0xFF;
+    u8[2] = (m >>> 16) & 0xFF;
+    u8[3] = (m >>> 24) & 0xFF;
+  }
+
+  function readMarker(u8){
+    return (u8[0] | (u8[1]<<8) | (u8[2]<<16) | (u8[3]<<24)) >>> 0;
+  }
+
+  async function microtaskBurst(n){
+    // bounded, não DoS
     let p = Promise.resolve();
-    for (let i = 0; i < 40; i++) p = p.then(() => {});
-    return p;
+    for (let i=0;i<n;i++){
+      p = p.then(() => 0);
+    }
+    await p;
   }
 
-  function classifyPayload(got){
-    const tag = Object.prototype.toString.call(got);
-    const isAB = (tag === "[object ArrayBuffer]") ||
-                 (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.slice === "function");
-    const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && got.buffer && typeof got.buffer === "object");
-    return { tag, isAB, isView };
+  function domChurnOnce(){
+    // bounded
+    const d = document.createElement("div");
+    d.textContent = "x";
+    document.body.appendChild(d);
+    d.remove();
   }
 
-  async function oneAttempt(kind, timeoutMs){
-    // kind: baseline | pressure | teardown
+  function gcPressureOnce(bytesTotal){
+    // bounded allocation churn
+    const arr = [];
+    const chunk = 4096;
+    const n = Math.max(1, (bytesTotal / chunk) | 0);
+    for (let i=0;i<n;i++){
+      arr.push(new Uint8Array(chunk));
+    }
+    // drop refs
+  }
+
+  function getStrategies(){
+    const list = [];
+    if ($("stBaseline").checked) list.push("baseline");
+    if ($("stMicrotask").checked) list.push("microtask");
+    if ($("stPortClose").checked) list.push("close");
+    if ($("stDomChurn").checked) list.push("dom");
+    if ($("stGcPressure").checked) list.push("gc");
+    if (!list.length) list.push("baseline");
+    return list;
+  }
+
+  async function applyStrategy(kind){
+    // todas são pequenas / bounded
+    if (kind === "microtask") {
+      await microtaskBurst(200);
+    } else if (kind === "dom") {
+      for (let i=0;i<6;i++) domChurnOnce();
+    } else if (kind === "gc") {
+      gcPressureOnce(64 * 1024);
+      await microtaskBurst(50);
+    }
+  }
+
+  async function tryTransferOnce(kind, timeoutMs){
+    // Retorna: { outcome, senderLen, gotType, gotTag, gotMarkerOk, gotLen, threw }
     const ch = new MessageChannel();
+    let got = undefined;
+    let gotSet = false;
+
+    ch.port2.onmessage = (ev) => { got = ev.data; gotSet = true; };
+
     const ab = new ArrayBuffer(4096);
     const u8 = new Uint8Array(ab);
-    u8[0] = 0xAA;
-    u8[1] = 0x55;
-    u8[4095] = 0xCC;
+    const marker = mkMarker();
+    writeMarker(u8, marker);
 
-    let got = undefined;
-    let recvCount = 0;
-
-    ch.port2.onmessage = (ev) => { got = ev.data; recvCount++; };
+    // Strategy pre-conditioning (bounded)
+    await applyStrategy(kind);
 
     let threw = false;
-    try { ch.port1.postMessage(ab, [ab]); }
-    catch(_){ threw = true; }
-
-    if (threw) return { outcome:"THROW" };
-
-    // Interleave stress between post and receive
-    if (kind === "pressure") lightPressure();
-    if (kind === "teardown") await lightTeardown();
-
-    // Wait delivery (or timeout)
     try {
-      await withTimeout(
-        (async () => {
-          // spin a few ticks
-          for (let i = 0; i < 6; i++){
-            if (recvCount) break;
-            await sleep(0);
-          }
-        })(),
-        timeoutMs
-      );
-    } catch(_){
-      // fallthrough to classify
+      ch.port1.postMessage(ab, [ab]);
+    } catch (e) {
+      threw = true;
     }
+
+    // "close race" strategy: close after posting (pode aumentar DROP sem ser DoS)
+    if (kind === "close") {
+      try { ch.port1.close(); } catch(_){}
+      // não fechar port2 aqui para ainda permitir entrega; isso gera janela de race
+    }
+
+    // aguarda delivery (não loga interno)
+    await waitFor(() => gotSet, timeoutMs);
 
     const senderLen = ab.byteLength;
+    const gotType = (got === null) ? "null" : (typeof got);
+    const gotTag = (got !== undefined && got !== null) ? Object.prototype.toString.call(got) : "";
+    let gotMarkerOk = false;
+    let gotLen = -1;
 
-    // Sender byteLength should be 0 (transfer) or 4096 (clone)
-    if (senderLen !== 0 && senderLen !== 4096) {
-      return { outcome:"SENDER_IMP", senderLen };
-    }
-
-    if (senderLen === 0) {
-      // transfer path: receiver must exist + be readable + preserve markers
-      if (got === undefined || got === null) {
-        return { outcome:"DROP", senderLen, gotType: typeof got };
+    try {
+      let r8 = null;
+      if (gotTag === "[object ArrayBuffer]") r8 = new Uint8Array(got);
+      else if (got && got.buffer && typeof got.byteLength === "number") r8 = new Uint8Array(got.buffer);
+      if (r8) {
+        gotLen = r8.length;
+        gotMarkerOk = (r8.length >= 4 && readMarker(r8) === marker);
       }
-      const c = classifyPayload(got);
+    } catch(_){}
 
-      try {
-        let r8 = null;
-        if (c.isAB) r8 = new Uint8Array(got);
-        else if (c.isView) {
-          if (got instanceof Uint8Array) r8 = got;
-          else r8 = new Uint8Array(got.buffer);
-        } else {
-          return { outcome:"BAD_PAYLOAD", senderLen, tag: c.tag };
+    let outcome = "OTHER";
+    if (threw) outcome = "THROW";
+    else if (senderLen === 0 && !gotSet) outcome = "DROP";
+    else if (senderLen === 0 && gotSet && gotMarkerOk) outcome = "DETACH_OK";
+    else if (senderLen === 4096 && gotSet) outcome = "CLONE_OK";
+    else if (!gotSet) outcome = "TIMEOUT_OR_NODLV";
+    else outcome = "BAD_PAYLOAD";
+
+    // cleanup
+    try { ch.port1.close(); } catch(_){}
+    try { ch.port2.close(); } catch(_){}
+
+    return { kind, outcome, senderLen, gotType, gotTag, gotMarkerOk, gotLen, threw };
+  }
+
+  async function postDropQueueTest(timeoutMs, pings){
+    // Objetivo: detectar fila/porta "stuck", reorder, loss após um DROP.
+    // Estratégia: criar um channel novo, induzir DROP, então testar sequência ping/pong + 2 transfers.
+    // Como não temos controle absoluto sobre indução, vamos: executar um DROP-attempt loop pequeno e,
+    // ao primeiro DROP, rodar validação usando *o mesmo channel* daquele attempt.
+    const maxAttempts = 40; // bounded
+    const strategies = getStrategies();
+
+    for (let a=0; a<maxAttempts && !STOP; a++){
+      const kind = strategies[a % strategies.length];
+      const ch = new MessageChannel();
+      let got = [];
+      ch.port2.onmessage = (ev) => { got.push(ev.data); };
+
+      const ab = new ArrayBuffer(4096);
+      const u8 = new Uint8Array(ab);
+      const marker = mkMarker();
+      writeMarker(u8, marker);
+
+      await applyStrategy(kind);
+
+      let threw = false;
+      try { ch.port1.postMessage(ab, [ab]); } catch(e){ threw = true; }
+      if (kind === "close") { try { ch.port1.close(); } catch(_){} }
+
+      // wait for first delivery window
+      await sleep(Math.min(50, timeoutMs));
+      const senderLen = ab.byteLength;
+      const firstGot = got.length ? got[0] : undefined;
+
+      const isDrop = (!threw && senderLen === 0 && firstGot === undefined);
+      if (!isDrop) {
+        try { ch.port1.close(); } catch(_){}
+        try { ch.port2.close(); } catch(_){}
+        continue;
+      }
+
+      // Achou DROP -> agora testa "fila/porta" no MESMO channel:
+      // 1) ping/pong strings
+      // 2) novo transfer
+      // 3) ver se entrega fica travada ou perde ordem
+
+      got = [];
+      // ping burst
+      for (let i=0;i<pings;i++){
+        try { ch.port1.postMessage("PING#" + i); } catch(_){}
+      }
+      // send a second transfer
+      const ab2 = new ArrayBuffer(2048);
+      const u82 = new Uint8Array(ab2);
+      const m2 = mkMarker();
+      writeMarker(u82, m2);
+      try { ch.port1.postMessage(ab2, [ab2]); } catch(_){}
+
+      // wait
+      await waitFor(() => got.length >= (pings + 1), timeoutMs);
+
+      // analyze
+      let pingOk = 0, pingMissing = 0;
+      const seen = new Set();
+      for (const msg of got){
+        if (typeof msg === "string" && msg.indexOf("PING#") === 0) {
+          seen.add(msg);
         }
-
-        if (r8.length !== 4096) return { outcome:"BAD_PAYLOAD", senderLen, tag: c.tag, rLen: r8.length };
-
-        const ok = (r8[0] === 0xAA && r8[1] === 0x55 && r8[4095] === 0xCC);
-        if (!ok) return { outcome:"BAD_PAYLOAD", senderLen, tag: c.tag, r0:r8[0], r1:r8[1], rLast:r8[4095] };
-
-        return { outcome:"DETACH_OK" };
-      } catch(e){
-        return { outcome:"BAD_PAYLOAD", senderLen, err: (e && e.name) ? e.name : "ERR" };
       }
-    } else {
-      // clone path (rare on some engines). Validate no alias:
-      if (got === undefined || got === null) return { outcome:"CLONE_UNKNOWN" };
-      const c = classifyPayload(got);
-      try {
-        let r8 = c.isAB ? new Uint8Array(got) :
-                 (c.isView ? (got instanceof Uint8Array ? got : new Uint8Array(got.buffer)) : null);
-        if (!r8) return { outcome:"CLONE_UNKNOWN" };
-
-        const before = r8[0];
-        u8[0] = 0xBB;
-        const after = r8[0];
-        if (before !== after) return { outcome:"ALIAS_IN_CLONE" };
-        return { outcome:"CLONE_OK" };
-      } catch(_){
-        return { outcome:"CLONE_UNKNOWN" };
+      for (let i=0;i<pings;i++){
+        if (seen.has("PING#" + i)) pingOk++;
+        else pingMissing++;
       }
+
+      // check transfer2 delivered + marker
+      let t2Ok = false;
+      for (const msg of got){
+        const tag = (msg !== undefined && msg !== null) ? Object.prototype.toString.call(msg) : "";
+        if (tag === "[object ArrayBuffer]") {
+          try {
+            const r = new Uint8Array(msg);
+            if (r.length >= 4 && readMarker(r) === m2) t2Ok = true;
+          } catch(_){}
+        }
+      }
+
+      // detect "stuck": got nothing or far less than expected
+      const stuck = (got.length === 0) || (pingOk === 0 && !t2Ok);
+
+      try { ch.port1.close(); } catch(_){}
+      try { ch.port2.close(); } catch(_){}
+
+      return {
+        foundDrop: true,
+        kind,
+        pingOk, pingMissing,
+        t2Ok,
+        gotCount: got.length,
+        stuck
+      };
     }
+
+    return { foundDrop: false };
   }
 
-  function pickKind(mode, i){
-    if (mode === "baseline") return "baseline";
-    if (mode === "pressure") return "pressure";
-    if (mode === "teardown") return "teardown";
-    // mix: 2 baseline, 1 pressure, 1 teardown repeating
-    const r = i % 4;
-    if (r === 0 || r === 1) return "baseline";
-    if (r === 2) return "pressure";
-    return "teardown";
+  async function postDropGcProbe(gcAllocs, gcSize){
+    // Não é “exploit”: é um *probe* para ver se aparece memória não inicializada / reuse anômalo.
+    // Após pressão, cria buffers e checa se algum contém padrões improváveis.
+    // Observação: isso é heurístico.
+    const needle = mkMarker();
+    let hits = 0;
+    let samples = 0;
+
+    // pressure a bit
+    for (let i=0;i<10;i++){
+      if (STOP) break;
+      gcPressureOnce(128 * 1024);
+      await microtaskBurst(30);
+      await sleep(0);
+    }
+
+    // allocate & scan first 16 bytes only (bounded)
+    for (let i=0;i<gcAllocs && !STOP;i++){
+      const ab = new ArrayBuffer(gcSize);
+      const u8 = new Uint8Array(ab);
+      // normally should be zeroed
+      const head = (u8[0] | (u8[1]<<8) | (u8[2]<<16) | (u8[3]<<24)) >>> 0;
+      if (head === needle) hits++;
+      samples++;
+      // tiny yield
+      if ((i % 20) === 0) await sleep(0);
+    }
+
+    return { needle, samples, hits };
   }
 
-  async function runAuto(){
-    STOP = false;
-    RUN_ID++;
-    const runId = RUN_ID;
-
-    if (typeof MessageChannel !== "function"){
-      logLine("MessageChannel not available.");
+  async function runAll(){
+    if (typeof MessageChannel !== "function") {
+      logLine("ERRO: MessageChannel não disponível.");
       return;
     }
+    STOP = false;
 
-    const N = Math.max(10, parseInt(document.getElementById("N").value || "60", 10));
-    const timeoutMs = Math.max(200, parseInt(document.getElementById("timeout").value || "1200", 10));
-    const delayMs = Math.max(0, parseInt(document.getElementById("delay").value || "30", 10));
-    const mode = document.getElementById("mode").value || "mix";
+    const N = Math.max(1, parseInt($("inN").value || "200", 10));
+    const timeoutMs = Math.max(50, parseInt($("inTimeout").value || "500", 10));
+    const delayMs = Math.max(0, parseInt($("inDelay").value || "0", 10));
+    const pings = Math.max(1, parseInt($("inPings").value || "6", 10));
+    const gcAllocs = Math.max(0, parseInt($("inGcAllocs").value || "80", 10));
+    const gcSize = Math.max(1024, parseInt($("inGcSize").value || "65536", 10));
+
+    const strategies = getStrategies();
+
+    logLine("============================================================");
+    logLine("Run ALL :: Amplifier + Post-DROP Queue + GC Probe (minimal)");
+    logLine(`Config :: ${j({ N, timeoutMs, delayMs, strategies, pings, gcAllocs, gcSize, ua:navigator.userAgent })}`);
+    logLine("============================================================");
 
     const stats = {
-      DETACH_OK:0,
-      DROP:0,
-      SENDER_IMP:0,
-      BAD_PAYLOAD:0,
-      THROW:0,
-      TIMEOUT:0,
-      CLONE_OK:0,
-      ALIAS_IN_CLONE:0,
-      CLONE_UNKNOWN:0
+      DETACH_OK:0, DROP:0, BAD_PAYLOAD:0, THROW:0, TIMEOUT:0, CLONE_OK:0, OTHER:0
     };
 
-    // Keep only first few "samples" to avoid huge logs
-    const samples = [];
-    const maxSamples = 6;
+    const firstDrops = [];
+    const firstBad = [];
 
-    logLine("============================================================");
-    logLine(`Run T8 AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms mode=${mode}`);
-    logLine("============================================================");
+    const progressStep = Math.max(1, Math.floor(N / 10));
 
-    for (let i = 0; i < N; i++){
-      if (STOP || runId !== RUN_ID) break;
+    for (let i=0;i<N && !STOP;i++){
+      const kind = strategies[i % strategies.length];
+      const r = await tryTransferOnce(kind, timeoutMs);
 
-      const kind = pickKind(mode, i);
-      let r;
-      try {
-        r = await oneAttempt(kind, timeoutMs);
-      } catch(e){
-        r = { outcome:"TIMEOUT", err:(e && e.name) ? e.name : "ERR" };
+      if (r.outcome in stats) stats[r.outcome]++; else stats.OTHER++;
+
+      if (r.outcome === "DROP" && firstDrops.length < 5) {
+        firstDrops.push({ i, kind:r.kind, senderLen:r.senderLen, gotType:r.gotType });
+      }
+      if (r.outcome === "BAD_PAYLOAD" && firstBad.length < 3) {
+        firstBad.push({ i, kind:r.kind, senderLen:r.senderLen, gotType:r.gotType, gotTag:r.gotTag, gotLen:r.gotLen, gotMarkerOk:r.gotMarkerOk });
       }
 
-      const o = r.outcome || "TIMEOUT";
-      if (stats[o] === undefined) stats[o] = 0;
-      stats[o]++;
-
-      if ((o === "DROP" || o === "SENDER_IMP" || o === "BAD_PAYLOAD" || o === "ALIAS_IN_CLONE") && samples.length < maxSamples){
-        samples.push({ i, kind, ...r });
+      if (((i+1) % progressStep) === 0) {
+        logLine(`progress: ${i+1}/${N}`);
       }
-
-      // Minimal progress ping every 10
-      if ((i+1) % 10 === 0) logLine(`progress: ${i+1}/${N}`);
 
       if (delayMs) await sleep(delayMs);
     }
 
     logLine("------------------------------------------------------------");
-    logLine("RESULT SUMMARY:");
-    logLine(JSON.stringify(stats));
-    if (samples.length){
-      logLine("SAMPLES (first failures):");
-      logLine(JSON.stringify(samples));
+    logLine(`RESULT SUMMARY: ${j(stats)}`);
+    if (firstDrops.length) logLine(`SAMPLES (first DROPs): ${j(firstDrops)}`);
+    if (firstBad.length) logLine(`SAMPLES (first BAD_PAYLOAD): ${j(firstBad)}`);
+
+    // Post-DROP tests (only if we saw DROP at least once)
+    if (!STOP && stats.DROP > 0) {
+      logLine("------------------------------------------------------------");
+      logLine("POST-DROP :: Queue corruption check (reuse channel on first DROP found)");
+      const q = await postDropQueueTest(timeoutMs, pings);
+      logLine(`QUEUE_CHECK: ${j(q)}`);
+
+      logLine("------------------------------------------------------------");
+      logLine("POST-DROP :: GC/orphan probe (heuristic, non-exploit)");
+      const g = await postDropGcProbe(gcAllocs, gcSize);
+      logLine(`GC_PROBE: ${j(g)}`);
+      if (g.hits > 0) {
+        logLine("ALERTA: GC_PROBE encontrou head==needle em novo ArrayBuffer. Isso é altamente incomum (verificar repetição).");
+      }
     } else {
-      logLine("SAMPLES: none (no interesting failures captured).");
+      logLine("POST-DROP :: skipped (no DROP observed in this run).");
     }
+
     logLine("DONE.");
   }
 
-  $run.onclick = () => runAuto().catch(() => logLine("ERRO: runAuto failed."));
-  $stop.onclick = () => { STOP = true; logLine("STOP requested."); };
-  $reset.onclick = resetLog;
+  async function runPocMinimal(){
+    if (typeof MessageChannel !== "function") {
+      logLine("ERRO: MessageChannel não disponível.");
+      return;
+    }
+    STOP = false;
+
+    const N = 60;                 // pequeno e copiável
+    const timeoutMs = 250;        // curto para amplificar em FW PS4
+    const delayMs = 10;
+    const strategies = ["baseline","close","microtask","dom"]; // amplifica sem DoS
+
+    logLine("============================================================");
+    logLine("PoC (HackerOne minimal) :: MessageChannel transfer may detach without delivery");
+    logLine(`Env :: ${j({ fw_hint:"PS4", ua:navigator.userAgent })}`);
+    logLine(`Config :: ${j({ N, timeoutMs, delayMs, strategies })}`);
+    logLine("============================================================");
+
+    const stats = { DETACH_OK:0, DROP:0, THROW:0, TIMEOUT:0, OTHER:0 };
+    const samples = [];
+
+    for (let i=0;i<N && !STOP;i++){
+      const kind = strategies[i % strategies.length];
+      const r = await tryTransferOnce(kind, timeoutMs);
+
+      if (r.outcome === "DETACH_OK") stats.DETACH_OK++;
+      else if (r.outcome === "DROP") stats.DROP++;
+      else if (r.outcome === "THROW") stats.THROW++;
+      else if (r.outcome === "TIMEOUT_OR_NODLV") stats.TIMEOUT++;
+      else stats.OTHER++;
+
+      if (r.outcome === "DROP" && samples.length < 3) {
+        samples.push({ i, kind:r.kind, senderLen:r.senderLen, gotType:r.gotType });
+      }
+
+      if (delayMs) await sleep(delayMs);
+    }
+
+    logLine("------------------------------------------------------------");
+    logLine(`SUMMARY: ${j(stats)}`);
+    if (samples.length) logLine(`SAMPLES: ${j(samples)}`);
+
+    // Snippet pronto para report
+    logLine("------------------------------------------------------------");
+    logLine("REPORT_SNIPPET (copy/paste):");
+    logLine("Title: MessageChannel transfer can detach ArrayBuffer without delivery (DROP)");
+    logLine(`Observed: DETACH_OK=${stats.DETACH_OK}, DROP=${stats.DROP}, THROW=${stats.THROW}, TIMEOUT=${stats.TIMEOUT} over N=${N}`);
+    logLine("Invariant: sender byteLength==0 (detached) but receiver got undefined (no payload), no exception");
+    if (samples.length) logLine("Sample indices: " + samples.map(s => s.i + ":" + s.kind).join(", "));
+    logLine("DONE.");
+  }
+
+  $("btnReset").onclick = resetLog;
+  $("btnStop").onclick = () => { STOP = true; logLine("STOP requested."); };
+  $("btnRunAll").onclick = () => runAll().catch(e => logLine("ERRO(runAll): " + (e && e.name ? e.name : "ERR")));
+  $("btnRunPoc").onclick = () => runPocMinimal().catch(e => logLine("ERRO(runPoc): " + (e && e.name ? e.name : "ERR")));
 
   resetLog();
 })();
