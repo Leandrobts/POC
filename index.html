@@ -1,447 +1,268 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-  <meta charset="UTF-8">
-  <title>PS4 POC Pack — TypedArray/ArrayBuffer Invariants (Minimal+Impact)</title>
+  <meta charset="utf-8">
+  <title>PS4 T8 Retest — MessageChannel Transfer DROP (Minimal Log)</title>
 </head>
 <body>
-  <h1>PS4 POC Pack — TypedArray/ArrayBuffer Invariants (Minimal+Impact)</h1>
+  <h1>PS4 T8 Retest — MessageChannel Transfer DROP (Auto, Minimal Log)</h1>
 
-  <button id="btnReset">Reset log</button>
-  <button id="btnRunAll">Run ALL (T1 + A + B + C + D + T8)</button>
-  <hr>
-
-  <button id="btnT1">T1 :: AB.byteLength descriptor audit (+ policy)</button>
-  <button id="btnA">A :: Object.defineProperty on ta[0] (+ policy)</button>
-  <button id="btnB">B :: Reflect.defineProperty on ta[0] (+ policy)</button>
-  <button id="btnC">C :: Proxy wrapper invariants (+ policy)</button>
-  <button id="btnD">D :: Cross-realm iframe reproduce (+ policy)</button>
-  <button id="btnT8">T8 :: MessageChannel transfer DROP detector</button>
+  <button id="run">RUN T8 AUTO</button>
+  <button id="stop">STOP</button>
+  <button id="reset">Reset log</button>
 
   <p>
-    N (T8 reps): <input id="t8N" type="number" value="30" min="1" step="1">
-    Delay (ms): <input id="t8Delay" type="number" value="50" min="0" step="10">
-    Timeout (ms): <input id="t8Timeout" type="number" value="1200" min="50" step="50">
+    Attempts (N): <input id="N" type="number" value="60" min="10" step="10">
+    Timeout per attempt (ms): <input id="timeout" type="number" value="1200" min="200" step="100">
+    Delay between attempts (ms): <input id="delay" type="number" value="30" min="0" step="10">
+    Mode:
+    <select id="mode">
+      <option value="baseline">baseline</option>
+      <option value="pressure">pressure</option>
+      <option value="teardown">teardown</option>
+      <option value="mix" selected>mix</option>
+    </select>
   </p>
 
-  <pre id="log" style="white-space:pre-wrap;"></pre>
+  <pre id="log"></pre>
 
 <script>
 (() => {
   "use strict";
 
   const $log = document.getElementById("log");
+  const $run = document.getElementById("run");
+  const $stop = document.getElementById("stop");
+  const $reset = document.getElementById("reset");
+
   let STOP = false;
   let RUN_ID = 0;
 
   function ts(){ return Date.now(); }
   function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
   function resetLog(){ $log.textContent=""; logLine("Reset."); }
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  function j(x){
-    try { return JSON.stringify(x, null, 2); } catch(e){ return String(x); }
-  }
-
-  function section(title){
-    logLine("============================================================");
-    logLine(title);
-    logLine("============================================================");
-  }
-
-  function safeCall(fn){
-    try { return { threw:false, val: fn() }; }
-    catch(e){ return { threw:true, err:(e&&e.name)||"ERR", msg:(e&&e.message)||"" }; }
-  }
-
-  function tryGetDesc(obj, prop){
-    const r = safeCall(() => Object.getOwnPropertyDescriptor(obj, prop) || null);
-    if (r.threw) return { threw:true, err:r.err };
-    return r.val;
-  }
-
-  function verdictLine(name, ok, detailsObj){
-    logLine(`${ok ? "PASS" : "FAIL"} :: ${name}${detailsObj ? " :: " + j(detailsObj).replace(/\n/g, " ") : ""}`);
-  }
-
-  function hardeningPolicyOnIndex(realm, label, target, key /* "0" */){
-    // Policy model (non-exploit):
-    // - If descriptor claims configurable:true, we SHOULD be able to delete.
-    // - If engine refuses delete while saying configurable:true -> enforcement mismatch.
-    // - Try "normalize": defineProperty configurable:false and see if descriptor updates.
-    const Object_ = realm.Object || Object;
-    const Reflect_ = realm.Reflect || Reflect;
-
-    const out = {
-      key,
-      preDesc: null,
-      claimedConfigurable: null,
-      delDeleteOp: null,
-      delReflect: null,
-      postDelDesc: null,
-      normalizeDefine: null,
-      postNormalizeDesc: null,
-      ownKeys: null
-    };
-
-    out.preDesc = safeCall(() => Object_.getOwnPropertyDescriptor(target, key));
-    const preD = out.preDesc.threw ? null : out.preDesc.val;
-    out.claimedConfigurable = preD && typeof preD === "object" ? preD.configurable : undefined;
-
-    out.delDeleteOp = safeCall(() => { return (delete target[key]); });
-    out.delReflect = safeCall(() => Reflect_.deleteProperty(target, key));
-    out.postDelDesc = safeCall(() => Object_.getOwnPropertyDescriptor(target, key));
-
-    // Try to "normalize" (if engine allows). This is still non-exploit: integrity enforcement attempt.
-    out.normalizeDefine = safeCall(() => {
-      return Reflect_.defineProperty(target, key, { value: 9, writable: true, enumerable: true, configurable: false });
-    });
-
-    out.postNormalizeDesc = safeCall(() => Object_.getOwnPropertyDescriptor(target, key));
-    out.ownKeys = safeCall(() => Reflect_.ownKeys(target));
-
-    // Determine mismatch:
-    // Mismatch = descriptor CLAIMS configurable:true, but delete fails/throws.
-    const claimed = (out.claimedConfigurable === true);
-    const delFailed =
-      out.delDeleteOp.threw || out.delDeleteOp.val === false ||
-      out.delReflect.threw || out.delReflect.val === false;
-
-    const mismatch = claimed && delFailed;
-
-    return { mismatch, out };
-  }
-
-  function typedArrayCase(label, defineFn){
-    section(`POC ${label}: TypedArray index invariants (+ policy)`);
-    const ta = new Uint8Array(16);
-    ta[0] = 7;
-
-    const baselineOwnDesc = tryGetDesc(ta, "0");
-    logLine(`${label} baseline desc(ta,"0")=${j(baselineOwnDesc)}`);
-
-    // Step: defineProperty per variant
-    let defineRes = { ok:null, threw:false, err:null, desc:null };
-    try {
-      const ok = defineFn(ta);
-      defineRes.ok = ok;
-      defineRes.desc = tryGetDesc(ta, "0");
-    } catch(e){
-      defineRes.threw = true;
-      defineRes.err = (e && e.name) ? e.name : "ERR";
-      defineRes.desc = tryGetDesc(ta, "0");
-    }
-    logLine(`${label} defineProperty result=${j(defineRes)}`);
-    logLine(`${label} after define, ta[0]=${ta[0]}`);
-
-    // Mutate value (normal)
-    ta[0] = 0x33;
-
-    // Run hardening policy simulation on index "0"
-    const pol = hardeningPolicyOnIndex({ Object, Reflect }, label, ta, "0");
-
-    // Compact summary for triage
-    const preD = pol.out.preDesc.threw ? null : pol.out.preDesc.val;
-    const postD = pol.out.postNormalizeDesc.threw ? null : pol.out.postNormalizeDesc.val;
-
-    const summary = {
-      ta0_afterWrite: ta[0],
-      claimedConfigurable: pol.out.claimedConfigurable,
-      deleteOp: pol.out.delDeleteOp.threw ? ("THREW:"+pol.out.delDeleteOp.err) : pol.out.delDeleteOp.val,
-      reflectDelete: pol.out.delReflect.threw ? ("THREW:"+pol.out.delReflect.err) : pol.out.delReflect.val,
-      normalizeDefine: pol.out.normalizeDefine.threw ? ("THREW:"+pol.out.normalizeDefine.err) : pol.out.normalizeDefine.val,
-      preDesc: preD,
-      postNormalizeDesc: postD
-    };
-
-    if (pol.mismatch) {
-      logLine(`ALERTA: ${label} policy FAIL :: engine reporta configurable:true mas delete falha/lança (invariantes inconsistentes).`);
-      verdictLine(`${label}/PolicyEnforcement`, false, summary);
-    } else {
-      verdictLine(`${label}/PolicyEnforcement`, true, summary);
-    }
-  }
-
-  // --- T1: ArrayBuffer.prototype.byteLength descriptor audit + policy test
-  function runT1(){
-    section("T1 :: ArrayBuffer.prototype.byteLength descriptor audit (+ policy)");
-    const desc = tryGetDesc(ArrayBuffer.prototype, "byteLength");
-    logLine(`T1 desc(ArrayBuffer.prototype,"byteLength")=${j(desc)}`);
-
-    // Policy simulation: if configurable:true, attempt to lock it down (defineProperty configurable:false)
-    // NOTE: This is not exploitation; it's a demonstration of whether descriptor-based policy is meaningful here.
-    const attempt = safeCall(() => {
-      return Reflect.defineProperty(ArrayBuffer.prototype, "byteLength", { configurable: false });
-    });
-
-    const desc2 = tryGetDesc(ArrayBuffer.prototype, "byteLength");
-
-    // Small detach sample to show transfers work (not a vuln)
-    const ab = new ArrayBuffer(16);
-    const beforeLen = ab.byteLength;
-    let det = { attempted:false, ok:false, via:null, err:null };
-    if (typeof structuredClone === "function") {
-      det.attempted = true;
-      det.via = "structuredClone";
-      try { structuredClone(ab, { transfer:[ab] }); det.ok = true; }
-      catch(e){ det.ok = false; det.err = (e&&e.name)||"ERR"; }
-    }
-    const afterLen = ab.byteLength;
-
-    const policyInfo = {
-      definePropertyResult: attempt.threw ? ("THREW:"+attempt.err) : attempt.val,
-      descBefore: desc,
-      descAfter: desc2,
-      detachSample: { beforeLen, afterLen, det }
-    };
-
-    // We don't assert "impossible" here; we assert "policy meaningfulness":
-    // If desc says configurable but defineProperty behavior doesn't align, that's also an enforcement mismatch surface.
-    const cfg = desc && typeof desc === "object" ? desc.configurable : undefined;
-    const attemptFailed = attempt.threw;
-
-    if (cfg === true && attemptFailed) {
-      logLine("ALERTA: T1 policy mismatch :: descriptor sugere configurável, mas policy (defineProperty) falhou/lançou.");
-      verdictLine("T1/DescriptorPolicy", false, policyInfo);
-    } else {
-      verdictLine("T1/DescriptorPolicy", true, policyInfo);
-    }
-  }
-
-  // --- A/B/C
-  function runA(){
-    typedArrayCase("A", (ta) => {
-      Object.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true });
-      return true;
-    });
-  }
-
-  function runB(){
-    typedArrayCase("B", (ta) => {
-      return Reflect.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true });
-    });
-  }
-
-  function runC(){
-    section("POC C: Proxy wrapper invariants (+ policy)");
-    const ta = new Uint8Array(16);
-    ta[0] = 7;
-
-    const baselineOwnDesc = tryGetDesc(ta, "0");
-    logLine(`C baseline desc(ta,"0")=${j(baselineOwnDesc)}`);
-
-    const p = new Proxy(ta, {
-      defineProperty(target, prop, desc) { return Reflect.defineProperty(target, prop, desc); },
-      getOwnPropertyDescriptor(target, prop) { return Reflect.getOwnPropertyDescriptor(target, prop); },
-      deleteProperty(target, prop) { return Reflect.deleteProperty(target, prop); },
-      ownKeys(target) { return Reflect.ownKeys(target); }
-    });
-
-    // Apply defineProperty via Proxy
-    const defineRes = safeCall(() => Reflect.defineProperty(p, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
-    const descAfterDefine = safeCall(() => Reflect.getOwnPropertyDescriptor(p, "0"));
-    logLine(`C defineProperty via Proxy => ${j({ defineRes, descAfterDefine, ta0: ta[0] })}`);
-
-    ta[0] = 0x33;
-
-    // Policy hardening on Proxy target "0"
-    const pol = hardeningPolicyOnIndex({ Object, Reflect }, "C", p, "0");
-
-    const preD = pol.out.preDesc.threw ? null : pol.out.preDesc.val;
-    const postD = pol.out.postNormalizeDesc.threw ? null : pol.out.postNormalizeDesc.val;
-
-    const summary = {
-      ta0_afterWrite: ta[0],
-      claimedConfigurable: pol.out.claimedConfigurable,
-      deleteOp: pol.out.delDeleteOp.threw ? ("THREW:"+pol.out.delDeleteOp.err) : pol.out.delDeleteOp.val,
-      reflectDelete: pol.out.delReflect.threw ? ("THREW:"+pol.out.delReflect.err) : pol.out.delReflect.val,
-      normalizeDefine: pol.out.normalizeDefine.threw ? ("THREW:"+pol.out.normalizeDefine.err) : pol.out.normalizeDefine.val,
-      preDesc: preD,
-      postNormalizeDesc: postD
-    };
-
-    if (pol.mismatch) {
-      logLine("ALERTA: C policy FAIL via Proxy :: configurable:true reportado, delete falha/lança.");
-      verdictLine("C/PolicyEnforcement", false, summary);
-    } else {
-      verdictLine("C/PolicyEnforcement", true, summary);
-    }
-  }
-
-  // --- D (iframe)
-  function runD(){
-    section("POC D: Cross-realm iframe reproduce (+ policy)");
-    const f = document.createElement("iframe");
-    document.body.appendChild(f);
-
-    try {
-      const w = f.contentWindow;
-      const ta = new w.Uint8Array(16);
-      ta[0] = 7;
-
-      // defineProperty in iframe realm
-      const defineRes = safeCall(() => w.Reflect.defineProperty(ta, "0", { value: 9, writable: true, enumerable: true, configurable: true }));
-      const desc = safeCall(() => w.Object.getOwnPropertyDescriptor(ta, "0"));
-      logLine(`D defineProperty in iframe => ${j({ defineRes, desc, ta0: ta[0] })}`);
-
-      ta[0] = 0x33;
-
-      // Policy hardening in iframe realm
-      const pol = hardeningPolicyOnIndex({ Object: w.Object, Reflect: w.Reflect }, "D", ta, "0");
-
-      const preD = pol.out.preDesc.threw ? null : pol.out.preDesc.val;
-      const postD = pol.out.postNormalizeDesc.threw ? null : pol.out.postNormalizeDesc.val;
-
-      const summary = {
-        ta0_afterWrite: ta[0],
-        claimedConfigurable: pol.out.claimedConfigurable,
-        deleteOp: pol.out.delDeleteOp.threw ? ("THREW:"+pol.out.delDeleteOp.err) : pol.out.delDeleteOp.val,
-        reflectDelete: pol.out.delReflect.threw ? ("THREW:"+pol.out.delReflect.err) : pol.out.delReflect.val,
-        normalizeDefine: pol.out.normalizeDefine.threw ? ("THREW:"+pol.out.normalizeDefine.err) : pol.out.normalizeDefine.val,
-        preDesc: preD,
-        postNormalizeDesc: postD
-      };
-
-      if (pol.mismatch) {
-        logLine("ALERTA: D cross-realm policy FAIL :: configurable:true reportado, delete falha/lança.");
-        verdictLine("D/CrossRealmPolicyEnforcement", false, summary);
-      } else {
-        verdictLine("D/CrossRealmPolicyEnforcement", true, summary);
-      }
-
-    } catch(e){
-      logLine(`ERRO: D falhou: ${(e&&e.name)||"ERR"}`);
-    } finally {
-      try { f.remove(); } catch(_) {}
-    }
-  }
-
-  // --- T8: MessageChannel transfer DROP detector
   async function withTimeout(promise, ms){
     let t;
     const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
     try { return await Promise.race([promise, timeout]); }
     finally { clearTimeout(t); }
   }
-  function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  async function runT8(){
-    section("T8 :: MessageChannel transfer DROP detector (handshake)");
+  // --- light, bounded "pressure" (no DoS)
+  function lightPressure(){
+    // Small churn: allocate a few medium buffers + touch them
+    const arr = [];
+    for (let i = 0; i < 24; i++){
+      const ab = new ArrayBuffer(0x4000); // 16KB
+      const u32 = new Uint32Array(ab);
+      u32[0] = 0x41414141 ^ i;
+      u32[u32.length-1] = 0x42424242 ^ i;
+      arr.push(ab);
+    }
+    return arr;
+  }
 
-    if (typeof MessageChannel !== "function") {
-      logLine("INFO: MessageChannel não disponível.");
-      return;
+  function lightTeardown(){
+    // Create/remove iframe + small microtask chain
+    const f = document.createElement("iframe");
+    document.body.appendChild(f);
+    try { f.contentWindow && f.contentWindow.location; } catch(_){}
+    try { f.remove(); } catch(_){}
+    // microtask churn (bounded)
+    let p = Promise.resolve();
+    for (let i = 0; i < 40; i++) p = p.then(() => {});
+    return p;
+  }
+
+  function classifyPayload(got){
+    const tag = Object.prototype.toString.call(got);
+    const isAB = (tag === "[object ArrayBuffer]") ||
+                 (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.slice === "function");
+    const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && got.buffer && typeof got.buffer === "object");
+    return { tag, isAB, isView };
+  }
+
+  async function oneAttempt(kind, timeoutMs){
+    // kind: baseline | pressure | teardown
+    const ch = new MessageChannel();
+    const ab = new ArrayBuffer(4096);
+    const u8 = new Uint8Array(ab);
+    u8[0] = 0xAA;
+    u8[1] = 0x55;
+    u8[4095] = 0xCC;
+
+    let got = undefined;
+    let recvCount = 0;
+
+    ch.port2.onmessage = (ev) => { got = ev.data; recvCount++; };
+
+    let threw = false;
+    try { ch.port1.postMessage(ab, [ab]); }
+    catch(_){ threw = true; }
+
+    if (threw) return { outcome:"THROW" };
+
+    // Interleave stress between post and receive
+    if (kind === "pressure") lightPressure();
+    if (kind === "teardown") await lightTeardown();
+
+    // Wait delivery (or timeout)
+    try {
+      await withTimeout(
+        (async () => {
+          // spin a few ticks
+          for (let i = 0; i < 6; i++){
+            if (recvCount) break;
+            await sleep(0);
+          }
+        })(),
+        timeoutMs
+      );
+    } catch(_){
+      // fallthrough to classify
     }
 
-    const N = Math.max(1, parseInt(document.getElementById("t8N").value || "30", 10));
-    const delayMs = Math.max(0, parseInt(document.getElementById("t8Delay").value || "50", 10));
-    const timeoutMs = Math.max(50, parseInt(document.getElementById("t8Timeout").value || "1200", 10));
-    logLine(`Config :: N=${N} delayMs=${delayMs} timeoutMs=${timeoutMs}`);
+    const senderLen = ab.byteLength;
 
-    const stats = {
-      ok_detach: 0,
-      ok_clone: 0,
-      transfer_throw: 0,
-      drops_detach_path: 0,
-      sender_impossible: 0,
-      other: 0
-    };
+    // Sender byteLength should be 0 (transfer) or 4096 (clone)
+    if (senderLen !== 0 && senderLen !== 4096) {
+      return { outcome:"SENDER_IMP", senderLen };
+    }
 
-    for (let i = 0; i < N; i++) {
-      const ch = new MessageChannel();
-      const ab = new ArrayBuffer(4096);
-      const u8 = new Uint8Array(ab);
-      u8[0] = 0xAA;
-
-      let got = undefined;
-      ch.port2.onmessage = (ev) => { got = ev.data; };
-
-      let postThrew = false;
-      try { ch.port1.postMessage(ab, [ab]); }
-      catch (_) { postThrew = true; }
-
-      if (postThrew) {
-        stats.transfer_throw++;
-        if (delayMs) await delay(delayMs);
-        continue;
+    if (senderLen === 0) {
+      // transfer path: receiver must exist + be readable + preserve markers
+      if (got === undefined || got === null) {
+        return { outcome:"DROP", senderLen, gotType: typeof got };
       }
+      const c = classifyPayload(got);
 
-      // wait delivery window
-      try { await withTimeout(delay(0), timeoutMs); } catch(_) {}
-
-      const senderLen = ab.byteLength;
-      if (senderLen !== 0 && senderLen !== 4096) {
-        stats.sender_impossible++;
-        if (delayMs) await delay(delayMs);
-        continue;
-      }
-
-      if (senderLen === 0) {
-        // transfer path: must have receiver payload
-        if (got === undefined || got === null) {
-          stats.drops_detach_path++;
+      try {
+        let r8 = null;
+        if (c.isAB) r8 = new Uint8Array(got);
+        else if (c.isView) {
+          if (got instanceof Uint8Array) r8 = got;
+          else r8 = new Uint8Array(got.buffer);
         } else {
-          // best-effort read
-          let ok = false;
-          try {
-            const tag = Object.prototype.toString.call(got);
-            const isAB = (tag === "[object ArrayBuffer]") || (got && typeof got.byteLength === "number" && typeof got.slice === "function");
-            const isView = (got && typeof got === "object" && typeof got.byteLength === "number" && typeof got.buffer === "object");
-            let r8 = isAB ? new Uint8Array(got) : (got instanceof Uint8Array ? got : (isView ? new Uint8Array(got.buffer) : null));
-            if (r8 && r8.length === 4096 && r8[0] === 0xAA) ok = true;
-          } catch(_) {}
-          if (ok) stats.ok_detach++;
-          else stats.other++;
+          return { outcome:"BAD_PAYLOAD", senderLen, tag: c.tag };
         }
-      } else {
-        stats.ok_clone++;
+
+        if (r8.length !== 4096) return { outcome:"BAD_PAYLOAD", senderLen, tag: c.tag, rLen: r8.length };
+
+        const ok = (r8[0] === 0xAA && r8[1] === 0x55 && r8[4095] === 0xCC);
+        if (!ok) return { outcome:"BAD_PAYLOAD", senderLen, tag: c.tag, r0:r8[0], r1:r8[1], rLast:r8[4095] };
+
+        return { outcome:"DETACH_OK" };
+      } catch(e){
+        return { outcome:"BAD_PAYLOAD", senderLen, err: (e && e.name) ? e.name : "ERR" };
       }
-
-      if (delayMs) await delay(delayMs);
-    }
-
-    logLine(`RESULTADOS: ${j(stats)}`);
-
-    if (stats.drops_detach_path > 0) {
-      logLine("ALERTA: T8 DROP :: sender detacha (len=0) mas receiver veio undefined/null em algumas repetições.");
-      verdictLine("T8/MessageChannelDrop", false, stats);
     } else {
-      verdictLine("T8/MessageChannelDrop", true, stats);
+      // clone path (rare on some engines). Validate no alias:
+      if (got === undefined || got === null) return { outcome:"CLONE_UNKNOWN" };
+      const c = classifyPayload(got);
+      try {
+        let r8 = c.isAB ? new Uint8Array(got) :
+                 (c.isView ? (got instanceof Uint8Array ? got : new Uint8Array(got.buffer)) : null);
+        if (!r8) return { outcome:"CLONE_UNKNOWN" };
+
+        const before = r8[0];
+        u8[0] = 0xBB;
+        const after = r8[0];
+        if (before !== after) return { outcome:"ALIAS_IN_CLONE" };
+        return { outcome:"CLONE_OK" };
+      } catch(_){
+        return { outcome:"CLONE_UNKNOWN" };
+      }
     }
   }
 
-  async function runAll(){
+  function pickKind(mode, i){
+    if (mode === "baseline") return "baseline";
+    if (mode === "pressure") return "pressure";
+    if (mode === "teardown") return "teardown";
+    // mix: 2 baseline, 1 pressure, 1 teardown repeating
+    const r = i % 4;
+    if (r === 0 || r === 1) return "baseline";
+    if (r === 2) return "pressure";
+    return "teardown";
+  }
+
+  async function runAuto(){
     STOP = false;
     RUN_ID++;
     const runId = RUN_ID;
-    section("Run ALL :: T1 + A + B + C + D + T8");
-    try {
-      if (runId !== RUN_ID || STOP) return;
-      runT1();
-      if (runId !== RUN_ID || STOP) return;
-      runA();
-      if (runId !== RUN_ID || STOP) return;
-      runB();
-      if (runId !== RUN_ID || STOP) return;
-      runC();
-      if (runId !== RUN_ID || STOP) return;
-      runD();
-      if (runId !== RUN_ID || STOP) return;
-      await runT8();
-    } catch (e) {
-      logLine(`ERRO em Run ALL: ${(e&&e.name)||"ERR"}`);
+
+    if (typeof MessageChannel !== "function"){
+      logLine("MessageChannel not available.");
+      return;
     }
-    logLine("ALL DONE.");
+
+    const N = Math.max(10, parseInt(document.getElementById("N").value || "60", 10));
+    const timeoutMs = Math.max(200, parseInt(document.getElementById("timeout").value || "1200", 10));
+    const delayMs = Math.max(0, parseInt(document.getElementById("delay").value || "30", 10));
+    const mode = document.getElementById("mode").value || "mix";
+
+    const stats = {
+      DETACH_OK:0,
+      DROP:0,
+      SENDER_IMP:0,
+      BAD_PAYLOAD:0,
+      THROW:0,
+      TIMEOUT:0,
+      CLONE_OK:0,
+      ALIAS_IN_CLONE:0,
+      CLONE_UNKNOWN:0
+    };
+
+    // Keep only first few "samples" to avoid huge logs
+    const samples = [];
+    const maxSamples = 6;
+
+    logLine("============================================================");
+    logLine(`Run T8 AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms mode=${mode}`);
+    logLine("============================================================");
+
+    for (let i = 0; i < N; i++){
+      if (STOP || runId !== RUN_ID) break;
+
+      const kind = pickKind(mode, i);
+      let r;
+      try {
+        r = await oneAttempt(kind, timeoutMs);
+      } catch(e){
+        r = { outcome:"TIMEOUT", err:(e && e.name) ? e.name : "ERR" };
+      }
+
+      const o = r.outcome || "TIMEOUT";
+      if (stats[o] === undefined) stats[o] = 0;
+      stats[o]++;
+
+      if ((o === "DROP" || o === "SENDER_IMP" || o === "BAD_PAYLOAD" || o === "ALIAS_IN_CLONE") && samples.length < maxSamples){
+        samples.push({ i, kind, ...r });
+      }
+
+      // Minimal progress ping every 10
+      if ((i+1) % 10 === 0) logLine(`progress: ${i+1}/${N}`);
+
+      if (delayMs) await sleep(delayMs);
+    }
+
+    logLine("------------------------------------------------------------");
+    logLine("RESULT SUMMARY:");
+    logLine(JSON.stringify(stats));
+    if (samples.length){
+      logLine("SAMPLES (first failures):");
+      logLine(JSON.stringify(samples));
+    } else {
+      logLine("SAMPLES: none (no interesting failures captured).");
+    }
+    logLine("DONE.");
   }
 
-  // Wire
-  document.getElementById("btnReset").onclick = resetLog;
-  document.getElementById("btnRunAll").onclick = () => runAll().catch(() => logLine("ERRO: Run ALL falhou."));
-  document.getElementById("btnT1").onclick = runT1;
-  document.getElementById("btnA").onclick = runA;
-  document.getElementById("btnB").onclick = runB;
-  document.getElementById("btnC").onclick = runC;
-  document.getElementById("btnD").onclick = runD;
-  document.getElementById("btnT8").onclick = () => runT8().catch(() => logLine("ERRO: T8 falhou."));
+  $run.onclick = () => runAuto().catch(() => logLine("ERRO: runAuto failed."));
+  $stop.onclick = () => { STOP = true; logLine("STOP requested."); };
+  $reset.onclick = resetLog;
 
   resetLog();
 })();
