@@ -1,239 +1,127 @@
-
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
-  <title>PS4 T8 Retest + Pós-DROP Queue Integrity (Minimal)</title>
+<meta charset="UTF-8">
+<title>PS4 UaF Window Harness — Post-Detach</title>
 </head>
 <body>
-  <h2>PS4 T8 Retest — MessageChannel Transfer DROP + Pós-DROP Queue Integrity</h2>
 
-  <button id="run">RUN AUTO</button>
-  <button id="stop">STOP</button>
-  <button id="reset">Reset log</button>
+<h3>Potential Use-After-Detach Window — Auto Harness</h3>
 
-  <p>
-    Attempts (N): <input id="N" type="number" value="10" min="1" step="1">
-    Timeout per attempt (ms): <input id="timeout" type="number" value="200" min="50" step="50">
-    Delay between attempts (ms): <input id="delay" type="number" value="10" min="0" step="5">
-  </p>
-
-  <pre id="log"></pre>
+<button id="run">RUN AUTO</button>
+<pre id="log"></pre>
 
 <script>
 (() => {
-  "use strict";
+"use strict";
 
-  const $log = document.getElementById("log");
-  const $N = document.getElementById("N");
-  const $timeout = document.getElementById("timeout");
-  const $delay = document.getElementById("delay");
+const logEl = document.getElementById("log");
+function log(s){ logEl.textContent += s + "\n"; }
 
-  let STOP = false;
+function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  function ts(){ return Date.now(); }
-  function logLine(s){ $log.textContent += `[${ts()}] ${s}\n`; }
-  function resetLog(){ $log.textContent=""; logLine("Reset."); }
+function gcPressure(){
+  const arr = [];
+  for (let i=0;i<200;i++){
+    arr.push(new ArrayBuffer(1024*1024));
+  }
+  return arr;
+}
 
-  function j(x){
-    try { return JSON.stringify(x); } catch(e){ return String(x); }
+async function attempt(iter){
+
+  const ch = new MessageChannel();
+
+  const ab = new ArrayBuffer(4096);
+  const view = new Uint8Array(ab);
+  view[0] = 0xAA;
+
+  let got;
+  ch.port2.onmessage = e => { got = e.data; };
+
+  try{
+    ch.port1.postMessage(ab, [ab]);
+  }catch{
+    return { kind:"THROW" };
   }
 
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+  const detached = (ab.byteLength === 0);
 
-  async function withTimeout(p, ms){
-    let t;
-    const to = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("TIMEOUT")), ms); });
-    try { return await Promise.race([p, to]); }
-    finally { clearTimeout(t); }
-  }
+  // 1️⃣ immediate read
+  let imm;
+  try { imm = view[0]; }
+  catch(e){ imm = "THREW"; }
 
-  // Pós-DROP: verifica se a fila/canal continua saudável.
-  // Critérios fortes (sem exploração):
-  // - mensagens subsequentes não podem sumir
-  // - não podem chegar fora de ordem
-  // - payload deve bater (id/seq)
-  async function postDropQueueCheck(ch, attemptIdx, timeoutMs){
-    const port1 = ch.port1;
-    const port2 = ch.port2;
+  // 2️⃣ microtask read
+  await Promise.resolve();
+  let micro;
+  try { micro = view[0]; }
+  catch(e){ micro = "THREW"; }
 
-    const expect = [];
-    const got = [];
+  // 3️⃣ GC pressure
+  gcPressure();
+  let afterGC;
+  try { afterGC = view[0]; }
+  catch(e){ afterGC = "THREW"; }
 
-    port2.onmessage = (ev) => {
-      got.push(ev.data);
-    };
+  // 4️⃣ queue activity
+  ch.port1.postMessage("ping");
+  await delay(0);
 
-    // Enfileira 2 pings simples e um objeto leve
-    const m1 = "PING#" + attemptIdx + "#1";
-    const m2 = "PING#" + attemptIdx + "#2";
-    const m3 = { kind:"PINGOBJ", i: attemptIdx, t: ts() };
+  let afterQueue;
+  try { afterQueue = view[0]; }
+  catch(e){ afterQueue = "THREW"; }
 
-    expect.push(m1, m2, m3);
+  return {
+    detached,
+    gotType: typeof got,
+    imm,
+    micro,
+    afterGC,
+    afterQueue
+  };
+}
 
-    try { port1.postMessage(m1); } catch(e){ return { ok:false, reason:"THROW_POST1", err:(e&&e.name)||"ERR" }; }
-    try { port1.postMessage(m2); } catch(e){ return { ok:false, reason:"THROW_POST2", err:(e&&e.name)||"ERR" }; }
-    try { port1.postMessage(m3); } catch(e){ return { ok:false, reason:"THROW_POST3", err:(e&&e.name)||"ERR" }; }
+async function run(){
 
-    // Aguarda delivery (curto)
-    try {
-      await withTimeout((async () => {
-        // dá tempo de 2-3 ticks
-        await sleep(0); await sleep(0); await sleep(0);
-      })(), timeoutMs);
-    } catch(_) {}
+  log("RUN :: UaF Window Auto");
+  log("================================");
 
-    // Analisa ordenação + presença
-    const summary = {
-      expectCount: expect.length,
-      gotCount: got.length,
-      missing: 0,
-      outOfOrder: false,
-      firstGot: got.length ? got[0] : null
-    };
+  const N = 40;
 
-    // Regra: precisa receber 3 mensagens
-    if (got.length < expect.length) summary.missing = (expect.length - got.length);
+  let uafHits = 0;
+  let drops = 0;
 
-    // Regra: ordem deve ser a mesma (comparação simples para 1 e 2)
-    if (got.length >= 2) {
-      if (got[0] !== m1 || got[1] !== m2) summary.outOfOrder = true;
+  for (let i=0;i<N;i++){
+
+    const r = await attempt(i);
+
+    if (!r.detached) continue;
+
+    if (r.gotType === "undefined") drops++;
+
+    const reads = [r.imm, r.micro, r.afterGC, r.afterQueue];
+
+    const hasLiveRead =
+      reads.some(v => typeof v === "number" && v === 0xAA);
+
+    if (hasLiveRead){
+      uafHits++;
+      log("UAF_WINDOW :: " + JSON.stringify(r));
     }
-
-    // Regra: objeto deve bater
-    let objOk = false;
-    if (got.length >= 3 && got[2] && typeof got[2] === "object") {
-      objOk = (got[2].kind === "PINGOBJ" && got[2].i === attemptIdx);
-    }
-
-    const ok = (summary.missing === 0) && (summary.outOfOrder === false) && objOk;
-
-    return {
-      ok,
-      reason: ok ? "QUEUE_OK" : "QUEUE_SUSPECT",
-      details: { summary, objOk }
-    };
   }
 
-  async function runAuto(){
-    STOP = false;
+  log("================================");
+  log("SUMMARY");
+  log(JSON.stringify({ drops, uafHits }, null, 2));
+}
 
-    const N = Math.max(1, parseInt($N.value||"10", 10));
-    const timeoutMs = Math.max(50, parseInt($timeout.value||"200", 10));
-    const delayMs = Math.max(0, parseInt($delay.value||"10", 10));
+document.getElementById("run").onclick = () => {
+  run().catch(()=>log("ERROR"));
+};
 
-    logLine("============================================================");
-    logLine(`Run T8 AUTO :: N=${N} timeout=${timeoutMs}ms delay=${delayMs}ms mode=mix (baseline+microtasks)`);
-    logLine("============================================================");
-
-    const stats = {
-      DETACH_OK: 0,
-      DROP: 0,
-      SENDER_IMP: 0,
-      BAD_PAYLOAD: 0,
-      THROW: 0,
-      TIMEOUT: 0,
-      QUEUE_SUSPECT_AFTER_DROP: 0,
-      QUEUE_OK_AFTER_DROP: 0
-    };
-
-    const samples = []; // primeiros casos relevantes (mínimo)
-
-    for (let i = 0; i < N && !STOP; i++) {
-      const ch = new MessageChannel();
-      const port1 = ch.port1;
-      const port2 = ch.port2;
-
-      let got = undefined;
-      port2.onmessage = (ev) => { got = ev.data; };
-
-      const ab = new ArrayBuffer(4096);
-      const u8 = new Uint8Array(ab);
-      u8[0] = 0xAA;
-
-      // "mix" leve: microtasks antes do post (mantém espírito do teu modo)
-      await Promise.resolve();
-
-      let threw = false;
-      try {
-        port1.postMessage(ab, [ab]); // transfer
-      } catch (e) {
-        threw = true;
-        stats.THROW++;
-        if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"THROW", err:(e&&e.name)||"ERR" });
-      }
-
-      if (!threw) {
-        // aguarda entrega curta
-        try {
-          await withTimeout((async () => { await sleep(0); await sleep(0); })(), timeoutMs);
-        } catch (_) {
-          stats.TIMEOUT++;
-          if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"TIMEOUT" });
-        }
-
-        const senderLen = ab.byteLength;
-
-        // estados impossíveis do sender
-        if (senderLen !== 0 && senderLen !== 4096) {
-          stats.SENDER_IMP++;
-          if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"SENDER_IMP", senderLen });
-        } else if (senderLen === 0) {
-          // caminho detach (esperado no transfer)
-          if (got === undefined || got === null) {
-            stats.DROP++;
-            if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"DROP", senderLen:0, gotType:String(got) });
-
-            // >>> NOVO: pós-DROP queue integrity check (sem mudar resto do teste)
-            const qc = await postDropQueueCheck(ch, i, timeoutMs);
-            if (qc.ok) stats.QUEUE_OK_AFTER_DROP++;
-            else {
-              stats.QUEUE_SUSPECT_AFTER_DROP++;
-              if (samples.length < 5) samples.push({ i, kind:"postDrop", outcome:qc.reason, details: qc.details });
-            }
-          } else {
-            // valida payload mínimo
-            let ok = false;
-            try {
-              const tag = Object.prototype.toString.call(got);
-              if (tag === "[object ArrayBuffer]") {
-                const r = new Uint8Array(got);
-                ok = (r.length === 4096 && r[0] === 0xAA);
-              }
-            } catch(_) {}
-
-            if (ok) stats.DETACH_OK++;
-            else {
-              stats.BAD_PAYLOAD++;
-              if (samples.length < 3) samples.push({ i, kind:"baseline", outcome:"BAD_PAYLOAD" });
-            }
-          }
-        } else {
-          // clone path (raro)
-          // aqui não é erro; só não é o foco
-        }
-      }
-
-      if ((i+1) % 5 === 0) logLine(`progress: ${i+1}/${N}`);
-      if (delayMs) await sleep(delayMs);
-
-      try { port1.close(); port2.close(); } catch(_) {}
-    }
-
-    logLine("------------------------------------------------------------");
-    logLine("RESULT SUMMARY:");
-    logLine(j(stats));
-    logLine("SAMPLES (first relevant):");
-    logLine(j(samples));
-    logLine("DONE.");
-  }
-
-  document.getElementById("run").onclick = () => runAuto().catch(e => logLine("ERRO:" + ((e&&e.name)||"ERR")));
-  document.getElementById("stop").onclick = () => { STOP = true; logLine("STOP requested."); };
-  document.getElementById("reset").onclick = resetLog;
-
-  resetLog();
 })();
 </script>
+
 </body>
 </html>
