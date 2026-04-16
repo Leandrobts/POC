@@ -447,6 +447,55 @@ export const Factory = {
                 try { this.style.remove(); } catch(e) {}
             }
         });
+        // ══════════════════════════════════════════════════════════════
+        // 9. NodeIterator / TreeWalker Mutation (Type Confusion Target)
+        //    C++: NodeIterator.cpp / TreeWalker.cpp
+        //    Risco: ALTO — Especialista em causar Boolean Flips e Nulls
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'TREEWALKER_TYPE_CONFUSION',
+            category: 'DOM',
+            risk: 'HIGH',
+            description: [
+                'Um TreeWalker retém ponteiros nativos C++ para nós do DOM.',
+                'Se o DOM sob ele for agressivamente destruído e recriado com',
+                'elementos de tipos diferentes, chamar nextNode() pode retornar',
+                'um tipo diferente, null inesperado, ou inverter booleanos do nó.'
+            ].join(' '),
+
+            setup: function() {
+                this.sandbox = document.createElement('div');
+                this.sandbox.innerHTML = '<span>A</span><b>B</b><i>C</i>';
+                document.body.appendChild(this.sandbox);
+                
+                // Cria o walker travado no <b>
+                this.walker = document.createTreeWalker(this.sandbox, NodeFilter.SHOW_ALL, null, false);
+                this.walker.nextNode(); // Vai para o span
+                this.walker.nextNode(); // Vai para o b
+                
+                // Ref para o nó alvo (para comparar booleanos e tipos)
+                this.targetNode = this.walker.currentNode;
+            },
+
+            trigger: function() {
+                // Mutação agressiva! Destrói os nós onde o Walker está pisando.
+                this.sandbox.innerHTML = '<video></video><audio></audio>';
+                // O C++ tenta atualizar o ponteiro do walker internamente...
+            },
+
+            probe: [
+                s => s.walker.currentNode.nodeType,
+                s => s.walker.currentNode.nodeName,
+                s => s.walker.currentNode.isConnected, // Booleano! Pode inverter!
+                s => s.walker.previousNode() !== null, // Boolean: Deve retornar null ou objeto válido
+                s => s.targetNode.nodeType,            // Verifica o nó original isolado
+                s => s.targetNode.isConnected          // Era true, deve virar false. Se virar undefined = Type Confusion!
+            ],
+
+            cleanup: function() {
+                try { this.sandbox.remove(); } catch(e) {}
+            }
+        });
 
         return list;
     }
