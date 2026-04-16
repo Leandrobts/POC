@@ -1,33 +1,60 @@
 /**
- * MÓDULO 4: GARBAGE COLLECTOR STRESSOR
- * Objetivo: Forçar o motor JS a limpar a memória heap imediatamente.
- * Uso: Acionado logo após um Mutator tentar corromper uma referência.
+ * MOD_GC.JS â€” EstratÃ©gias de pressÃ£o de memÃ³ria para PS4 WebKit
+ *
+ * PrincÃ­pio: O JSC usa um GC geracional (Nursery â†’ Eden â†’ Old Gen).
+ * Para garantir que um objeto freed Ã© realmente coletado, precisamos
+ * pressionar cada geraÃ§Ã£o de forma incremental â€” sem crashar o tab.
+ *
+ * Limites seguros para o PS4 (~512MB disponÃ­vel para o browser process):
+ *   light  â†’ ~1.5MB   (apenas nursery flush)
+ *   medium â†’ ~6MB     (nursery + eden)
+ *   heavy  â†’ ~24MB    (3 rounds â€” forÃ§a major GC cycle)
  */
 
 export const GC = {
-    // Array global para segurar referências temporárias e evitar otimização do compilador
-    trashBin: [],
 
-    // Força uma coleta de lixo gerando pressão de alocação
-    force: function() {
-        try {
-            // Cria um buffer enorme rapidamente para esgotar a "Nursery" (memória jovem do JSC)
-            // Isso força o motor a rodar o Garbage Collector para liberar espaço.
-            for (let i = 0; i < 50; i++) {
-                this.trashBin.push(new ArrayBuffer(1024 * 1024 * 2)); // Aloca 2MB por iteração
-            }
-            
-            // Imediatamente remove as referências para que sejam coletadas
-            this.trashBin = []; 
-            
-            // Bônus: Alocação de Strings (Força outro tipo de Heap)
-            let s = "FUZZ";
-            for(let i = 0; i < 15; i++) { s += s; }
-            s = null;
-            
-        } catch (e) {
-            // Se der Out of Memory, o GC foi acionado com sucesso. Limpamos o lixo.
-            this.trashBin = [];
+    /**
+     * Leve: limpa apenas a Young Generation (nursery).
+     * Use apÃ³s operaÃ§Ãµes rÃ¡pidas de free que nÃ£o sobrevivem Ã  nursery.
+     */
+    light: async function() {
+        let buf = [];
+        for (let i = 0; i < 50; i++)
+            buf.push(new ArrayBuffer(32 * 1024)); // 50 Ã— 32KB = 1.6MB
+        buf = null;
+        await new Promise(r => setTimeout(r, 2)); // yield pro event loop â†’ GC roda
+    },
+
+    /**
+     * MÃ©dio: pressiona nursery + eden generation.
+     * Use na maioria dos cenÃ¡rios UAF depois do trigger.
+     */
+    medium: async function() {
+        let buf = [];
+        for (let i = 0; i < 100; i++)
+            buf.push(new ArrayBuffer(64 * 1024)); // 100 Ã— 64KB = 6.4MB
+        buf = null;
+
+        // String heap separada (forÃ§a coleta do JSString heap)
+        let s = "A";
+        for (let i = 0; i < 16; i++) s += s; // ~65KB
+        s = null;
+
+        await new Promise(r => setTimeout(r, 8));
+    },
+
+    /**
+     * Pesado: 3 rounds incrementais para forÃ§ar um major GC cycle completo.
+     * Evita alocar tudo de uma vez (risco de OOM).
+     * Use para objetos que promoviram para a Old Generation.
+     */
+    heavy: async function() {
+        for (let round = 0; round < 3; round++) {
+            let buf = [];
+            for (let i = 0; i < 80; i++)
+                buf.push(new ArrayBuffer(100 * 1024)); // 80 Ã— 100KB = 8MB / round
+            buf = null;
+            await new Promise(r => setTimeout(r, 15));
         }
     }
 };
