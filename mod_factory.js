@@ -839,6 +839,119 @@ export const Factory = {
                 this.leakedData = null;
             }
         });
+
+        // ══════════════════════════════════════════════════════════════
+        // 16. WeakMap GC Ephemeron Desync (Timing UAF)
+        //     C++: WeakMapImpl.cpp / EphemeronTable
+        //     Risco: ALTO — Tenta corromper a tabela interna do GC
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'WEAKMAP_EPHEMERON_UAF',
+            category: 'CoreJS',
+            risk: 'HIGH',
+            description: [
+                'Usa um WeakMap para ligar um objeto (Chave) a um Array (Valor).',
+                'Destrói a chave e força o GC. A tabela de Ephemerons do WebKit deve',
+                'remover o valor assincronamente. Se acedermos ao mapa durante essa janela',
+                'de limpeza (Sweeping Phase), o C++ pode devolver um ponteiro para um valor já libertado.'
+            ].join(' '),
+
+            setup: function() {
+                this.wm = new WeakMap();
+                this.vulnArray = [1.1, 2.2, 3.3, 4.4];
+                
+                // A chave tem de ser um objeto
+                this.keyObj = document.createElement('div');
+                
+                // Ligamos a chave ao array
+                this.wm.set(this.keyObj, this.vulnArray);
+            },
+
+            trigger: function() {
+                try {
+                    // 1. Apagamos a referência primária à chave e ao array
+                    this.keyObj = null;
+                    this.vulnArray = null;
+                    
+                    // (O mod_executor fará o GC em seguida).
+                    // O motor interno do WeakMap entrará em pânico para limpar a entrada.
+                } catch(e) {}
+            },
+
+            probe: [
+                // Tentativa cega: O array original devia estar morto, mas se o recuperarmos 
+                // por outras vias (ou se a memória dele vazar para um novo objeto), temos um UAF.
+                // Como perdemos a referência, vamos verificar se o WeakMap corrompeu o próprio tamanho (se suportado internamente)
+                s => s.wm.has(s.keyObj), // Deveria ser TypeError ou false
+            ],
+
+            cleanup: function() {
+                this.wm = null;
+                this.keyObj = null;
+                this.vulnArray = null;
+            }
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        // 17. CSS Custom Properties Cascade Teardown
+        //     C++: CSSVariableReferenceValue.cpp / StyleResolver
+        //     Risco: CRÍTICO — Histórico gigantesco de UAFs no WebKit
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'CSS_CUSTOM_PROPERTY_UAF',
+            category: 'Rendering',
+            risk: 'HIGH',
+            description: [
+                'Cria uma cascata profunda de Variáveis CSS que se referenciam mutuamente.',
+                'Enquanto o StyleResolver (C++) está a recalcular o layout, removemos os',
+                'elementos do DOM e forçamos a limpeza do cache de estilos.',
+                'Referências internas para blocos de CSS desanexados podem ser usadas após o free.'
+            ].join(' '),
+
+            setup: function() {
+                this.parent = document.createElement('div');
+                this.child = document.createElement('div');
+                
+                // Cascata maliciosa: A propriedade do filho depende do pai
+                this.parent.style.setProperty('--fuzz-base', '100px');
+                this.child.style.setProperty('width', 'calc(var(--fuzz-base) * 2)');
+                
+                this.parent.appendChild(this.child);
+                document.body.appendChild(this.parent);
+                
+                // Forçamos o WebKit a calcular e fazer cache dos estilos no C++
+                this.initialWidth = getComputedStyle(this.child).width;
+            },
+
+            trigger: function() {
+                try {
+                    // O GATILHO: Removemos a base da cascata e o elemento simultaneamente
+                    this.parent.style.removeProperty('--fuzz-base');
+                    this.parent.remove();
+                    
+                    // Forçamos um recalculo instantâneo de um elemento órfão
+                    this.child.style.setProperty('--fuzz-base', '200px');
+                    void this.child.offsetWidth; // Força Layout síncrono no C++
+                } catch(e) {}
+            },
+
+            probe: [
+                // Lemos as propriedades computadas do elemento órfão.
+                // Se o C++ estiver a ler o cache libertado, isto devolve valores residuais 
+                // da memória em vez de falhar ou devolver o padrão (auto).
+                s => getComputedStyle(s.child).width,
+                s => s.child.style.getPropertyValue('--fuzz-base')
+            ],
+
+            cleanup: function() {
+                try { 
+                    this.parent.remove(); 
+                    this.child.remove();
+                } catch(e) {}
+                this.parent = null;
+                this.child = null;
+            }
+        });
         return list;
     }
 };
