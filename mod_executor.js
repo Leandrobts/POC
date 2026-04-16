@@ -187,50 +187,46 @@ export const Executor = {
     // ────────────────────────────────────────────────────────────────
     checkPointerLeak: function(val) {
 
-    if (typeof val === 'number' && isFinite(val) && !isNaN(val)) {
-        const buf  = new ArrayBuffer(8);
-        new Float64Array(buf)[0] = val;
-        const bits = new BigUint64Array(buf)[0];
+        // ── Ponteiro 32-bit em número ──────────────────────────────
+        if (typeof val === 'number' && !isNaN(val) && isFinite(val) && val > 0) {
+            const u32 = val >>> 0; // interpreta como unsigned 32-bit
+            // Faixa de userspace: >64KB, <2GB, alinhado a 4 bytes
+            const isAligned    = (u32 & 3) === 0;
+            const isUserspace  = u32 > 0x00010000 && u32 < 0x80000000;
+            const notSentinel  = ![0x7FFFFFFF, 0xFFFF, 0xFFFFFFFF, 0x10000].includes(u32);
 
-        // ── NaN-boxed pointer (JSC 64-bit) ──────────────────────────────
-        // JSC representa ponteiros como doubles com upper 16 bits = 0x0000.
-        // Um float normal NUNCA tem expoente zero + mantissa não-zero acima de 2^48.
-        // Padrão: 0x0000_XXXX_XXXX_XXXX onde X é endereço de userspace
-        const upper16 = bits >> 48n;
-        if (upper16 === 0x0000n) {
-            const addr = bits & 0x0000FFFFFFFFFFFFn;
-            // Descarta endereços muito baixos (null, sentinels)
-            if (addr > 0x10000n) {
-                return `Possível ponteiro NaN-boxed JSC: 0x${bits.toString(16).padStart(16,'0')}`
-                    + ` → addr=0x${addr.toString(16)} (padrão de pointer encoding do JSC).`;
+            if (isAligned && isUserspace && notSentinel && u32 > 0x00100000) {
+                return `Número parece ponteiro 32-bit (PS4 userspace): 0x${u32.toString(16)}`
+                    + ` (alinhado, acima de 1MB) → possível info leak.`;
+            }
+
+            // Float64 cujos bits não são NaN/Infinity normais
+            // NaN-boxing do JSC: 0x0000xxxxxxxxxxxx = ponteiro encoded
+            const buf  = new ArrayBuffer(8);
+            new Float64Array(buf)[0] = val;
+            const bits = new BigUint64Array(buf)[0];
+            // Padrão suspeito: bits que não são nem zero nem NaN canônico
+            if (bits > 0x0000FFFFFFFFFFFFn && bits < 0xFFFE000000000000n) {
+                return `Float64 com padrão de bits suspeito: 0x${bits.toString(16)}`
+                    + ` → possível ponteiro NaN-boxed ou corrupção de JSValue.`;
             }
         }
 
-        // ── Float64 com NaN não-canônico (payload de ponteiro) ───────────
-        // NaN canônico do x86: 0xFFF8000000000000 (quiet NaN)
-        // NaN com payload: qualquer NaN cujos bits baixos não são zero
-        const isNaNBits = (bits & 0x7FF0000000000000n) === 0x7FF0000000000000n
-                       && (bits & 0x000FFFFFFFFFFFFFn) !== 0n;
-        if (isNaNBits) {
-            const payload = bits & 0x000FFFFFFFFFFFFFn;
-            if (payload > 0x10000n) {
-                return `NaN não-canônico com payload suspeito: 0x${bits.toString(16).padStart(16,'0')}`
-                    + ` → payload=0x${payload.toString(16)} (possível ponteiro em NaN tag).`;
+        // ── Ponteiro 64-bit via BigInt ─────────────────────────────
+        if (typeof val === 'bigint' && val !== 0n) {
+            // PS4 userspace 64-bit: 0x0000_1000_0000_0000 – 0x0000_7FFF_FFFF_FFFF
+            const LO = 0x0000100000000000n;
+            const HI = 0x0000800000000000n;
+            if (val > LO && val < HI) {
+                const hex = '0x' + val.toString(16).padStart(16, '0');
+                return `BigInt parece ponteiro PS4 userspace 64-bit: ${hex}`
+                    + ` → info leak confirmado (faixa de userspace FreeBSD AMD64).`;
             }
+            // Mesmo fora da faixa ideal, BigInt não-zero após free é suspeito
+            return `BigInt não-zero capturado pós-free: 0x${val.toString(16)}`
+                + ` → valor inesperado, investigar manualmente.`;
         }
-        // Float normal → não é ponteiro, não reporta
+
         return null;
     }
-
-    if (typeof val === 'bigint' && val !== 0n) {
-        const LO = 0x0000100000000000n;
-        const HI = 0x0000800000000000n;
-        if (val > LO && val < HI) {
-            return `BigInt parece ponteiro PS4 userspace 64-bit: 0x${val.toString(16).padStart(16,'0')}`;
-        }
-        // BigInt fora da faixa de userspace → provavelmente valor legítimo
-        return null;
-    }
-
-    return null;
-}
+};
