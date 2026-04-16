@@ -133,6 +133,10 @@ export const Executor = {
     // ─────────────────────────────────────────────────────────────────────────
     // Executa uma probe e compara com baseline para detectar anomalias
     // ─────────────────────────────────────────────────────────────────────────
+   // ─────────────────────────────────────────────────────────────────────────
+    // Executa uma probe e compara com baseline para detectar anomalias
+    // Foco V8.2: TYPE CONFUSION (Booleans, Nulls, Undefined)
+    // ─────────────────────────────────────────────────────────────────────────
     runProbe: function(scenario, probeFn, idx, baseline) {
         const base = baseline[idx];
         const result = {
@@ -148,7 +152,7 @@ export const Executor = {
             const val  = probeFn(scenario);
             result.val = String(val).slice(0, 200);
 
-            // 1. Verifica se o valor parece um ponteiro vazado
+            // 1. Deteção de Ponteiro (Mantida do V8.1)
             const ptrCheck = this.checkPointerLeak(val);
             if (ptrCheck) {
                 result.anomaly = true;
@@ -156,67 +160,58 @@ export const Executor = {
                 return result;
             }
 
-            // 2. O tipo retornado mudou completamente pós-free
-            //    (ex: era 'number', agora é 'object' → corrupção de JSValue)
-            if (base.ok && typeof val !== base.type && base.type !== 'undefined') {
-                result.anomaly = true;
-                result.reason  = `Tipo mudou pós-free: era "${base.type}" → agora "${typeof val}".`
-                    + ` Possível corrupção de JSValue (type confusion).`;
-                return result;
+            if (base.ok) {
+                // 2. TYPE CONFUSION DIRETO: O tipo da variável mudou!
+                // Exemplo: Era 'number' e virou 'boolean' ou 'object' (null)
+                if (typeof val !== base.type) {
+                    
+                    // Filtro de Falso Positivo: É normal um objeto virar 'null' quando destruído (ex: parentNode).
+                    // Mas NÃO É normal um número ou booleano virar 'object' (null) ou 'undefined'.
+                    if (base.type === 'number' || base.type === 'boolean' || base.type === 'string') {
+                        result.anomaly = true;
+                        result.reason = `[TYPE CONFUSION] O tipo mudou radicalmente pós-free!\n` +
+                                        `Esperado: ${base.type} (${base.repr})\n` +
+                                        `Encontrado: ${typeof val} (${val})\n` +
+                                        `O C++ leu a memória errada e retornou um JSValue corrompido!`;
+                        return result;
+                    }
+                }
+
+                // 3. BOOLEAN FLIP / SILENT NULL (O que você sugeriu!)
+                // Valores estáticos que nunca deveriam mudar
+                if (base.type === 'boolean' && typeof val === 'boolean') {
+                    // Se uma propriedade nativa (ex: isConnected, paused) inverteu silenciosamente
+                    // sem que interagíssemos com ela, a memória estrutural foi subscrita.
+                    if (val !== (base.repr === 'true')) {
+                        result.anomaly = true;
+                        result.reason = `[MEMORY CORRUPTION] Boolean Flip silencioso.\n` +
+                                        `O valor alterou de ${base.repr} para ${val} sozinho.`;
+                        return result;
+                    }
+                }
+
+                // 4. MUTAÇÃO NUMÉRICA (Mantida, mas mais rigorosa)
+                if (base.type === 'number' && typeof val === 'number') {
+                    if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
+                        const baseNum = parseFloat(base.repr);
+                        // Ignora quedas para 0 no DOM (comportamento normal de remoção)
+                        if (baseNum !== 0 && val === 0 && scenario.category === 'DOM') return result;
+                        
+                        if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
+                            result.anomaly = true;
+                            result.reason  = `Leitura de Stale Data (Memória Antiga): baseline=${base.repr} → pós-free=${val}.`;
+                            return result;
+                        }
+                    }
+                }
             }
-
-           // 3. Valor numérico mudou entre baseline e pós-free
-if (base.ok && base.type === 'number' && typeof val === 'number') {
-    if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
-        const baseNum = parseFloat(base.repr);
-        
-        // FILTRO DE FALSOS POSITIVOS DO DOM: Se foi de um valor para 0, e a probe é de layout, ignore.
-        if (baseNum !== 0 && val === 0 && scenario.category === 'DOM') {
-            return result; // Comportamento normal de el.remove()
-        }
-
-        if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
-            result.anomaly = true;
-            result.reason  = `Valor numérico mudou pós-free: baseline=${base.repr} → pós-free=${val}.`
-                + ` Possível leitura de heap reutilizado (stale data).`;
-            return result;
-        }
-    }
-}
 
         } catch(e) {
             result.val = `${e.constructor.name}: ${e.message}`;
-
-            // TypeError onde baseline era válido
-            // → ponteiro C++ dereferenciado com vtable inválido = UAF clássico
+            // (Mantenha aqui as regras de TypeError, RangeError, etc., do seu código anterior)
             if (e instanceof TypeError && base.ok) {
                 result.anomaly = true;
-                result.reason  = `TypeError pós-free onde baseline era válido (${base.repr}).`
-                    + ` O objeto C++ subjacente foi provavelmente freed → UAF CANDIDATE.`;
-                return result;
-            }
-
-            // RangeError inesperado → possível OOB read em objeto corrompido
-            if (e instanceof RangeError) {
-                result.anomaly = true;
-                result.reason  = `RangeError pós-free → possível OOB read em heap reutilizado.`;
-                return result;
-            }
-
-            // SecurityError inesperado → contexto de origem mudou (UAF de Frame)
-            if (e instanceof DOMException && e.name === 'SecurityError' && base.ok) {
-                result.anomaly = true;
-                result.reason  = `SecurityError pós-free onde baseline era válido.`
-                    + ` Contexto de origem mudou → possível UAF de FrameLoader.`;
-                return result;
-            }
-
-            // InvalidStateError em AudioNode onde baseline funcionava
-            // → AudioContext.close() freed o backend antes do esperado
-            if (e instanceof DOMException && e.name === 'InvalidStateError' && base.ok) {
-                result.anomaly = true;
-                result.reason  = `InvalidStateError pós-free onde baseline era válido (${base.repr}).`
-                    + ` Objeto C++ do WebAudio pode ter sido freed pelo close() → AUDIO UAF CANDIDATE.`;
+                result.reason  = `TypeError pós-free onde baseline era válido (${base.repr}). UAF CANDIDATE.`;
                 return result;
             }
         }
