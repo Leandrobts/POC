@@ -563,50 +563,64 @@ export const Factory = {
         });
 
         // ══════════════════════════════════════════════════════════════
-        // 11. Array Length Integer Overflow (OOB Write/Read)
-        //     C++: JSArray.cpp / JSObject.cpp
-        //     Risco: ALTO — Tenta estourar os limites matemáticos de 32 bits
+        // 11. Integer Overflow Direto (O(1) Boundary Bypass)
+        //     C++: JSArray.cpp / JSGenericTypedArrayView.cpp
+        //     Risco: ALTO — Estouro sem travamento da CPU (No Hang)
         // ══════════════════════════════════════════════════════════════
         register({
             id: 'ARRAY_MATH_INTEGER_OVERFLOW',
             category: 'Boundary',
             risk: 'HIGH',
             description: [
-                'Tenta causar um Integer Overflow no motor C++ ao manipular o tamanho (length)',
-                'de arrays perto do limite de 32 bits (0xFFFFFFFF). Se o C++ falhar na checagem',
-                'de transbordo ao adicionar novos elementos, ocorrerá um Heap Buffer Overflow.'
+                'Testa o transbordo de inteiros sem funções iterativas (evitando CPU Hang).',
+                'Foca no array.push() num array de tamanho máximo (0xFFFFFFFF) e',
+                'na criação de TypedArrays com offsets que estouram os 32 bits.'
             ].join(' '),
 
             setup: function() {
                 this.vulnArray = [];
-                // Colocamos o array no limite máximo permitido pelo JavaScript (2^32 - 1)
+                // Colocamos o array no limite de 32-bits sem preencher a RAM
                 this.vulnArray.length = 0xFFFFFFFF; 
+                
+                // O Buffer isca para o TypedArray Overflow
+                this.buffer = new ArrayBuffer(8);
             },
 
             trigger: function() {
                 try {
-                    // GATILHO: Tentamos empurrar o limite para além do tamanho máximo.
-                    // O C++ tentará fazer 0xFFFFFFFF + 1. Se a variável for de 32 bits, 
-                    // isso vira 0. O C++ pode achar que o array agora tem tamanho 0, 
-                    // mas nós estamos escrevendo no índice 0xFFFFFFFF!
+                    // GATILHO 1: O(1) Push Overflow
+                    // O C++ tentará fazer 0xFFFFFFFF + 1. Se usar uma variável
+                    // de 32 bits (uint32_t), isso dá a volta para 0!
                     this.vulnArray.push(1337); 
-                    
-                    // Outro gatilho clássico de matemática de arrays:
-                    this.vulnArray.splice(0x7FFFFFFF, 0, 1, 2, 3);
+                } catch(e) {}
+
+                try {
+                    // GATILHO 2: TypedArray Constructor Overflow
+                    // Tentamos criar uma View (DataView/Uint8Array) que começa num
+                    // offset gigantesco. Se a soma do offset + tamanho exceder
+                    // os 32 bits e o WebKit não verificar direito, a View é criada 
+                    // a apontar para memória inválida (OOB Read/Write imediato).
+                    this.view = new Uint8Array(this.buffer, 0xFFFFFFFF, 1);
                 } catch(e) {
-                    // RangeError é o comportamento normal e seguro.
-                    // Se o navegador crashar sem erro, encontramos um Buffer Overflow nativo.
+                    // RangeError esperado se o WebKit estiver blindado.
                 }
             },
 
             probe: [
+                // Se o push() deu a volta para zero, length será 0 em vez de dar erro.
                 s => s.vulnArray.length,
-                // Se conseguirmos ler um índice além de 0xFFFFFFFF sem erro, o motor enlouqueceu.
-                s => s.vulnArray[0xFFFFFFFF + 1] 
+                
+                // Se a View for criada, a proteção falhou brutalmente.
+                s => s.view ? s.view.byteOffset : null,
+                
+                // Tentativa de ler o conteúdo da View corrompida (memória nativa vazada)
+                s => s.view ? s.view[0] : null
             ],
 
             cleanup: function() {
                 this.vulnArray = null;
+                this.buffer = null;
+                this.view = null;
             }
         });
 
