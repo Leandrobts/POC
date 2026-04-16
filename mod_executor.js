@@ -177,11 +177,14 @@ export const Executor = {
                     }
                 }
 
-                // 3. BOOLEAN FLIP / SILENT NULL (O que você sugeriu!)
-                // Valores estáticos que nunca deveriam mudar
+// 3. BOOLEAN FLIP / SILENT NULL (Corrigido para ignorar W3C Specs)
                 if (base.type === 'boolean' && typeof val === 'boolean') {
-                    // Se uma propriedade nativa (ex: isConnected, paused) inverteu silenciosamente
-                    // sem que interagíssemos com ela, a memória estrutural foi subscrita.
+                    // Ignoramos propriedades estruturais do DOM que devem mudar quando o elemento é removido
+                    const ignorar = ['isConnected', 'isSameNode', 'isEqualNode'];
+                    if (ignorar.some(p => action.includes(p))) {
+                        return result; // Comportamento normal da especificação
+                    }
+
                     if (val !== (base.repr === 'true')) {
                         result.anomaly = true;
                         result.reason = `[MEMORY CORRUPTION] Boolean Flip silencioso.\n` +
