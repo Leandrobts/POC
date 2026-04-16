@@ -165,19 +165,24 @@ export const Executor = {
                 return result;
             }
 
-            // 3. Valor numérico mudou entre baseline e pós-free
-            //    Só flagga se a mudança não é trivial (±1 = contador normal)
-            if (base.ok && base.type === 'number' && typeof val === 'number') {
-                if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
-                    const baseNum = parseFloat(base.repr);
-                    if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
-                        result.anomaly = true;
-                        result.reason  = `Valor numérico mudou pós-free: baseline=${base.repr} → pós-free=${val}.`
-                            + ` Possível leitura de heap reutilizado (stale data).`;
-                        return result;
-                    }
-                }
-            }
+           // 3. Valor numérico mudou entre baseline e pós-free
+if (base.ok && base.type === 'number' && typeof val === 'number') {
+    if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
+        const baseNum = parseFloat(base.repr);
+        
+        // FILTRO DE FALSOS POSITIVOS DO DOM: Se foi de um valor para 0, e a probe é de layout, ignore.
+        if (baseNum !== 0 && val === 0 && scenario.category === 'DOM') {
+            return result; // Comportamento normal de el.remove()
+        }
+
+        if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
+            result.anomaly = true;
+            result.reason  = `Valor numérico mudou pós-free: baseline=${base.repr} → pós-free=${val}.`
+                + ` Possível leitura de heap reutilizado (stale data).`;
+            return result;
+        }
+    }
+}
 
         } catch(e) {
             result.val = `${e.constructor.name}: ${e.message}`;
