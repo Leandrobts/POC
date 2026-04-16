@@ -73,25 +73,22 @@ export const Executor = {
 
     // O Analisador de Corrupção
     analyze: function(prop, val, action) {
-        // 1. Confusão de Tipos (Lógica Booleana)
-        if (/^(is|has|can|should)/i.test(prop) && val !== undefined && val !== null && typeof val !== 'boolean') {
+        // 1. Confusão de Tipos (Regex corrigida para CamelCase: isReady, canPlay)
+        if (/^(is|has|can|should)[A-Z]/.test(prop) && val !== undefined && val !== null && typeof val !== 'boolean') {
             return { action, val, reason: "Type Confusion: C++ retornou não-booleano." };
         }
 
-        // 2. Vazamento de Ponteiro (Memory Leak no JSC)
-        // Se um valor que deveria ser primitivo retorna um endereço alto
+        // 2. Vazamento de Ponteiro
         if (typeof val === 'number' && val > 0x10000000 && val !== 2147483647 && val !== Infinity) {
-            // Pode ser um endereço da base do WebKit (Slide) ou do heap do ArrayBuffer
-            return { action, val: `0x${val.toString(16)}`, reason: "Leak: Endereço de memória bruto capturado!" };
+            return { action, val: `0x${val.toString(16)}`, reason: "Leak: Endereço bruto capturado!" };
         }
 
-        // 3. Objeto C++ Destruído (UAF Indicator)
-        // Se a API converteu nosso payload Mutator e destruiu o objeto subjacente,
-        // ele pode retornar um primitivo inesperado.
-        if (val === null && !prop.toLowerCase().includes('element')) {
-            return { action, val, reason: "NullPointerException Lógico: Objeto possivelmente liberado (Free)." };
+        // 3. Objeto C++ Destruído (UAF Indicator com Filtro Anti-Ruído)
+        const expectedNulls = ['get', 'getContext', 'exec', 'match', 'getItem', 'querySelector'];
+        if (val === null && !expectedNulls.includes(prop) && !prop.toLowerCase().includes('element')) {
+            return { action, val, reason: "Possível UAF: C++ retornou Null inesperado." };
         }
 
-        return null; // Nenhuma anomalia detectada
-    }
+        return null;
+}
 };
