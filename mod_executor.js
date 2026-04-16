@@ -194,11 +194,22 @@ export const Executor = {
                 }
 
                 // 4. MUTAÇÃO NUMÉRICA (Mantida, mas mais rigorosa)
+               // 4. MUTAÇÃO NUMÉRICA (Mantida, mas mais rigorosa)
                 if (base.type === 'number' && typeof val === 'number') {
                     if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
                         const baseNum = parseFloat(base.repr);
-                        // Ignora quedas para 0 no DOM (comportamento normal de remoção)
-                        if (baseNum !== 0 && val === 0 && scenario.category === 'DOM') return result;
+
+                        // --- NOVO FILTRO: IGNORAR RUÍDO ESTRUTURAL DO DOM ---
+                        // Ignora propriedades que mudam naturalmente quando o DOM é destruído/percorrido
+                        const ignorarDom = ['nodeType', 'nodeName', 'nodeValue'];
+                        if (scenario.category === 'DOM' && ignorarDom.some(p => action.includes(p))) {
+                            return result; // Comportamento normal da especificação W3C
+                        }
+
+                        // Ignora quedas para 0 no DOM (comportamento normal de remoção de layout/width/height)
+                        if (baseNum !== 0 && val === 0 && scenario.category === 'DOM') {
+                            return result; 
+                        }
                         
                         if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
                             result.anomaly = true;
