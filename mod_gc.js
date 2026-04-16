@@ -1,26 +1,26 @@
 /**
- * MÃ“DULO 4: GARBAGE COLLECTOR STRESSOR
- * Objetivo: ForÃ§ar o motor JS a limpar a memÃ³ria heap imediatamente.
- * Uso: Acionado logo apÃ³s um Mutator tentar corromper uma referÃªncia.
+ * MÓDULO 4: GARBAGE COLLECTOR STRESSOR
+ * Objetivo: Forçar o motor JS a limpar a memória heap imediatamente.
+ * Uso: Acionado logo após um Mutator tentar corromper uma referência.
  */
 
 export const GC = {
-    // Array global para segurar referÃªncias temporÃ¡rias e evitar otimizaÃ§Ã£o do compilador
+    // Array global para segurar referências temporárias e evitar otimização do compilador
     trashBin: [],
 
-    // ForÃ§a uma coleta de lixo gerando pressÃ£o de alocaÃ§Ã£o
+    // Força uma coleta de lixo gerando pressão de alocação
     force: function() {
         try {
-            // Cria um buffer enorme rapidamente para esgotar a "Nursery" (memÃ³ria jovem do JSC)
-            // Isso forÃ§a o motor a rodar o Garbage Collector para liberar espaÃ§o.
+            // Cria um buffer enorme rapidamente para esgotar a "Nursery" (memória jovem do JSC)
+            // Isso força o motor a rodar o Garbage Collector para liberar espaço.
             for (let i = 0; i < 50; i++) {
-                this.trashBin.push(new ArrayBuffer(1024 * 1024 * 2)); // Aloca 2MB por iteraÃ§Ã£o
+                this.trashBin.push(new ArrayBuffer(1024 * 1024 * 2)); // Aloca 2MB por iteração
             }
             
-            // Imediatamente remove as referÃªncias para que sejam coletadas
+            // Imediatamente remove as referências para que sejam coletadas
             this.trashBin = []; 
             
-            // BÃ´nus: AlocaÃ§Ã£o de Strings (ForÃ§a outro tipo de Heap)
+            // Bônus: Alocação de Strings (Força outro tipo de Heap)
             let s = "FUZZ";
             for(let i = 0; i < 15; i++) { s += s; }
             s = null;

