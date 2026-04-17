@@ -162,11 +162,16 @@ export const Executor = {
 
             if (base.ok) {
                 // 2. TYPE CONFUSION DIRETO: O tipo da variável mudou!
-                // Exemplo: Era 'number' e virou 'boolean' ou 'object' (null)
                 if (typeof val !== base.type) {
                     
-                    // Filtro de Falso Positivo: É normal um objeto virar 'null' quando destruído (ex: parentNode).
-                    // Mas NÃO É normal um número ou booleano virar 'object' (null) ou 'undefined'.
+                    // --- NOVO FILTRO DE FALSO POSITIVO (UNDEFINED & OBJECT) ---
+                    // Se o valor se tornou 'undefined', é apenas o JS a avisar que a propriedade 
+                    // ou o índice do array foi apagado legitimamente pelo teardown.
+                    // Se virou um 'object' nulo (null), o C++ também zerou o ponteiro por segurança.
+                    if (typeof val === 'undefined' || val === null) {
+                        return result; 
+                    }
+
                     if (base.type === 'number' || base.type === 'boolean' || base.type === 'string') {
                         result.anomaly = true;
                         result.reason = `[TYPE CONFUSION] O tipo mudou radicalmente pós-free!\n` +
@@ -177,39 +182,28 @@ export const Executor = {
                     }
                 }
 
-// 3. BOOLEAN FLIP / SILENT NULL (Corrigido para ignorar W3C Specs)
+                // 3. BOOLEAN FLIP SILENCIOSO (Ajustado para ruído DOM)
                 if (base.type === 'boolean' && typeof val === 'boolean') {
-                    // Ignoramos propriedades estruturais do DOM que devem mudar quando o elemento é removido
-                    const ignorar = ['isConnected', 'isSameNode', 'isEqualNode'];
-                    if (ignorar.some(p => action.includes(p))) {
-                        return result; // Comportamento normal da especificação
-                    }
+                    const ignorarDom = ['isConnected', 'isSameNode', 'isEqualNode'];
+                    if (ignorarDom.some(p => action.includes(p))) return result;
 
                     if (val !== (base.repr === 'true')) {
                         result.anomaly = true;
-                        result.reason = `[MEMORY CORRUPTION] Boolean Flip silencioso.\n` +
-                                        `O valor alterou de ${base.repr} para ${val} sozinho.`;
+                        result.reason = `[MEMORY CORRUPTION] Boolean Flip silencioso. Valor alterou de ${base.repr} para ${val}.`;
                         return result;
                     }
                 }
 
-                // 4. MUTAÇÃO NUMÉRICA (Mantida, mas mais rigorosa)
-               // 4. MUTAÇÃO NUMÉRICA (Mantida, mas mais rigorosa)
+                // 4. MUTAÇÃO NUMÉRICA (Ajustado para Layout 0)
                 if (base.type === 'number' && typeof val === 'number') {
                     if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
                         const baseNum = parseFloat(base.repr);
 
-                        // --- NOVO FILTRO: IGNORAR RUÍDO ESTRUTURAL DO DOM ---
-                        // Ignora propriedades que mudam naturalmente quando o DOM é destruído/percorrido
-                        const ignorarDom = ['nodeType', 'nodeName', 'nodeValue'];
-                        if (scenario.category === 'DOM' && ignorarDom.some(p => action.includes(p))) {
-                            return result; // Comportamento normal da especificação W3C
-                        }
+                        const ignorarDom = ['nodeType', 'nodeName', 'nodeValue', 'length'];
+                        if (ignorarDom.some(p => action.includes(p))) return result;
 
-                        // Ignora quedas para 0 no DOM (comportamento normal de remoção de layout/width/height)
-                        if (baseNum !== 0 && val === 0 && scenario.category === 'DOM') {
-                            return result; 
-                        }
+                        // Ignora reduções a ZERO (elemento removido = tamanho/layout 0)
+                        if (baseNum !== 0 && val === 0) return result; 
                         
                         if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
                             result.anomaly = true;
