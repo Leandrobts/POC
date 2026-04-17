@@ -8,12 +8,16 @@
  * e adicione o import + register aqui.
  */
 
-// ── Media ─────────────────────────────────────────────────────────────
 import ScVideoFullscreenRemove  from './scenarios/sc_video_fullscreen_remove.js';
+import ScAudioCtxClose          from './scenarios/sc_audio_ctx_close.js';
+import ScWeakmapEphemeron       from './scenarios/sc_weakmap_ephemeron.js';
+
+/* ── Media ─────────────────────────────────────────────────────────────
+
 import ScMediaSourceUAF         from './scenarios/sc_mediasource_uaf.js';
 
 // ── WebAudio ──────────────────────────────────────────────────────────
-import ScAudioCtxClose          from './scenarios/sc_audio_ctx_close.js';
+
 
 // ── Rendering ─────────────────────────────────────────────────────────
 import ScSvgFilterUAF           from './scenarios/sc_svg_filter_uaf.js';
@@ -30,7 +34,7 @@ import ScMessagePortUAF         from './scenarios/sc_messageport_uaf.js';
 
 // ── CoreJS ────────────────────────────────────────────────────────────
 import ScNativeCallbackUAF      from './scenarios/sc_native_callback_uaf.js';
-import ScWeakmapEphemeron       from './scenarios/sc_weakmap_ephemeron.js';
+
 
 // ── Concurrency ───────────────────────────────────────────────────────
 import ScStructuredClone        from './scenarios/sc_structured_clone.js';
@@ -39,7 +43,7 @@ import ScPromiseMicrotask       from './scenarios/sc_promise_microtask.js';
 // ── Boundary ──────────────────────────────────────────────────────────
 import ScArrayIntOverflow       from './scenarios/sc_array_int_overflow.js';
 import ScStringIntOverflow      from './scenarios/sc_string_int_overflow.js';
-import ScRegexpOverflow         from './scenarios/sc_regexp_overflow.js';
+import ScRegexpOverflow         from './scenarios/sc_regexp_overflow.js';*/
 
 export const Factory = {
 
