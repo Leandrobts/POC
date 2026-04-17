@@ -63,13 +63,15 @@ export const Factory = {
         // Ordem de prioridade: HIGH primeiro, depois MEDIUM, depois Boundary
         register(ScVideoFullscreenRemove);
         register(ScAudioCtxClose);
-        register(ScMediaSourceUAF);
+        register(ScWeakmapEphemeron);
+        
+        /*register(ScMediaSourceUAF);
         register(ScIframeFrameUAF);
         register(ScNativeCallbackUAF);
         register(ScTreewalkerConfusion);
         register(ScStructuredClone);
         register(ScPromiseMicrotask);
-        register(ScWeakmapEphemeron);
+    
         register(ScCssCustomProp);
 
         register(ScSvgFilterUAF);
@@ -79,7 +81,7 @@ export const Factory = {
 
         register(ScArrayIntOverflow);
         register(ScStringIntOverflow);
-        register(ScRegexpOverflow);
+        register(ScRegexpOverflow);*/
 
         return list;
     }
