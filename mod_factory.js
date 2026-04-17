@@ -5,7 +5,6 @@
 
 // ── Imports dos Alvos de Ouro ─────────────────────────────────────────
 import ScVideoFullscreenRemove  from './scenarios/sc_video_fullscreen_remove.js';
-import ScWeakmapEphemeron       from './scenarios/sc_weakmap_ephemeron.js';
 
 export const Factory = {
     buildScenarios: function() {
@@ -23,8 +22,7 @@ export const Factory = {
 
         // Registramos APENAS os nossos 3 alvos cirúrgicos
         register(ScVideoFullscreenRemove); // Media Manx (Código proprietário da Sony)
-         register(ScWeakmapEphemeron);      // JavaScriptCore (Dessincronização do GC)
-
+         
         return list;
     }
 };
