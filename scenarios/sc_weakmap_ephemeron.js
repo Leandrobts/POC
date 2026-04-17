@@ -1,110 +1,51 @@
 /**
- * CENÁRIO: WEAKMAP_EPHEMERON_UAF
- * Superfície C++: WeakMapImpl.cpp / EphemeronTable / Heap.cpp (sweeping phase)
- * Risco: HIGH
- *
- * Diferença para a versão genérica:
- *   - Versão anterior usava apenas 1 par chave/valor e não tinha como
- *     observar o estado durante o sweeping do GC.
- *   - Versão robusta usa múltiplos pares e uma FinalizationRegistry
- *     (se disponível) para observar quando as chaves são coletadas.
- *   - Adiciona WeakRef para criar referência fraca para o valor — permite
- *     verificar se o valor foi coletado ANTES da entrada do WeakMap
- *     (desync na EphemeronTable = UAF candidate).
- *   - Testa WeakSet além do WeakMap — superfície adicional com ponteiro
- *     para EphemeronTable compartilhada.
- *   - Ciclo de 10 pares chave/valor para maximizar chance de timing.
+ * CENÁRIO: WEAKMAP_EPHEMERON_UAF (Otimizado)
+ * Alvo: EphemeronTable Sweeping Phase
  */
 
 export default {
     id:       'WEAKMAP_EPHEMERON_UAF',
     category: 'CoreJS',
     risk:     'HIGH',
-    description:
-        'WeakMap com múltiplos pares + FinalizationRegistry para observar sweeping. ' +
-        'WeakRef nos valores detecta desync: valor coletado antes da entrada do WeakMap. ' +
-        'WeakSet adicional compartilha EphemeronTable. ' +
-        '10 pares maximizam a janela de timing durante o GC.',
+    description: 'Tenta causar desync na EphemeronTable aumentando a carga de pares durante o sweeping do GC.',
 
     setup: function() {
         this.wm = new WeakMap();
-        this.ws = new WeakSet();
-        this.finLog = [];
+        this.keys = [];
+        this.valueRefs = [];
 
-        // FinalizationRegistry — callback quando a chave é coletada
-        try {
-            this.registry = new FinalizationRegistry(token => {
-                this.finLog.push({ collected: token, time: Date.now() });
-            });
-        } catch(e) {}
-
-        // 10 pares chave/valor
-        this.valueRefs = [];  // WeakRefs para os valores
-        this.keys = [];       // Refs fortes temporárias para as chaves
-
-        for (let i = 0; i < 10; i++) {
-            const key   = { id: i, data: new ArrayBuffer(1024) };
-            const value = [i * 1.1, i * 2.2, i * 3.3, i * 4.4]; // array de doubles
-
+        // Aumentamos para 100 pares para maximizar o tempo de varredura do GC
+        for (let i = 0; i < 100; i++) {
+            const key = { id: i };
+            const value = new Float64Array(1024).fill(1337.1337);
             this.wm.set(key, value);
-            this.ws.add(key);
-
-            // WeakRef para o valor — nos permite verificar se foi coletado
-            try {
-                this.valueRefs.push(new WeakRef(value));
-            } catch(e) {
-                this.valueRefs.push(null);
-            }
-
-            // Registra finalizer para a chave
-            try {
-                this.registry?.register(key, `key_${i}`);
-            } catch(e) {}
-
             this.keys.push(key);
+            try { this.valueRefs.push(new WeakRef(value)); } catch(e) {}
         }
-
-        // Guarda uma das chaves para probes (vai ser zerada no trigger)
         this.probeKey = this.keys[0];
     },
 
     trigger: function() {
-        // Zera todas as refs fortes para as chaves
-        // O GC do executor vai coletar as chaves e acionar os ephemerons
+        // Libera as chaves para acionar a lógica de EphemeronTable::sweep() no C++
         this.keys = null;
-        // Nota: probeKey ainda mantém a chave[0] viva intencionalmente
-        // para testar o caminho "chave ainda viva, mas outras mortas"
+        // O mod_executor chamará o GC pesado em seguida
     },
 
     probe: [
-        // Testa has() com a chave ainda viva (probeKey)
         s => s.wm.has(s.probeKey),
-        s => s.ws.has(s.probeKey),
-        s => s.wm.get(s.probeKey),
-
-        // Verifica se o valor ainda está acessível via WeakRef
-        // Se o valor foi coletado ANTES da entrada do WeakMap, há desync
-        s => s.valueRefs[0]?.deref()?.length,
-        s => s.valueRefs[0]?.deref()?.[0],
-        s => s.valueRefs[1]?.deref()?.length,
-        s => s.valueRefs[5]?.deref()?.length,
-        s => s.valueRefs[9]?.deref()?.length,
-
-        // Quantas chaves foram finalizadas (FinalizationRegistry)
-        s => s.finLog.length,
-        s => s.finLog.map(e => e.collected).join(','),
-
-        // Tenta has() com a chave zerda — TypeError ou false
-        s => { try { return s.wm.has(null); } catch(e) { return e.constructor.name; } },
-        s => { try { return s.wm.has(undefined); } catch(e) { return e.constructor.name; } },
+        s => s.wm.get(s.probeKey)?.[0],
+        // Verifica se o valor "fantasma" ainda existe na memória após a coleta da chave
+        s => {
+            if (s.valueRefs[0]) {
+                const val = s.valueRefs[0].deref();
+                return val ? val[0] : 'collected';
+            }
+            return 'no-weakref';
+        }
     ],
 
     cleanup: function() {
-        try { this.registry?.cleanupSome?.(); } catch(e) {}
-        this.wm       = null;
-        this.ws       = null;
-        this.probeKey = null;
-        this.valueRefs = null;
-        this.finLog   = null;
+        this.wm = null;
+        this.keys = null;
     }
 };
