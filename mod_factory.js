@@ -5,7 +5,6 @@
 
 // ── Imports dos Alvos de Ouro ─────────────────────────────────────────
 import ScVideoFullscreenRemove  from './scenarios/sc_video_fullscreen_remove.js';
-import ScAudioCtxClose          from './scenarios/sc_audio_ctx_close.js';
 import ScWeakmapEphemeron       from './scenarios/sc_weakmap_ephemeron.js';
 
 export const Factory = {
@@ -24,8 +23,7 @@ export const Factory = {
 
         // Registramos APENAS os nossos 3 alvos cirúrgicos
         register(ScVideoFullscreenRemove); // Media Manx (Código proprietário da Sony)
-        register(ScAudioCtxClose);         // WebAudio (Condição de Corrida)
-        register(ScWeakmapEphemeron);      // JavaScriptCore (Dessincronização do GC)
+         register(ScWeakmapEphemeron);      // JavaScriptCore (Dessincronização do GC)
 
         return list;
     }
