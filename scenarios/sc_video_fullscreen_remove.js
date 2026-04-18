@@ -49,8 +49,7 @@ export default {
             // o controlo e está a desenhar o vídeo ativamente a 60 frames por segundo.
             await new Promise(r => setTimeout(r, 300)); 
 
-            // 3. A REMOÇÃO (A sua intuição)
-            this.video.remove();
+            
 
             // 4. A CORRIDA CONTRA O FRAME (Spray)
             // O ecrã da PS4 atualiza a cada ~16ms. Temos de encher a RAM de lixo 
@@ -61,6 +60,9 @@ export default {
                 arr.set(this.sprayPayload);
                 this.spray.push(arr);
             }
+
+            // 3. A REMOÇÃO (A sua intuição)
+            this.video.remove();
 
             // ZERO chamadas de saída. Deixamos o Manx bater na parede de lixo a 100km/h.
 
