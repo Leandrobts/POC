@@ -4,7 +4,7 @@
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_REMOVE',
+    id:       'VIDEO_FULLSCREEN_REMOVE2',
     category: 'Media',
     risk:     'CRITICAL',
     description: 'Pausa o fuzzer e cria um vídeo real na tela. ' +
