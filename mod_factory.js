@@ -147,65 +147,6 @@ export const Factory = {
             }
         });
 
-        // ══════════════════════════════════════════════════════════════
-        // 17. CSS Custom Properties Cascade Teardown
-        //     C++: CSSVariableReferenceValue.cpp / StyleResolver
-        //     Risco: CRÍTICO — Histórico gigantesco de UAFs no WebKit
-        // ══════════════════════════════════════════════════════════════
-        register({
-            id: 'CSS_CUSTOM_PROPERTY_UAF',
-            category: 'Rendering',
-            risk: 'HIGH',
-            description: [
-                'Cria uma cascata profunda de Variáveis CSS que se referenciam mutuamente.',
-                'Enquanto o StyleResolver (C++) está a recalcular o layout, removemos os',
-                'elementos do DOM e forçamos a limpeza do cache de estilos.',
-                'Referências internas para blocos de CSS desanexados podem ser usadas após o free.'
-            ].join(' '),
-
-            setup: function() {
-                this.parent = document.createElement('div');
-                this.child = document.createElement('div');
-                
-                // Cascata maliciosa: A propriedade do filho depende do pai
-                this.parent.style.setProperty('--fuzz-base', '100px');
-                this.child.style.setProperty('width', 'calc(var(--fuzz-base) * 2)');
-                
-                this.parent.appendChild(this.child);
-                document.body.appendChild(this.parent);
-                
-                // Forçamos o WebKit a calcular e fazer cache dos estilos no C++
-                this.initialWidth = getComputedStyle(this.child).width;
-            },
-
-            trigger: function() {
-                try {
-                    // O GATILHO: Removemos a base da cascata e o elemento simultaneamente
-                    this.parent.style.removeProperty('--fuzz-base');
-                    this.parent.remove();
-                    
-                    // Forçamos um recalculo instantâneo de um elemento órfão
-                    this.child.style.setProperty('--fuzz-base', '200px');
-                    void this.child.offsetWidth; // Força Layout síncrono no C++
-                } catch(e) {}
-            },
-
-            probe: [
-                // Lemos as propriedades computadas do elemento órfão.
-                // Se o C++ estiver a ler o cache libertado, isto devolve valores residuais 
-                // da memória em vez de falhar ou devolver o padrão (auto).
-                s => getComputedStyle(s.child).width,
-                s => s.child.style.getPropertyValue('--fuzz-base')
-            ],
-
-            cleanup: function() {
-                try { 
-                    this.parent.remove(); 
-                    this.child.remove();
-                } catch(e) {}
-                this.parent = null;
-                this.child = null;
-            }
         });
         return list;
     }
