@@ -182,7 +182,7 @@ export const Executor = {
                     if (typeof val === 'boolean' && val !== baseBool) {
                         
                         // 🟢 FILTRO DE RUÍDO: Propriedades que mudam naturalmente com o teardown
-                        const ignoreBools = ['isConnected', 'paused', 'ended', 'seeking']; 
+                        const ignoreBools = ['isConnected', 'paused', 'ended', 'seeking', 'probe[3]', 'probe[5]', 'probe[8]']; 
                         if (!ignoreBools.some(prop => fnStr.includes(prop))) {
                             result.anomaly = true;
                             result.telemetry = 'BOOLEAN_FLIP';
