@@ -34,49 +34,7 @@ export const Factory = {
 
         
         
-            id: 'SVG_CSS_FILTER_UAF',
             
-                'dispatchEvent() em elemento removido do DOM.',
-                'O RenderObject pode ter sido freed, mas o JS EventTarget',
-                'ainda processa o evento e tenta acessar layout/geometry.'
-            ].join(' '),
-
-            setup: function() {
-                this.el = document.createElement('div');
-                this.el.style.cssText = 'width:100px;height:100px;background:#222;position:absolute';
-                this.callbackResults = [];
-                // Listener acessa layout durante o callback
-                this.el.addEventListener('customevent', () => {
-                    try {
-                        this.callbackResults.push({
-                            rect: this.el.getBoundingClientRect(),
-                            offset: this.el.offsetWidth,
-                            computed: getComputedStyle(this.el).width
-                        });
-                    } catch(ex) { this.callbackResults.push({ error: ex.message }); }
-                });
-                document.body.appendChild(this.el);
-            },
-
-            trigger: function() {
-                this.el.remove(); // Destrói RenderObject
-            },
-
-            probe: [
-                s => { s.el.dispatchEvent(new Event('customevent')); return s.callbackResults.length; },
-                s => s.el.getBoundingClientRect().width,
-                s => s.el.offsetWidth,
-                s => s.el.clientWidth,
-                s => s.el.scrollWidth,
-                s => s.el.isConnected,
-                s => s.el.ownerDocument,
-                s => s.el.getRootNode(),
-                s => getComputedStyle(s.el).width,
-            ],
-
-            cleanup: function() {}
-        });
-
 
         
         
