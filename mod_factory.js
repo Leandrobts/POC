@@ -147,7 +147,7 @@ export const Factory = {
             }
         });
 
-        });
+        
         return list;
     }
 };
