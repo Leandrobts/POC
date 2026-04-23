@@ -1,40 +1,68 @@
-/**
- * MOD_FACTORY.JS — Cenários de UAF para PS4 WebKit FW 13.50
- *
- * Cada cenário implementa o ciclo completo de um UAF:
- *   setup()   → cria o objeto alvo e a infraestrutura necessária
- *   trigger() → executa a ação que LIBERA o objeto nativo (free)
- *   probe[]   → lista de funções que ACESSAM o objeto pós-free
- *   cleanup() → remove efeitos colaterais do DOM/contexto
- *
- * As probes recebem o próprio cenário (`s`) como parâmetro
- * para acessar `s.video`, `s.ctx`, etc. de forma explícita.
- *
- * Superfícies de alta prioridade para PS4 FW 13.50:
- *   - MediaPlayerPrivateManx / FullscreenVideoController
- *   - WebAudio graph (AudioContext.close → nodes órfãos)
- *   - MediaSource pipeline teardown
- *   - SVG RenderSVGResourceFilter lifetime
- *   - FrameLoader / Frame teardown via document.write
- *   - MessagePort ownership transfer
+
+     /**
+ * MOD_FACTORY.JS — Gerenciador de Cenários
+ * Importa e registra todos os módulos de teste UAF para o PS4.
  */
 
+// Importação de todos os cenários individuais
+import scArrayOverflow from './sc_array_int_overflow.js';
+import scAudioCtx from './sc_audio_ctx_close.js';
+import scCssAnim from './sc_css_anim_removed.js';
+import scCssCustom from './sc_css_custom_prop.js';
+import scDomEvent from './sc_dom_event_removed.js';
+import scIframeUaf from './sc_iframe_frame_uaf.js';
+import scMediaSource from './sc_mediasource_uaf.js';
+import scMessagePort from './sc_messageport_uaf.js';
+import scNativeCallback from './sc_native_callback_uaf.js';
+import scPromiseMicro from './sc_promise_microtask.js';
+import scRegexpOverflow from './sc_regexp_overflow.js';
+import scStringOverflow from './sc_string_int_overflow.js';
+import scStructuredClone from './sc_structured_clone.js';
+import scSvgFilter from './sc_svg_filter_uaf.js';
+import scTreewalker from './sc_treewalker_confusion.js';
+import scVideoFullscreen from './sc_video_fullscreen_remove.js';
+import scWeakmapEphemeron from './sc_weakmap_ephemeron.js';
+
 export const Factory = {
-
     buildScenarios: function() {
-        const list = [];
+        const allScenarios = [
+            scArrayOverflow,
+            scAudioCtx,
+            scCssAnim,
+            scCssCustom,
+            scDomEvent,
+            scIframeUaf,
+            scMediaSource,
+            scMessagePort,
+            scNativeCallback,
+            scPromiseMicro,
+            scRegexpOverflow,
+            scStringOverflow,
+            scStructuredClone,
+            scSvgFilter,
+            scTreewalker,
+            scVideoFullscreen,
+            scWeakmapEphemeron
+        ];
 
-        const register = (scenario) => {
-            // Verifica suporte de API antes de adicionar
+        const activeList = [];
+
+        allScenarios.forEach(s => {
             try {
-                if (scenario.supported && scenario.supported() === false) return;
-                list.push(scenario);
-            } catch(e) {}
-        };
+                // Verifica se o cenário é suportado pelo navegador atual
+                if (s.supported && s.supported() === false) {
+                    console.log(`[Factory] Ignorando ${s.id}: API não suportada.`);
+                    return;
+                }
+                activeList.push(s);
+            } catch(e) {
+                console.error(`[Factory] Erro ao carregar cenário ${s.id}:`, e);
+            }
+        });
 
-        
-        
-            
+        return activeList;
+    }
+};       
 
         
         
