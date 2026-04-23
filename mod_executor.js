@@ -146,14 +146,18 @@ export const Executor = {
             baseline: base.repr,
             val:      null,
             reason:   null,
-            telemetry: null // Nova flag para debug rápido
+            telemetry: null
         };
 
         try {
+            // Lemos o texto da função para saber o que está sendo testado
+            // Ex: "s => s.video.error?.code"
+            const fnStr = probeFn.toString(); 
+
             const val  = probeFn(scenario);
             result.val = String(val).slice(0, 200);
 
-            // 1. Checagem de Ponteiro (Mantida do seu código)
+            // 1. Deteção de Ponteiro
             const ptrCheck = this.checkPointerLeak(val);
             if (ptrCheck) {
                 result.anomaly = true;
@@ -163,26 +167,23 @@ export const Executor = {
 
             if (base.ok) {
                 // 🚨 TELEMETRIA 1: Unexpected Null / Undefined
-                // Se o objeto era válido e de repente sumiu, o C++ zerou o ponteiro
-                // ou o JS perdeu a referência da tabela de ephemerons.
                 if (base.type !== 'undefined' && base.repr !== 'null') {
                     if (val === null || typeof val === 'undefined') {
                         result.anomaly = true;
                         result.telemetry = 'NULL_UNDEFINED_DROP';
-                        result.reason = `[TELEMETRIA] Referência perdida! Esperava ${base.type} (${base.repr}), mas retornou ${val}. O WebKit zerou o ponteiro nativo sob o wrapper JS.`;
+                        result.reason = `[TELEMETRIA] Referência perdida! Esperava ${base.type} (${base.repr}), mas retornou ${val}. O C++ zerou o ponteiro nativo.`;
                         return result;
                     }
                 }
 
                 // 🚨 TELEMETRIA 2: Boolean Flip Silencioso
-                // Um booleano no C++ é 1 byte. Se ele mudar, outra coisa escreveu naquela memória (UAF).
                 if (base.type === 'boolean' || base.repr === 'true' || base.repr === 'false') {
                     const baseBool = (base.repr === 'true');
                     if (typeof val === 'boolean' && val !== baseBool) {
                         
-                        // Filtro de falsos positivos conhecidos do DOM
-                        const ignorar = ['isConnected', 'paused', 'ended']; 
-                        if (!ignorar.some(i => result.action.includes(i))) {
+                        // 🟢 FILTRO DE RUÍDO: Propriedades que mudam naturalmente com o teardown
+                        const ignoreBools = ['isConnected', 'paused', 'ended', 'seeking']; 
+                        if (!ignoreBools.some(prop => fnStr.includes(prop))) {
                             result.anomaly = true;
                             result.telemetry = 'BOOLEAN_FLIP';
                             result.reason = `[TELEMETRIA] Boolean Flip! Esperado: ${baseBool}, Recebido: ${val}. Corrupção de memória ou estado zumbi.`;
@@ -193,9 +194,16 @@ export const Executor = {
 
                 // 🚨 TELEMETRIA 3: Type Confusion de Primitivos
                 if (typeof val !== base.type) {
+                    
+                    // 🟢 FILTRO DE RUÍDO: MediaError (undefined -> 4)
+                    // Especificação do HTML5 dita erro 4 (MEDIA_ERR_SRC_NOT_SUPPORTED) ao limpar a source
+                    if (base.type === 'undefined' && val === 4 && fnStr.includes('error')) {
+                        return result; // Silencia o falso positivo
+                    }
+
                     result.anomaly = true;
                     result.telemetry = 'TYPE_CONFUSION';
-                    result.reason = `[TELEMETRIA] O tipo mudou radicalmente pós-free! Esperado: ${base.type}, Encontrado: ${typeof val}. O C++ leu a memória errada.`;
+                    result.reason = `[TELEMETRIA] O tipo mudou radicalmente! Esperado: ${base.type}, Encontrado: ${typeof val}. Leitura de memória C++ errada.`;
                     return result;
                 }
             }
@@ -204,16 +212,14 @@ export const Executor = {
             result.val = `${e.constructor.name}: ${e.message}`;
 
             // 🚨 TELEMETRIA 4: InvalidStateError
-            // Isso acontece quando o JS pede para o C++ fazer algo, o C++ checa o 
-            // objeto interno, vê que tá destruído/inválido e cospe esse erro específico.
             if (e.name === 'InvalidStateError' && base.ok) {
                 result.anomaly = true;
                 result.telemetry = 'INVALID_STATE_ERROR';
-                result.reason  = `[TELEMETRIA] InvalidStateError disparado pós-free! O wrapper JS tentou usar o backing object C++ que já foi destruído. (Baseline era: ${base.repr})`;
+                result.reason  = `[TELEMETRIA] InvalidStateError disparado! O wrapper JS tentou usar o backing object C++ que já foi destruído. (Baseline era: ${base.repr})`;
                 return result;
             }
 
-            // Mantém a regra do TypeError original
+            // TypeError
             if (e instanceof TypeError && base.ok) {
                 result.anomaly = true;
                 result.reason  = `TypeError pós-free onde baseline era válido. UAF CANDIDATE.`;
@@ -223,7 +229,6 @@ export const Executor = {
 
         return result;
     },
-
     // ─────────────────────────────────────────────────────────────────────────
     // Verifica se um valor retornado parece um ponteiro vazado
     //
