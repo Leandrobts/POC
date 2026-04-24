@@ -25,7 +25,7 @@ import scTypedarray from './scenarios/sc_typedarray_neuter.js';
 import scButterfly from './scenarios/sc_butterfly_splice.js';
 import scFinalization from './scenarios/sc_finalization_race.js';
 import scFullscreen from './scenarios/sc_fullscreen_api_race.js';
-import scVideoNativefrom './scenarios/sc_video_native_fs_swap.js';
+import scVideoNative from './scenarios/sc_video_native_fs_swap.js';
 
 
 
