@@ -201,7 +201,7 @@ export const Executor = {
                // 🚨 ORÁCULO DE GC: Deteção de Objeto Fantasma (Blindado 2.0)
                 const tag = `${scenario.id}_target`;
                 if (GCOracle.freedTags.has(tag)) {
-                    const safeReturns = ['null', 'undefined', 'ok', 'complete', 'about:blank', 'true', 'false'];
+                    const safeReturns = ['null', 'undefined', 'ok', 'complete', 'about:blank', 'true', 'false', '', 'none', 'auto'];
                     
                     // Se o valor mudou em relação à baseline...
                     if (!safeReturns.includes(String(val)) && String(val) !== base.repr) {
