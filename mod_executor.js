@@ -150,13 +150,21 @@ export const Executor = {
                     }
                 }
 
+// BOOLEAN FLIP (Blindado contra Teardown Natural)
                 if (base.type === 'boolean' && typeof val === 'boolean') {
-                    // 🚨 FIX: Removidas as whitelists hardcoded por ID. Usando análise da string da função.
-                    if (base.fnStr.includes('isConnected') || base.fnStr.includes('previousNode')) return result;
+                    // 🚨 FIX: Ignora propriedades e comparações de identidade que mudam naturalmente
+                    if (
+                        base.fnStr.includes('isConnected') || 
+                        base.fnStr.includes('previousNode') || 
+                        base.fnStr.includes('===') ||  // Ignora: a === b (identidade mudou porque o objeto foi recriado)
+                        base.fnStr.includes('==')
+                    ) {
+                        return result;
+                    }
 
                     if (val !== (base.repr === 'true')) {
                         result.anomaly = true;
-                        result.reason = `[MEMORY CORRUPTION] Boolean Flip.`;
+                        result.reason = `[MEMORY CORRUPTION] Boolean Flip: ${base.repr} -> ${val}.`;
                         return result;
                     }
                 }
