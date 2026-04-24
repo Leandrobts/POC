@@ -1,4 +1,4 @@
-
+import { Groomer } from '../mod_groomer.js';
 export default {
     id:       'REGEXP_GROUP_INTEGER_OVERFLOW',
     category: 'Boundary',
