@@ -3,7 +3,8 @@
  * MOD_FACTORY.JS — Gerenciador de Cenários Modular
  * MODO PRODUÇÃO: Todos os 16 cenários ativos para varredura contínua.
  */
-
+import scTreewalker from './scenarios/sc_treewalker_confusion.js';
+/*
 import scArrayOverflow from './scenarios/sc_array_int_overflow.js';
 import scCssAnim from './scenarios/sc_css_anim_removed.js';
 import scCssCustom from './scenarios/sc_css_custom_prop.js';
@@ -17,14 +18,15 @@ import scRegexpOverflow from './scenarios/sc_regexp_overflow.js';
 import scStringOverflow from './scenarios/sc_string_int_overflow.js';
 import scStructuredClone from './scenarios/sc_structured_clone.js';
 import scSvgFilter from './scenarios/sc_svg_filter_uaf.js';
-import scTreewalker from './scenarios/sc_treewalker_confusion.js';
 import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
 import scWeakmapEphemeron from './scenarios/sc_weakmap_ephemeron.js';
+*/
 
 export const Factory = {
     buildScenarios: function() {
-        const allScenarios = [
-            scArrayOverflow,
+        const allScenarios = [  scTreewalker
+                              
+          /*  scArrayOverflow,
             scCssAnim,
             scCssCustom,
             scDomEvent,
@@ -36,10 +38,9 @@ export const Factory = {
             scRegexpOverflow,
             scStringOverflow,
             scStructuredClone,
-            scSvgFilter,
-            scTreewalker,
+            scSvgFilter,          
             scVideoFullscreen,
-            scWeakmapEphemeron
+            scWeakmapEphemeron*/
         ];
 
         const activeList = [];
