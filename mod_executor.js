@@ -139,7 +139,7 @@ export const Executor = {
         return base;
     },
 
-    runProbe: function(scenario, probeFn, idx, baseline) {
+   runProbe: function(scenario, probeFn, idx, baseline) {
         const base = baseline[idx];
         const result = {
             anomaly:  false,
@@ -147,17 +147,28 @@ export const Executor = {
             action:   `probe[${idx}]`,
             baseline: base.repr,
             val:      null,
-            reason:   null
+            reason:   null,
+            telemetry: null
         };
 
         try {
+            const fnStr = probeFn.toString(); 
+
+            // 🚨 NOVO: Oráculo de Tempo (Timing Attack)
+            const t0 = performance.now();
             const val  = probeFn(scenario);
+            const t1 = performance.now();
+            const deltaMs = t1 - t0;
+
             result.val = String(val).slice(0, 200);
 
-            const ptrCheck = this.checkPointerLeak(val);
-            if (ptrCheck) {
+            // ⏱️ Análise de Tempo: Se uma propriedade síncrona demorar absurdamente 
+            // a mais do que o normal após o free, o C++ entrou num "Slow Path" corrompido.
+            // Ignoramos probes que naturalmente demoram (ex: getter de arrays massivos)
+            if (base.ok && deltaMs > 5.0 && !fnStr.includes('length')) {
                 result.anomaly = true;
-                result.reason  = ptrCheck;
+                result.telemetry = 'TIMING_ANOMALY';
+                result.reason = `[TIMING] Lentidão extrema pós-free: ${deltaMs.toFixed(2)}ms. O C++ provavelmente entrou num loop ou iterou memória corrompida.`;
                 return result;
             }
 
@@ -205,6 +216,15 @@ export const Executor = {
                             return result;
                         }
                     }
+                }
+            }
+
+       const tag = `${scenario.id}_target`;
+                if (GCOracle.freedTags.has(tag)) {
+                    result.anomaly = true;
+                    result.telemetry = 'CONFIRMED_UAF_GHOST';
+                    result.reason = `[GHOST OBJECT] O C++ notificou que a memória nativa foi apagada, MAS a variável JS leu o valor (${val}) com sucesso! UAF Perfeito.`;
+                    return result;
                 }
             }
 
