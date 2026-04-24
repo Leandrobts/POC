@@ -213,7 +213,13 @@ export const Executor = {
                         if (typeof val === 'string' && (val.startsWith('http') || val === 'REWRITTEN' || val === 'original test')) return result;
                         
                         // IGNORA: Navegação no DOM TreeWalker (mudança de tipo de nó)
-                        if (typeof val === 'string' && ['SPAN', '#text'].includes(val)) return result;
+                        // IGNORA: Redirecionamentos normais em IFrames e injeções de texto do nosso próprio fuzzer
+                        if (typeof val === 'string' && (
+                            val.startsWith('http') || 
+                            val.includes('REWRITTEN') || 
+                            val.includes('original') ||
+                            val === 'about:blank'
+                        )) return result;
                         if (String(val).includes('HTMLParagraphElement')) return result;
 
                         result.anomaly = true;
