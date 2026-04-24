@@ -39,7 +39,8 @@ export const Executor = {
 
                 // ── FASE 2: GROOM A (antes do free) ───────────────────────
                 let slotsA = Mutator.groomAll(Mutator.CANARY_A, 32);
-
+                let oobVictims = Mutator.groomOOB(2000);
+                
                 // ── FASE 3: TRIGGER FREE ───────────────────────────────────
                 await scenario.trigger?.call(scenario);
 
@@ -72,6 +73,16 @@ export const Executor = {
                             + ` offset=${corruption.offset}`
                             + ` esperado=0x${Mutator.CANARY_B.toString(16)}`
                             + ` encontrado=${corruption.hex}`;
+                    }
+                    const oobCheck = Mutator.scanOOB(oobVictims);
+                    if (oobCheck.corrupted && !result.wafDetected) {
+                        result.anomaly = true;
+                        result.wafDetected = true; // Tratamos OOB como WAF para destacar no ecrã
+                        result.reason = (result.reason ?? '') + ` | ${oobCheck.reason}`;
+                    }
+
+                    if (result.anomaly) {
+                        yield { type: 'ANOMALY', risk: scenario.risk, ...result };
                     }
 
                     // Detecção extra: scan de ponteiros nos slots B
