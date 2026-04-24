@@ -23,7 +23,8 @@ import scWeakmapEphemeron from './scenarios/sc_weakmap_ephemeron.js';
 */
 export const Factory = {
     buildScenarios: function() {
-        const allScenarios = [
+        const allScenarios = [scRegexpOverflow
+            /*
             scArrayOverflow,
             scCssAnim,
             scCssCustom,
@@ -33,13 +34,12 @@ export const Factory = {
             scMessagePort,
             scNativeCallback,
             scPromiseMicro,
-            scRegexpOverflow,
             scStringOverflow,
             scStructuredClone,
             scSvgFilter,
             scTreewalker,
             scVideoFullscreen,
-            scWeakmapEphemeron
+            scWeakmapEphemeron*/
         ];
 
         const activeList = [];
