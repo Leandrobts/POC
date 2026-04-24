@@ -81,59 +81,7 @@ export const Factory = {
             }
         });
 
-        // ══════════════════════════════════════════════════════════════
-        // 2. AudioContext.close() → AudioNodes órfãos acessam C++ freed
-        //    C++: AudioContext.cpp / AudioNode.cpp
-        //    Risco: ALTO — histórico massivo de UAF no WebAudio em geral
-        // ══════════════════════════════════════════════════════════════
-        register({
-            id: 'AUDIO_CTX_CLOSE_NODE_ACCESS',
-            category: 'WebAudio',
-            risk: 'HIGH',
-            description: [
-                'AudioContext.close() destrói o objeto C++ e encerra o grafo de áudio.',
-                'Mas JS ainda mantém referências vivas para os AudioNodes filhos.',
-                'Acessar AudioParam.value ou AudioNode.context depois do close()',
-                'pode dereferenciar ponteiro freed.'
-            ].join(' '),
-
-            setup: async function() {
-                let AC = window.AudioContext || window.webkitAudioContext;
-                this.ctx = new AC();
-                this.osc  = this.ctx.createOscillator();
-                this.biq  = this.ctx.createBiquadFilter();
-                this.gain = this.ctx.createGain();
-                this.dyn  = this.ctx.createDynamicsCompressor();
-                // Conecta o grafo
-                this.osc.connect(this.biq);
-                this.biq.connect(this.gain);
-                this.gain.connect(this.dyn);
-                this.dyn.connect(this.ctx.destination);
-            },
-
-            trigger: async function() {
-                await this.ctx.close(); // Destrói todos os objetos C++ do grafo
-            },
-
-            probe: [
-                s => s.osc.frequency.value,       // AudioParam → objeto C++ freed?
-                s => s.osc.detune.value,
-                s => s.osc.type,
-                s => s.biq.frequency.value,
-                s => s.biq.Q.value,
-                s => s.biq.gain.value,
-                s => s.biq.type,
-                s => s.gain.gain.value,
-                s => s.dyn.threshold.value,
-                s => s.dyn.ratio.value,
-                s => s.osc.context,               // Ref de volta para ctx fechado
-                s => s.osc.numberOfInputs,
-                s => s.osc.numberOfOutputs,
-                s => s.osc.channelCount,
-            ],
-
-            cleanup: function() {}
-        });
+        
 
         // ══════════════════════════════════════════════════════════════
         // 3. HTMLVideoElement.src = '' enquanto MediaSource ativa
