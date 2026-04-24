@@ -5,6 +5,16 @@
 
 import { GC }      from './mod_gc.js';
 import { Mutator } from './mod_mutator.js';
+import { Groomer } from './mod_groomer.js';
+
+export const GCOracle = {
+    freedTags: new Set(),
+    registry: typeof FinalizationRegistry !== 'undefined' 
+        ? new FinalizationRegistry(tag => GCOracle.freedTags.add(tag)) 
+        : null,
+        
+    reset: function() { this.freedTags.clear(); }
+};
 
 export const Executor = {
 
