@@ -169,17 +169,23 @@ export const Executor = {
                     }
                 }
 
-// STALE DATA (Mutação Numérica Blindada)
+// STALE DATA (Mutação Numérica Nível Sniper)
                 if (base.type === 'number' && typeof val === 'number') {
                     if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
                         const baseNum = parseFloat(base.repr);
                         if (base.fnStr.includes('nodeType') || base.fnStr.includes('nodeName')) return result;
                         
-                        // 🚨 FIX GIGANTE: Permite que transições de 0 -> Ponteiro disparem o alarme!
-                        if (Math.abs(val - baseNum) > 1000 || (baseNum === 0 && val !== 0)) {
+                        // 1. O motor zerou o buffer por segurança (Neutering seguro)
+                        if (val === 0) return result; 
+
+                        // 2. É um contador inofensivo a subir a partir do zero
+                        if (baseNum === 0 && val > -10000 && val < 10000) return result;
+
+                        // 3. O GATILHO REAL: Salto gigantesco indicando Ponteiro ou lixo da RAM
+                        if (Math.abs(val - baseNum) > 10000 || (baseNum === 0 && (val < -10000 || val > 10000))) {
                             result.anomaly = true;
                             result.telemetry = 'STALE_DATA';
-                            result.reason = `💥 STALE DATA (Possível LEAK): ${base.repr} -> ${val}`;
+                            result.reason = `💥 STALE DATA (INFO LEAK): ${base.repr} -> ${val}`;
                             return result;
                         }
                     }
