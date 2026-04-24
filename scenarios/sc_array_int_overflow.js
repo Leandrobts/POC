@@ -1,18 +1,3 @@
-/**
- * CENÁRIO: ARRAY_MATH_INTEGER_OVERFLOW
- * Superfície C++: JSArray.cpp / JSGenericTypedArrayView.cpp / ArrayBuffer.cpp
- * Risco: HIGH
- *
- * Diferença para a versão genérica:
- *   - Versão anterior só testava push() e DataView offset — muito superficial.
- *   - Versão robusta adiciona:
- *     (A) splice() com índice negativo near INT_MIN — underflow
- *     (B) slice() com start/end que combinam para transbordo 32-bit
- *     (C) ArrayBuffer.transfer() (se disponível) com tamanho gigante
- *     (D) TypedArray subarray() com offset + length que estouram
- *     (E) fill() em array de tamanho máximo — sem loop (O(1))
- */
-
 export default {
     id:       'ARRAY_MATH_INTEGER_OVERFLOW',
     category: 'Boundary',
@@ -28,7 +13,6 @@ export default {
     },
 
     trigger: function() {
-
         // A: push() overflow (0xFFFFFFFF + 1 wraps para 0)
         try {
             const arr = [];
@@ -40,7 +24,7 @@ export default {
         // B: splice() com índice near INT_MIN (underflow de signed 32-bit)
         try {
             const arr = [1, 2, 3, 4, 5];
-            arr.splice(-0x80000001, 1); // -2147483649 underflowa
+            arr.splice(-0x80000001, 1); 
             this.results.spliceLen = arr.length;
         } catch(e) { this.results.spliceErr = e.constructor.name; }
 
@@ -58,7 +42,7 @@ export default {
             this.results.subArrLen = this.results.subArr?.byteLength;
         } catch(e) { this.results.subArrErr = e.constructor.name; }
 
-        // E: DataView com offset gigante (RangeError esperado — bypass = bug)
+        // E: DataView com offset gigante
         try {
             this.results.dataView = new DataView(this.buffer, 0xFFFFFFFF, 1);
         } catch(e) { this.results.dataViewErr = e.constructor.name; }
@@ -77,7 +61,6 @@ export default {
         s => s.results.subArrLen ?? s.results.subArrErr,
         s => s.results.dataView ? s.results.dataView.byteOffset : s.results.dataViewErr,
         s => s.results.bigOffsetView ? s.results.bigOffsetView.byteOffset : s.results.bigOffsetErr,
-        // Se qualquer view foi criada, tenta ler memória nativa
         s => { try { return s.results.subArr ? s.results.subArr[0] : null; } catch(e) { return e.constructor.name; } },
     ],
 
