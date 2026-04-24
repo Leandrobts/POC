@@ -198,16 +198,27 @@ export const Executor = {
                     }
                 }
 
-                // 🚨 ORÁCULO DE GC: Deteção de Objeto Fantasma (Modo Sniper)
+               // 🚨 ORÁCULO DE GC: Deteção de Objeto Fantasma (Blindado 2.0)
                 const tag = `${scenario.id}_target`;
                 if (GCOracle.freedTags.has(tag)) {
                     const safeReturns = ['null', 'undefined', 'ok', 'complete', 'about:blank', 'true', 'false'];
                     
+                    // Se o valor mudou em relação à baseline...
                     if (!safeReturns.includes(String(val)) && String(val) !== base.repr) {
+                        
+                        // IGNORA: Contadores que sobem naturalmente (ex: logs de callbacks)
+                        if (typeof val === 'number') return result; 
+                        
+                        // IGNORA: Redirecionamentos normais do WindowProxy em IFrames
+                        if (typeof val === 'string' && (val.startsWith('http') || val === 'REWRITTEN' || val === 'original test')) return result;
+                        
+                        // IGNORA: Navegação no DOM TreeWalker (mudança de tipo de nó)
+                        if (typeof val === 'string' && ['SPAN', '#text'].includes(val)) return result;
+                        if (String(val).includes('HTMLParagraphElement')) return result;
+
                         result.anomaly = true;
                         result.telemetry = 'CONFIRMED_UAF_GHOST';
-                        // Usamos String() aqui para garantir que mesmo um objeto corrompido não trave o log
-                        result.reason = `[GHOST LEAK] C++ libertou, e JS leu lixo: ${String(val).slice(0, 50)}.`;
+                        result.reason = `[GHOST LEAK] C++ libertou, e JS leu lixo real: ${String(val).slice(0, 50)}.`;
                         return result;
                     }
                 }
