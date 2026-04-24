@@ -171,11 +171,15 @@ export const Executor = {
                     }
                 }
 
-                // BOOLEAN FLIP (Filtro Cirúrgico)
+               // BOOLEAN FLIP (Filtro Cirúrgico)
                 if (base.type === 'boolean' && typeof val === 'boolean') {
-                    // SILENCIA FALSOS POSITIVOS CONHECIDOS
-                    if (scenario.id === 'DOM_EVENT_REMOVED_ELEMENT' && idx === 5) return result;
-                    if (scenario.id === 'DOM_EVENT_REMOVED_ELEMENT' && idx >= 9 && idx <= 13) return result;
+                    
+                    // 1. Ignora globalmente propriedades DOM que naturalmente ficam false após remoção
+                    if (fnStr.includes('isConnected')) return result;
+                    
+                    // 2. Silencia probes específicas de teardown
+                    if (scenario.id === 'IFRAME_DOCWRITE_FRAME_UAF' && [7].includes(idx)) return result;
+                    if (scenario.id === 'DOM_EVENT_REMOVED_ELEMENT' && [5, 9, 10, 11, 12, 13].includes(idx)) return result;
                     if (scenario.id === 'TREEWALKER_TYPE_CONFUSION' && [2, 3, 5, 14, 18].includes(idx)) return result;
                     if (scenario.id === 'VIDEO_FULLSCREEN_REMOVE' && [12, 13, 14].includes(idx)) return result;
 
