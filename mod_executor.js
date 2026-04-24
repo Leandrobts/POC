@@ -1,7 +1,6 @@
 /**
- * MOD_EXECUTOR.JS — Orquestrador Maestro (Versão 11.0 — Sniper Mode)
- * Filtra "Wrappers Seguros" e "Flutuações Normais" no DOM para focar
- * apenas em corrupções reais de memória e Timing Anomalies.
+ * MOD_EXECUTOR.JS — Orquestrador Maestro (Versão 12.0 - Desempenho e Precisão)
+ * Corrigido: Threshold de 35ms, JSC Internal Pointers, Independência WAF/OOB.
  */
 
 import { GC }      from './mod_gc.js';
@@ -10,6 +9,7 @@ import { Groomer } from './mod_groomer.js';
 
 export const GCOracle = {
     freedTags: new Set(),
+    // Nota: FinalizationRegistry não é determinístico, atua apenas como heurística passiva.
     registry: typeof FinalizationRegistry !== 'undefined' 
         ? new FinalizationRegistry(tag => GCOracle.freedTags.add(tag)) 
         : null,
@@ -18,10 +18,7 @@ export const GCOracle = {
 
 export const Executor = {
     isRunning: false,
-
-    stop: function() {
-        this.isRunning = false;
-    },
+    stop: function() { this.isRunning = false; },
 
     run: async function*(scenarios) {
         this.isRunning = true;
@@ -33,17 +30,13 @@ export const Executor = {
                 if (!this.isRunning) break;
 
                 yield { type: 'STATUS', target: `Ciclo ${cycleCount} | ${scenario.category} > ${scenario.id}` };
-                yield {
-                    type: 'SCENARIO_START',
-                    id:   scenario.id,
-                    risk: scenario.risk,
-                    desc: scenario.description
-                };
+                yield { type: 'SCENARIO_START', id: scenario.id, risk: scenario.risk, desc: scenario.description };
 
                 try {
                     GCOracle.reset(); 
-
                     await scenario.setup?.call(scenario);
+                    
+                    // 🚨 FIX: Pré-computando as strings das funções aqui para poupar CPU no loop quente
                     const baseline = await this.captureBaseline(scenario);
 
                     let slotsA = Mutator.groomAll(Mutator.CANARY_A, 32);
@@ -55,6 +48,8 @@ export const Executor = {
                     await GC.medium();
 
                     slotsA = null;
+                    // 🚨 FIX: Yield explicito para garantir que o macro-task queue processe o null antes do GC
+                    await new Promise(r => setTimeout(r, 0)); 
                     await GC.light();
 
                     let slotsB = Mutator.groomAll(Mutator.CANARY_B, 32);
@@ -65,24 +60,22 @@ export const Executor = {
 
                         const result = this.runProbe(scenario, scenario.probe[i], i, baseline);
 
+                        // 🚨 FIX: Avaliação INDEPENDENTE de WAF e OOB
                         const corruption = Mutator.checkCorruption(slotsB, Mutator.CANARY_B);
-                        if (corruption.corrupted && !result.wafDetected) {
-                            result.anomaly     = true;
-                            result.wafDetected = true;
-                            result.reason = (result.reason ?? '') + ` | ⚠ WRITE-AFTER-FREE: ${corruption.hex}`;
+                        if (corruption.corrupted) {
+                            result.anomaly = true;
+                            result.reason = (result.reason ?? '') + ` | ⚠ WAF: ${corruption.hex}`;
                         }
 
                         const oobCheck = Mutator.scanOOB(oobVictims);
-                        if (oobCheck.corrupted && !result.wafDetected) {
+                        if (oobCheck.corrupted) {
                             result.anomaly = true;
-                            result.wafDetected = true;
                             result.reason = (result.reason ?? '') + ` | ${oobCheck.reason}`;
                         }
 
                         const ptrs = Mutator.scanForPointers(slotsB);
                         if (ptrs.length > 0) {
                             result.anomaly  = true;
-                            result.ptrLeaks = ptrs;
                             result.reason   = (result.reason ?? '') + ` | 🔍 PTR LEAK!`;
                         }
 
@@ -99,7 +92,6 @@ export const Executor = {
                 } catch(fatalErr) {
                     yield { type: 'SCENARIO_ERROR', id: scenario.id, error: fatalErr.message };
                 }
-
                 yield { type: 'SCENARIO_DONE', id: scenario.id };
             }
             cycleCount++;
@@ -110,11 +102,13 @@ export const Executor = {
     captureBaseline: async function(scenario) {
         const base = [];
         for (let i = 0; i < scenario.probe.length; i++) {
+            // Guarda a string da função uma única vez
+            let fnStr = scenario.probe[i].toString();
             try {
                 const val = scenario.probe[i](scenario);
-                base.push({ ok: true, type: typeof val, repr: String(val).slice(0, 120) });
+                base.push({ ok: true, type: typeof val, repr: String(val).slice(0, 120), fnStr });
             } catch(e) {
-                base.push({ ok: false, errType: e.constructor.name, repr: e.message });
+                base.push({ ok: false, errType: e.constructor.name, repr: e.message, fnStr });
             }
         }
         return base;
@@ -122,28 +116,19 @@ export const Executor = {
 
     runProbe: function(scenario, probeFn, idx, baseline) {
         const base = baseline[idx];
-        const result = {
-            anomaly: false, api: scenario.id, action: `probe[${idx}]`,
-            baseline: base.repr, val: null, reason: null, telemetry: null
-        };
+        const result = { anomaly: false, api: scenario.id, action: `probe[${idx}]`, baseline: base.repr, val: null, reason: null };
 
         try {
-            const fnStr = probeFn.toString(); 
             const t0 = performance.now();
             const val  = probeFn(scenario);
             const t1 = performance.now();
             const deltaMs = t1 - t0;
 
-            // 🚨 PROTEÇÃO DE CONVERSÃO: Evita o TypeError em objetos puros (RegExp groups)
-            try {
-                result.val = String(val).slice(0, 200);
-            } catch(castErr) {
-                result.val = "[Objeto Sem Representação em Texto]";
-            }
+            try { result.val = String(val).slice(0, 200); } catch(e) { result.val = "[Objeto Sem Representação]"; }
 
-            if (base.ok && deltaMs > 5.0 && !fnStr.includes('length')) {
+            // 🚨 FIX: Threshold ajustado para 35ms para evitar ruído de reflow do WebKit
+            if (base.ok && deltaMs > 35.0 && !base.fnStr.includes('length')) {
                 result.anomaly = true;
-                result.telemetry = 'TIMING_ANOMALY';
                 result.reason = `[TIMING] Lentidão: ${deltaMs.toFixed(2)}ms.`;
                 return result;
             }
@@ -160,71 +145,46 @@ export const Executor = {
                     if (val === null || val === undefined) return result;
                     if (['number', 'boolean', 'string'].includes(base.type)) {
                         result.anomaly = true;
-                        result.telemetry = 'TYPE_CONFUSION';
                         result.reason = `[TYPE CONFUSION] ${base.type} -> ${typeof val}.`;
                         return result;
                     }
                 }
 
                 if (base.type === 'boolean' && typeof val === 'boolean') {
-                    if (fnStr.includes('isConnected')) return result;
-                    if (scenario.id === 'IFRAME_DOCWRITE_FRAME_UAF' && [7].includes(idx)) return result;
-                    if (scenario.id === 'DOM_EVENT_REMOVED_ELEMENT' && [5, 9, 10, 11, 12, 13].includes(idx)) return result;
-                    if (scenario.id === 'TREEWALKER_TYPE_CONFUSION' && [2, 3, 5, 14, 18].includes(idx)) return result;
-                    if (scenario.id === 'VIDEO_FULLSCREEN_REMOVE' && [12, 13, 14].includes(idx)) return result;
+                    // 🚨 FIX: Removidas as whitelists hardcoded por ID. Usando análise da string da função.
+                    if (base.fnStr.includes('isConnected') || base.fnStr.includes('previousNode')) return result;
 
                     if (val !== (base.repr === 'true')) {
                         result.anomaly = true;
-                        result.telemetry = 'BOOLEAN_FLIP';
                         result.reason = `[MEMORY CORRUPTION] Boolean Flip.`;
                         return result;
                     }
                 }
 
-                // STALE DATA (Mutação Numérica Blindada)
                 if (base.type === 'number' && typeof val === 'number') {
                     if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
                         const baseNum = parseFloat(base.repr);
-                        if (fnStr.includes('nodeType') || fnStr.includes('nodeName')) return result;
+                        if (base.fnStr.includes('nodeType') || base.fnStr.includes('nodeName')) return result;
                         if (baseNum !== 0 && val === 0) return result; 
                         
-                        // 🚨 NOVO: Ignora flutuações de inteiros pequenos (ex: tamanhos de arrays)
                         if (baseNum !== 0 && Math.abs(val - baseNum) > 1000) {
                             result.anomaly = true;
-                            result.telemetry = 'STALE_DATA';
                             result.reason = `Stale Data Massivo: ${base.repr} -> ${val}.`;
                             return result;
                         }
                     }
                 }
 
-               // 🚨 ORÁCULO DE GC: Deteção de Objeto Fantasma (Blindado 2.0)
                 const tag = `${scenario.id}_target`;
                 if (GCOracle.freedTags.has(tag)) {
                     const safeReturns = ['null', 'undefined', 'ok', 'complete', 'about:blank', 'true', 'false', '', 'none', 'auto'];
-                    
-                    // Se o valor mudou em relação à baseline...
                     if (!safeReturns.includes(String(val)) && String(val) !== base.repr) {
-                        
-                        // IGNORA: Contadores que sobem naturalmente (ex: logs de callbacks)
                         if (typeof val === 'number') return result; 
-                        
-                        // IGNORA: Redirecionamentos normais do WindowProxy em IFrames
-                        if (typeof val === 'string' && (val.startsWith('http') || val === 'REWRITTEN' || val === 'original test')) return result;
-                        
-                        // IGNORA: Navegação no DOM TreeWalker (mudança de tipo de nó)
-                        // IGNORA: Redirecionamentos normais em IFrames e injeções de texto do nosso próprio fuzzer
-                        if (typeof val === 'string' && (
-                            val.startsWith('http') || 
-                            val.includes('REWRITTEN') || 
-                            val.includes('original') ||
-                            val === 'about:blank'
-                        )) return result;
+                        if (typeof val === 'string' && (val.startsWith('http') || val.includes('REWRITTEN') || val.includes('original') || ['SPAN', '#text'].includes(val))) return result;
                         if (String(val).includes('HTMLParagraphElement')) return result;
 
                         result.anomaly = true;
-                        result.telemetry = 'CONFIRMED_UAF_GHOST';
-                        result.reason = `[GHOST LEAK] C++ libertou, e JS leu lixo real: ${String(val).slice(0, 50)}.`;
+                        result.reason = `[GHOST LEAK] JS leu lixo nativo: ${String(val).slice(0, 50)}.`;
                         return result;
                     }
                 }
@@ -247,9 +207,14 @@ export const Executor = {
             new Float64Array(buf)[0] = val;
             const bits = new BigUint64Array(buf)[0];
             const upper16 = bits >> 48n;
+            
+            // 🚨 FIX: Deteta ponteiros Userspace e PONTEIROS INTERNOS JSC (0xFFFFn)
             if (upper16 === 0x0000n) {
                 const addr = bits & 0x0000FFFFFFFFFFFFn;
-                if (addr > 0x10000n) return `Ponteiro NaN-boxed: 0x${addr.toString(16)}`;
+                if (addr > 0x10000n) return `Ponteiro Userspace Vazado: 0x${addr.toString(16)}`;
+            } else if (upper16 === 0xFFFFn) {
+                const addr = bits & 0x0000FFFFFFFFFFFFn;
+                if (addr > 0x10000n) return `🚨 PONTEIRO INTERNO JSC VAZADO: 0x${addr.toString(16)}`;
             }
         }
         return null;
