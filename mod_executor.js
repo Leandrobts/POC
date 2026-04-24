@@ -180,28 +180,39 @@ export const Executor = {
                     }
                 }
 
+                // STALE DATA (Mutação Numérica Blindada)
                 if (base.type === 'number' && typeof val === 'number') {
                     if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
                         const baseNum = parseFloat(base.repr);
                         if (fnStr.includes('nodeType') || fnStr.includes('nodeName')) return result;
                         if (baseNum !== 0 && val === 0) return result; 
-                        if (baseNum !== 0 && Math.abs(val - baseNum) > 1) {
+                        
+                        // 🚨 NOVO: Ignora flutuações de inteiros pequenos (ex: tamanhos de arrays, offsetWidth)
+                        // Só grita se a diferença for absurda, indicando leitura de um ponteiro corrompido.
+                        if (baseNum !== 0 && Math.abs(val - baseNum) > 1000) {
                             result.anomaly = true;
                             result.telemetry = 'STALE_DATA';
-                            result.reason = `Stale Data: ${base.repr} -> ${val}.`;
+                            result.reason = `Stale Data Massivo: ${base.repr} -> ${val}.`;
                             return result;
                         }
                     }
                 }
 
+                // 🚨 ORÁCULO DE GC: Deteção de Objeto Fantasma (Modo Sniper)
                 const tag = `${scenario.id}_target`;
                 if (GCOracle.freedTags.has(tag)) {
-                    result.anomaly = true;
-                    result.telemetry = 'CONFIRMED_UAF_GHOST';
-                    result.reason = `[GHOST OBJECT] Lida memória libertada pelo C++.`;
-                    return result;
+                    // O C++ morreu. Mas o JS Wrapper devolveu um valor seguro (null, ok, undefined, strings normais)?
+                    const safeReturns = ['null', 'undefined', 'ok', 'complete', 'about:blank', 'true', 'false'];
+                    
+                    // Se o valor NÃO for um retorno seguro e NÃO for exatamente igual à baseline, 
+                    // significa que o JS Wrapper leu memória corrompida achando que era válida!
+                    if (!safeReturns.includes(String(val)) && String(val) !== base.repr) {
+                        result.anomaly = true;
+                        result.telemetry = 'CONFIRMED_UAF_GHOST';
+                        result.reason = `[GHOST LEAK] C++ libertou, e JS leu lixo: ${val.slice(0, 50)}.`;
+                        return result;
+                    }
                 }
-            }
 
         } catch(e) {
             result.val = `${e.constructor.name}: ${e.message}`;
