@@ -191,16 +191,18 @@ export const Executor = {
                     }
                 }
 
+                // 🚨 ORÁCULO DE GC: Lógica Refatorada (Sem Whitelists)
                 const tag = `${scenario.id}_target`;
                 if (GCOracle.freedTags.has(tag)) {
-                    const safeReturns = ['null', 'undefined', 'ok', 'complete', 'about:blank', 'true', 'false', '', 'none', 'auto'];
-                    if (!safeReturns.includes(String(val)) && String(val) !== base.repr) {
-                        if (typeof val === 'number') return result; 
-                        if (typeof val === 'string' && (val.startsWith('http') || val.includes('REWRITTEN') || val.includes('original') || ['SPAN', '#text'].includes(val))) return result;
-                        if (String(val).includes('HTMLParagraphElement')) return result;
+                    // Se o valor mutou E o tipo mudou radicalmente (evitando flutuações da mesma classe)
+                    if (String(val) !== base.repr && typeof val !== base.type) {
+                        
+                        // Ignora apenas limpezas normais do sistema
+                        if (val === null || val === undefined) return result;
 
                         result.anomaly = true;
-                        result.reason = `[GHOST LEAK] JS leu lixo nativo: ${String(val).slice(0, 50)}.`;
+                        result.telemetry = 'CONFIRMED_UAF_GHOST';
+                        result.reason = `[GHOST LEAK] Tipo Mutado Pós-Free: ${base.type} -> ${typeof val}. Valor: ${String(val).slice(0, 30)}`;
                         return result;
                     }
                 }
