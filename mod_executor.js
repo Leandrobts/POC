@@ -163,15 +163,19 @@ export const Executor = {
                     }
                 }
 
-                // BOOLEAN FLIP SILENCIOSO
+                // 3. BOOLEAN FLIP SILENCIOSO (Filtro Cirúrgico Corrigido)
                 if (base.type === 'boolean' && typeof val === 'boolean') {
-                    // Filtro para não usar .toString(), que o PS4 pode cortar
-                    const ignorarDom = ['isConnected', 'isSameNode', 'isEqualNode'];
-                    if (ignorarDom.some(p => result.action.includes(p))) return result;
+                    
+                    // Silencia probes específicas que testam .isConnected ou .paused 
+                    // e que naturalmente mudam para false durante o teardown
+                    if (scenario.id === 'DOM_EVENT_REMOVED_ELEMENT' && idx === 5) return result;
+                    if (scenario.id === 'DOM_EVENT_REMOVED_ELEMENT' && idx >= 9 && idx <= 13) return result;
+                    if (scenario.id === 'TREEWALKER_TYPE_CONFUSION' && [2, 3, 5, 14, 18].includes(idx)) return result;
+                    if (scenario.id === 'VIDEO_FULLSCREEN_REMOVE' && [12, 13, 14].includes(idx)) return result;
 
                     if (val !== (base.repr === 'true')) {
                         result.anomaly = true;
-                        result.reason = `[MEMORY CORRUPTION] Boolean Flip! Valor alterou de ${base.repr} para ${val}.`;
+                        result.reason = `[MEMORY CORRUPTION] Boolean Flip silencioso. Valor alterou de ${base.repr} para ${val}.`;
                         return result;
                     }
                 }
