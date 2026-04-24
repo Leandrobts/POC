@@ -169,15 +169,17 @@ export const Executor = {
                     }
                 }
 
+// STALE DATA (Mutação Numérica Blindada)
                 if (base.type === 'number' && typeof val === 'number') {
                     if (!isNaN(val) && !isNaN(parseFloat(base.repr))) {
                         const baseNum = parseFloat(base.repr);
                         if (base.fnStr.includes('nodeType') || base.fnStr.includes('nodeName')) return result;
-                        if (baseNum !== 0 && val === 0) return result; 
                         
-                        if (baseNum !== 0 && Math.abs(val - baseNum) > 1000) {
+                        // 🚨 FIX GIGANTE: Permite que transições de 0 -> Ponteiro disparem o alarme!
+                        if (Math.abs(val - baseNum) > 1000 || (baseNum === 0 && val !== 0)) {
                             result.anomaly = true;
-                            result.reason = `Stale Data Massivo: ${base.repr} -> ${val}.`;
+                            result.telemetry = 'STALE_DATA';
+                            result.reason = `💥 STALE DATA (Possível LEAK): ${base.repr} -> ${val}`;
                             return result;
                         }
                     }
