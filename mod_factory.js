@@ -53,7 +53,7 @@ export const Factory = {
             scStructuredClone,
             scTreewalker,
             scSvgFilter,        
-            scVideoFullscreen,
+          //  scVideoFullscreen,
             scWeakmapEphemeron
         ];
 
