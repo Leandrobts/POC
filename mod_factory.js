@@ -32,20 +32,21 @@ import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
 
 export const Factory = {
     buildScenarios: function() {
-        const allScenarios = [ scIframeUaf,
-         scFullscreen,
-         scVideoNative,
-          scFinalization,
+        const allScenarios = [ 
+            scIframeUaf,
+            scFullscreen,
+            scVideoNative,
+            scFinalization,
             scButterfly,              
             scArrayOverflow,
             scCssAnim,
             scCssCustom,
             scDomEvent, 
             scDomRange,
-         scMediaSource,                   
-                              scCanvasImage,
+            scMediaSource,                   
+            scCanvasImage,
             scMessagePort,
-          scNativeCallback,
+            scNativeCallback,
             scPromiseMicro,
             scRegexpOverflow,
             scStringOverflow,
@@ -53,7 +54,7 @@ export const Factory = {
             scTreewalker,
             scSvgFilter,        
             scVideoFullscreen,
-          scWeakmapEphemeron
+            scWeakmapEphemeron
         ];
 
         const activeList = [];
