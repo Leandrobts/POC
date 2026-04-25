@@ -5,6 +5,7 @@
  */
 import scIframeUaf from './scenarios/sc_iframe_frame_uaf.js';
 import scDomRange from './scenarios/sc_dom_range_extract_uaf.js';
+import scCanvasImage from './scenarios/sc_canvas_imagedata_oob.js';
 
 
 import scArrayOverflow from './scenarios/sc_array_int_overflow.js';
@@ -41,7 +42,8 @@ export const Factory = {
             scCssCustom,
             scDomEvent, 
             scDomRange,
-         scMediaSource,
+         scMediaSource,                   
+                              scCanvasImage,
           //  scMessagePort,
          //   scNativeCallback,
           //  scPromiseMicro,
