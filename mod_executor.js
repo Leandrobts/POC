@@ -131,17 +131,23 @@ export const Executor = {
         }
 
         
-        // --- 3. TYPE CONFUSION ---
+        // --- 3. TYPE CONFUSION & CUSTOM ALERTS ---
+        // Se a nossa probe disparou um Alerta Customizado (String com os nossos Emojis)
+        const isCustomAlert = valType === 'string' && (val.includes('💥') || val.includes('🏆') || val.includes('LEAK'));
+        
+        if (isCustomAlert) {
+            result.anomaly = true;
+            result.telemetry = 'CUSTOM_LEAK';
+            result.reason = val; // Imprime a nossa mensagem exata de OOB/Ponteiro!
+            return result;
+        }
+
+        // Se for uma mudança de tipo real não planeada (O verdadeiro Type Confusion)
         if (valType !== base.type && base.type !== 'undefined' && val !== null) {
-            // 🚨 FIX DO RUÍDO: Ignora alertas visuais customizados das nossas probes
-            const isCustomAlert = valType === 'string' && (val.includes('💥') || val.includes('🏆') || val.includes('LEAK'));
-            
-            if (!isCustomAlert) {
-                result.anomaly = true;
-                result.telemetry = 'TYPE_CONFUSION';
-                result.reason = `[TYPE CONFUSION] ${base.type} -> ${valType}. Baseline: ${base.repr} | Pós: ${valRepr}`;
-                return result;
-            }
+            result.anomaly = true;
+            result.telemetry = 'TYPE_CONFUSION';
+            result.reason = `[TYPE CONFUSION] ${base.type} -> ${valType}. Baseline: ${base.repr} | Pós: ${valRepr}`;
+            return result;
         }
 
         // --- 4. BOOLEAN FLIP (GC Validated) ---
