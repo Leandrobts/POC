@@ -32,7 +32,7 @@ export default {
             // Vamos instanciar dezenas de elementos de áudio. Eles criam estruturas
             // HTMLMediaElement gigantes na RAM nativa, repletas de ponteiros vTable.
             this.pointerTargets = [];
-            for (let i = 0; i < 40; i++) {
+            for (let i = 0; i < 200; i++) {
                 let el = document.createElement('audio');
                 this.sandbox.appendChild(el);
                 this.pointerTargets.push(el);
