@@ -4,6 +4,7 @@
  * MODO PRODUÇÃO: Todos os 16 cenários ativos para varredura contínua.
  */
 import scIframeUaf from './scenarios/sc_iframe_frame_uaf.js';
+import scDomRange from './scenarios/sc_dom_range_extract_uaf.js';
 
 
 import scArrayOverflow from './scenarios/sc_array_int_overflow.js';
@@ -39,7 +40,7 @@ export const Factory = {
             scCssAnim,
             scCssCustom,
             scDomEvent, 
-            
+            scDomRange,
          scMediaSource,
           //  scMessagePort,
          //   scNativeCallback,
