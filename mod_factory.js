@@ -19,20 +19,20 @@ import scStringOverflow from './scenarios/sc_string_int_overflow.js';
 import scStructuredClone from './scenarios/sc_structured_clone.js';
 import scTreewalker from './scenarios/sc_treewalker_confusion.js';
 import scSvgFilter from './scenarios/sc_svg_filter_uaf.js';
-import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
 import scWeakmapEphemeron from './scenarios/sc_weakmap_ephemeron.js';
 import scButterfly from './scenarios/sc_butterfly_splice.js';
 import scFinalization from './scenarios/sc_finalization_race.js';
-import scFullscreen from './scenarios/sc_fullscreen_api_race.js';
+/*import scFullscreen from './scenarios/sc_fullscreen_api_race.js';
 import scVideoNative from './scenarios/sc_video_native_fs_swap.js';
-
+import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
+*/
 
 
 export const Factory = {
     buildScenarios: function() {
         const allScenarios = [  
-            scFullscreen,
-            scVideoNative,
+         //   scFullscreen,
+          //  scVideoNative,
             scFinalization,
             scButterfly,              
             scArrayOverflow,
@@ -49,7 +49,7 @@ export const Factory = {
             scStructuredClone,
             scTreewalker,
             scSvgFilter,          
-            scVideoFullscreen,
+         //   scVideoFullscreen,
             scWeakmapEphemeron
         ];
 
