@@ -12,7 +12,7 @@ import scCssCustom from './scenarios/sc_css_custom_prop.js';
 import scDomEvent from './scenarios/sc_dom_event_removed.js';
 import scMediaSource from './scenarios/sc_mediasource_uaf.js';
 import scMessagePort from './scenarios/sc_messageport_uaf.js';
-import scNativeCallback from './scenarios/sc_native_callback_uaf.js';
+//import scNativeCallback from './scenarios/sc_native_callback_uaf.js';
 import scPromiseMicro from './scenarios/sc_promise_microtask.js';
 import scRegexpOverflow from './scenarios/sc_regexp_overflow.js';
 import scStringOverflow from './scenarios/sc_string_int_overflow.js';
@@ -42,7 +42,7 @@ export const Factory = {
             
          scMediaSource,
             scMessagePort,
-            scNativeCallback,
+           // scNativeCallback,
             scPromiseMicro,
             scRegexpOverflow,
             scStringOverflow,
