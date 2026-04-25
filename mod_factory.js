@@ -21,7 +21,6 @@ import scTreewalker from './scenarios/sc_treewalker_confusion.js';
 import scSvgFilter from './scenarios/sc_svg_filter_uaf.js';
 import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
 import scWeakmapEphemeron from './scenarios/sc_weakmap_ephemeron.js';
-import scTypedarray from './scenarios/sc_typedarray_neuter.js';
 import scButterfly from './scenarios/sc_butterfly_splice.js';
 import scFinalization from './scenarios/sc_finalization_race.js';
 import scFullscreen from './scenarios/sc_fullscreen_api_race.js';
@@ -35,8 +34,7 @@ export const Factory = {
             scFullscreen,
             scVideoNative,
             scFinalization,
-            scButterfly,
-            scTypedarray,                
+            scButterfly,              
             scArrayOverflow,
             scCssAnim,
             scCssCustom,
