@@ -130,12 +130,18 @@ export const Executor = {
             return result;
         }
 
+        
         // --- 3. TYPE CONFUSION ---
         if (valType !== base.type && base.type !== 'undefined' && val !== null) {
-            result.anomaly = true;
-            result.telemetry = 'TYPE_CONFUSION';
-            result.reason = `[TYPE CONFUSION] ${base.type} -> ${valType}. Baseline: ${base.repr} | Pós: ${valRepr}`;
-            return result;
+            // 🚨 FIX DO RUÍDO: Ignora alertas visuais customizados das nossas probes
+            const isCustomAlert = valType === 'string' && (val.includes('💥') || val.includes('🏆') || val.includes('LEAK'));
+            
+            if (!isCustomAlert) {
+                result.anomaly = true;
+                result.telemetry = 'TYPE_CONFUSION';
+                result.reason = `[TYPE CONFUSION] ${base.type} -> ${valType}. Baseline: ${base.repr} | Pós: ${valRepr}`;
+                return result;
+            }
         }
 
         // --- 4. BOOLEAN FLIP (GC Validated) ---
