@@ -56,7 +56,7 @@ export default {
                 if (matchedStr !== 'alvo' && matchedStr !== 'lixo') {
                     return `💥 LEAK/CORRUPÇÃO: Motor leu -> ${matchedStr}`;
                 }
-                return 'Seguro (Mitigado)';
+                return 0;
             }
             return 0; // Seguro (Devolveu Null)
         }
