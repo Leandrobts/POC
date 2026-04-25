@@ -69,10 +69,8 @@ export const Mutator = {
     groomOOB: function(count = 2000) {
         let victims = new Array(count);
         for (let i = 0; i < count; i++) {
-            // 🚨 FIX: Floats hiper-granulares para evitar colisões
-            let arr = [1.1111111111111, 2.2222222222222, 3.3333333333333, 4.4444444444444];
-            arr.marker = 0x1337; 
-            victims[i] = arr;
+            // Array puro de doubles — mantém fast double array no JSC (sem PropertyTable)
+            victims[i] = [1.1111111111111, 2.2222222222222, 3.3333333333333, 4.4444444444444];
         }
         return victims;
     },
