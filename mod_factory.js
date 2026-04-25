@@ -48,7 +48,7 @@ export const Factory = {
             scMessagePort,
             scNativeCallback,
             scPromiseMicro,
-           // scRegexpOverflow,
+            scRegexpOverflow,
             scStringOverflow,
             scStructuredClone,
             scTreewalker,
