@@ -3,7 +3,7 @@
  * MOD_FACTORY.JS — Gerenciador de Cenários Modular
  * MODO PRODUÇÃO: Todos os 16 cenários ativos para varredura contínua.
  */
-/*import scIframeUaf from './scenarios/sc_iframe_frame_uaf.js';
+import scIframeUaf from './scenarios/sc_iframe_frame_uaf.js';
 import scDomRange from './scenarios/sc_dom_range_extract_uaf.js';
 import scCanvasImage from './scenarios/sc_canvas_imagedata_oob.js';
 
@@ -22,8 +22,7 @@ import scTreewalker from './scenarios/sc_treewalker_confusion.js';
 import scSvgFilter from './scenarios/sc_svg_filter_uaf.js';
 import scWeakmapEphemeron from './scenarios/sc_weakmap_ephemeron.js';
 import scButterfly from './scenarios/sc_butterfly_splice.js';
-import scFinalization from './scenarios/sc_finalization_race.js';
-*/import scFullscreen from './scenarios/sc_fullscreen_api_race.js';
+import scFinalization from './scenarios/sc_finalization_race.js';/import scFullscreen from './scenarios/sc_fullscreen_api_race.js';
 import scVideoNative from './scenarios/sc_video_native_fs_swap.js';
 import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
 
@@ -31,10 +30,10 @@ import scVideoFullscreen from './scenarios/sc_video_fullscreen_remove.js';
 
 export const Factory = {
     buildScenarios: function() {
-        const allScenarios = [ // scIframeUaf,
+        const allScenarios = [ scIframeUaf,
          scFullscreen,
-            scVideoNative,
-        /*    scFinalization,
+         scVideoNative,
+          scFinalization,
             scButterfly,              
             scArrayOverflow,
             scCssAnim,
@@ -50,9 +49,9 @@ export const Factory = {
             scStringOverflow,
             scStructuredClone,
             scTreewalker,
-            scSvgFilter, */         
-            scVideoFullscreen
-          //  scWeakmapEphemeron
+            scSvgFilter,        
+            scVideoFullscreen,
+          scWeakmapEphemeron
         ];
 
         const activeList = [];
