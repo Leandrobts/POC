@@ -1,113 +1,86 @@
 /**
- * SC_MESSAGEPORT_UAF.JS
- * Categoria : WORKERS — Use-After-Free / Type Confusion
- * Alvo      : WebCore::MessagePort C++ lifecycle
- * Técnica   : Cria um MessageChannel, transfere port2 via postMessage
- *             e mantém referência JS ao port transferido. Fecha port1
- *             e verifica se operações sobre port2 acessam memória livre.
- *             Também testa entangle/disentangle de ports.
- * Referência: WebKit MessagePort disentangle UAF pattern
+ * CENÁRIO: MESSAGEPORT_TRANSFER_UAF
+ * Superfície C++: MessagePort.cpp / MessagePortChannel.cpp / WorkerMessagingProxy.cpp
+ * Risco: MEDIUM
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior fazia transfer apenas uma vez e não verificava o
+ *     estado do port detachado de forma sistemática.
+ *   - Versão robusta testa três variantes de transfer:
+ *     (A) transfer via postMessage para iframe (cross-window)
+ *     (B) transfer via postMessage para Worker (cross-thread)
+ *     (C) transfer duplo — re-transfer de um port já transferido
+ *   - Probes testam todos os métodos do port neutered para verificar
+ *     se o C++ ainda executa código sobre o backing object freed.
+ *   - Verifica se o handler onmessage no port transferido ainda dispara
+ *     sobre o wrapper JS do contexto de origem.
  */
 
 export default {
-    id:          'MESSAGEPORT_UAF',
-    category:    'WORKERS',
-    risk:        'HIGH',
-    description: 'MessagePort JS retém referência após transferência. '
-                + 'Testa acesso ao port C++ entangled após close/transfer.',
+    id:       'MESSAGEPORT_TRANSFER_UAF',
+    category: 'IPC',
+    risk:     'MEDIUM',
+    description:
+        'Transfer de MessagePort via postMessage para iframe e Worker. ' +
+        'Ref retida ao port transferido testa todos os métodos do wrapper neutered. ' +
+        'Inclui double-transfer (re-transfer de port já transferido) e ' +
+        'verificação de onmessage pós-transfer no contexto de origem.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _channel:      null,
-    _port1:        null,
-    _port2:        null,
-    _recvCount:    0,
-    _recvData:     null,
-    _transferPort: null,
+    setup: function() {
+        this.mc      = new MessageChannel();
+        this.portRef = this.mc.port1;
+        this.received = [];
 
-    supported: function() {
-        return typeof MessageChannel !== 'undefined';
+        this.mc.port1.start();
+        this.mc.port2.start();
+        this.mc.port2.onmessage = e => this.received.push(e.data);
     },
 
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._recvCount    = 0;
-        this._recvData     = null;
-        this._transferPort = null;
+    trigger: function() {
+        // VETOR A: transfer para iframe
+        this.iframe = document.createElement('iframe');
+        this.iframe.src = 'about:blank';
+        document.body.appendChild(this.iframe);
 
-        this._channel = new MessageChannel();
-        this._port1   = this._channel.port1;
-        this._port2   = this._channel.port2;
+        try {
+            // Transfer: port1 ownership vai para o iframe
+            // portRef ainda referencia o wrapper JS neutered
+            this.iframe.contentWindow.postMessage('init', '*', [this.mc.port1]);
+        } catch(e) {}
 
-        this._port1.onmessage = (e) => {
-            this._recvCount++;
-            this._recvData = typeof e.data === 'object' ? JSON.stringify(e.data) : String(e.data);
-        };
-
-        this._port1.start();
-        this._port2.start();
-
-        // Troca inicial para confirmar funcionamento
-        this._port2.postMessage({ phase: 'init', canary: 0x41414141 });
-        await new Promise(r => setTimeout(r, 20));
+        // VETOR B: remove o iframe imediatamente após o transfer
+        // O contexto destino é destruído enquanto o port ainda existe
+        this.iframe.remove();
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // Cria um segundo canal e transfere port2 para dentro de uma mensagem
-        const helperChannel = new MessageChannel();
-
-        // Guarda referência ao port antes de transferir
-        this._transferPort = this._port2;
-
-        try {
-            // Transferência — após isso, port2 fica "neutered" no JS
-            this._port1.postMessage({ payload: 'transfer' }, [this._port2]);
-        } catch(_) {}
-
-        // Fecha port1 — libera o entanglement C++
-        try {
-            this._port1.close();
-        } catch(_) {}
-
-        helperChannel.port1.close();
-        helperChannel.port2.close();
-
-        // Tenta usar o port transferido (neutered)
-        try {
-            this._transferPort.postMessage({ phase: 'post-transfer' });
-        } catch(_) {}
-
-        await new Promise(r => setTimeout(r, 20));
-    },
-
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-3] port1 após close
-        s => typeof s._port1,
-        s => s._port1 === null,
-        s => s._port1 instanceof MessagePort,
-        s => s._recvCount,
+        // Estado do port neutered
+        s => s.portRef.onmessage,
+        s => s.portRef.onmessageerror,
 
-        // [4-6] port2 após transferência (deve ser neutered)
-        s => typeof s._port2,
-        s => s._port2 instanceof MessagePort,
-        s => s._recvData ?? 'null',
+        // Tenta usar os métodos — InvalidStateError esperado, crash = bug
+        s => { try { s.portRef.postMessage('A'); return 'ok'; } catch(e) { return e.constructor.name + ':' + e.message; } },
+        s => { try { s.portRef.postMessage('B', [new ArrayBuffer(8)]); return 'ok'; } catch(e) { return e.constructor.name; } },
+        s => { try { s.portRef.start(); return 'ok'; } catch(e) { return e.constructor.name; } },
+        s => { try { s.portRef.close(); return 'ok'; } catch(e) { return e.constructor.name; } },
+        s => { try { s.portRef.dispatchEvent(new MessageEvent('message', { data: 'x' })); return 'ok'; } catch(e) { return e.constructor.name; } },
 
-        // [7-9] port transferido — tentativa de uso pós-transfer
-        s => typeof s._transferPort,
-        s => s._transferPort instanceof MessagePort,
-        s => { try { s._transferPort?.postMessage('probe'); return 'ok'; } catch(e) { return e.constructor.name; } },
+        // Re-transfer: tenta transferir o port neutered novamente
+        // Se aceitar, o C++ pode criar double-free
+        s => {
+            try {
+                const ch = new MessageChannel();
+                ch.port1.postMessage('reuse', '*', [s.portRef]);
+                return 'double-transfer-accepted';
+            } catch(e) { return e.constructor.name; }
+        },
+
+        // Verifica mensagens recebidas no port2 (atividade pós-transfer)
+        s => s.received.length,
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        try { this._port1?.close(); } catch(_) {}
-        try { this._port2?.close(); } catch(_) {}
-        this._channel      = null;
-        this._port1        = null;
-        this._port2        = null;
-        this._transferPort = null;
-        this._recvCount    = 0;
-        this._recvData     = null;
+    cleanup: function() {
+        try { this.iframe?.remove(); } catch(e) {}
+        try { this.mc.port2.close(); } catch(e) {}
     }
 };

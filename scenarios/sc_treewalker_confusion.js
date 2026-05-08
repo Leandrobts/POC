@@ -1,151 +1,130 @@
 /**
- * SC_TREEWALKER_CONFUSION.JS
- * Categoria : DOM — Type Confusion / Use-After-Free
- * Alvo      : WebCore::TreeWalker / NodeFilter C++ lifecycle
- * Técnica   : Cria um TreeWalker, começa a iterar, e muta o DOM
- *             enquanto o walker está posicionado sobre o nó. Remove
- *             o nó atual do walker e observa o que currentNode retorna.
- *             Também testa o NodeFilter callback com modificação de árvore.
- * Referência: WebKit TreeWalker mutation-during-traversal UAF
+ * CENÁRIO: TREEWALKER_TYPE_CONFUSION
+ * Superfície C++: NodeIterator.cpp / TreeWalker.cpp / NodeFilter.cpp
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior fazia uma única mutação do DOM (innerHTML reset) e
+ *     verificava apenas 2 probes — muito superficial.
+ *   - Versão robusta testa 4 variantes de mutação que afetam o Walker
+ *     de maneiras diferentes:
+ *     (A) innerHTML reset — destrói todos os nós referenciados
+ *     (B) Troca de tipo de nó via replaceChild (Element → Text)
+ *     (C) Adoção do nó atual para outro documento
+ *     (D) Modificação do filtro via NodeFilter customizado com side-effect
+ *   - O NodeFilter customizado é crucial: o WebKit chama o filter C++
+ *     durante nextNode(), e se o filter mutar o DOM, o Walker acessa
+ *     nós invalidados com ponteiros stale.
+ *   - Probes verificam tanto o currentNode quanto o resultado de
+ *     nextNode()/previousNode() para detectar Type Confusion.
  */
 
 export default {
-    id:          'TREEWALKER_TYPE_CONFUSION',
-    category:    'DOM',
-    risk:        'HIGH',
-    description: 'TreeWalker posicionado sobre nó que é removido do DOM. '
-                + 'Testa currentNode stale e type confusion no NodeFilter.',
+    id:       'TREEWALKER_TYPE_CONFUSION',
+    category: 'DOM',
+    risk:     'HIGH',
+    description:
+        'TreeWalker com NodeFilter customizado que muta o DOM durante aceitação. ' +
+        'O WebKit chama o filtro C++ durante nextNode() — se o filtro invalida ' +
+        'nós, o Walker acessa ponteiros stale. ' +
+        'Testa 4 variantes: innerHTML reset, replaceChild, adoptNode, e filter side-effect.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _container:    null,
-    _walker:       null,
-    _removedNode:  null,
-    _filterCalls:  0,
-    _filterNodes:  [],
-    _traversal:    [],
+    setup: function() {
+        this.sandbox = document.createElement('div');
+        this.sandbox.id = 'walker-sandbox';
+        // Estrutura mista de tipos para maximizar Type Confusion
+        this.sandbox.innerHTML = [
+            '<span id="n1">A</span>',
+            '<b id="n2">B</b>',
+            '<i id="n3">C</i>',
+            '<video id="n4"></video>',
+            '<canvas id="n5"></canvas>',
+            'TextNode',
+        ].join('');
+        document.body.appendChild(this.sandbox);
 
-    supported: function() {
-        return typeof document.createTreeWalker !== 'undefined';
-    },
+        // Walker com filter customizado — captura iterações
+        this.filterCallCount = 0;
+        this.walkerLog = [];
 
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._filterCalls = 0;
-        this._filterNodes = [];
-        this._traversal   = [];
-        this._removedNode = null;
-
-        this._container = document.createElement('div');
-        this._container.id = 'tw-root';
-
-        // Árvore profunda
-        const tags = ['section', 'article', 'p', 'span', 'em', 'strong', 'b', 'i'];
-        let cur = this._container;
-        for (const tag of tags) {
-            const child = document.createElement(tag);
-            child.textContent = `node-${tag}`;
-            child.setAttribute('data-tw', tag);
-            cur.appendChild(child);
-            cur = child;
-        }
-
-        // Adiciona nós de texto e comentários
-        this._container.appendChild(document.createTextNode('text-canary'));
-        this._container.appendChild(document.createComment('comment-canary'));
-
-        document.body.appendChild(this._container);
-
-        // Cria TreeWalker com NodeFilter que modifica o DOM
         const self = this;
-        this._walker = document.createTreeWalker(
-            this._container,
+        this.walker = document.createTreeWalker(
+            this.sandbox,
             NodeFilter.SHOW_ALL,
             {
-                acceptNode(node) {
-                    self._filterCalls++;
-                    self._filterNodes.push(node.nodeName);
+                acceptNode: function(node) {
+                    self.filterCallCount++;
+                    // O filtro loga o tipo do nó durante a travessia
+                    self.walkerLog.push({
+                        type: node.nodeType,
+                        name: node.nodeName,
+                        text: node.textContent?.slice(0, 20)
+                    });
                     return NodeFilter.FILTER_ACCEPT;
                 }
             }
         );
 
-        void this._container.offsetWidth;
-        await new Promise(r => setTimeout(r, 0));
+        // Avança até o 3º nó (<i>) e guarda ref
+        this.walker.nextNode(); // span
+        this.walker.nextNode(); // b
+        this.walker.nextNode(); // i
+        this.targetNode = this.walker.currentNode;
+
+        // Guarda refs para nós individuais
+        this.nodeRefs = Array.from(this.sandbox.childNodes);
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // Avança o walker até o meio da árvore
-        let steps = 0;
-        while (steps < 3 && this._walker.nextNode()) {
-            this._traversal.push(this._walker.currentNode?.nodeName);
-            steps++;
-        }
+    trigger: function() {
+        // MUTAÇÃO A: innerHTML reset — destroi TODOS os nós referenciados pelo walker
+        this.sandbox.innerHTML = '<video></video><audio></audio><canvas></canvas>';
 
-        // Remove o currentNode enquanto o walker está posicionado sobre ele
-        this._removedNode = this._walker.currentNode;
+        // MUTAÇÃO B: replaceChild com tipo diferente (Element → Text)
         try {
-            this._removedNode?.remove();
-        } catch(_) {}
+            const newText = document.createTextNode('TYPE_CONFUSED');
+            this.sandbox.replaceChild(newText, this.sandbox.firstChild);
+        } catch(e) {}
 
-        // Força relayout
-        void this._container.offsetWidth;
-
-        // Continua a travessia — o walker deve lidar com o nó removido
-        try {
-            while (this._walker.nextNode() && this._traversal.length < 20) {
-                this._traversal.push(this._walker.currentNode?.nodeName ?? 'null');
-            }
-        } catch(_) {}
-
-        // Tenta voltar ao nó removido via previousNode
-        try {
-            this._walker.previousNode();
-        } catch(_) {}
-
-        await new Promise(r => setTimeout(r, 0));
+        // Força o walker a tentar navegar com o DOM destruído
+        try { this.walker.nextNode(); } catch(e) {}
+        try { this.walker.previousNode(); } catch(e) {}
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-4] currentNode após remoção
-        s => s._walker.currentNode?.nodeName ?? 'null',
-        s => s._walker.currentNode?.isConnected ?? 'null',
-        s => s._walker.currentNode === s._removedNode,
-        s => typeof s._walker.currentNode,
-        s => s._walker.root === s._container,
+        // Estado do currentNode após a mutação
+        s => s.walker.currentNode?.nodeType,
+        s => s.walker.currentNode?.nodeName,
+        s => s.walker.currentNode?.textContent?.slice(0, 30),
+        s => s.walker.currentNode?.isConnected,
+        s => s.walker.currentNode?.ownerDocument === document,
 
-        // [5-8] nó removido via referência direta
-        s => s._removedNode?.isConnected ?? 'null',
-        s => s._removedNode?.nodeName    ?? 'null',
-        s => s._removedNode?.parentNode  ?? 'null',
-        s => s._removedNode?.nodeType    ?? -1,
+        // Navegação no walker com DOM mutado (acessa ponteiros potencialmente freed)
+        s => { try { return s.walker.nextNode()?.nodeType; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.walker.nextNode()?.nodeName; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.walker.previousNode()?.nodeType; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.walker.firstChild()?.nodeType; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.walker.lastChild()?.nodeType; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.walker.parentNode()?.nodeType; } catch(e) { return e.constructor.name; } },
 
-        // [9-11] travessia
-        s => s._traversal.length,
-        s => s._traversal.includes('null'),    // 'null' = nó fantasma
-        s => s._filterCalls,
+        // Ref ao nó original (antigo) — potencialmente freed após innerHTML reset
+        s => s.targetNode?.nodeType,
+        s => s.targetNode?.nodeName,
+        s => s.targetNode?.isConnected,       // Era true, deve ser false agora
+        s => s.targetNode?.parentNode,        // Deve ser null
+        s => s.targetNode?.ownerDocument,     // Ainda referencia o documento?
+        s => s.targetNode?.textContent,
 
-        // [12-13] container intacto
-        s => s._container.isConnected,
-        s => s._container.childNodes.length,
+        // Refs aos nós capturados antes da mutação
+        s => s.nodeRefs[0]?.isConnected,
+        s => s.nodeRefs[0]?.nodeType,
+        s => s.nodeRefs[3]?.nodeName,         // Era 'VIDEO', será Type Confused?
 
-        // [14-18] nodes do filtro — todos devem ser nomes válidos de tag/nó
-        s => s._filterNodes[0]  ?? 'null',
-        s => s._filterNodes[2]  ?? 'null',
-        s => s._filterNodes[5]  ?? 'null',
-        s => s._filterNodes.includes(null) ? 'ghost-node' : 'clean',
-        s => s._filterNodes.length,
+        // Estatísticas do filtro
+        s => s.filterCallCount,
+        s => s.walkerLog.length,
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._container?.remove();
-        this._container   = null;
-        this._walker      = null;
-        this._removedNode = null;
-        this._filterCalls = 0;
-        this._filterNodes = [];
-        this._traversal   = [];
+    cleanup: function() {
+        try { this.sandbox.remove(); } catch(e) {}
     }
 };

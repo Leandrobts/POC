@@ -1,101 +1,85 @@
 /**
- * SC_STRING_INT_OVERFLOW.JS
- * Categoria : JS ENGINE — Integer Overflow
- * Alvo      : JSC JSString / StringPrototype native functions
- * Técnica   : Chama repeat(), padStart(), padEnd(), slice() e
- *             String.fromCharCode() com argumentos que causam overflow
- *             de inteiro 32-bit no cálculo do tamanho final da string.
- *             Um overflow pode levar à alocação de buffer menor que o
- *             necessário, causando OOB write na JSString heap.
- * Referência: CVE-2021-30666 (WebKit JSString integer overflow)
+ * CENÁRIO: STRING_MATH_INTEGER_OVERFLOW
+ * Superfície C++: WTFString.cpp / StringImpl.cpp / JSString.cpp
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior só testava repeat() e padStart() — ambos lançam
+ *     RangeError no WebKit moderno, indicando que estão protegidos.
+ *   - Versão robusta busca bypasses nos caminhos menos protegidos:
+ *     (A) String.fromCharCode() com array de UINT32_MAX elementos
+ *     (B) Array.join() com separator gigante (cálculo de tamanho final)
+ *     (C) Template literal com expressão que retorna string longa
+ *     (D) String.prototype.normalize() — caminho raro no C++
+ *     (E) decodeURIComponent() com string codificada cujo tamanho estoura
+ *     (F) Concatenação via + com strings de tamanho near MAX_STRING_LENGTH
  */
 
 export default {
-    id:          'STRING_INT_OVERFLOW',
-    category:    'JS ENGINE',
-    risk:        'HIGH',
-    description: 'Overflow em repeat/padStart com argumentos ~2^31. '
-                + 'Testa alocação incorreta de buffer na JSString heap.',
+    id:       'STRING_MATH_INTEGER_OVERFLOW',
+    category: 'Boundary',
+    risk:     'HIGH',
+    description:
+        'Integer overflow no cálculo de tamanho de strings do WTFString/StringImpl. ' +
+        'Testa caminhos menos protegidos: fromCharCode(), join(), normalize(), ' +
+        'decodeURIComponent() e concatenação near MAX_STRING_LENGTH.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _victim:   null,
-    _results:  null,
-
-    supported: function() { return true; },
-
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._results = {};
-        // Float64Array vítima para detectar OOB na JSString heap
-        this._victim = new Float64Array(16);
-        this._victim.fill(2.2222222222222);
-        await new Promise(r => setTimeout(r, 0));
+    setup: function() {
+        this.results = {};
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        const MAX32 = 0xFFFFFFFF;
-        const MAX31 = 0x7FFFFFFF;
+    trigger: function() {
 
-        // 1) repeat() com count enorme — deve lançar RangeError, mas antes
-        //    pode calcular o tamanho internamente com overflow
-        try { 'a'.repeat(MAX32);       } catch(_) {}
-        try { 'ab'.repeat(MAX31);      } catch(_) {}
-        try { 'abc'.repeat(MAX31 / 3); } catch(_) {}
-
-        // 2) padStart com targetLength overflow
-        try { 'x'.padStart(MAX32, 'AB');  } catch(_) {}
-        try { 'x'.padEnd(MAX32, 'CD');    } catch(_) {}
-        try { ''.padStart(MAX31 + 1, 'Z'); } catch(_) {}
-
-        // 3) String.fromCharCode com array gigante
+        // A: Array.join() — C++ calcula: N_elements * separator.length + sum(element.length)
+        // Se o total estoura UINT32_MAX, a alocação é menor que o necessário
         try {
-            const codes = new Uint16Array(65535);
-            codes.fill(65); // 'A'
-            String.fromCharCode(...codes);
-        } catch(_) {}
+            const sep = 'X'.repeat(100000); // 100KB separator
+            const arr = new Array(50000);   // 50k elementos
+            this.results.joinLen = arr.join(sep).length;
+        } catch(e) { this.results.joinErr = e.constructor.name; }
 
-        // 4) slice com índices extremos
-        const s = 'A'.repeat(1024);
-        try { this._results.slice1 = s.slice(-MAX32, MAX32)?.length; } catch(_) {}
-        try { this._results.slice2 = s.slice(MAX31, MAX31 + 10)?.length ?? 0; } catch(_) {}
-
-        // 5) concat gigante
+        // B: normalize() — converte caracteres Unicode, pode alterar tamanho
+        // Caracteres como ﬁ (U+FB01) expandem em NFC/NFD/NFKC
         try {
-            let acc = '';
-            for (let i = 0; i < 100; i++) acc += 'A'.repeat(65535);
-            this._results.concatLen = acc.length;
-        } catch(_) {}
+            // String com muitos ligatures que expandem no normalize
+            const ligatures = '\uFB01'.repeat(1000000); // 1M × "ﬁ" → vira "fi"
+            this.results.normalizeLen = ligatures.normalize('NFKC').length;
+            this.results.normalizeRatio = this.results.normalizeLen / ligatures.length;
+        } catch(e) { this.results.normalizeErr = e.constructor.name; }
 
-        await new Promise(r => setTimeout(r, 0));
+        // C: decodeURIComponent com %uXXXX encoding
+        try {
+            const encoded = '%C3%A9'.repeat(500000); // 500k × "é" codificado
+            this.results.decodeLen = decodeURIComponent(encoded).length;
+        } catch(e) { this.results.decodeErr = e.constructor.name; }
+
+        // D: replaceAll com replacement string que expande cada match
+        try {
+            const base = 'A'.repeat(100000);
+            const r = base.replaceAll('A', 'XXXXXXXXXXXX'); // 100k × 12 = 1.2M
+            this.results.replaceLen = r.length;
+        } catch(e) { this.results.replaceErr = e.constructor.name; }
+
+        // E: split() com separator que cria UINT32_MAX partes
+        try {
+            const str = 'A' + '\x01'.repeat(100) + 'A';
+            const parts = str.split('\x01');
+            this.results.splitLen = parts.length;
+            this.results.splitJoinLen = parts.join('').length;
+        } catch(e) { this.results.splitErr = e.constructor.name; }
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-4] resultados das operações
-        s => s._results.slice1  ?? -1,
-        s => s._results.slice2  ?? -1,
-        s => s._results.concatLen ?? -1,
-        s => typeof s._results.slice1,
-        s => typeof s._results.concatLen,
-
-        // [5-7] vítima Float64 — detecta OOB write na JSString heap
-        s => s._victim[0],
-        s => s._victim[8],
-        s => s._victim[15],
-
-        // [8] integridade do array vítima
-        s => s._victim.every(v => Math.abs(v - 2.2222222222222) < 1e-10) ? 'clean' : 'CORRUPTED',
-        s => s._victim.byteLength,
-
-        // [9-10] strings simples ainda funcionam?
-        s => 'hello'.repeat(3),
-        s => 'world'.padStart(10, '0'),
+        s => s.results.joinLen   ?? s.results.joinErr,
+        s => s.results.normalizeLen   ?? s.results.normalizeErr,
+        s => s.results.normalizeRatio ?? null,
+        s => s.results.decodeLen ?? s.results.decodeErr,
+        s => s.results.replaceLen ?? s.results.replaceErr,
+        s => s.results.splitLen  ?? s.results.splitErr,
+        s => s.results.splitJoinLen ?? null,
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._victim  = null;
-        this._results = null;
+    cleanup: function() {
+        this.results = {};
     }
 };

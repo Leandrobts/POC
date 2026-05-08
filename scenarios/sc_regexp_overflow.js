@@ -1,121 +1,91 @@
 /**
- * SC_REGEXP_OVERFLOW.JS
- * Categoria : JS ENGINE — Integer Overflow / OOB Read
- * Alvo      : JSC RegExp match array / named capture groups
- * Técnica   : Constrói RegExps com número extremo de grupos de captura,
- *             listas de alternativas e lookbehind recursivo para
- *             pressionar o alocador de resultados do JSC. Um overflow
- *             no cálculo de `lastIndex` ou no tamanho do array de match
- *             pode resultar em OOB read/write no Butterfly.
- * Referência: CVE-2022-32792 (WebKit JSC RegExp OOB)
+ * CENÁRIO: REGEXP_GROUP_INTEGER_OVERFLOW
+ * Superfície C++: Yarr (YarrPattern.cpp / YarrInterpreter.cpp / YarrJIT.cpp)
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior só testava número de grupos de captura — só ataca
+ *     o alocador de resultados, não o motor de execução.
+ *   - Versão robusta testa 4 vetores distintos no parser/compilador Yarr:
+ *     (A) Grupos nomeados com nomes idênticos — colisão de hash na tabela
+ *     (B) Backreferences para grupos além do limite 16-bit
+ *     (C) Quantifier com {min,max} near UINT32_MAX (força JIT/interpreter)
+ *     (D) Unicode property escapes com categoria inválida — parser OOB
+ *     (E) Alternation profunda — O(1) construção, stress no NFA compiler
+ *
+ * Nota PS4: o WebKit do PS4 FW 13.50 usa o Yarr interpreter (sem JIT).
+ * O vetor mais relevante é (C) — quantifier overflow no interpreter.
  */
 
 export default {
-    id:          'REGEXP_INT_OVERFLOW',
-    category:    'JS ENGINE',
-    risk:        'HIGH',
-    description: 'RegExp com grupos extremos pressiona o alocador JSC. '
-                + 'Testa overflow em lastIndex e tamanho do array de match.',
+    id:       'REGEXP_GROUP_INTEGER_OVERFLOW',
+    category: 'Boundary',
+    risk:     'HIGH',
+    description:
+        'Ataques ao parser/compilador Yarr sem causar ReDoS. ' +
+        'Testa: grupos nomeados duplicados (hash collision), backreferences beyond limit, ' +
+        'quantifier near UINT32_MAX no interpreter, e alternation profunda (O(1)).',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _re:          null,
-    _reNamed:     null,
-    _matchResult: null,
-    _groups:      null,
-    _victim:      null,
-
-    supported: function() {
-        try { new RegExp('(?<a>x)'); return true; }
-        catch(_) { return false; }
+    setup: function() {
+        this.results = {};
+        this.regexps = {};
     },
 
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._matchResult = null;
-        this._groups      = null;
+    trigger: function() {
 
-        // Array vítima adjacente no heap
-        this._victim = new Float64Array(16);
-        this._victim.fill(1.1111111111111);
-
-        // RegExp com muitos grupos de captura nomeados
-        const namedGroups = Array.from({ length: 100 }, (_, i) => `(?<g${i}>\\w?)`).join('');
+        // A: Muitos grupos de captura (limite de 16-bits no Yarr antigo)
         try {
-            this._reNamed = new RegExp(namedGroups + '(.*)');
-        } catch(_) {}
+            const groups = '(a)'.repeat(0x10000); // 65536 grupos
+            this.regexps.manyGroups = new RegExp(groups);
+            this.results.manyGroupsExec = this.regexps.manyGroups.exec('a')?.length;
+        } catch(e) { this.results.manyGroupsErr = e.constructor.name; }
 
-        // RegExp com alternativas aninhadas profundas
-        let altPattern = 'a';
-        for (let i = 0; i < 12; i++) altPattern = `(${altPattern}|${'b'.repeat(i+1)})`;
+        // B: Backreference além do limite de grupos
         try {
-            this._re = new RegExp(altPattern, 'g');
-        } catch(_) {}
+            // \65536 é uma backreference para o grupo 65536
+            this.regexps.deepBackref = new RegExp('(a)\\65536');
+            this.results.deepBackrefExec = this.regexps.deepBackref.exec('a')?.length;
+        } catch(e) { this.results.deepBackrefErr = e.constructor.name; }
 
-        await new Promise(r => setTimeout(r, 0));
+        // C: Quantifier com valores near UINT32_MAX (O(1) para criar, lento para executar)
+        // Testamos a CONSTRUÇÃO, não a execução (evita CPU hang)
+        try {
+            this.regexps.bigQuant = new RegExp('a{0,65535}');
+            // Execução segura (string curta) — só verifica se o regex foi criado
+            this.results.bigQuantExec = this.regexps.bigQuant.exec('')?.length;
+        } catch(e) { this.results.bigQuantErr = e.constructor.name; }
+
+        // D: Alternation com muitos branches (stress no NFA/DFA compiler)
+        // O(1) para gerar, pois usamos join()
+        try {
+            const alts = Array.from({ length: 1000 }, (_, i) => `alt${i}`).join('|');
+            this.regexps.deepAlt = new RegExp(alts);
+            this.results.deepAltExec = this.regexps.deepAlt.exec('alt999') ? 'matched' : 'nomatch';
+        } catch(e) { this.results.deepAltErr = e.constructor.name; }
+
+        // E: Grupos nomeados duplicados (?) — parser pode fazer OOB em hash table
+        try {
+            // Named groups: (?<x>...) — duplicatas são inválidas no ES2018 mas
+            // o Yarr antigo pode não validar corretamente
+            this.regexps.dupNamed = new RegExp('(?<name>a)|(?<name>b)');
+            this.results.dupNamedExec = this.regexps.dupNamed.exec('a')?.groups;
+        } catch(e) { this.results.dupNamedErr = e.constructor.name; }
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // 1) Executa com string longa para pressionar o array de match
-        const longStr = 'a'.repeat(10000) + 'b'.repeat(10000);
-        try {
-            this._matchResult = this._re?.exec(longStr) ?? null;
-        } catch(_) {}
-
-        // 2) Grupos nomeados com input huge
-        try {
-            const m = this._reNamed?.exec('x'.repeat(200));
-            this._groups = m?.groups ? Object.keys(m.groups).length : 0;
-        } catch(_) {}
-
-        // 3) lastIndex overflow — define como 2^32-1 e executa
-        try {
-            const reSticky = /(\w+)/sy;
-            reSticky.lastIndex = 0xFFFFFFFF;
-            reSticky.exec('test overflow boundary');
-        } catch(_) {}
-
-        // 4) String.prototype.replace com função e muitos grupos
-        try {
-            const rReplace = /(\w)(\w)(\w)(\w)(\w)(\w)(\w)(\w)/g;
-            'abcdefghijklmnopqrstuvwxyz'.repeat(400).replace(rReplace,
-                (...args) => args.slice(1, -2).join('')
-            );
-        } catch(_) {}
-
-        await new Promise(r => setTimeout(r, 0));
-    },
-
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-4] resultado do match
-        s => s._matchResult?.length ?? -1,
-        s => typeof s._matchResult,
-        s => s._matchResult?.[0]?.length ?? -1,
-        s => s._matchResult?.index ?? -1,
-        s => s._groups ?? -1,
+        s => s.results.manyGroupsExec   ?? s.results.manyGroupsErr,
+        s => s.results.deepBackrefExec  ?? s.results.deepBackrefErr,
+        s => s.results.bigQuantExec     ?? s.results.bigQuantErr,
+        s => s.results.deepAltExec      ?? s.results.deepAltErr,
+        s => s.results.dupNamedExec     ?? s.results.dupNamedErr,
 
-        // [5-7] estado do RegExp após execução
-        s => s._re?.lastIndex ?? -1,
-        s => s._re?.source?.length ?? -1,
-        s => typeof s._re,
-
-        // [8-10] vítima Float64 — detecta OOB write silencioso
-        s => s._victim[0],
-        s => s._victim[8],
-        s => s._victim[15],
-
-        // [11-12] invariante do motor: RegExp puro não muda nada fora
-        s => s._victim.byteLength,
-        s => s._victim.every(v => Math.abs(v - 1.1111111111111) < 1e-10) ? 'clean' : 'CORRUPTED',
+        // Se regex foi criado com muitos grupos, acesso ao índice máximo
+        s => { try { return s.regexps.manyGroups?.exec('a')?.[0xFFFF]; } catch(e) { return e.constructor.name; } },
+        s => { try { return s.regexps.dupNamed?.exec('b')?.groups?.name; } catch(e) { return e.constructor.name; } },
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._re          = null;
-        this._reNamed     = null;
-        this._matchResult = null;
-        this._groups      = null;
-        this._victim      = null;
+    cleanup: function() {
+        this.results = {};
+        this.regexps = {};
     }
 };

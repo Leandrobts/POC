@@ -1,129 +1,110 @@
 /**
- * SC_CSS_ANIM_REMOVED.JS
- * Categoria : DOM/STYLE — Use-After-Free
- * Alvo      : WebCore::AnimationTimeline / CSSAnimation lifecycle
- * Técnica   : Inicia uma animação CSS num elemento, remove o elemento
- *             do DOM durante o primeiro frame, e observa se callbacks
- *             de animação ainda disparam sobre o objeto C++ liberado.
- *             O AnimationTimeline pode manter uma referência "stale"
- *             ao elemento mesmo após remoção.
- * Referência: Similar ao CVE-2020-9802 (WebKit animation UAF)
+ * CENÁRIO: CSS_ANIMATION_REMOVED_ELEMENT
+ * Superfície C++: CSSAnimationController.cpp / RenderStyle.cpp / CompositorAnimations.cpp
+ * Risco: MEDIUM
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior tinha apenas 1 animação e aguardava passivamente.
+ *   - Versão robusta usa múltiplas animações simultâneas em propriedades
+ *     diferentes (transform, opacity, filter, clip-path) para pressionar
+ *     mais caminhos do CSSAnimationController.
+ *   - Adiciona Web Animations API (element.animate()) que tem ciclo de
+ *     vida separado do CSS — o AnimationTimeline pode segurar ptr freed.
+ *   - Remove o elemento durante um requestAnimationFrame ativo (não apenas
+ *     programaticamente) para coincidir com o frame tick do compositor.
+ *   - Probes verificam getAnimations() e Animation.playState pós-free.
  */
 
 export default {
-    id:          'CSS_ANIM_REMOVED',
-    category:    'DOM/STYLE',
-    risk:        'HIGH',
-    description: 'AnimationTimeline mantém ref para elemento já removido. '
-                + 'Dispara callbacks de animação pós-free para detectar UAF no C++.',
+    id:       'CSS_ANIMATION_REMOVED_ELEMENT',
+    category: 'Rendering',
+    risk:     'MEDIUM',
+    description:
+        'Múltiplas animações CSS + Web Animations API em elemento removido. ' +
+        'Transform, opacity, filter e clip-path pressionam 4 caminhos do compositor. ' +
+        'Remove durante requestAnimationFrame para coincidir com frame tick. ' +
+        'AnimationTimeline pode manter ptr para RenderStyle freed.',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _el:             null,
-    _container:      null,
-    _styleTag:       null,
-    _callbackCount:  0,
-    _callbackPhase:  null,
-    _animObj:        null,
-
-    supported: function() {
-        return typeof document !== 'undefined'
-            && typeof CSSAnimation !== 'undefined';
-    },
-
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        this._callbackCount = 0;
-        this._callbackPhase = null;
-
-        // Injeta keyframes via <style>
-        this._styleTag = document.createElement('style');
-        this._styleTag.textContent = `
-            @keyframes uaf-anim {
-                0%   { transform: translateX(0px);   opacity: 1; }
-                50%  { transform: translateX(100px); opacity: 0.5; }
-                100% { transform: translateX(200px); opacity: 0; }
-            }
-            .uaf-target {
-                animation: uaf-anim 0.1s linear 3;
-                width: 10px; height: 10px;
-                position: absolute; left: -9999px;
+    setup: function() {
+        this.style = document.createElement('style');
+        this.style.textContent = `
+            @keyframes fuzz-t  { 0%{transform:translateX(0)  rotate(0deg)}   100%{transform:translateX(80px) rotate(360deg)} }
+            @keyframes fuzz-o  { 0%{opacity:1}                                100%{opacity:0.1} }
+            @keyframes fuzz-f  { 0%{filter:blur(0px)}                         100%{filter:blur(4px) brightness(2)} }
+            @keyframes fuzz-c  { 0%{clip-path:inset(0%)}                      100%{clip-path:inset(20%)} }
+            .fuzz-multi {
+                animation:
+                    fuzz-t 0.07s linear infinite,
+                    fuzz-o 0.05s ease infinite alternate,
+                    fuzz-f 0.09s linear infinite,
+                    fuzz-c 0.06s ease-in-out infinite alternate;
+                width: 60px;
+                height: 60px;
+                background: linear-gradient(45deg, red, blue);
+                position: absolute;
+                will-change: transform, opacity;
+                top: 0; left: 0;
             }
         `;
-        document.head.appendChild(this._styleTag);
+        document.head.appendChild(this.style);
 
-        this._container = document.createElement('div');
-        document.body.appendChild(this._container);
+        this.el = document.createElement('div');
+        this.el.className = 'fuzz-multi';
+        document.body.appendChild(this.el);
 
-        this._el = document.createElement('div');
-        this._el.className = 'uaf-target';
-
-        // Registra handlers ANTES de adicionar ao DOM
-        this._el.addEventListener('animationstart', (e) => {
-            this._callbackCount++;
-            this._callbackPhase = 'start';
-            this._animObj = e.target.getAnimations?.()[0] ?? null;
-        });
-        this._el.addEventListener('animationiteration', () => {
-            this._callbackCount++;
-            this._callbackPhase = 'iteration';
-        });
-        this._el.addEventListener('animationend', () => {
-            this._callbackCount++;
-            this._callbackPhase = 'end';
+        // Web Animations API — AnimationTimeline separado do CSS
+        this.webAnim = this.el.animate([
+            { backgroundColor: 'red',  transform: 'scale(1)'   },
+            { backgroundColor: 'blue', transform: 'scale(1.5)' },
+        ], {
+            duration:   60,
+            iterations: Infinity,
+            easing:     'ease-in-out',
         });
 
-        this._container.appendChild(this._el);
-
-        // Aguarda o primeiro frame para a animação começar
-        await new Promise(r => requestAnimationFrame(r));
-        await new Promise(r => requestAnimationFrame(r));
+        this.animLog = [];
+        this.el.addEventListener('animationiteration', () => {
+            try { this.animLog.push({ rect: this.el.getBoundingClientRect() }); }
+            catch(e) { this.animLog.push({ err: e.message }); }
+        });
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        // Remove o elemento do DOM enquanto a animação está ativa
-        this._el.remove();
-
-        // Força layout para que o motor processo o estilo
-        void document.body.offsetWidth;
-
-        // Aguarda possível disparo de callbacks sobre o objeto liberado
-        await new Promise(r => setTimeout(r, 50));
-        await new Promise(r => requestAnimationFrame(r));
+    trigger: function() {
+        // Remove durante um requestAnimationFrame — coincide com frame tick do compositor
+        requestAnimationFrame(() => {
+            this.el.remove();
+            // Tenta continuar a animação Web Animations após remover o elemento
+            try { this.webAnim.play(); } catch(e) {}
+        });
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-3] estado do elemento após remoção
-        s => s._el.isConnected,
-        s => s._el.parentNode,
-        s => s._el.style.animationPlayState,
-        s => s._el.getAnimations?.().length ?? 0,
+        // CSS Animations pós-remove
+        s => s.el.getAnimations?.().length,
+        s => s.el.getAnimations?.()[0]?.playState,
+        s => s.el.getAnimations?.()[0]?.currentTime,
+        s => s.el.getAnimations?.()[0]?.effect?.target === s.el,
 
-        // [4-6] callbacks — se callbackCount subiu após remoção = UAF
-        s => s._callbackCount,
-        s => s._callbackPhase,
-        s => typeof s._callbackPhase,
+        // Web Animations API pós-remove
+        s => s.webAnim?.playState,
+        s => s.webAnim?.currentTime,
+        s => { try { s.webAnim?.cancel(); return 'ok'; } catch(e) { return e.message; } },
 
-        // [7-9] objeto de animação obtido no callback
-        s => s._animObj?.playState ?? 'null',
-        s => s._animObj?.effect?.target === s._el,
-        s => typeof s._animObj,
+        // Geometry (RenderObject freed)
+        s => s.el.getBoundingClientRect().x,
+        s => s.el.getBoundingClientRect().width,
+        s => getComputedStyle(s.el).transform,
+        s => getComputedStyle(s.el).opacity,
+        s => getComputedStyle(s.el).filter,
+        s => getComputedStyle(s.el).animationPlayState,
 
-        // [10-11] integridade do container
-        s => s._container.isConnected,
-        s => s._container.children.length,
+        // Eventos de animação gravados
+        s => s.animLog.length,
+        s => s.animLog.some(l => l.err) ? 'ANIM_CALLBACK_ERROR' : 'ok',
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._container?.remove();
-        this._styleTag?.remove();
-        this._container    = null;
-        this._el           = null;
-        this._styleTag     = null;
-        this._animObj      = null;
-        this._callbackCount = 0;
-        this._callbackPhase = null;
+    cleanup: function() {
+        try { this.webAnim?.cancel(); } catch(e) {}
+        try { this.style.remove(); } catch(e) {}
     }
 };

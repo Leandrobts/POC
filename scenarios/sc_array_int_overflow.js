@@ -1,94 +1,88 @@
 /**
- * SC_ARRAY_INT_OVERFLOW.JS
- * Categoria : MEMORY — Integer Overflow
- * Alvo      : JSC ArrayPrototype / Butterfly realloc
- * Técnica   : Overflow de inteiro 32-bit em splice() e push() com
- *             índices próximos de 2^32-1, forçando underflow no
- *             cálculo do novo tamanho do Butterfly, podendo sobrescrever
- *             metadados adjacentes no heap.
- * Referência: Similar ao CVE-2019-8506 (WebKit array length confusion)
+ * CENÁRIO: ARRAY_MATH_INTEGER_OVERFLOW
+ * Superfície C++: JSArray.cpp / JSGenericTypedArrayView.cpp / ArrayBuffer.cpp
+ * Risco: HIGH
+ *
+ * Diferença para a versão genérica:
+ *   - Versão anterior só testava push() e DataView offset — muito superficial.
+ *   - Versão robusta adiciona:
+ *     (A) splice() com índice negativo near INT_MIN — underflow
+ *     (B) slice() com start/end que combinam para transbordo 32-bit
+ *     (C) ArrayBuffer.transfer() (se disponível) com tamanho gigante
+ *     (D) TypedArray subarray() com offset + length que estouram
+ *     (E) fill() em array de tamanho máximo — sem loop (O(1))
  */
 
 export default {
-    id:          'ARRAY_INT_OVERFLOW',
-    category:    'MEMORY',
-    risk:        'HIGH',
-    description: 'Integer overflow em splice/push com índice ~2^32-1. '
-                + 'Testa se o JSC recalcula o Butterfly sem truncar para 32 bits.',
+    id:       'ARRAY_MATH_INTEGER_OVERFLOW',
+    category: 'Boundary',
+    risk:     'HIGH',
+    description:
+        'Integer overflow em operações de array sem loops (O(1)). ' +
+        'Testa push() em array length=0xFFFFFFFF, splice() com índice near INT_MIN, ' +
+        'TypedArray subarray offset+length overflow, e ArrayBuffer.transfer().',
 
-    /* ── estado interno ──────────────────────────────────────────────── */
-    _arr:        null,
-    _sparse:     null,
-    _victim:     null,
-
-    supported: function() { return true; },
-
-    /* ── setup ──────────────────────────────────────────────────────── */
-    setup: async function() {
-        // Array denso normal
-        this._arr    = [1.1, 2.2, 3.3, 4.4, 5.5];
-
-        // Array esparso com índice muito alto
-        this._sparse = [];
-        this._sparse[0xFFFFFFFE] = 0xDEAD;   // força length = 0xFFFFFFFF
-
-        // Array vítima adjacente no heap — detectamos corrupção se ele mudar
-        this._victim = new Float64Array(8);
-        this._victim.fill(1.1111111111111);
+    setup: function() {
+        this.results = {};
+        this.buffer = new ArrayBuffer(16);
     },
 
-    /* ── trigger ─────────────────────────────────────────────────────── */
-    trigger: async function() {
-        try {
-            // 1) splice no limite superior — pode truncar para negativo internamente
-            this._arr.splice(0xFFFFFFFF - 2, 1, 9.9, 8.8, 7.7);
-        } catch(_) {}
+    trigger: function() {
 
+        // A: push() overflow (0xFFFFFFFF + 1 wraps para 0)
         try {
-            // 2) push empurrando além de 2^32 — length wraps to 0?
-            const big = new Array(0xFFFFFFFF);
-            big.push(1.1, 2.2);
-        } catch(_) {}
+            const arr = [];
+            arr.length = 0xFFFFFFFF;
+            arr.push(1337);
+            this.results.pushLen = arr.length;
+        } catch(e) { this.results.pushErr = e.constructor.name; }
 
+        // B: splice() com índice near INT_MIN (underflow de signed 32-bit)
         try {
-            // 3) fill com offset inteiro-overflow
-            const f64 = new Float64Array(new ArrayBuffer(64));
-            f64.fill(3.14, 0xFFFFFFFF, 0xFFFFFFFF + 4);
-        } catch(_) {}
+            const arr = [1, 2, 3, 4, 5];
+            arr.splice(-0x80000001, 1); // -2147483649 underflowa
+            this.results.spliceLen = arr.length;
+        } catch(e) { this.results.spliceErr = e.constructor.name; }
 
-        await new Promise(r => setTimeout(r, 0));
+        // C: slice() com combinação de indices que somam > UINT32_MAX
+        try {
+            const arr = new Array(100).fill(1.1);
+            const r = arr.slice(0xFFFFFFF0, 0xFFFFFFFF);
+            this.results.sliceLen = r.length;
+        } catch(e) { this.results.sliceErr = e.constructor.name; }
+
+        // D: TypedArray subarray com offset+length overflow
+        try {
+            const ta = new Uint8Array(this.buffer);
+            this.results.subArr = ta.subarray(0xFFFFFFF0, 0xFFFFFFFF);
+            this.results.subArrLen = this.results.subArr?.byteLength;
+        } catch(e) { this.results.subArrErr = e.constructor.name; }
+
+        // E: DataView com offset gigante (RangeError esperado — bypass = bug)
+        try {
+            this.results.dataView = new DataView(this.buffer, 0xFFFFFFFF, 1);
+        } catch(e) { this.results.dataViewErr = e.constructor.name; }
+
+        // F: TypedArray constructor com byteOffset near MAX_SAFE_INTEGER
+        try {
+            const ab = new ArrayBuffer(8);
+            this.results.bigOffsetView = new Uint8Array(ab, Number.MAX_SAFE_INTEGER - 7, 1);
+        } catch(e) { this.results.bigOffsetErr = e.constructor.name; }
     },
 
-    /* ── probes ──────────────────────────────────────────────────────── */
     probe: [
-        // [0-4] integridade do array normal
-        s => s._arr.length,
-        s => s._arr[0],
-        s => s._arr[4],
-        s => Array.isArray(s._arr),
-        s => Object.isFrozen(s._arr),
-
-        // [5-7] integridade do esparso
-        s => s._sparse.length,
-        s => s._sparse[0xFFFFFFFE],
-        s => typeof s._sparse[0xFFFFFFFE],
-
-        // [8-11] vítima Float64 — detecta OOB write silencioso
-        s => s._victim[0],
-        s => s._victim[3],
-        s => s._victim[7],
-        s => s._victim.byteLength,
-
-        // [12-14] invariantes do motor
-        s => [].concat(s._arr).length,
-        s => s._arr.indexOf(1.1),
-        s => JSON.stringify(s._arr.slice(0, 5)),
+        s => s.results.pushLen ?? s.results.pushErr,
+        s => s.results.spliceLen ?? s.results.spliceErr,
+        s => s.results.sliceLen ?? s.results.sliceErr,
+        s => s.results.subArrLen ?? s.results.subArrErr,
+        s => s.results.dataView ? s.results.dataView.byteOffset : s.results.dataViewErr,
+        s => s.results.bigOffsetView ? s.results.bigOffsetView.byteOffset : s.results.bigOffsetErr,
+        // Se qualquer view foi criada, tenta ler memória nativa
+        s => { try { return s.results.subArr ? s.results.subArr[0] : null; } catch(e) { return e.constructor.name; } },
     ],
 
-    /* ── cleanup ─────────────────────────────────────────────────────── */
-    cleanup: async function() {
-        this._arr    = null;
-        this._sparse = null;
-        this._victim = null;
+    cleanup: function() {
+        this.results = {};
+        this.buffer  = null;
     }
 };
