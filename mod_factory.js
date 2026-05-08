@@ -3,7 +3,7 @@
  * MOD_FACTORY.JS — Gerenciador de Cenários Modular
  * MODO PRODUÇÃO: Todos os 16 cenários ativos para varredura contínua.
  */
-import scIframeUaf from './scenarios/sc_iframe_frame_uaf.js';
+
 import scDomRange from './scenarios/sc_dom_range_extract_uaf.js';
 import scCanvasImage from './scenarios/sc_canvas_imagedata_oob.js';
 //import scMediaSource from './scenarios/sc_mediasource_uaf.js';
