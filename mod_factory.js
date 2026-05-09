@@ -26,19 +26,16 @@ import scCssAnim           from './scenarios/sc_css_anim_removed.js';
 import scCssCustom         from './scenarios/sc_css_custom_prop.js';
 import scDomEvent          from './scenarios/sc_dom_event_removed.js';
 import scIframeUaf         from './scenarios/sc_iframe_frame_uaf.js';
-
-
-
-
-
-
-
-
-
-
-
-
-
+import scWebglBuffer      from './scenarios/sc_webgl_buffer_overflow.js';
+import scShadowSlot       from './scenarios/sc_shadow_dom_slot_uaf.js';
+import scAudioNode        from './scenarios/sc_audio_node_uaf.js';
+import scRangeBoundary    from './scenarios/sc_range_boundary_uaf.js';
+import scCanvasContext    from './scenarios/sc_canvas_context_uaf.js';
+import scCustomElement    from './scenarios/sc_custom_element_uaf.js';
+import scProxyConfusion   from './scenarios/sc_proxy_type_confusion.js';
+import scFetchAbort       from './scenarios/sc_fetch_abort_uaf.js';
+import scGeneratorGC      from './scenarios/sc_generator_gc_uaf.js';
+import scIntersectionObs  from './scenarios/sc_intersection_observer_uaf.js';
 
 export const Factory = {
     buildScenarios: function() {
