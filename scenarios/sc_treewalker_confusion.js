@@ -1,130 +1,141 @@
 /**
- * CENÁRIO: TREEWALKER_TYPE_CONFUSION
- * Superfície C++: NodeIterator.cpp / TreeWalker.cpp / NodeFilter.cpp
- * Risco: HIGH
+ * SC_TREEWALKER_CONFUSION.JS  [v2 — falsos positivos corrigidos]
  *
- * Diferença para a versão genérica:
- *   - Versão anterior fazia uma única mutação do DOM (innerHTML reset) e
- *     verificava apenas 2 probes — muito superficial.
- *   - Versão robusta testa 4 variantes de mutação que afetam o Walker
- *     de maneiras diferentes:
- *     (A) innerHTML reset — destrói todos os nós referenciados
- *     (B) Troca de tipo de nó via replaceChild (Element → Text)
- *     (C) Adoção do nó atual para outro documento
- *     (D) Modificação do filtro via NodeFilter customizado com side-effect
- *   - O NodeFilter customizado é crucial: o WebKit chama o filter C++
- *     durante nextNode(), e se o filter mutar o DOM, o Walker acessa
- *     nós invalidados com ponteiros stale.
- *   - Probes verificam tanto o currentNode quanto o resultado de
- *     nextNode()/previousNode() para detectar Type Confusion.
+ * FIX probe[5] — TYPE_CONFUSION string→boolean:
+ *   s._removedNode era null no baseline (atribuído só no trigger).
+ *   s._removedNode?.isConnected ?? 'null' retornava 'null' (string).
+ *   Após trigger, _removedNode existia e isConnected=false (boolean).
+ *   O executor via string→boolean = TYPE_CONFUSION falso.
+ *   Correção: String() em todas as probes que usam ?. + ?? 'null'
+ *   sobre variáveis atribuídas no trigger, para manter tipo string
+ *   em baseline e em pós-trigger.
+ *
+ * Probes afetadas: [5] _removedNode?.isConnected
+ *                  [6] _removedNode?.nodeName
+ *                  [7] _removedNode?.parentNode
+ *                  [8] _removedNode?.nodeType
  */
 
 export default {
-    id:       'TREEWALKER_TYPE_CONFUSION',
-    category: 'DOM',
-    risk:     'HIGH',
-    description:
-        'TreeWalker com NodeFilter customizado que muta o DOM durante aceitação. ' +
-        'O WebKit chama o filtro C++ durante nextNode() — se o filtro invalida ' +
-        'nós, o Walker acessa ponteiros stale. ' +
-        'Testa 4 variantes: innerHTML reset, replaceChild, adoptNode, e filter side-effect.',
+    id:          'TREEWALKER_TYPE_CONFUSION',
+    category:    'DOM',
+    risk:        'HIGH',
+    description: 'TreeWalker posicionado sobre nó que é removido do DOM. '
+                + 'Testa currentNode stale e type confusion no NodeFilter.',
 
-    setup: function() {
-        this.sandbox = document.createElement('div');
-        this.sandbox.id = 'walker-sandbox';
-        // Estrutura mista de tipos para maximizar Type Confusion
-        this.sandbox.innerHTML = [
-            '<span id="n1">A</span>',
-            '<b id="n2">B</b>',
-            '<i id="n3">C</i>',
-            '<video id="n4"></video>',
-            '<canvas id="n5"></canvas>',
-            'TextNode',
-        ].join('');
-        document.body.appendChild(this.sandbox);
+    _container:    null,
+    _walker:       null,
+    _removedNode:  null,
+    _filterCalls:  0,
+    _filterNodes:  [],
+    _traversal:    [],
 
-        // Walker com filter customizado — captura iterações
-        this.filterCallCount = 0;
-        this.walkerLog = [];
+    supported: function() {
+        return typeof document.createTreeWalker !== 'undefined';
+    },
+
+    setup: async function() {
+        this._filterCalls = 0;
+        this._filterNodes = [];
+        this._traversal   = [];
+        this._removedNode = null;
+
+        this._container = document.createElement('div');
+        this._container.id = 'tw-root';
+
+        const tags = ['section', 'article', 'p', 'span', 'em', 'strong', 'b', 'i'];
+        let cur = this._container;
+        for (const tag of tags) {
+            const child = document.createElement(tag);
+            child.textContent = `node-${tag}`;
+            child.setAttribute('data-tw', tag);
+            cur.appendChild(child);
+            cur = child;
+        }
+
+        this._container.appendChild(document.createTextNode('text-canary'));
+        this._container.appendChild(document.createComment('comment-canary'));
+
+        document.body.appendChild(this._container);
 
         const self = this;
-        this.walker = document.createTreeWalker(
-            this.sandbox,
+        this._walker = document.createTreeWalker(
+            this._container,
             NodeFilter.SHOW_ALL,
             {
-                acceptNode: function(node) {
-                    self.filterCallCount++;
-                    // O filtro loga o tipo do nó durante a travessia
-                    self.walkerLog.push({
-                        type: node.nodeType,
-                        name: node.nodeName,
-                        text: node.textContent?.slice(0, 20)
-                    });
+                acceptNode(node) {
+                    self._filterCalls++;
+                    self._filterNodes.push(node.nodeName);
                     return NodeFilter.FILTER_ACCEPT;
                 }
             }
         );
 
-        // Avança até o 3º nó (<i>) e guarda ref
-        this.walker.nextNode(); // span
-        this.walker.nextNode(); // b
-        this.walker.nextNode(); // i
-        this.targetNode = this.walker.currentNode;
-
-        // Guarda refs para nós individuais
-        this.nodeRefs = Array.from(this.sandbox.childNodes);
+        void this._container.offsetWidth;
+        await new Promise(r => setTimeout(r, 0));
     },
 
-    trigger: function() {
-        // MUTAÇÃO A: innerHTML reset — destroi TODOS os nós referenciados pelo walker
-        this.sandbox.innerHTML = '<video></video><audio></audio><canvas></canvas>';
+    trigger: async function() {
+        let steps = 0;
+        while (steps < 3 && this._walker.nextNode()) {
+            this._traversal.push(this._walker.currentNode?.nodeName);
+            steps++;
+        }
 
-        // MUTAÇÃO B: replaceChild com tipo diferente (Element → Text)
+        this._removedNode = this._walker.currentNode;
+        try { this._removedNode?.remove(); } catch(_) {}
+
+        void this._container.offsetWidth;
+
         try {
-            const newText = document.createTextNode('TYPE_CONFUSED');
-            this.sandbox.replaceChild(newText, this.sandbox.firstChild);
-        } catch(e) {}
+            while (this._walker.nextNode() && this._traversal.length < 20) {
+                this._traversal.push(this._walker.currentNode?.nodeName ?? 'null');
+            }
+        } catch(_) {}
 
-        // Força o walker a tentar navegar com o DOM destruído
-        try { this.walker.nextNode(); } catch(e) {}
-        try { this.walker.previousNode(); } catch(e) {}
+        try { this._walker.previousNode(); } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 0));
     },
 
     probe: [
-        // Estado do currentNode após a mutação
-        s => s.walker.currentNode?.nodeType,
-        s => s.walker.currentNode?.nodeName,
-        s => s.walker.currentNode?.textContent?.slice(0, 30),
-        s => s.walker.currentNode?.isConnected,
-        s => s.walker.currentNode?.ownerDocument === document,
+        // [0-4] currentNode após remoção
+        s => s._walker.currentNode?.nodeName    ?? 'null',
+        s => String(s._walker.currentNode?.isConnected ?? 'null'),   // FIX: boolean→string
+        s => String(s._walker.currentNode === s._removedNode),
+        s => typeof s._walker.currentNode,
+        s => String(s._walker.root === s._container),
 
-        // Navegação no walker com DOM mutado (acessa ponteiros potencialmente freed)
-        s => { try { return s.walker.nextNode()?.nodeType; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.walker.nextNode()?.nodeName; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.walker.previousNode()?.nodeType; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.walker.firstChild()?.nodeType; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.walker.lastChild()?.nodeType; } catch(e) { return e.constructor.name; } },
-        s => { try { return s.walker.parentNode()?.nodeType; } catch(e) { return e.constructor.name; } },
+        // [5-8] FIX: String() em todas as probes de _removedNode
+        s => String(s._removedNode?.isConnected ?? 'null'),  // [5] era boolean falso positivo
+        s => String(s._removedNode?.nodeName    ?? 'null'),  // [6]
+        s => String(s._removedNode?.parentNode  ?? 'null'),  // [7]
+        s => String(s._removedNode?.nodeType    ?? -1),      // [8]
 
-        // Ref ao nó original (antigo) — potencialmente freed após innerHTML reset
-        s => s.targetNode?.nodeType,
-        s => s.targetNode?.nodeName,
-        s => s.targetNode?.isConnected,       // Era true, deve ser false agora
-        s => s.targetNode?.parentNode,        // Deve ser null
-        s => s.targetNode?.ownerDocument,     // Ainda referencia o documento?
-        s => s.targetNode?.textContent,
+        // [9-11] travessia
+        s => s._traversal.length,
+        s => String(s._traversal.includes('null')),
+        s => s._filterCalls,
 
-        // Refs aos nós capturados antes da mutação
-        s => s.nodeRefs[0]?.isConnected,
-        s => s.nodeRefs[0]?.nodeType,
-        s => s.nodeRefs[3]?.nodeName,         // Era 'VIDEO', será Type Confused?
+        // [12-13] container
+        s => String(s._container.isConnected),
+        s => s._container.childNodes.length,
 
-        // Estatísticas do filtro
-        s => s.filterCallCount,
-        s => s.walkerLog.length,
+        // [14-18] nodes do filtro
+        s => s._filterNodes[0]  ?? 'null',
+        s => s._filterNodes[2]  ?? 'null',
+        s => s._filterNodes[5]  ?? 'null',
+        s => s._filterNodes.includes(null) ? 'ghost-node' : 'clean',
+        s => s._filterNodes.length,
     ],
 
-    cleanup: function() {
-        try { this.sandbox.remove(); } catch(e) {}
+    cleanup: async function() {
+        this._container?.remove();
+        this._container   = null;
+        this._walker      = null;
+        this._removedNode = null;
+        this._filterCalls = 0;
+        this._filterNodes = [];
+        this._traversal   = [];
     }
 };

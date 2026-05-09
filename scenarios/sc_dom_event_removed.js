@@ -1,134 +1,116 @@
 /**
- * CENÁRIO: DOM_EVENT_REMOVED_ELEMENT
- * Superfície C++: EventTarget.cpp / RenderObject.cpp / RenderLayerCompositor.cpp
- * Risco: MEDIUM
+ * SC_DOM_EVENT_REMOVED.JS  [v2 — falsos positivos corrigidos]
  *
- * Diferença para a versão genérica:
- *   - Versão anterior usava apenas 'customevent' simples — events sintéticos
- *     não ativam o caminho de layout/paint do RenderObject.
- *   - Versão robusta usa eventos que forçam ação no RenderObject:
- *     'focus'/'blur' (ativa FocusController), 'mouseenter'/'mouseleave'
- *     (ativa HitTest), 'resize' (ativa RenderLayerCompositor).
- *   - Testa elemento com compositor layer (will-change: transform) — o
- *     RenderLayer tem seu próprio ciclo de vida e pode ser freed antes
- *     do RenderObject pai.
- *   - Adiciona MutationObserver registrado antes do remove() — o callback
- *     pode disparar sobre o nó freed após o GC do executor.
- *   - Probe acessa offsetParent, scrollIntoView() e focus() pós-free.
+ * FIX probe[6] / probe[7] — TYPE_CONFUSION object→string:
+ *   _lastTarget e _lastType eram inicializados como null (tipo object).
+ *   Após o trigger recebiam string ('SPAN', 'click').
+ *   O executor via object→string = TYPE_CONFUSION falso.
+ *   Correção: inicializar ambos como 'none' (string) desde o setup().
  */
 
 export default {
-    id:       'DOM_EVENT_REMOVED_ELEMENT',
-    category: 'DOM',
-    risk:     'MEDIUM',
-    description:
-        'Múltiplos tipos de eventos disparados em elemento removido do DOM. ' +
-        'Usa eventos que ativam caminhos de RenderObject: focus, mouseenter, resize. ' +
-        'will-change:transform cria RenderLayer separado com ciclo de vida próprio. ' +
-        'MutationObserver registrado pré-remove pode disparar sobre nó freed.',
+    id:          'DOM_EVENT_REMOVED_ELEMENT',
+    category:    'DOM',
+    risk:        'HIGH',
+    description: 'Despacha eventos sobre nó removido do DOM. '
+                + 'Testa se o EventTarget C++ sobrevive ao GC após remoção.',
 
-    setup: function() {
-        this.callbackLog = [];
+    _el:          null,
+    _child:       null,
+    _container:   null,
+    _fireCount:   0,
+    _lastTarget:  'none',   // FIX: string desde a declaração
+    _lastType:    'none',   // FIX: string desde a declaração
+    _bubbleCount: 0,
 
-        this.el = document.createElement('div');
-        this.el.tabIndex = 0; // Necessário para eventos de foco
-        this.el.style.cssText = [
-            'width:100px',
-            'height:100px',
-            'background:#222',
-            'position:absolute',
-            'top:0',
-            'left:0',
-            // will-change força criação de RenderLayer separado no compositor
-            'will-change:transform',
-            'transform:translateZ(0)',
-        ].join(';');
+    supported: function() { return typeof document !== 'undefined'; },
 
-        // Listener 1: foco — ativa FocusController no C++
-        this.el.addEventListener('focus', () => {
-            try { this.callbackLog.push({ ev: 'focus', rect: this.el.getBoundingClientRect() }); }
-            catch(e) { this.callbackLog.push({ ev: 'focus', err: e.message }); }
+    setup: async function() {
+        this._fireCount   = 0;
+        this._bubbleCount = 0;
+        this._lastTarget  = 'none';   // FIX
+        this._lastType    = 'none';   // FIX
+
+        this._container = document.createElement('div');
+        document.body.appendChild(this._container);
+
+        this._el = document.createElement('div');
+        this._el.id = 'uaf-dom-target';
+
+        this._child = document.createElement('span');
+        this._child.textContent = 'canary';
+        this._el.appendChild(this._child);
+
+        this._el.addEventListener('click', (e) => {
+            this._fireCount++;
+            this._lastTarget = e.target?.nodeName ?? 'none';
+            this._lastType   = e.type ?? 'none';
         });
 
-        // Listener 2: mouseenter — ativa HitTest no C++
-        this.el.addEventListener('mouseenter', () => {
-            try { this.callbackLog.push({ ev: 'mouseenter', offset: this.el.offsetWidth }); }
-            catch(e) { this.callbackLog.push({ ev: 'mouseenter', err: e.message }); }
+        this._container.addEventListener('click', () => {
+            this._bubbleCount++;
         });
 
-        // Listener 3: evento customizado acessa layout
-        this.el.addEventListener('fuzz', () => {
-            try {
-                this.callbackLog.push({
-                    ev:       'fuzz',
-                    rect:     this.el.getBoundingClientRect(),
-                    offset:   this.el.offsetWidth,
-                    computed: getComputedStyle(this.el).transform,
-                });
-            } catch(e) { this.callbackLog.push({ ev: 'fuzz', err: e.message }); }
-        });
+        this._el.addEventListener('mouseover', () => { this._fireCount++; });
+        this._el.addEventListener('focus',     () => { this._fireCount++; });
+        this._el.addEventListener('input',     () => { this._fireCount++; });
+        this._el.addEventListener('blur',      () => { this._fireCount++; });
 
-        document.body.appendChild(this.el);
-
-        // MutationObserver registrado ANTES do remove — callback pode ser chamado pós-free
-        this.mutations = [];
-        this.observer = new MutationObserver(records => {
-            records.forEach(r => {
-                try {
-                    this.mutations.push({
-                        type:    r.type,
-                        target:  r.target?.nodeName,
-                        removed: r.removedNodes?.length,
-                    });
-                } catch(e) { this.mutations.push({ err: e.message }); }
-            });
-        });
-        this.observer.observe(document.body, { childList: true, subtree: true });
+        this._container.appendChild(this._el);
+        void this._el.offsetWidth;
+        await new Promise(r => setTimeout(r, 0));
     },
 
-    trigger: function() {
-        // Remove elemento → destrói RenderObject e RenderLayer
-        this.el.remove();
+    trigger: async function() {
+        this._el.remove();
+        void document.body.offsetWidth;
+
+        const types = ['click', 'mouseover', 'focus', 'input', 'blur'];
+        for (const type of types) {
+            try {
+                this._el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+            } catch(_) {}
+        }
+
+        try {
+            this._child.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        } catch(_) {}
+
+        await new Promise(r => setTimeout(r, 10));
     },
 
     probe: [
-        // Dispara eventos que acessam o RenderObject freed
-        s => { s.el.dispatchEvent(new Event('fuzz')); return s.callbackLog.length; },
-        s => { s.el.dispatchEvent(new FocusEvent('focus')); return s.callbackLog.length; },
-        s => { s.el.dispatchEvent(new MouseEvent('mouseenter')); return s.callbackLog.length; },
+        // [0-4] estado do elemento após remoção e dispatch
+        s => s._el.isConnected,
+        s => s._el.nodeType,
+        s => s._el.nodeName,
+        s => s._el.id,
+        s => s._el.childNodes.length,
 
-        // Acesso direto ao layout do elemento freed
-        s => s.el.getBoundingClientRect().width,
-        s => s.el.getBoundingClientRect().height,
-        s => s.el.offsetWidth,
-        s => s.el.offsetHeight,
-        s => s.el.clientWidth,
-        s => s.el.clientHeight,
-        s => s.el.scrollWidth,
-        s => s.el.scrollHeight,
+        // [5-8] contadores — _lastTarget/_lastType agora sempre string
+        s => s._fireCount,
+        s => s._lastTarget,    // string: 'none' → 'SPAN' se disparou pós-remoção
+        s => s._lastType,      // string: 'none' → 'click' se disparou pós-remoção
+        s => s._bubbleCount,
 
-        // Propriedades que apontam para o RenderObject freed
-        s => s.el.offsetParent,
-        s => s.el.isConnected,
-        s => s.el.ownerDocument,
-        s => s.el.getRootNode(),
-        s => s.el.parentNode,
+        // [9-11] filho
+        s => s._child.isConnected,
+        s => s._child.parentNode === s._el,
+        s => s._child.textContent,
 
-        // Computed style — acessa StyleResolver com RenderObject freed
-        s => getComputedStyle(s.el).transform,
-        s => getComputedStyle(s.el).width,
-        s => getComputedStyle(s.el).willChange,
-
-        // Tenta focus() e blur() no elemento freed
-        s => { try { s.el.focus(); return 'ok'; } catch(e) { return e.message; } },
-        s => { try { s.el.scrollIntoView(); return 'ok'; } catch(e) { return e.message; } },
-
-        // MutationObserver logs — qualquer erro interno indica acesso a nó freed
-        s => s.mutations.length,
-        s => s.mutations.some(m => m.err) ? 'MUTATION_ERROR' : 'ok',
+        // [12-13] container
+        s => s._container.contains(s._el),
+        s => s._container.children.length,
     ],
 
-    cleanup: function() {
-        try { this.observer.disconnect(); } catch(e) {}
+    cleanup: async function() {
+        this._container?.remove();
+        this._container  = null;
+        this._el         = null;
+        this._child      = null;
+        this._lastTarget = 'none';
+        this._lastType   = 'none';
+        this._fireCount   = 0;
+        this._bubbleCount = 0;
     }
 };

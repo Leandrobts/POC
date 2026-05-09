@@ -1,110 +1,134 @@
 /**
- * CENÁRIO: WEAKMAP_EPHEMERON_UAF
- * Superfície C++: WeakMapImpl.cpp / EphemeronTable / Heap.cpp (sweeping phase)
- * Risco: HIGH
+ * SC_WEAKMAP_EPHEMERON.JS  [v2 — falsos positivos corrigidos]
  *
- * Diferença para a versão genérica:
- *   - Versão anterior usava apenas 1 par chave/valor e não tinha como
- *     observar o estado durante o sweeping do GC.
- *   - Versão robusta usa múltiplos pares e uma FinalizationRegistry
- *     (se disponível) para observar quando as chaves são coletadas.
- *   - Adiciona WeakRef para criar referência fraca para o valor — permite
- *     verificar se o valor foi coletado ANTES da entrada do WeakMap
- *     (desync na EphemeronTable = UAF candidate).
- *   - Testa WeakSet além do WeakMap — superfície adicional com ponteiro
- *     para EphemeronTable compartilhada.
- *   - Ciclo de 10 pares chave/valor para maximizar chance de timing.
+ * FIX probe[4] — TYPE_CONFUSION string→boolean:
+ *   _result era null (object) no baseline.
+ *   s._result?.hasA ?? 'null' retornava 'null' (string).
+ *   Após trigger, _result.hasA = true (boolean).
+ *   Correção: inicializar _result como objeto com tipos corretos.
+ *
+ * FIX probe[8] — TYPE_CONFUSION string→boolean (mesma causa, hasAAfterGC).
+ *
+ * FIX probe[10] — TYPE_CONFUSION string→number:
+ *   _result.dataAfterGC era undefined → ?? 'null' = 'null' (string).
+ *   Após trigger, dataAfterGC = 3.14 (number).
+ *   Correção: String() na probe[10] para forçar string sempre.
  */
 
 export default {
-    id:       'WEAKMAP_EPHEMERON_UAF',
-    category: 'CoreJS',
-    risk:     'HIGH',
-    description:
-        'WeakMap com múltiplos pares + FinalizationRegistry para observar sweeping. ' +
-        'WeakRef nos valores detecta desync: valor coletado antes da entrada do WeakMap. ' +
-        'WeakSet adicional compartilha EphemeronTable. ' +
-        '10 pares maximizam a janela de timing durante o GC.',
+    id:          'WEAKMAP_EPHEMERON_UAF',
+    category:    'JS ENGINE',
+    risk:        'MEDIUM',
+    description: 'Ephemeron chain (WeakMap A→B→A) durante GC pressure. '
+                + 'Testa ordering de coleta e acesso a obj semi-coletado via WeakRef.',
 
-    setup: function() {
-        this.wm = new WeakMap();
-        this.ws = new WeakSet();
-        this.finLog = [];
+    _wm1:      null,
+    _wm2:      null,
+    _wr:       null,
+    _sentinel: null,
 
-        // FinalizationRegistry — callback quando a chave é coletada
-        try {
-            this.registry = new FinalizationRegistry(token => {
-                this.finLog.push({ collected: token, time: Date.now() });
-            });
-        } catch(e) {}
+    // FIX: _result inicializado com tipos corretos para o baseline capturar corretamente
+    _result: {
+        hasA:         false,    // boolean
+        aValue:       'null',   // string
+        wrBefore:     'null',   // string
+        hasAAfterGC:  false,    // boolean
+        aAfterGC:     'null',   // string
+        dataAfterGC:  'null',   // string (FIX: era undefined→number após trigger)
+    },
+    _derefAfterGC: 'pending',   // FIX: era null
 
-        // 10 pares chave/valor
-        this.valueRefs = [];  // WeakRefs para os valores
-        this.keys = [];       // Refs fortes temporárias para as chaves
-
-        for (let i = 0; i < 10; i++) {
-            const key   = { id: i, data: new ArrayBuffer(1024) };
-            const value = [i * 1.1, i * 2.2, i * 3.3, i * 4.4]; // array de doubles
-
-            this.wm.set(key, value);
-            this.ws.add(key);
-
-            // WeakRef para o valor — nos permite verificar se foi coletado
-            try {
-                this.valueRefs.push(new WeakRef(value));
-            } catch(e) {
-                this.valueRefs.push(null);
-            }
-
-            // Registra finalizer para a chave
-            try {
-                this.registry?.register(key, `key_${i}`);
-            } catch(e) {}
-
-            this.keys.push(key);
-        }
-
-        // Guarda uma das chaves para probes (vai ser zerada no trigger)
-        this.probeKey = this.keys[0];
+    supported: function() {
+        return typeof WeakMap !== 'undefined';
     },
 
-    trigger: function() {
-        // Zera todas as refs fortes para as chaves
-        // O GC do executor vai coletar as chaves e acionar os ephemerons
-        this.keys = null;
-        // Nota: probeKey ainda mantém a chave[0] viva intencionalmente
-        // para testar o caminho "chave ainda viva, mas outras mortas"
+    setup: async function() {
+        // FIX: reset com tipos corretos
+        this._result = {
+            hasA:         false,
+            aValue:       'null',
+            wrBefore:     'null',
+            hasAAfterGC:  false,
+            aAfterGC:     'null',
+            dataAfterGC:  'null',
+        };
+        this._derefAfterGC = 'pending';
+
+        this._wm1      = new WeakMap();
+        this._wm2      = new WeakMap();
+        this._sentinel = { id: 'canary', value: 0x1337CAFE };
+
+        const objA = { ref: 'objA', data: new Float64Array(16).fill(3.14) };
+        const objB = { ref: 'objB', data: new Float64Array(16).fill(2.71) };
+
+        this._wm1.set(this._sentinel, objA);
+        this._wm2.set(objA, this._sentinel);
+        this._wm1.set(objB, this._sentinel);
+
+        if (typeof WeakRef !== 'undefined') {
+            this._wr = new WeakRef(objA);
+        }
+
+        void objB;
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    trigger: async function() {
+        const beforeGC = this._wm1.get(this._sentinel);
+        this._result.hasA    = beforeGC !== undefined;         // boolean — correto
+        this._result.aValue  = String(beforeGC?.ref ?? 'null'); // string  — correto
+        this._result.wrBefore = this._wr?.deref()?.ref ?? 'collected'; // string — correto
+
+        const pressure = [];
+        for (let i = 0; i < 50; i++)
+            pressure.push(new ArrayBuffer(128 * 1024));
+        pressure.length = 0;
+
+        await new Promise(r => setTimeout(r, 30));
+
+        this._derefAfterGC = this._wr?.deref()?.ref ?? 'collected'; // string
+
+        const afterGC = this._wm1.get(this._sentinel);
+        this._result.hasAAfterGC = afterGC !== undefined;               // boolean
+        this._result.aAfterGC    = String(afterGC?.ref ?? 'collected'); // string
+
+        // FIX probe[10]: dataAfterGC sempre string para evitar string→number
+        this._result.dataAfterGC = String(afterGC?.data?.[0] ?? 'null');
     },
 
     probe: [
-        // Testa has() com a chave ainda viva (probeKey)
-        s => s.wm.has(s.probeKey),
-        s => s.ws.has(s.probeKey),
-        s => s.wm.get(s.probeKey),
+        // [0-3] sentinela deve permanecer vivo
+        s => s._sentinel?.id,
+        s => s._sentinel?.value,
+        s => typeof s._sentinel,
+        s => String(s._wm1.has(s._sentinel)),
 
-        // Verifica se o valor ainda está acessível via WeakRef
-        // Se o valor foi coletado ANTES da entrada do WeakMap, há desync
-        s => s.valueRefs[0]?.deref()?.length,
-        s => s.valueRefs[0]?.deref()?.[0],
-        s => s.valueRefs[1]?.deref()?.length,
-        s => s.valueRefs[5]?.deref()?.length,
-        s => s.valueRefs[9]?.deref()?.length,
+        // [4-7] resultado pré-GC — tipos agora estáveis desde o setup
+        s => s._result.hasA,        // boolean → boolean (sem type change)
+        s => s._result.aValue,      // string  → string
+        s => s._result.wrBefore,    // string  → string
+        s => typeof s._result.aValue,
 
-        // Quantas chaves foram finalizadas (FinalizationRegistry)
-        s => s.finLog.length,
-        s => s.finLog.map(e => e.collected).join(','),
+        // [8-11] resultado pós-GC — tipos estáveis
+        s => s._result.hasAAfterGC,  // boolean → boolean
+        s => s._result.aAfterGC,     // string  → string
+        s => s._result.dataAfterGC,  // string  → string  (FIX: era number)
+        s => s._derefAfterGC,        // string  → string
 
-        // Tenta has() com a chave zerda — TypeError ou false
-        s => { try { return s.wm.has(null); } catch(e) { return e.constructor.name; } },
-        s => { try { return s.wm.has(undefined); } catch(e) { return e.constructor.name; } },
+        // [12-13] WeakMap com sentinela não deve ter sido coletado
+        s => String(s._wm2.has(s._wm1.get(s._sentinel) ?? {})),
+        s => typeof s._wm1.get(s._sentinel),
     ],
 
-    cleanup: function() {
-        try { this.registry?.cleanupSome?.(); } catch(e) {}
-        this.wm       = null;
-        this.ws       = null;
-        this.probeKey = null;
-        this.valueRefs = null;
-        this.finLog   = null;
+    cleanup: async function() {
+        this._wm1      = null;
+        this._wm2      = null;
+        this._wr       = null;
+        this._sentinel = null;
+        this._result   = {
+            hasA: false, aValue: 'null', wrBefore: 'null',
+            hasAAfterGC: false, aAfterGC: 'null', dataAfterGC: 'null',
+        };
+        this._derefAfterGC = 'pending';
     }
 };

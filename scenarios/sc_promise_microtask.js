@@ -1,109 +1,123 @@
 /**
- * CENÁRIO: PROMISE_MICROTASK_UAF
- * Superfície C++: JSPromise.cpp / MicrotaskQueue.cpp / JSJob.cpp
- * Risco: HIGH
+ * SC_PROMISE_MICROTASK.JS  [v2 — falsos positivos corrigidos]
  *
- * Diferença para a versão genérica:
- *   - Versão anterior resolvia a Promise, apagava a ref e esperava.
- *     O callback .then() geralmente acessa contexto válido pois o
- *     executor mantém ref durante o drain da microtask queue.
- *   - Versão robusta usa cadeia de Promises para criar jobs encadeados
- *     na MicrotaskQueue e testa se jobs posteriores acessam contexto
- *     de jobs anteriores que podem ter sido freed.
- *   - Adiciona race entre resolve() e GC forçado via queueMicrotask()
- *     para pressionar o drainer da fila durante o teardown.
- *   - Testa Promise.all() e Promise.race() — ambos criam objetos C++
- *     PromiseReactionJob com back-pointers para as promises originais.
+ * FIX probe[4] / probe[5] / probe[8] — TYPE_CONFUSION object→string:
+ *   _microResult, _microPhase e _asyncResult eram null (object).
+ *   Após o trigger recebiam strings ('TypeError', 'disconnected', 'microtask-canary').
+ *   Correção: inicializar os três como 'pending' (string) no setup().
  */
 
 export default {
-    id:       'PROMISE_MICROTASK_UAF',
-    category: 'Concurrency',
-    risk:     'HIGH',
-    description:
-        'Cadeia de Promises cria jobs encadeados na MicrotaskQueue C++. ' +
-        'Promise.all/race criam PromiseReactionJobs com back-pointers. ' +
-        'Race entre resolve() e queueMicrotask() pressiona o drainer durante teardown.',
+    id:          'PROMISE_MICROTASK_UAF',
+    category:    'JS ENGINE',
+    risk:        'MEDIUM',
+    description: 'Microtask Promise acessa nó DOM removido entre resolve e .then(). '
+                + 'Testa ordering entre GC e microtask queue no JSC.',
 
-    setup: function() {
-        this.log     = [];
-        this.resolvers = [];
-        this.promises  = [];
+    _container:   null,
+    _target:      null,
+    _microResult: 'pending',   // FIX: era null
+    _microPhase:  'pending',   // FIX: era null
+    _asyncResult: 'pending',   // FIX: era null
+    _chainDepth:  0,
 
-        // Cria cadeia de 5 Promises que passam dados entre si
-        for (let i = 0; i < 5; i++) {
-            let res;
-            const p = new Promise(r => { res = r; });
-            this.promises.push(p);
-            this.resolvers.push(res);
-        }
-
-        // Cada .then() acessa o resultado do step anterior
-        this.chainResult = this.promises[0]
-            .then(v => { this.log.push({ step: 1, v }); return v * 2; })
-            .then(v => { this.log.push({ step: 2, v }); return v + 1; })
-            .then(v => { this.log.push({ step: 3, v }); return String(v); })
-            .then(v => { this.log.push({ step: 4, v }); return { final: v }; })
-            .catch(e => { this.log.push({ step: 'catch', err: e.message }); });
-
-        // Promise.all — cria PromiseReactionJobs para cada promise
-        this.allResult = null;
-        Promise.all(this.promises.slice(0, 3))
-            .then(vals => { this.allResult = vals; })
-            .catch(() => {});
-
-        // Promise.race — job que cancela quando qualquer uma resolve
-        this.raceResult = null;
-        Promise.race(this.promises)
-            .then(v => { this.raceResult = v; })
-            .catch(() => {});
+    supported: function() {
+        return typeof Promise !== 'undefined';
     },
 
-    trigger: function() {
-        // Resolve a primeira promise com um valor
-        this.resolvers[0](42);
+    setup: async function() {
+        this._microResult = 'pending';   // FIX
+        this._microPhase  = 'pending';   // FIX
+        this._asyncResult = 'pending';   // FIX
+        this._chainDepth  = 0;
 
-        // Imediatamente após resolve, apaga refs para as promises e resolvers
-        // O C++ ainda mantém refs internas nos PromiseReactionJobs
-        this.promises  = null;
-        this.resolvers = null;
+        this._container = document.createElement('div');
+        document.body.appendChild(this._container);
 
-        // Insere microtask que tenta pressionar o heap durante o drain
-        queueMicrotask(() => {
-            // Aloca durante a execução da microtask queue
-            const trash = [];
-            for (let i = 0; i < 10; i++) trash.push(new ArrayBuffer(256 * 1024));
-            // trash é coletado imediatamente — pressão sem OOM
-        });
+        this._target = document.createElement('div');
+        this._target.id = 'promise-uaf-target';
+        this._target.textContent = 'microtask-canary';
+        this._target.setAttribute('data-val', '42');
+        this._container.appendChild(this._target);
 
-        // Resolve as demais promises de forma encadeada
-        // (os resolvers foram apagados, então não conseguimos resolver)
-        // — isso é intencional: deixa Promise.all() pendente indefinidamente
-        // para testar o que acontece com PromiseReactionJobs pendentes
+        void this._target.offsetWidth;
+        await new Promise(r => setTimeout(r, 0));
+    },
+
+    trigger: async function() {
+        const el = this._target;
+
+        const deepChain = (n) => {
+            let p = Promise.resolve(el);
+            for (let i = 0; i < n; i++) {
+                p = p.then(node => {
+                    this._chainDepth++;
+                    try {
+                        return { node, val: node.getAttribute('data-val'), conn: node.isConnected };
+                    } catch(e) {
+                        return { node: null, err: e.constructor.name };
+                    }
+                });
+            }
+            return p;
+        };
+
+        const chain = deepChain(20);
+        el.remove(); // libera do DOM enquanto microtasks estão na fila
+
+        try {
+            const result = await chain;
+            // FIX: garante que _microResult e _microPhase são sempre string
+            this._microResult = String(result?.val ?? result?.err ?? 'empty');
+            this._microPhase  = result?.conn ? 'connected' : 'disconnected';
+        } catch(e) {
+            this._microResult = `ERROR:${e.constructor.name}`;
+            this._microPhase  = 'error';
+        }
+
+        const asyncRead = async (node) => {
+            await Promise.resolve();
+            return node.textContent;
+        };
+
+        try {
+            this._asyncResult = String(await asyncRead(el));
+        } catch(e) {
+            this._asyncResult = `ERROR:${e.constructor.name}`;
+        }
+
+        await new Promise(r => setTimeout(r, 10));
     },
 
     probe: [
-        // Estado da cadeia após execução das microtasks
-        s => s.log.length,
-        s => s.log[0]?.step,
-        s => s.log[0]?.v,
-        s => s.log[s.log.length - 1]?.step,
+        // [0-3] estado do nó
+        s => s._target.isConnected,
+        s => s._target.textContent,
+        s => s._target.getAttribute('data-val'),
+        s => s._target.nodeType,
 
-        // Promise.all — deveria estar pendente (não todas resolvidas)
-        s => s.allResult,
+        // [4-7] resultado das microtasks — sempre string
+        s => s._microResult,   // 'pending' → string real (sem type change)
+        s => s._microPhase,    // 'pending' → 'connected'|'disconnected'|'error'
+        s => s._chainDepth,
+        s => typeof s._microResult,
 
-        // Promise.race — deveria ter resolvido com 42
-        s => s.raceResult,
+        // [8-9] resultado async/await — sempre string
+        s => s._asyncResult,   // 'pending' → string real
+        s => typeof s._asyncResult,
 
-        // chainResult — uma Promise (deve ser objeto Promise)
-        s => typeof s.chainResult,
-        s => s.chainResult !== null,
+        // [10-11] container
+        s => s._container.isConnected,
+        s => s._container.contains(s._target),
     ],
 
-    cleanup: function() {
-        this.log        = null;
-        this.promises   = null;
-        this.resolvers  = null;
-        this.chainResult = null;
+    cleanup: async function() {
+        this._container?.remove();
+        this._container  = null;
+        this._target     = null;
+        this._microResult = 'pending';
+        this._microPhase  = 'pending';
+        this._asyncResult = 'pending';
+        this._chainDepth  = 0;
     }
 };
