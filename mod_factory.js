@@ -63,7 +63,17 @@ export const Factory = {
             scStructuredClone,
             scTreewalker,
             scSvgFilter,        
-            scVideoFullscreen,                     
+            scVideoFullscreen,     
+            scWebglBuffer,
+ scShadowSlot,      
+     scAudioNode,     
+            scRangeBoundary, 
+            scCanvasContext,
+            scCustomElement,
+            scProxyConfusion,
+            scFetchAbort,
+            scGeneratorGC,      
+            scIntersectionObs,
   
             scWeakmapEphemeron
 
