@@ -75,7 +75,7 @@ export const Factory = {
             scIntersectionObs,
             scWeakmapEphemeron,
             */
-            scRangeBoundary, 
+            scRangeBoundary
   
             
 
