@@ -66,7 +66,7 @@ export const Factory = {
           //  scAudioNode,     
          //   scRangeBoundary, 
           //  scCanvasContext,
-    // scCustomElement,
+            scCustomElement,
             scProxyConfusion,
             scFetchAbort,
             scGeneratorGC,      
