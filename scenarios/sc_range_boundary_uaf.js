@@ -101,30 +101,39 @@ export default {
     },
 
     probe: [
-        // [0-3] offsets do Range após remoção das âncoras
-        s => s._range.startOffset,
-        s => s._startOffset,        // baseline
-        s => s._range.endOffset,
-        s => s._endOffset,          // baseline
+    // [0]
+    s => { console.log('[RANGE] probe 0 — startOffset'); return s._range.startOffset; },
+    // [1]
+    s => { console.log('[RANGE] probe 1 — startOffset baseline'); return s._startOffset; },
+    // [2]
+    s => { console.log('[RANGE] probe 2 — endOffset'); return s._range.endOffset; },
+    // [3]
+    s => { console.log('[RANGE] probe 3 — endOffset baseline'); return s._endOffset; },
 
-        // [4-7] nós âncora stale — leitura via Range
-        s => s._range.startContainer?.nodeName ?? 'null',
-        s => s._startNode,          // baseline
-        s => s._range.endContainer?.nodeName   ?? 'null',
-        s => s._endNode,            // baseline
+    // [4]
+    s => { console.log('[RANGE] probe 4 — startContainer nodeName'); return s._range.startContainer?.nodeName ?? 'null'; },
+    // [5]
+    s => { console.log('[RANGE] probe 5 — startNode baseline'); return s._startNode; },
+    // [6]
+    s => { console.log('[RANGE] probe 6 — endContainer nodeName'); return s._range.endContainer?.nodeName ?? 'null'; },
+    // [7]
+    s => { console.log('[RANGE] probe 7 — endNode baseline'); return s._endNode; },
 
-        // [8-10] estado collapsed e cloneContents
-        s => String(s._range.collapsed),
-        s => s._collapsed,          // baseline
-        s => s._range.cloneContents()?.textContent?.slice(0, 30) ?? 'null',
+    // [8]
+    s => { console.log('[RANGE] probe 8 — collapsed'); return String(s._range.collapsed); },
+    // [9]
+    s => { console.log('[RANGE] probe 9 — collapsed baseline'); return s._collapsed; },
+    // [10]
+    s => { console.log('[RANGE] probe 10 — cloneContents text'); return s._range.cloneContents()?.textContent?.slice(0, 30) ?? 'null'; },
 
-        // [11-12] Selection e extract
-        s => s._extractErr,
-        s => String(s._selection?.rangeCount ?? -1),
+    // [11]
+    s => { console.log('[RANGE] probe 11 — extractErr'); return s._extractErr; },
+    // [12]
+    s => { console.log('[RANGE] probe 12 — selection rangeCount'); return String(s._selection?.rangeCount ?? -1); },
 
-        // [13] container intacto
-        s => String(s._container.isConnected),
-    ],
+    // [13]
+    s => { console.log('[RANGE] probe 13 — container isConnected'); return String(s._container.isConnected); },
+],
 
     cleanup: async function() {
         try { this._selection?.removeAllRanges(); }  catch(_) {}
