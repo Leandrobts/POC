@@ -35,7 +35,14 @@ import scProxyConfusion   from './scenarios/sc_proxy_type_confusion.js';
 import scFetchAbort       from './scenarios/sc_fetch_abort_uaf.js';
 import scGeneratorGC      from './scenarios/sc_generator_gc_uaf.js';
 import scIntersectionObs  from './scenarios/sc_intersection_observer_uaf.js';
-
+import scDomMatrix        from './scenarios/sc_dommatrix_overflow.js';
+import scSymbolPrimitive  from './scenarios/sc_symbol_toprimitive_confusion.js';
+import scDocFragment      from './scenarios/sc_document_fragment_uaf.js';
+import scTemplateContent  from './scenarios/sc_template_content_uaf.js';
+import scCryptoSubtle     from './scenarios/sc_crypto_subtle_uaf.js';
+import scCssGrid          from './scenarios/sc_css_grid_layout_uaf.js';
+import scGetterGcTrap     from './scenarios/sc_getter_gc_trap.js';
+import scWorkerTransfer   from './scenarios/sc_worker_transfer_uaf.js';
 // import scRangeBoundary    from './scenarios/sc_range_boundary_uaf.js';
 
 
@@ -77,6 +84,15 @@ export const Factory = {
             
             //scRangeBoundary
   
+           scDomMatrix,
+        scSymbolPrimitive,
+            scDocFragment,
+            scTemplateContent,
+            
+ scCryptoSubtle,   
+            scCssGrid,      
+            scGetterGcTrap,    
+            scWorkerTransfer,
             
 
 
