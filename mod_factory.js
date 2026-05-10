@@ -63,7 +63,7 @@ export const Factory = {
             scVideoFullscreen,     
            scWebglBuffer,
             scShadowSlot,      
-           scAudioNode,     
+        //nao tem ps4   scAudioNode,     
         //tela branca scRangeBoundary, 
           scCanvasContext,
             scCustomElement,
