@@ -67,7 +67,7 @@ export const Factory = {
         //tela branca scRangeBoundary, 
           scCanvasContext,
             scCustomElement,
-            //scProxyConfusion,
+            scProxyConfusion,
             scFetchAbort,
             scGeneratorGC,      
             scIntersectionObs,
