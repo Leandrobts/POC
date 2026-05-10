@@ -67,7 +67,7 @@ export const Factory = {
          //   scRangeBoundary, 
           //  scCanvasContext,
     // scCustomElement,
-          //  scProxyConfusion,
+            scProxyConfusion,
             scFetchAbort,
             scGeneratorGC,      
             scIntersectionObs,
