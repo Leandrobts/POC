@@ -3,7 +3,7 @@
  * MOD_FACTORY.JS — Gerenciador de Cenários Modular
  * MODO PRODUÇÃO: Todos os 16 cenários ativos para varredura contínua.
  */
-/*
+
 import scDomRange from './scenarios/sc_dom_range_extract_uaf.js';
 import scCanvasImage from './scenarios/sc_canvas_imagedata_oob.js';
 //import scMediaSource from './scenarios/sc_mediasource_uaf.js';
@@ -35,14 +35,14 @@ import scProxyConfusion   from './scenarios/sc_proxy_type_confusion.js';
 import scFetchAbort       from './scenarios/sc_fetch_abort_uaf.js';
 import scGeneratorGC      from './scenarios/sc_generator_gc_uaf.js';
 import scIntersectionObs  from './scenarios/sc_intersection_observer_uaf.js';
-*/
-import scRangeBoundary    from './scenarios/sc_range_boundary_uaf.js';
+
+// import scRangeBoundary    from './scenarios/sc_range_boundary_uaf.js';
 
 
 export const Factory = {
     buildScenarios: function() {
         const allScenarios = [ 
-          /*  scIframeUaf,
+          scIframeUaf,
             scFullscreen,
             scVideoNative,
             scFinalization,
@@ -74,8 +74,8 @@ export const Factory = {
             scGeneratorGC,      
             scIntersectionObs,
             scWeakmapEphemeron,
-            */
-            scRangeBoundary
+            
+            //scRangeBoundary
   
             
 
