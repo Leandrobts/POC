@@ -64,7 +64,7 @@ export const Factory = {
            // scWebglBuffer,
             //  scShadowSlot,      
           //  scAudioNode,     
-         //   scRangeBoundary, 
+          scRangeBoundary, 
           scCanvasContext,
             scCustomElement,
             //scProxyConfusion,
