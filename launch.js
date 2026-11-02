@@ -52,7 +52,7 @@ function picked() {
 
 function start() {
   stopClock();
-  location.href = "jb.html?" + TARGET[picked()];
+  location.href = "jb.js?" + TARGET[picked()];
 }
 
 function stopClock() {
